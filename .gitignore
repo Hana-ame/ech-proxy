@@ -11,3 +11,4 @@ ech-proxy-android/android/local.properties
 # Ignore IDE files
 .idea/
 *.iml
+ech-proxy-android/certs/

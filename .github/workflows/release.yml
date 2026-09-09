@@ -102,7 +102,7 @@ jobs:
 
       - name: Build ECH shared library (arm64)
         run: |
-          cd cmd/ech-proxy-android
+          cd ech-proxy-android
           CGO_ENABLED=1 \
           GOOS=android \
           GOARCH=arm64 \
@@ -112,8 +112,8 @@ jobs:
 
       - name: Copy library to Android project
         run: |
-          mkdir -p cmd/ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a
-          cp cmd/ech-proxy-android/libechproxy.so cmd/ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a/
+          mkdir -p ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a
+          cp ech-proxy-android/libechproxy.so ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a/
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
@@ -126,7 +126,7 @@ jobs:
 
       - name: Generate Gradle Wrapper
         run: |
-          cd cmd/ech-proxy-android/android
+          cd ech-proxy-android/android
           gradle wrapper --gradle-version 8.5
 
       - name: Build APK
@@ -135,18 +135,18 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'release' }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
         run: |
-          cd cmd/ech-proxy-android/android
+          cd ech-proxy-android/android
           ./gradlew assembleRelease --no-daemon
 
       - name: List APK output
         run: |
-          find cmd/ech-proxy-android/android/app/build/outputs -name "*.apk" -type f
+          find ech-proxy-android/android/app/build/outputs -name "*.apk" -type f
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-apk
-          path: cmd/ech-proxy-android/android/app/build/outputs/apk/release/*.apk
+          path: ech-proxy-android/android/app/build/outputs/apk/release/*.apk
 
   release:
     needs: [build, build-shared, build-android]

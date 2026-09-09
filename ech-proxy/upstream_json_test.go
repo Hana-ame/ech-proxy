@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/Hana-ame/ech-proxy/pkg/echproxy"
+	"github.com/Hana-ame/ech-proxy/echproxy"
 )
 
 // TestRepoUpstreamJSONValid 解析仓库内真实 upstream.json:

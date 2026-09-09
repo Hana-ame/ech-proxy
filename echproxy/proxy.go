@@ -21,8 +21,8 @@ import (
 	"sync"
 	"time"
 
-	cloudflare_ech "github.com/Hana-ame/ech-proxy/pkg/ech"
-	"github.com/Hana-ame/ech-proxy/pkg/netdial"
+	cloudflare_ech "github.com/Hana-ame/ech-proxy/ech"
+	"github.com/Hana-ame/ech-proxy/netdial"
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"

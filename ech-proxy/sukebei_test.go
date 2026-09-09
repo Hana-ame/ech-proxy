@@ -16,7 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Hana-ame/ech-proxy/pkg/echproxy"
+	"github.com/Hana-ame/ech-proxy/echproxy"
 )
 
 type dohAnswer struct {

@@ -6,7 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/Hana-ame/ech-proxy/pkg/echproxy"
+	"github.com/Hana-ame/ech-proxy/echproxy"
 )
 
 func TestLoadUpstreamConfig(t *testing.T) {

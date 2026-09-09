@@ -10,8 +10,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	cloudflare_ech "github.com/Hana-ame/ech-proxy/pkg/ech"
-	"github.com/Hana-ame/ech-proxy/pkg/netdial"
+	cloudflare_ech "github.com/Hana-ame/ech-proxy/ech"
+	"github.com/Hana-ame/ech-proxy/netdial"
 )
 
 type Option struct {

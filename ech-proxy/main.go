@@ -17,9 +17,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Hana-ame/ech-proxy/pkg/apifwd"
-	cloudflare_ech "github.com/Hana-ame/ech-proxy/pkg/ech"
-	"github.com/Hana-ame/ech-proxy/pkg/echproxy"
+	"github.com/Hana-ame/ech-proxy/apifwd"
+	cloudflare_ech "github.com/Hana-ame/ech-proxy/ech"
+	"github.com/Hana-ame/ech-proxy/echproxy"
 )
 
 //go:embed static/index.html

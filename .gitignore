@@ -1,0 +1,13 @@
+# Ignore Go build artifacts
+*.exe
+*.so
+*.apk
+
+# Ignore Android build outputs
+ech-proxy-android/android/.gradle/
+ech-proxy-android/android/app/build/
+ech-proxy-android/android/local.properties
+
+# Ignore IDE files
+.idea/
+*.iml

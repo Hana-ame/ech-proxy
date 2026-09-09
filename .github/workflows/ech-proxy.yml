@@ -5,27 +5,53 @@ on:
     branches: [main]
     paths:
       - "ech-proxy/**"
+      - "ech-proxy-android/**"
       - "ech/**"
       - "echproxy/**"
       - "apifwd/**"
+      - "netdial/**"
       - "certs/**"
       - "go.mod"
       - "go.sum"
+      - ".github/workflows/ech-proxy.yml"
+      - ".github/workflows/ech-proxy-android.yml"
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
           go-version: "1.26"
 
       - name: Build ech-proxy (Windows amd64)
-        run: GOOS=windows GOARCH=amd64 go build -o ech-proxy.exe ./ech-proxy/
+        run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-proxy-windows-amd64.exe ./ech-proxy/
 
-      - name: Upload ech-proxy.exe
+      - name: Build ech-proxy (Linux amd64)
+        run: GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ech-proxy-linux-amd64 ./ech-proxy/
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ech-proxy-windows-amd64
-          path: ech-proxy.exe
+          name: ech-proxy-desktop
+          path: |
+            ech-proxy-windows-amd64.exe
+            ech-proxy-linux-amd64
+
+      # 桌面版与 Android 版上传到同一个 release tag，保证 win/linux/android 同步更新
+      - name: Upload to Release
+        run: |
+          gh release upload v1.0.0 \
+            ech-proxy-windows-amd64.exe \
+            ech-proxy-linux-amd64 --clobber
+          echo "=== Release assets ==="
+          gh release view v1.0.0 --json assets --jq '.assets[] | "\(.name)  \(.updatedAt)"'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

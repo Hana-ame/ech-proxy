@@ -4,10 +4,17 @@ on:
   push:
     branches: [main]
     paths:
+      - "ech-proxy/**"
       - "ech-proxy-android/**"
       - "ech/**"
+      - "echproxy/**"
+      - "apifwd/**"
+      - "netdial/**"
+      - "certs/**"
       - "go.mod"
       - "go.sum"
+      - ".github/workflows/ech-proxy.yml"
+      - ".github/workflows/ech-proxy-android.yml"
   workflow_dispatch:
 
 jobs:
@@ -42,6 +49,22 @@ jobs:
           mkdir -p ech-proxy-android/android
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > ech-proxy-android/android/release.keystore
           ls -la ech-proxy-android/android/release.keystore
+
+      # 签名凭证必须显式存在于 Secrets（不依赖默认值兜底），缺失则立即失败
+      - name: Validate signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!v}" ]; then
+              echo "::error::Missing GitHub Secret: $v (APK 签名凭证必须在 Secrets 中显式配置)"
+              exit 1
+            fi
+          done
+          echo "All signing secrets present"
 
       - name: Build ECH shared library (arm64)
         run: |
@@ -90,3 +113,14 @@ jobs:
         with:
           name: twitter-pic-android
           path: ech-proxy-android/android/app/build/outputs/apk/release/*.apk
+
+      # 与桌面版（ech-proxy.yml）上传到同一个 release tag，保证 win/linux/android 同步
+      - name: Upload APK to Release
+        run: |
+          APK=$(find ech-proxy-android/android/app/build/outputs/apk/release -name "*.apk" -type f | head -1)
+          cp "$APK" app-release.apk
+          gh release upload v1.0.0 app-release.apk --clobber
+          echo "=== Release assets ==="
+          gh release view v1.0.0 --json assets --jq '.assets[] | "\(.name)  \(.updatedAt)"'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

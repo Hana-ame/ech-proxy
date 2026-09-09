@@ -1,0 +1,72 @@
+{
+    "cert_path": "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/certs/l.moonchan.xyz/fullchain.cer?proxy_host=raw.githubusercontent.com",
+    "key_path": "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/certs/l.moonchan.xyz/privkey.pem?proxy_host=raw.githubusercontent.com",
+    "upstreams": {
+        "l.moonchan.xyz": {
+            "host": "reminder.moonchan.xyz",
+            "mode": "direct"
+        },
+        "twimg.l.moonchan.xyz": {
+            "host": "video-cf.twimg.com",
+            "referer": "https://x.com"
+        },
+        "ex.l.moonchan.xyz": {
+            "host": "exhentai.org",
+            "cookie": "ipb_member_id=xxx; ipb_pass_hash=yyy; igneous=zzz"
+        },
+        "sukebei.l.moonchan.xyz": {
+            "host": "sukebei.nyaa.si",
+            "mode": "sni"
+        },
+        "ao3.l.moonchan.xyz": {
+            "host": "archiveofourown.org"
+        },
+        "iwara.l.moonchan.xyz": {
+            "host": "iwara.tv",
+            "referer": "https://www.iwara.tv/",
+            "wildcard": {
+                "prefix": "iwara-",
+                "entry_suffix": ".l.moonchan.xyz",
+                "upstream_suffix": ".iwara.tv",
+                "referer": "https://www.iwara.tv/"
+            },
+            "rewrites": {
+                "www.iwara.tv": "iwara.l.moonchan.xyz"
+            }
+        },
+        "zen.l.moonchan.xyz": {
+            "host": "opencode.ai"
+        },
+        "sensenova.l.moonchan.xyz": {
+            "host": "token.sensenova.cn",
+            "mode": "direct"
+        },
+        "dlsite.l.moonchan.xyz": {
+            "host": "www.dlsite.com",
+            "referer": "https://www.dlsite.com/",
+            "wildcard": {
+                "prefix": "dlsite-",
+                "entry_suffix": ".l.moonchan.xyz",
+                "upstream_suffix": ".dlsite.com",
+                "referer": "https://www.dlsite.com/"
+            },
+            "rewrites": {
+                "www.dlsite.com": "dlsite.l.moonchan.xyz",
+                "img.dlsite.jp": "dlsite-img.l.moonchan.xyz"
+            },
+            "sw_inject": true
+        },
+        "dlsite-img.l.moonchan.xyz": {
+            "host": "img.dlsite.jp",
+            "referer": "https://www.dlsite.com/"
+        }
+    },
+    "blocked_hosts": [
+        "https://fonts.googleapis.com",
+        "https://fonts.gstatic.com",
+        "https://www.google.com/jsapi",
+        "https://ajax.googleapis.com",
+        "https://www.googletagmanager.com",
+        "https://media.dlsite.com"
+    ]
+}

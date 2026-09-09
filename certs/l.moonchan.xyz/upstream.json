@@ -1,6 +1,6 @@
 {
-    "cert_path": "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/certs/l.moonchan.xyz/fullchain.cer?proxy_host=raw.githubusercontent.com",
-    "key_path": "https://proxy.moonchan.xyz/Hana-ame/wintools/refs/heads/main/certs/l.moonchan.xyz/privkey.pem?proxy_host=raw.githubusercontent.com",
+    "cert_path": "https://proxy.moonchan.xyz/Hana-ame/ech-proxy/refs/heads/main/certs/l.moonchan.xyz/fullchain.cer?proxy_host=raw.githubusercontent.com",
+    "key_path": "https://proxy.moonchan.xyz/Hana-ame/ech-proxy/refs/heads/main/certs/l.moonchan.xyz/privkey.pem?proxy_host=raw.githubusercontent.com",
     "upstreams": {
         "l.moonchan.xyz": {
             "host": "reminder.moonchan.xyz",

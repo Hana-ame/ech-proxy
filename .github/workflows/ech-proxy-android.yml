@@ -56,8 +56,8 @@ jobs:
 
       - name: Copy library to Android project
         run: |
-          mkdir -p ech-proxy-android/android/app/src/master/jniLibs/arm64-v8a
-          cp ech-proxy-android/libechproxy.so ech-proxy-android/android/app/src/master/jniLibs/arm64-v8a/
+          mkdir -p ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a
+          cp ech-proxy-android/libechproxy.so ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a/
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3

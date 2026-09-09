@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	_ "embed"
 	"flag"
 	"fmt"
 	"log"
@@ -21,9 +20,6 @@ import (
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/ech"
 	"github.com/Hana-ame/ech-proxy/echproxy"
 )
-
-//go:embed static/index.html
-var chatHTML string
 
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
@@ -66,14 +62,6 @@ func main() {
 	r.Use(gin.Recovery())
 	r.Use(apifwd.CORSMiddleware())
 
-	r.GET("/healthz", func(c *gin.Context) {
-		c.String(200, "ok")
-	})
-
-	var upstreamCfg echproxy.UpstreamMap
-	var upstreamHandler gin.HandlerFunc
-	var tlsCert *tls.Certificate
-
 	// 配置单一来源: 无论 TLS 还是 --http 模式, 都从 GitHub 拉取同一份
 	// upstream.json (避免 embeddedConfig 与仓库配置双份漂移)。
 	proxyBase := "https://proxy.moonchan.xyz/Hana-ame/ech-proxy/refs/heads/main/%s?proxy_host=raw.githubusercontent.com"
@@ -84,8 +72,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("加载上游配置失败: %v", err)
 	}
-	upstreamCfg = cfg.Upstreams
+	upstreamCfg := cfg.Upstreams
 	log.Printf("上游配置加载成功: %d 条规则", len(upstreamCfg))
+
+	var tlsCert *tls.Certificate
 
 	if !*httpMode {
 		// TLS 模式额外拉取证书: 证书 URL 与上游路由都写死在 repo 的
@@ -107,34 +97,8 @@ func main() {
 		tlsCert = &cert
 	}
 
-	upstreamHandler = echproxy.ProxyHandler(upstreamCfg, cfg.BlockedHosts)
-
-	hostOf := func(c *gin.Context) string {
-		h := c.Request.Host
-		if hh, _, err := net.SplitHostPort(h); err == nil {
-			h = hh
-		}
-		return h
-	}
-
-	r.GET("/", func(c *gin.Context) {
-		// 精确或通配入口都走代理, 否则返回 chatHTML。
-		h := hostOf(c)
-		if _, ok := upstreamCfg[h]; ok {
-			upstreamHandler(c)
-			return
-		}
-		if _, ok := echproxy.MatchWildcardForTest(upstreamCfg, h); ok {
-			upstreamHandler(c)
-			return
-		}
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(200, chatHTML)
-	})
-
-	r.NoRoute(func(c *gin.Context) {
-		upstreamHandler(c)
-	})
+	// 分流路由（桌面版与 Android 版共用 echproxy.SetupRouter）
+	echproxy.SetupRouter(r, cfg)
 
 	fmt.Printf("=== ECH Proxy ===\n")
 	fmt.Printf("  模式: %s\n", map[bool]string{true: "HTTP (本地代理)", false: "TLS (远程)"}[*httpMode])

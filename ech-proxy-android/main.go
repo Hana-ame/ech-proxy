@@ -6,7 +6,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	_ "embed"
 	"fmt"
 	"log"
 	"net"
@@ -23,9 +22,6 @@ import (
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/ech"
 	"github.com/Hana-ame/ech-proxy/echproxy"
 )
-
-//go:embed web/index.html
-var indexHTML string
 
 var (
 	proxyMu     sync.Mutex
@@ -125,88 +121,8 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	r.Use(gin.Recovery())
 	r.Use(apifwd.CORSMiddleware())
 
-	r.GET("/healthz", func(c *gin.Context) {
-		c.String(200, "ok")
-	})
-
-	upstreamHandler := echproxy.ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)
-
-	hostOf := func(c *gin.Context) string {
-		h := c.Request.Host
-		if hh, _, err := net.SplitHostPort(h); err == nil {
-			h = hh
-		}
-		return h
-	}
-
-	// 根路径：只有主入口 l.moonchan.xyz 显示列表页，其他 upstream 域名走正常代理
-	r.GET("/", func(c *gin.Context) {
-		h := hostOf(c)
-		if h != "l.moonchan.xyz" {
-			upstreamHandler(c)
-			return
-		}
-		var sb strings.Builder
-		// 当前端口（点击条目时跳转同端口对应入口）
-		port := ""
-		if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
-			port = ":" + p
-		}
-		// 按 upstream.json 的书写顺序展示（LoadConfig 用 orderedmap 提取），不排序
-		entries := cfg.UpstreamOrder
-		if len(entries) == 0 {
-			for entry := range cfg.Upstreams {
-				entries = append(entries, entry)
-			}
-		}
-		colors := []string{"#5ce1e6", "#f0a35e", "#7c9cff", "#5ecb8e", "#e68ab8", "#9b8cff", "#5ec9e6", "#e6c45e"}
-		ci := 0
-		for _, entry := range entries {
-			uc, ok := cfg.Upstreams[entry]
-			if !ok {
-				continue
-			}
-			// display 为 false 的条目跳过
-			if !uc.Display {
-				continue
-			}
-			color := colors[ci%len(colors)]
-			ci++
-			mode := uc.Mode
-			if mode == "" {
-				mode = "ech"
-			}
-			desc := uc.Describe
-			if desc == "" {
-				desc = "通过 ECH 代理访问 " + uc.Host
-			}
-			badge := strings.ToUpper(entry[:1])
-			sb.WriteString(`<a class="item" href="https://` + entry + port + `/">`)
-			sb.WriteString(`<div class="badge" style="background:` + color + `">` + badge + `</div>`)
-			sb.WriteString(`<div class="info"><div class="entry">` + entry + `</div>`)
-			sb.WriteString(`<div class="desc">` + desc + `</div>`)
-			sb.WriteString(`<div class="target">→ ` + uc.Host + `</div></div>`)
-			sb.WriteString(`<div class="mode">` + mode + `</div>`)
-			sb.WriteString(`</a>`)
-		}
-		page := strings.Replace(indexHTML, "{{UPSTREAMS}}", sb.String(), 1)
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(200, page)
-	})
-
-	r.NoRoute(func(c *gin.Context) {
-		h := hostOf(c)
-		if _, ok := cfg.Upstreams[h]; ok {
-			upstreamHandler(c)
-			return
-		}
-		if _, ok := echproxy.MatchWildcardForTest(cfg.Upstreams, h); ok {
-			upstreamHandler(c)
-			return
-		}
-		c.Header("Content-Type", "text/html; charset=utf-8")
-		c.String(200, indexHTML)
-	})
+	// 分流路由（桌面版与 Android 版共用 echproxy.SetupRouter）
+	echproxy.SetupRouter(r, cfg)
 
 	ln, err := net.Listen("tcp4", "127.0.0.1:8443")
 	if err != nil {

@@ -33,9 +33,17 @@ cd cmd/ech-proxy-android/android
 
 ## 配置
 
-上游配置位于 `certs/l.moonchan.xyz/upstream.json`，从 GitHub 远程加载。
+上游配置位于 `certs/l.moonchan.xyz/upstream.json`，运行时从 GitHub `main`
+分支远程加载（经 `proxy.moonchan.xyz` 转发到 `raw.githubusercontent.com`）。
+不锁定 commit/tag，main 分支变更会直接影响线上代理行为。
 
-证书依赖 `wintools` 仓库（私钥不公开）。
+**SSL 证书完全公开**：`certs/l.moonchan.xyz/fullchain.cer` 与 `privkey.pem`
+都提交在仓库内（`wintools` 仓库存有同一份，两仓库均 public），桌面版运行时
+直接从公开地址拉取证书 + 私钥。Let's Encrypt 证书浏览器天然信任，任何拿到该
+私钥的人都能对 `*.l.moonchan.xyz` 做浏览器可信的 TLS 终止 —— 这是刻意的
+（见 `d23da9b`），不是泄漏。
+
+唯一例外是 Android APK 签名密钥（`release.keystore`），仍走 GitHub Secrets。
 
 ## GitHub Actions
 

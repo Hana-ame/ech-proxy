@@ -2,7 +2,7 @@ name: ech-proxy-android
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths:
       - "ech-proxy-android/**"
       - "ech/**"

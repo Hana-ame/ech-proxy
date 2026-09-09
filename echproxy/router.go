@@ -28,36 +28,34 @@ const indexHost = "l.moonchan.xyz"
 func SetupRouter(r *gin.Engine, cfg *Config) {
 	upstreamHandler := ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)
 
-	hostOf := func(c *gin.Context) string {
-		h := c.Request.Host
-		if hh, _, err := net.SplitHostPort(h); err == nil {
-			h = hh
-		}
-		return h
-	}
-
 	r.GET("/healthz", func(c *gin.Context) {
 		c.String(200, "ok")
 	})
 
 	r.GET("/", func(c *gin.Context) {
-		h := hostOf(c)
+		// host 为去掉端口的 hostname，用于匹配 indexHost 与 upstream 表；
+		// 列表页链接的端口直接取自 c.Request.Host（renderUpstreamList 内解析，
+		// Host 头无端口时兜底 :8443）。
+		host := c.Request.Host
+		if name, _, err := net.SplitHostPort(host); err == nil {
+			host = name
+		}
 		// 列表入口 host 的根路径 → 渲染列表页
-		if h == indexHost {
-			serveIndex(c, cfg, h)
+		if host == indexHost {
+			serveIndex(c, cfg, c.Request.Host)
 			return
 		}
 		// 精确或通配入口 → 走代理
-		if _, ok := cfg.Upstreams[h]; ok {
+		if _, ok := cfg.Upstreams[host]; ok {
 			upstreamHandler(c)
 			return
 		}
-		if _, ok := MatchWildcardForTest(cfg.Upstreams, h); ok {
+		if _, ok := MatchWildcardForTest(cfg.Upstreams, host); ok {
 			upstreamHandler(c)
 			return
 		}
 		// 未知 host → 兜底列表页
-		serveIndex(c, cfg, h)
+		serveIndex(c, cfg, c.Request.Host)
 	})
 
 	// 其余所有路径直接代理（ProxyHandler 内部按 host 分流到对应 upstream）
@@ -83,6 +81,9 @@ func renderUpstreamList(cfg *Config, requestHost string) string {
 	port := ""
 	if _, p, err := net.SplitHostPort(requestHost); err == nil {
 		port = ":" + p
+	} else {
+		// Host header 没带端口时兜底 8443（避免链接缺端口打不开）
+		port = ":8443"
 	}
 	entries := cfg.UpstreamOrder
 	if len(entries) == 0 {

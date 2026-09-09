@@ -16,6 +16,7 @@ require (
 )
 
 require (
+	github.com/Hana-ame/orderedmap v0.0.0-20240106085855-280cc19a9b81 // indirect
 	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/bytedance/sonic v1.15.0 // indirect
 	github.com/bytedance/sonic/loader v0.5.0 // indirect

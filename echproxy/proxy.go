@@ -23,6 +23,7 @@ import (
 
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/ech"
 	"github.com/Hana-ame/ech-proxy/netdial"
+	"github.com/Hana-ame/orderedmap"
 	"github.com/andybalholm/brotli"
 	"github.com/gin-gonic/gin"
 	"github.com/klauspost/compress/zstd"
@@ -80,6 +81,9 @@ type Config struct {
 	CertPath  string      `json:"cert_path"`
 	KeyPath   string      `json:"key_path"`
 	Upstreams UpstreamMap `json:"upstreams"`
+	// UpstreamOrder 是 upstreams 在 JSON 中的书写顺序（LoadConfig 用 orderedmap 提取）。
+	// 供启动页按配置顺序展示入口，不做字母排序。
+	UpstreamOrder []string `json:"-"`
 	// BlockedHosts 直连/代理都无法到达的第三方域名 (完整 https:// 前缀):
 	// 响应中出现的这些 URL 整段剔除, 浏览器不再发起请求避免挂起超时。
 	// 用于 Google 字体/jsapi 等被墙资源、无法代理的 CDN (如 media.dlsite.com)。
@@ -113,9 +117,23 @@ func LoadConfig(rawURL string) (*Config, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
 	}
+	buf, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read upstream config: %w", err)
+	}
 	var cfg Config
-	if err := json.NewDecoder(resp.Body).Decode(&cfg); err != nil {
+	if err := json.Unmarshal(buf, &cfg); err != nil {
 		return nil, fmt.Errorf("decode upstream config: %w", err)
+	}
+	// 用 orderedmap 重新解析一次, 提取 upstreams 在 JSON 中的书写顺序
+	// (encoding/json 解到 map 会丢顺序, 启动页需要按配置原顺序展示)。
+	om := orderedmap.New()
+	if err := json.Unmarshal(buf, om); err == nil {
+		if us, ok := om.Get("upstreams"); ok {
+			if usMap, ok := us.(orderedmap.OrderedMap); ok {
+				cfg.UpstreamOrder = usMap.Keys()
+			}
+		}
 	}
 	if len(cfg.Upstreams) == 0 {
 		return nil, fmt.Errorf("upstream config has no upstreams")

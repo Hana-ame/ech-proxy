@@ -11,7 +11,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -130,18 +129,28 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		c.String(200, "ok")
 	})
 
-	// 根路径：渲染 upstream 入口列表页（按 display 字段过滤，带 describe）
+	// 根路径：渲染 upstream 入口列表页（按 upstream.json 顺序，按 display 过滤）
 	r.GET("/", func(c *gin.Context) {
 		var sb strings.Builder
-		var entries []string
-		for entry := range cfg.Upstreams {
-			entries = append(entries, entry)
+		// 当前端口（点击条目时跳转同端口对应入口）
+		port := ""
+		if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
+			port = ":" + p
 		}
-		sort.Strings(entries)
+		// 按 upstream.json 的书写顺序展示（LoadConfig 用 orderedmap 提取），不排序
+		entries := cfg.UpstreamOrder
+		if len(entries) == 0 {
+			for entry := range cfg.Upstreams {
+				entries = append(entries, entry)
+			}
+		}
 		colors := []string{"#5ce1e6", "#f0a35e", "#7c9cff", "#5ecb8e", "#e68ab8", "#9b8cff", "#5ec9e6", "#e6c45e"}
 		ci := 0
 		for _, entry := range entries {
-			uc := cfg.Upstreams[entry]
+			uc, ok := cfg.Upstreams[entry]
+			if !ok {
+				continue
+			}
 			// display 为 false 的条目跳过
 			if !uc.Display {
 				continue
@@ -157,13 +166,13 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 				desc = "通过 ECH 代理访问 " + uc.Host
 			}
 			badge := strings.ToUpper(entry[:1])
-			sb.WriteString(`<div class="item">`)
+			sb.WriteString(`<a class="item" href="https://` + entry + port + `/">`)
 			sb.WriteString(`<div class="badge" style="background:` + color + `">` + badge + `</div>`)
 			sb.WriteString(`<div class="info"><div class="entry">` + entry + `</div>`)
 			sb.WriteString(`<div class="desc">` + desc + `</div>`)
 			sb.WriteString(`<div class="target">→ ` + uc.Host + `</div></div>`)
 			sb.WriteString(`<div class="mode">` + mode + `</div>`)
-			sb.WriteString(`</div>`)
+			sb.WriteString(`</a>`)
 		}
 		page := strings.Replace(indexHTML, "{{UPSTREAMS}}", sb.String(), 1)
 		c.Header("Content-Type", "text/html; charset=utf-8")

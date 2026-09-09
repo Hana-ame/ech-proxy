@@ -12,3 +12,4 @@ ech-proxy-android/android/local.properties
 .idea/
 *.iml
 ech-proxy-android/certs/
+ech-proxy-android/android/release.keystore

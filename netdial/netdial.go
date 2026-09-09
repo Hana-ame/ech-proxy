@@ -21,6 +21,15 @@ import (
 	"github.com/coder/websocket"
 )
 
+// 操作级超时与重试: DoH 拉取 / 拨号 / DNS / 配置抓取统一放宽到 5 分钟,
+// 瞬时失败时重试, 避免 moonchan.xyz DoH 端点偶发慢或抖动直接 context
+// deadline exceeded 导致 ECH 初始化 / SNI 解析失败。
+const (
+	OpTimeout     = 5 * time.Minute
+	RetryAttempts = 3
+	RetryBackoff  = 2 * time.Second
+)
+
 // dnsServers 公共 DNS 列表, 依次尝试。
 var dnsServers = []string{
 	"8.8.8.8:53",
@@ -37,7 +46,7 @@ func newResolver() *net.Resolver {
 	return &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			d := net.Dialer{Timeout: 5 * time.Second}
+			d := net.Dialer{Timeout: OpTimeout}
 			var err error
 			for _, dns := range dnsServers {
 				var conn net.Conn
@@ -75,7 +84,7 @@ func getRootPool() *x509.CertPool {
 // Dialer 返回使用公共 DNS 的 net.Dialer, 适用于 Termux 等无 resolv.conf 的环境。
 func Dialer() *net.Dialer {
 	return &net.Dialer{
-		Timeout:   10 * time.Second,
+		Timeout:   OpTimeout,
 		KeepAlive: 30 * time.Second,
 		Resolver:  getResolver(),
 	}
@@ -124,6 +133,40 @@ func Client(timeout time.Duration) *http.Client {
 // WebsocketDialOptions 返回适用于 Termux 的 websocket.DialOptions。
 func WebsocketDialOptions() *websocket.DialOptions {
 	return &websocket.DialOptions{
-		HTTPClient: Client(30 * time.Second),
+		HTTPClient: Client(OpTimeout),
 	}
+}
+
+// sleepCtx 休眠 d，期间响应 ctx 取消；返回 false 表示 ctx 已取消。
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Retry 重试 fn 直到成功、ctx 取消或达到 attempts 次；每次失败后 sleep backoff
+// （受 ctx 取消）。用于 DoH / 拨号 / 配置抓取等易因瞬时网络抖动失败的操作。
+// 返回最后一次错误；ctx 取消时立即返回 ctx.Err()。
+func Retry[T any](ctx context.Context, attempts int, backoff time.Duration, fn func() (T, error)) (T, error) {
+	var zero T
+	var last error
+	for i := 0; i < attempts; i++ {
+		if err := ctx.Err(); err != nil {
+			return zero, err
+		}
+		if i > 0 && !sleepCtx(ctx, backoff) {
+			return zero, ctx.Err()
+		}
+		v, err := fn()
+		if err == nil {
+			return v, nil
+		}
+		last = err
+	}
+	return zero, last
 }

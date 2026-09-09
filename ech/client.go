@@ -124,7 +124,7 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 			if err != nil {
 				return nil, err
 			}
-			dialer := &net.Dialer{Timeout: 5 * time.Second}
+			dialer := &net.Dialer{Timeout: dohTimeout}
 			return dialer.DialContext(ctx, network, net.JoinHostPort(dialIP, port))
 		}
 		uParsed, _ := url.Parse(urlStr)
@@ -137,10 +137,10 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 			if err != nil {
 				return nil, err
 			}
-			return dialTCP(ctx, host, port, 5*time.Second)
+			return dialTCP(ctx, host, port, dohTimeout)
 		}
 	}
-	dohClient := &http.Client{Transport: tr, Timeout: 5 * time.Second}
+	dohClient := &http.Client{Transport: tr, Timeout: dohTimeout}
 	return dohClient.Do(req)
 }
 
@@ -152,23 +152,32 @@ var (
 	nonHexRE      = regexp.MustCompile(`[^0-9a-fA-F]`)
 )
 
-// fetchECHConfig 通过 DoH 获取域名的 ECH 配置 (type=65 SVCB 记录),
-// 带 TTL 缓存。解析优先认 base64 的 ech= SvcParam, 兜底解析 wire 格式。
+// fetchECHConfig 通过 DoH 获取域名的 ECH 配置 (type=65 SVCB 记录), 带 TTL 缓存,
+// 瞬时失败时重试 (netdial.Retry)。解析优先认 base64 的 ech= SvcParam, 兜底 wire。
 func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 	if cached := getCachedECH(domain); cached != nil {
 		return cached, nil
 	}
-
 	dohURL := currentConfig().dohURL
+	cfg, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() ([]byte, error) {
+		return fetchECHConfigOnce(ctx, domain, dohURL)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("DoH %s (after %d attempts): %w", dohURL, netdial.RetryAttempts, err)
+	}
+	return cfg, nil
+}
+
+// fetchECHConfigOnce 执行一次 DoH 拉取与解析 (无重试, 由 fetchECHConfig 包重试)。
+func fetchECHConfigOnce(ctx context.Context, domain, dohURL string) ([]byte, error) {
 	u := fmt.Sprintf("%s?name=%s&type=65", dohURL, url.QueryEscape(domain))
 	resp, err := doDohRequest(ctx, u)
 	if err != nil {
-		return nil, fmt.Errorf("DoH %s: %w", dohURL, err)
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
 		return nil, fmt.Errorf("DoH %s failed: %d", dohURL, resp.StatusCode)
 	}
 
@@ -215,7 +224,10 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 
 const (
 	shellDomain = "cloudflare-ech.com"
-	dialTimeout = 10 * time.Second
+	// 操作级超时统一 5 分钟 (拨号 / TLS 握手 / DoH), 原 5s/10s/15s 在 DoH 端点
+	// 偶发慢或网络抖动时频繁 context deadline exceeded 导致 ECH 初始化失败。
+	dialTimeout = netdial.OpTimeout
+	dohTimeout  = netdial.OpTimeout
 )
 
 // config 保存 DoH 端点与 IP 偏好等可变全局配置。
@@ -331,11 +343,6 @@ func newTransport(echConfig []byte) *http.Transport {
 				return nil, err
 			}
 
-			rawConn, err := dialTCP(ctx, shellDomain, "443", dialTimeout)
-			if err != nil {
-				return nil, fmt.Errorf("dial shell: %w", err)
-			}
-
 			tlsCfg := &tls.Config{
 				ServerName:                     host,
 				EncryptedClientHelloConfigList: echConfig,
@@ -343,17 +350,29 @@ func newTransport(echConfig []byte) *http.Transport {
 				NextProtos:                     []string{"h2", "http/1.1"},
 			}
 
-			tlsConn := tls.Client(rawConn, tlsCfg)
-			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				rawConn.Close()
-				return nil, fmt.Errorf("TLS handshake: %w", err)
+			// 拨 shell 域 + TLS 握手整体重试: 瞬时 RST/超时重试,
+			// 避免单次抖动直接让请求失败。
+			conn, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
+				rawConn, derr := dialTCP(ctx, shellDomain, "443", dialTimeout)
+				if derr != nil {
+					return nil, derr
+				}
+				tc := tls.Client(rawConn, tlsCfg)
+				if herr := tc.HandshakeContext(ctx); herr != nil {
+					rawConn.Close()
+					return nil, herr
+				}
+				return tc, nil
+			})
+			if err != nil {
+				return nil, fmt.Errorf("dial shell: %w", err)
 			}
-			return tlsConn, nil
+			return conn, nil
 		},
 		ForceAttemptHTTP2:   true,
 		MaxIdleConns:        100,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
+		IdleConnTimeout:     netdial.OpTimeout,
+		TLSHandshakeTimeout: dialTimeout,
 	}
 }
 
@@ -372,7 +391,7 @@ func newClient(echConfig []byte) *Client {
 // New 初始化一个 ECH 域前置 HTTP 客户端。
 // 首次调用时会通过 DoH 获取 cloudflare-ech.com 的 ECH 密钥并缓存。
 func New() (*Client, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
 	defer cancel()
 
 	echConfig, err := fetchECHConfig(ctx, shellDomain)
@@ -444,7 +463,7 @@ func refreshLoop() {
 		case <-ticker.C:
 		}
 
-		ctx, cancel := context.WithTimeout(refreshCtx, 10*time.Second)
+		ctx, cancel := context.WithTimeout(refreshCtx, dohTimeout)
 		echConfig, err := fetchECHConfig(ctx, shellDomain)
 		cancel()
 		if err != nil {

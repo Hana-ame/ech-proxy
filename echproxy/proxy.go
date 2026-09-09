@@ -92,8 +92,17 @@ type Config struct {
 
 // FetchBytes 从 URL 拉取内容到内存（不落盘），请求失败或状态非 200 时报错。
 func FetchBytes(rawURL string) ([]byte, error) {
-	client := netdial.Client(30 * time.Second)
-	resp, err := client.Get(rawURL)
+	client := netdial.Client(netdial.OpTimeout)
+	resp, err := netdial.Retry(context.Background(), netdial.RetryAttempts, netdial.RetryBackoff, func() (*http.Response, error) {
+		r, e := client.Get(rawURL)
+		if e != nil {
+			if r != nil {
+				r.Body.Close()
+			}
+			return nil, e
+		}
+		return r, nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -108,8 +117,17 @@ func FetchBytes(rawURL string) ([]byte, error) {
 
 // LoadConfig 从远程 URL 加载上游配置 JSON（证书 URL + 路由规则）。
 func LoadConfig(rawURL string) (*Config, error) {
-	client := netdial.Client(30 * time.Second)
-	resp, err := client.Get(rawURL)
+	client := netdial.Client(netdial.OpTimeout)
+	resp, err := netdial.Retry(context.Background(), netdial.RetryAttempts, netdial.RetryBackoff, func() (*http.Response, error) {
+		r, e := client.Get(rawURL)
+		if e != nil {
+			if r != nil {
+				r.Body.Close()
+			}
+			return nil, e
+		}
+		return r, nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("fetch upstream config: %w", err)
 	}
@@ -1131,7 +1149,17 @@ func resolveHostIPs(ctx context.Context, host string) ([]string, error) {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/dns-json")
-	resp, err := (netdial.Client(8 * time.Second)).Do(req)
+	client := netdial.Client(netdial.OpTimeout)
+	resp, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (*http.Response, error) {
+		r, e := client.Do(req)
+		if e != nil {
+			if r != nil {
+				r.Body.Close()
+			}
+			return nil, e
+		}
+		return r, nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("DoH %s: %w", host, err)
 	}

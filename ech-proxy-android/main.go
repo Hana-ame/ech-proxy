@@ -129,8 +129,23 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		c.String(200, "ok")
 	})
 
-	// 根路径：渲染 upstream 入口列表页（按 upstream.json 顺序，按 display 过滤）
+	upstreamHandler := echproxy.ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)
+
+	hostOf := func(c *gin.Context) string {
+		h := c.Request.Host
+		if hh, _, err := net.SplitHostPort(h); err == nil {
+			h = hh
+		}
+		return h
+	}
+
+	// 根路径：只有主入口 l.moonchan.xyz 显示列表页，其他 upstream 域名走正常代理
 	r.GET("/", func(c *gin.Context) {
+		h := hostOf(c)
+		if h != "l.moonchan.xyz" {
+			upstreamHandler(c)
+			return
+		}
 		var sb strings.Builder
 		// 当前端口（点击条目时跳转同端口对应入口）
 		port := ""
@@ -178,16 +193,6 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		c.Header("Content-Type", "text/html; charset=utf-8")
 		c.String(200, page)
 	})
-
-	upstreamHandler := echproxy.ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)
-
-	hostOf := func(c *gin.Context) string {
-		h := c.Request.Host
-		if hh, _, err := net.SplitHostPort(h); err == nil {
-			h = hh
-		}
-		return h
-	}
 
 	r.NoRoute(func(c *gin.Context) {
 		h := hostOf(c)

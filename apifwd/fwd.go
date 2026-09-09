@@ -25,9 +25,9 @@ type Option struct {
 // 内存做 Modify, 不限长会被超大上传打爆 (OOM)。
 const maxBodySize = 64 << 20
 
-// writeTimeout 单次写入截止时间: 慢客户端 (不消费响应) 超时断开,
-// 防止连接/goroutine 无限堆积。SSE 每 chunk 重设不受影响。
-const writeTimeout = 60 * time.Second
+// writeTimeout 单次写入截止时间。代理瓶颈在上游/ECH 而非客户端写入,
+// 故给到 30 分钟, 避免误杀大文件/慢速但正常的下游传输; SSE 每 chunk 重设不受影响。
+const writeTimeout = 30 * time.Minute
 
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {

@@ -1047,9 +1047,10 @@ func proxyRoundTrip(req *http.Request, mode string) (*http.Response, error) {
 // maxRewriteSize 超过该字节数的文本响应不做替换（直接流式透传）。
 const maxRewriteSize = 8 << 20
 
-// writeTimeout 单次写入的截止时间: 慢客户端 (不消费响应) 超时后断开,
-// 防止连接/goroutine 无限堆积。SSE 等长连接每 chunk 都重设, 不受影响。
-const writeTimeout = 60 * time.Second
+// writeTimeout 单次写入的截止时间。代理瓶颈在上游/ECH 而非客户端写入,
+// 故给到 30 分钟, 避免误杀大文件/慢速但正常的下游传输; SSE 等长连接
+// 每 chunk 都重设, 不受影响。
+const writeTimeout = 30 * time.Minute
 
 // setWriteDeadline 为当前连接设置写截止时间 (每次写前重设)。
 // 底层连接不支持 deadline 时 (如测试用内存 writer) 忽略错误。

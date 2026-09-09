@@ -2,12 +2,12 @@ name: ech-proxy
 
 on:
   push:
-    branches: [main]
+    branches: [master]
     paths:
       - "ech-proxy/**"
-      - "pkg/ech/**"
-      - "pkg/echproxy/**"
-      - "pkg/apifwd/**"
+      - "ech/**"
+      - "echproxy/**"
+      - "apifwd/**"
       - "certs/**"
       - "go.mod"
       - "go.sum"

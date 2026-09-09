@@ -51,7 +51,9 @@ type UpstreamConfig struct {
 	Host string `json:"host"`
 	// Describe 为入口的描述信息（展示在 Android 启动页的 upstream 列表中）。
 	Describe string `json:"describe,omitempty"`
-	Referer  string `json:"referer,omitempty"`
+	// Display 控制是否在 Android 启动页的 upstream 列表中展示（默认 false 不展示）。
+	Display bool   `json:"display,omitempty"`
+	Referer string `json:"referer,omitempty"`
 	// Cookie 固定注入上游请求 (初始化 cookie overrider):
 	// 在 upstream.json 里直接写死需要携带的 Cookie 头原文,
 	// 适用于 exhentai 等需要登录态/特殊 cookie 的站点, 不依赖浏览器。

@@ -130,7 +130,7 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		c.String(200, "ok")
 	})
 
-	// 根路径：渲染 upstream 入口列表页（跳过通配符条目，带 describe）
+	// 根路径：渲染 upstream 入口列表页（按 display 字段过滤，带 describe）
 	r.GET("/", func(c *gin.Context) {
 		var sb strings.Builder
 		var entries []string
@@ -142,8 +142,8 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		ci := 0
 		for _, entry := range entries {
 			uc := cfg.Upstreams[entry]
-			// 通配符条目跳过
-			if uc.Wildcard != nil {
+			// display 为 false 的条目跳过
+			if !uc.Display {
 				continue
 			}
 			color := colors[ci%len(colors)]

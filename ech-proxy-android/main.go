@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -129,6 +130,46 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		c.String(200, "ok")
 	})
 
+	// 根路径：渲染 upstream 入口列表页（跳过通配符条目，带 describe）
+	r.GET("/", func(c *gin.Context) {
+		var sb strings.Builder
+		var entries []string
+		for entry := range cfg.Upstreams {
+			entries = append(entries, entry)
+		}
+		sort.Strings(entries)
+		colors := []string{"#5ce1e6", "#f0a35e", "#7c9cff", "#5ecb8e", "#e68ab8", "#9b8cff", "#5ec9e6", "#e6c45e"}
+		ci := 0
+		for _, entry := range entries {
+			uc := cfg.Upstreams[entry]
+			// 通配符条目跳过
+			if uc.Wildcard != nil {
+				continue
+			}
+			color := colors[ci%len(colors)]
+			ci++
+			mode := uc.Mode
+			if mode == "" {
+				mode = "ech"
+			}
+			desc := uc.Describe
+			if desc == "" {
+				desc = "通过 ECH 代理访问 " + uc.Host
+			}
+			badge := strings.ToUpper(entry[:1])
+			sb.WriteString(`<div class="item">`)
+			sb.WriteString(`<div class="badge" style="background:` + color + `">` + badge + `</div>`)
+			sb.WriteString(`<div class="info"><div class="entry">` + entry + `</div>`)
+			sb.WriteString(`<div class="desc">` + desc + `</div>`)
+			sb.WriteString(`<div class="target">→ ` + uc.Host + `</div></div>`)
+			sb.WriteString(`<div class="mode">` + mode + `</div>`)
+			sb.WriteString(`</div>`)
+		}
+		page := strings.Replace(indexHTML, "{{UPSTREAMS}}", sb.String(), 1)
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(200, page)
+	})
+
 	upstreamHandler := echproxy.ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)
 
 	hostOf := func(c *gin.Context) string {
@@ -226,7 +267,9 @@ func GetProxyPort() uint16 {
 
 //export IsEchReady
 func IsEchReady() C.int {
-	if echReady { return 1 }
+	if echReady {
+		return 1
+	}
 	return 0
 }
 

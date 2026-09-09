@@ -48,8 +48,10 @@ type WildcardRule struct {
 // 替换应用到响应头（Location/Refresh）与文本 body（html/js/json/xml），
 // 使页面内所有指向真实域名的绝对 URL 都改走代理入口，形成闭环。
 type UpstreamConfig struct {
-	Host    string `json:"host"`
-	Referer string `json:"referer,omitempty"`
+	Host string `json:"host"`
+	// Describe 为入口的描述信息（展示在 Android 启动页的 upstream 列表中）。
+	Describe string `json:"describe,omitempty"`
+	Referer  string `json:"referer,omitempty"`
 	// Cookie 固定注入上游请求 (初始化 cookie overrider):
 	// 在 upstream.json 里直接写死需要携带的 Cookie 头原文,
 	// 适用于 exhentai 等需要登录态/特殊 cookie 的站点, 不依赖浏览器。

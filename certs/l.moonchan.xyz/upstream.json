@@ -4,26 +4,32 @@
     "upstreams": {
         "l.moonchan.xyz": {
             "host": "reminder.moonchan.xyz",
-            "mode": "direct"
+            "mode": "direct",
+            "describe": "主入口 / 提醒服务"
         },
         "twimg.l.moonchan.xyz": {
             "host": "video-cf.twimg.com",
-            "referer": "https://x.com"
+            "referer": "https://x.com",
+            "describe": "Twitter/X 图片视频 CDN"
         },
         "ex.l.moonchan.xyz": {
             "host": "exhentai.org",
-            "cookie": "ipb_member_id=xxx; ipb_pass_hash=yyy; igneous=zzz"
+            "cookie": "ipb_member_id=xxx; ipb_pass_hash=yyy; igneous=zzz",
+            "describe": "ExHentai 画廊（需要登录 Cookie）"
         },
         "sukebei.l.moonchan.xyz": {
             "host": "sukebei.nyaa.si",
-            "mode": "sni"
+            "mode": "sni",
+            "describe": "Sukebei 里番资源站（SNI 伪装）"
         },
         "ao3.l.moonchan.xyz": {
-            "host": "archiveofourown.org"
+            "host": "archiveofourown.org",
+            "describe": "AO3 同人小说站"
         },
         "iwara.l.moonchan.xyz": {
             "host": "iwara.tv",
             "referer": "https://www.iwara.tv/",
+            "describe": "Iwara 视频站（支持通配子域名）",
             "wildcard": {
                 "prefix": "iwara-",
                 "entry_suffix": ".l.moonchan.xyz",
@@ -35,15 +41,18 @@
             }
         },
         "zen.l.moonchan.xyz": {
-            "host": "opencode.ai"
+            "host": "opencode.ai",
+            "describe": "ZEN / opencode.ai"
         },
         "sensenova.l.moonchan.xyz": {
             "host": "token.sensenova.cn",
-            "mode": "direct"
+            "mode": "direct",
+            "describe": "商汤日日新 API（直连）"
         },
         "dlsite.l.moonchan.xyz": {
             "host": "www.dlsite.com",
             "referer": "https://www.dlsite.com/",
+            "describe": "DLsite 数字版商店（支持通配子域名）",
             "wildcard": {
                 "prefix": "dlsite-",
                 "entry_suffix": ".l.moonchan.xyz",
@@ -58,7 +67,8 @@
         },
         "dlsite-img.l.moonchan.xyz": {
             "host": "img.dlsite.jp",
-            "referer": "https://www.dlsite.com/"
+            "referer": "https://www.dlsite.com/",
+            "describe": "DLsite 图片 CDN"
         }
     },
     "blocked_hosts": [

@@ -25,12 +25,6 @@ import (
 //go:embed static/index.html
 var chatHTML string
 
-//go:embed certs/fullchain.cer
-var embeddedCertPEM []byte
-
-//go:embed certs/privkey.pem
-var embeddedKeyPEM []byte
-
 func main() {
 	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
 	httpMode := flag.Bool("http", false, "run in HTTP mode (no TLS, local proxy)")

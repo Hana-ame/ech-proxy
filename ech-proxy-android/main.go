@@ -27,6 +27,12 @@ import (
 //go:embed web/index.html
 var indexHTML string
 
+//go:embed certs/fullchain.cer
+var embeddedCertPEM []byte
+
+//go:embed certs/privkey.pem
+var embeddedKeyPEM []byte
+
 var (
 	proxyMu     sync.Mutex
 	proxyServer *http.Server
@@ -99,27 +105,14 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	log.Printf("Upstream config loaded: %d entries", len(cfg.Upstreams))
 
 	var tlsCert *tls.Certificate
-	if cfg.CertPath != "" && cfg.KeyPath != "" {
-		log.Printf("Fetching certificate: %s", cfg.CertPath)
-		certPEM, err := echproxy.FetchBytes(cfg.CertPath)
-		if err != nil {
-			log.Printf("Failed to fetch cert: %v", err)
-			return 0
-		}
-		log.Printf("Fetching key: %s", cfg.KeyPath)
-		keyPEM, err := echproxy.FetchBytes(cfg.KeyPath)
-		if err != nil {
-			log.Printf("Failed to fetch key: %v", err)
-			return 0
-		}
-		cert, err := tls.X509KeyPair(certPEM, keyPEM)
-		if err != nil {
-			log.Printf("Failed to parse cert: %v", err)
-			return 0
-		}
-		tlsCert = &cert
-		log.Printf("Certificate loaded (*.l.moonchan.xyz)")
+	log.Printf("Using embedded certificate (*.l.moonchan.xyz)")
+	cert, err := tls.X509KeyPair(embeddedCertPEM, embeddedKeyPEM)
+	if err != nil {
+		log.Printf("Failed to parse embedded cert: %v", err)
+		return 0
 	}
+	tlsCert = &cert
+	log.Printf("Embedded certificate loaded")
 
 	r := gin.New()
 	r.Use(gin.Recovery())

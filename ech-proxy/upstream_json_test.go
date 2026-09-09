@@ -12,7 +12,7 @@ import (
 // 线上 ech-proxy 启动时从 GitHub main 拉取该文件, JSON 非法或条目字段
 // 打错会直接 Fatalf, 这里在 CI 里提前拦住。
 func TestRepoUpstreamJSONValid(t *testing.T) {
-	raw, err := os.ReadFile("../../certs/l.moonchan.xyz/upstream.json")
+	raw, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
 	if err != nil {
 		t.Fatalf("read upstream.json: %v", err)
 	}

@@ -683,6 +683,11 @@ type modeCacheEntry struct {
 
 const wildcardModeTTL = 10 * time.Minute
 
+// resolveIPFn 是 wildcardMode 用的 DNS 解析入口。
+// 测试替换为无网络假解析器，让通配 mode 探测在单测里既快又确定
+// （不依赖 moonchan.xyz DoH 可达性，也不污染 10 分钟全局缓存）。
+var resolveIPFn = resolveHostIP
+
 // wildcardMode 判断上游域名应走的通道: Cloudflare 段 ECH, 否则 SNI。
 // 探测一次后缓存 wildcardModeTTL 时长, 过期自动重查。
 func wildcardMode(ctx context.Context, host string) string {
@@ -693,7 +698,7 @@ func wildcardMode(ctx context.Context, host string) string {
 		}
 	}
 	mode := ""
-	if ip, err := resolveHostIP(ctx, host); err == nil {
+	if ip, err := resolveIPFn(ctx, host); err == nil {
 		if !isCloudflareIP(net.ParseIP(ip)) {
 			mode = "sni"
 		}

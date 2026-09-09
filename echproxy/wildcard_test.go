@@ -1,13 +1,52 @@
 package echproxy
 
 import (
+	"context"
 	"net/http"
-	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
-
-	"github.com/gin-gonic/gin"
 )
+
+// TestMain 把通配入口 mode 探测的 DNS 解析替换为无网络假解析器：
+// matchWildcard 会对每个子域打真实 DoH（wildcardMode → resolveHostIP），
+// 单测里既慢（每个子域一次查询）又随 DoH 可达性抖动 flaky，失败的探测还会
+// 写进 10 分钟全局缓存污染后续匹配。统一注入 Cloudflare 段 IP（判定为 ECH），
+// 需要验证「非 CF → sni」判定的用例再用 stubResolveIP 注入非 CF IP。
+func TestMain(m *testing.M) {
+	clearWildcardModeCache()
+	resolveIPFn = func(ctx context.Context, host string) (string, error) {
+		return cloudflareTestIP, nil
+	}
+	os.Exit(m.Run())
+}
+
+// cloudflareTestIP 单测用的 Cloudflare 段 IP（isCloudflareIP 判定为 ECH）。
+const cloudflareTestIP = "104.16.5.1"
+
+// nonCFTestIP 单测用的非 Cloudflare IP（isCloudflareIP 判定为 sni）。
+const nonCFTestIP = "3.214.0.1"
+
+// stubResolveIP 把通配探测的 DNS 解析固定为 ip 并清空 mode 缓存，测完还原
+// 解析器并再清一次缓存，避免用例间互相污染。用于确定性验证 ECH/SNI 判定。
+func stubResolveIP(t *testing.T, ip string) {
+	t.Helper()
+	prev := resolveIPFn
+	clearWildcardModeCache()
+	resolveIPFn = func(ctx context.Context, host string) (string, error) { return ip, nil }
+	t.Cleanup(func() {
+		resolveIPFn = prev
+		clearWildcardModeCache()
+	})
+}
+
+// clearWildcardModeCache 清空通配 mode 探测缓存，避免用例间互相污染。
+func clearWildcardModeCache() {
+	wildcardModeCache.Range(func(k, v any) bool {
+		wildcardModeCache.Delete(k)
+		return true
+	})
+}
 
 func TestMatchWildcard(t *testing.T) {
 	cfg := UpstreamMap{
@@ -49,10 +88,10 @@ func TestMatchWildcard(t *testing.T) {
 
 func TestReplaceWildcardDomain(t *testing.T) {
 	rw := buildRewriter(map[string]string{
-		"iwara.tv":     "iwara.l.moonchan.xyz",
+		"iwara.tv":      "iwara.l.moonchan.xyz",
 		"www.pixiv.net": "pixiv.l.moonchan.xyz",
-		"*.iwara.tv":   "iwara-*.l.moonchan.xyz",
-		"*.pixiv.net":  "pixiv-*.l.moonchan.xyz",
+		"*.iwara.tv":    "iwara-*.l.moonchan.xyz",
+		"*.pixiv.net":   "pixiv-*.l.moonchan.xyz",
 	})
 	body := []byte(`{"url":"https://filesq.iwara.tv/file/abc.mp4","img":"https://i.iwara.tv/x.jpg","api":"https://api.iwara.tv/trending","bare":"https://iwara.tv/","dl":"https://dl.pixiv.net/zip/a.zip","www":"https://www.pixiv.net/a"}`)
 	got := string(rw(body, "8443"))
@@ -129,7 +168,7 @@ func TestFixedCookieOverride(t *testing.T) {
 			Cookie: "igneous=xxx; ipb_member_id=123; ipb_pass_hash=abc",
 		},
 		"iwara.l.moonchan.xyz": {
-			Host: "iwara.tv",
+			Host:   "iwara.tv",
 			Cookie: "auth_token=abc123",
 			Wildcard: &WildcardRule{
 				Prefix:         "iwara-",
@@ -139,25 +178,15 @@ func TestFixedCookieOverride(t *testing.T) {
 		},
 	}
 
-	// 精确入口: 固定 cookie 覆盖内存 jar + 客户端 cookie。
-	gin.SetMode(gin.TestMode)
-	r := gin.New()
-	r.NoRoute(ProxyHandler(cfg, nil))
-	ts := httptest.NewServer(r)
-	defer ts.Close()
-
-	req, _ := http.NewRequest(http.MethodGet, ts.URL+"/", nil)
-	req.Host = "ex.l.moonchan.xyz"
-	req.Header.Set("Cookie", "browser_cookie=x")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Skipf("上游不可达: %v", err)
+	// 固定 cookie 原样覆盖内存 jar + 客户端 cookie（proxy.go 里 outReq.Header.Set
+	// "Cookie" 在 applyCookies 之后）。该注入内联在 handler 内，无 mock 上游时
+	// 断不了请求头；这里只验证配置解析 + 通配继承。旧版本在此发真实上游请求
+	// 验证「不崩」，超时 ~15s 且失败静默 skip，已移除。
+	if got := cfg["ex.l.moonchan.xyz"].Cookie; got != "igneous=xxx; ipb_member_id=123; ipb_pass_hash=abc" {
+		t.Errorf("fixed cookie = %q", got)
 	}
-	resp.Body.Close()
-	// 响应能回来说明请求已发出, 固定 cookie 注入逻辑在 handler 内。
-	// 这里无法直接断言请求头, 但配置解析+编译通过即可。
 
-	// 通配入口继承主入口 cookie。
+	// 通配入口继承主入口固定 cookie。
 	uc, ok := matchWildcard(cfg, "iwara-api.l.moonchan.xyz")
 	if !ok {
 		t.Fatal("wildcard match failed")
@@ -218,7 +247,7 @@ func TestBlockedThirdPartyHosts(t *testing.T) {
 // 避免浏览器直连挂起超时。ECH/SNI 都到不了这些域名。
 func TestBlockedThirdPartyStrip(t *testing.T) {
 	rw := buildEntryRewriter(UpstreamConfig{
-		Host: "www.dlsite.com",
+		Host:     "www.dlsite.com",
 		Rewrites: map[string]string{"www.dlsite.com": "dlsite.l.moonchan.xyz"},
 	}, testBlockedHosts)
 	body := []byte(`<link href="https://fonts.googleapis.com/css?family=Sawarabi+Gothic" rel="stylesheet">
@@ -258,7 +287,6 @@ func TestSetCookieNormalize(t *testing.T) {
 		t.Errorf("host-only cookie broken: %s", got[1])
 	}
 }
-
 
 // 回归: 前端 JS 用 document.cookie 设置语言/状态 cookie 时带
 // Domain=.dlsite.com, 必须重写为代理域且不带端口

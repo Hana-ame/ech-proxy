@@ -7,6 +7,8 @@ import (
 
 // 验证 dlsite 通配入口: 非 CF 子域自动 SNI, 重写规则来自主入口 wildcard。
 func TestDlsiteWildcard(t *testing.T) {
+	// 注入非 Cloudflare IP，验证 wildcardMode 的「非 CF → sni」判定（不打真实 DoH）。
+	stubResolveIP(t, nonCFTestIP)
 	cfg := UpstreamMap{
 		"dlsite.l.moonchan.xyz": {
 			Host: "www.dlsite.com",

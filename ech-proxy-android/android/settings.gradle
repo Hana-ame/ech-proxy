@@ -5,5 +5,5 @@ pluginManagement {
         gradlePluginPortal()
     }
 }
-rootProject.name = "TwitterPic"
+rootProject.name = "ech-proxy"
 include ':app'

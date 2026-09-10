@@ -1,11 +1,11 @@
 apply plugin: 'com.android.application'
 
 android {
-    namespace 'com.hanaame.twitterpic'
+    namespace 'xyz.moonchan.echproxy'
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.hanaame.twitterpic"
+        applicationId "xyz.moonchan.echproxy"
         minSdk 21
         targetSdk 34
         versionCode 1

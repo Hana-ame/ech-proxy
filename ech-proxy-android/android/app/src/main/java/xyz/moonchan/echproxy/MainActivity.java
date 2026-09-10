@@ -1,4 +1,4 @@
-package com.hanaame.twitterpic;
+package xyz.moonchan.echproxy;
 
 import android.content.Intent;
 import android.graphics.Typeface;

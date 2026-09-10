@@ -8,7 +8,7 @@
 //   IsEchReady() -> int
 //   GetLogs() -> char*
 //
-// JNI 函数名规则: Java_com_hanaame_twitterpic_MainActivity_<method>
+// JNI 函数名规则: Java_xyz_moonchan_echproxy_MainActivity_<method>
 
 #include <jni.h>
 #include <stdlib.h>
@@ -26,7 +26,7 @@ extern "C" {
 #endif
 
 JNIEXPORT jint JNICALL
-Java_com_hanaame_twitterpic_MainActivity_StartProxy(
+Java_xyz_moonchan_echproxy_MainActivity_StartProxy(
     JNIEnv *env,
     jobject thiz,
     jstring bootstrapIP) {
@@ -46,7 +46,7 @@ Java_com_hanaame_twitterpic_MainActivity_StartProxy(
 }
 
 JNIEXPORT void JNICALL
-Java_com_hanaame_twitterpic_MainActivity_StopProxy(
+Java_xyz_moonchan_echproxy_MainActivity_StopProxy(
     JNIEnv *env,
     jobject thiz) {
 
@@ -54,7 +54,7 @@ Java_com_hanaame_twitterpic_MainActivity_StopProxy(
 }
 
 JNIEXPORT jint JNICALL
-Java_com_hanaame_twitterpic_MainActivity_GetProxyPort(
+Java_xyz_moonchan_echproxy_MainActivity_GetProxyPort(
     JNIEnv *env,
     jobject thiz) {
 
@@ -63,7 +63,7 @@ Java_com_hanaame_twitterpic_MainActivity_GetProxyPort(
 }
 
 JNIEXPORT jint JNICALL
-Java_com_hanaame_twitterpic_MainActivity_IsEchReady(
+Java_xyz_moonchan_echproxy_MainActivity_IsEchReady(
     JNIEnv *env,
     jobject thiz) {
 
@@ -71,7 +71,7 @@ Java_com_hanaame_twitterpic_MainActivity_IsEchReady(
 }
 
 JNIEXPORT jstring JNICALL
-Java_com_hanaame_twitterpic_MainActivity_GetLogs(
+Java_xyz_moonchan_echproxy_MainActivity_GetLogs(
     JNIEnv *env,
     jobject thiz) {
 

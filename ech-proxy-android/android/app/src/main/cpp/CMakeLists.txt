@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(twitterpic)
+project(echproxy)
 
 # JNI wrapper source
 add_library(jni-wrapper SHARED jni_wrapper.c)

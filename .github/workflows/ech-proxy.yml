@@ -49,12 +49,12 @@ jobs:
       - name: Upload to Release
         run: |
           # release 不存在时先创建 (tag 触发的 release.yml 尚未建好时也能上传)
-          gh release view v1.0.1 >/dev/null 2>&1 || \
-            gh release create v1.0.1 --title "v1.0.1" --notes "ech-proxy desktop build"
-          gh release upload v1.0.1 \
+          gh release view v1.0.2 >/dev/null 2>&1 || \
+            gh release create v1.0.2 --title "v1.0.2" --notes "ech-proxy desktop build"
+          gh release upload v1.0.2 \
             ech-proxy-windows-amd64.exe \
             ech-proxy-linux-amd64 --clobber
           echo "=== Release assets ==="
-          gh release view v1.0.1 --json assets --jq '.assets[] | "\(.name)  \(.updatedAt)"'
+          gh release view v1.0.2 --json assets --jq '.assets[] | "\(.name)  \(.updatedAt)"'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

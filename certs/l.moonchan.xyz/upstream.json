@@ -79,6 +79,31 @@
             "referer": "https://www.dlsite.com/",
             "describe": "DLsite 图片 CDN",
             "display": false
+        },
+        "asmr.l.moonchan.xyz": {
+            "host": "asmr.one",
+            "describe": "ASMR Online 音声站（支持通配子域名）",
+            "display": true,
+            "rewrites": {
+                "api.asmr-200.com": "asmr-api-200.l.moonchan.xyz",
+                "api.asmr-100.com": "asmr-api-100.l.moonchan.xyz",
+                "api.asmr-300.com": "asmr-api-300.l.moonchan.xyz"
+            }
+        },
+        "asmr-api-100.l.moonchan.xyz": {
+            "host": "api.asmr-100.com",
+            "describe": "none",
+            "display": false
+        },
+        "asmr-api-200.l.moonchan.xyz": {
+            "host": "api.asmr-200.com",
+            "describe": "none",
+            "display": false
+        },
+        "asmr-api-300.l.moonchan.xyz": {
+            "host": "api.asmr-300.com",
+            "describe": "none",
+            "display": false
         }
     },
     "blocked_hosts": [

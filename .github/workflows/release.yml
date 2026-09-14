@@ -77,19 +77,45 @@ jobs:
           mkdir -p ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a
           cp ech-proxy-android/libechproxy.so ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a/
 
-      # ubuntu-latest runner 自带 Android SDK ($ANDROID_HOME), 无需第三方 action。
-      # android-actions/setup-android@v3 内部执行 sdkmanager tools, 而 Google 已把
-      # 过时的 tools 包从 SDK 仓库移除, 导致 "Failed to find package 'tools'" 失败。
+      - name: Write keystore from Secret
+        run: |
+          if [ -z "${{ secrets.KEYSTORE_BASE64 }}" ]; then
+            echo "::error::Missing GitHub Secret: KEYSTORE_BASE64"
+            exit 1
+          fi
+          mkdir -p ech-proxy-android/android
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > ech-proxy-android/android/release.keystore
+          test -s ech-proxy-android/android/release.keystore
+          echo "Keystore written: $(wc -c < ech-proxy-android/android/release.keystore) bytes"
+
+      # ubuntu-latest runner 预装 Android SDK 与 cmdline-tools, 但 sdkmanager 不在 PATH。
+      # android-actions/setup-android@v3 会执行 `sdkmanager tools`, 而 Google 已把
+      # 过时的 tools 包从 SDK 仓库移除, 因此这里直接使用预装的 sdkmanager。
       - name: Setup Android SDK (runner 预装)
         run: |
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          # 优先使用带版本号的 cmdline-tools (如 16.0), 避免 runner 上可能有问题的 latest 桩
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager 2>/dev/null | grep -v '/latest/' | sort -V | tail -n1)"
+          [ -n "$SDKMANAGER" ] || SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager 2>/dev/null | sort -V | tail -n1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found under $SDK_ROOT/cmdline-tools"
+            exit 1
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platforms;android-34" "build-tools;34.0.0"
 
       - name: Download Gradle 8.5
         run: |
           curl -L -o /tmp/gradle-8.5.zip "https://services.gradle.org/distributions/gradle-8.5-bin.zip"
           unzip -q /tmp/gradle-8.5.zip -d /tmp/
           echo "/tmp/gradle-8.5/bin" >> $GITHUB_PATH
+
+      - name: Generate Gradle Wrapper
+        run: |
+          cd ech-proxy-android/android
+          gradle wrapper --gradle-version 8.5
 
       - name: Build APK
         env:

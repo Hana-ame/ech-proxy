@@ -81,8 +81,23 @@ jobs:
           mkdir -p ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a
           cp ech-proxy-android/libechproxy.so ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a/
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      # ubuntu-latest runner 预装 Android SDK 与 cmdline-tools, 但 sdkmanager 不在 PATH。
+      # android-actions/setup-android@v3 会执行 `sdkmanager tools`, 而 Google 已把
+      # 过时的 tools 包从 SDK 仓库移除, 因此这里直接使用预装的 sdkmanager。
+      - name: Setup Android SDK (runner 预装)
+        run: |
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          # 优先使用带版本号的 cmdline-tools (如 16.0), 避免 runner 上可能有问题的 latest 桩
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager 2>/dev/null | grep -v '/latest/' | sort -V | tail -n1)"
+          [ -n "$SDKMANAGER" ] || SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager 2>/dev/null | sort -V | tail -n1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager not found under $SDK_ROOT/cmdline-tools"
+            exit 1
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" --install "platforms;android-34" "build-tools;34.0.0"
 
       - name: Download Gradle 8.5
         run: |

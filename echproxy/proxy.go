@@ -61,7 +61,7 @@ type UpstreamConfig struct {
 	// 优先级: 此固定 cookie > 内存 jar > 客户端 cookie。
 	Cookie string `json:"cookie,omitempty"`
 	// SWInject 为无 service worker 的站点注入代理拦截 SW:
-	// HTML 页面自动注册 /wt-sw.js, 代理对该路径返回生成的 fetch 拦截
+	// HTML 页面自动注册 /sw.js, 代理对该路径返回生成的 fetch 拦截
 	// 脚本, 兜住前端运行时动态拼接的 URL (响应重写覆盖不到)。
 	// 仅用于没有自己的 SW 的站点 (如 dlsite); 有 workbox 的站点
 	// (如 iwara) 绝不能开 — 注入会与 workbox 变量冲突/互相覆盖。
@@ -553,7 +553,7 @@ func swOverrideJS(m map[string]string, rules []WildcardRule, blockedHosts []stri
 	var b strings.Builder
 	b.WriteString(`self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
-const __wtMap = {`)
+const __swMap = {`)
 	for i, k := range keys {
 		if i > 0 {
 			b.WriteByte(',')
@@ -562,7 +562,7 @@ const __wtMap = {`)
 	}
 	b.WriteString(`
 };
-const __wtRules = [`)
+const __swRules = [`)
 	for i, r := range rules {
 		if i > 0 {
 			b.WriteByte(',')
@@ -571,9 +571,9 @@ const __wtRules = [`)
 	}
 	b.WriteString(`
 ];
-// __wtBlock: 直连不可达的第三方域名(Config.BlockedHosts),
+// __swBlock: 直连不可达的第三方域名(Config.BlockedHosts),
 // 直接在 SW 里拦截返回 204, 避免页面挂起等待。
-const __wtBlock = [`)
+const __swBlock = [`)
 	for i, bl := range swBlocked {
 		if i > 0 {
 			b.WriteByte(',')
@@ -585,14 +585,14 @@ const __wtBlock = [`)
 self.addEventListener('fetch', (e) => {
   try {
     const u = new URL(e.request.url);
-    if (__wtBlock.some((b) => (u.hostname + u.pathname).startsWith(b))) {
+    if (__swBlock.some((b) => (u.hostname + u.pathname).startsWith(b))) {
       e.respondWith(new Response('', { status: 204 }));
       return;
     }
-    let p = __wtMap[u.hostname];
+    let p = __swMap[u.hostname];
     if (!p) {
       const h = u.hostname;
-      for (const r of __wtRules) {
+      for (const r of __swRules) {
         if (h === r.us.slice(1)) {
           p = r.p.slice(0, -1) + r.es;
           break;
@@ -828,10 +828,10 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		rewriter := buildEntryRewriter(ucForRewrite, blocked)
 
 		// service worker 兜底标记: 仅对该入口配置了 SWInject (无 SW 站点
-		// 如 dlsite) 且请求的是代理专用 /wt-sw.js 时生效。
+		// 如 dlsite) 且请求的是代理专用 /sw.js 时生效。
 		// 有 workbox 的站点 (iwara) 不配 SWInject, 代理绝不碰其 SW 文件
 		// (注入会与 workbox 变量冲突, 导致整个 SW 崩溃)。
-		swWant := uc.SWInject && rawPath == "/wt-sw.js"
+		swWant := uc.SWInject && rawPath == "/sw.js"
 
 		targetURL := &url.URL{
 			Scheme:   "https",
@@ -894,7 +894,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		// 内存 jar 管代理→上游的认证 cookie, 与此无关。
 		rewriteSetCookieDomains(c.Writer.Header(), host, c.Request.TLS == nil)
 
-		// SW 兜底: 该入口配了 SWInject 且请求 /wt-sw.js (上游必然 404)
+		// SW 兜底: 该入口配了 SWInject 且请求 /sw.js (上游必然 404)
 		// 时, 直接返回生成的拦截 SW。用于没有 service worker 的站点
 		// (如 dlsite): 前端运行时动态拼接的 img.dlsite.jp 等 URL,
 		// 响应重写覆盖不到, 靠 SW fetch 拦截改道代理入口。
@@ -962,9 +962,12 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 					// 注册脚本插在 </head> 前, 页面加载即生效。
 					// 只注入没有 SW 迹象的页面 (含 'serviceWorker' 的
 					// 页面已有注册逻辑, 注入会冲突)。
-					if swWant && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
+					// 注意: 这里用 uc.SWInject 而非 swWant —— swWant 额外要求
+					// rawPath=="/sw.js", 而该路径永远不是 HTML, 用它判断会
+					// 让注册注入成为死代码 (SW 永不注册, 动态图片 URL 不兜底)。
+					if uc.SWInject && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
 						!bytes.Contains(body, []byte("serviceWorker")) {
-						reg := []byte(`<script>navigator.serviceWorker.register('/wt-sw.js').catch(function(){})</script>`)
+						reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
 						if idx := bytes.Index(body, []byte("</head>")); idx >= 0 {
 							body = append(body[:idx], append(reg, body[idx:]...)...)
 						} else {

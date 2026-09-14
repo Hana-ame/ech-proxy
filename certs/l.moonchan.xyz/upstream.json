@@ -12,10 +12,10 @@
             "host": "video-cf.twimg.com",
             "referer": "https://x.com",
             "describe": "Twitter/X 图片视频 CDN",
-            "display": true
+            "display": false
         },
         "ex.l.moonchan.xyz": {
-            "host": "exhentai.org",
+            "host": "e-hentai.org",
             "cookie": "ipb_member_id=xxx; ipb_pass_hash=yyy; igneous=zzz",
             "describe": "ExHentai 画廊（需要登录 Cookie）",
             "display": false
@@ -48,6 +48,7 @@
         },
         "zen.l.moonchan.xyz": {
             "host": "opencode.ai",
+            "mode": "direct",
             "describe": "ZEN / opencode.ai",
             "display": false
         },
@@ -84,6 +85,7 @@
             "host": "asmr.one",
             "describe": "ASMR Online 音声站（支持通配子域名）",
             "display": true,
+            "sw_inject": true,
             "rewrites": {
                 "api.asmr-200.com": "asmr-api-200.l.moonchan.xyz",
                 "api.asmr-100.com": "asmr-api-100.l.moonchan.xyz",
@@ -93,17 +95,26 @@
         "asmr-api-100.l.moonchan.xyz": {
             "host": "api.asmr-100.com",
             "describe": "none",
-            "display": false
+            "display": false,
+            "rewrites": {
+                "api.asmr-100.com": "asmr-api-100.l.moonchan.xyz"
+            }
         },
         "asmr-api-200.l.moonchan.xyz": {
             "host": "api.asmr-200.com",
             "describe": "none",
-            "display": false
+            "display": false,
+            "rewrites": {
+                "api.asmr-200.com": "asmr-api-200.l.moonchan.xyz"
+            }
         },
         "asmr-api-300.l.moonchan.xyz": {
             "host": "api.asmr-300.com",
             "describe": "none",
-            "display": false
+            "display": false,
+            "rewrites": {
+                "api.asmr-300.com": "asmr-api-300.l.moonchan.xyz"
+            }
         }
     },
     "blocked_hosts": [

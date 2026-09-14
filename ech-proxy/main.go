@@ -9,7 +9,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"runtime"
 	"sort"
 	"syscall"
 	"time"
@@ -100,6 +102,13 @@ func main() {
 	// 分流路由（桌面版与 Android 版共用 echproxy.SetupRouter）
 	echproxy.SetupRouter(r, cfg)
 
+	// 入口域名统一拼上监听端口显示: 与浏览器实际访问地址完全一致
+	// (列表页链接同样按请求 Host 拼端口, 两处口径对齐)。
+	listenPort := ""
+	if _, p, err := net.SplitHostPort(*addr); err == nil {
+		listenPort = p
+	}
+
 	fmt.Printf("=== ECH Proxy ===\n")
 	fmt.Printf("  模式: %s\n", map[bool]string{true: "HTTP (本地代理)", false: "TLS (远程)"}[*httpMode])
 	fmt.Printf("  监听: %s\n", *addr)
@@ -113,13 +122,21 @@ func main() {
 	sort.Strings(domains)
 	for _, d := range domains {
 		uc := upstreamCfg[d]
-		fmt.Printf("  域名: %s -> %s (%s)", d, uc.Host, echproxy.ModeName(uc.Mode))
+		entry := d
+		if listenPort != "" {
+			entry += ":" + listenPort
+		}
+		fmt.Printf("  域名: %s -> %s (%s)", entry, uc.Host, echproxy.ModeName(uc.Mode))
 		if uc.Referer != "" {
 			fmt.Printf(" (referer: %s)", uc.Referer)
 		}
 		// 通配入口一并显示: iwara-* → *.iwara.tv, 让 banner 反映真实覆盖范围。
 		if w := uc.Wildcard; w != nil {
-			fmt.Printf(" [+通配 %s*%s -> *%s]", w.Prefix, w.EntrySuffix, w.UpstreamSuffix)
+			we := w.Prefix + "*" + w.EntrySuffix
+			if listenPort != "" {
+				we += ":" + listenPort
+			}
+			fmt.Printf(" [+通配 %s -> *%s]", we, w.UpstreamSuffix)
 		}
 		fmt.Println()
 	}
@@ -147,6 +164,17 @@ func main() {
 		log.Fatalf("监听失败: %v", err)
 	}
 
+	// 监听成功即自动打开浏览器访问列表入口 (PC 使用场景):
+	// TLS 模式 https://l.moonchan.xyz:8443, --http 本地模式 http://。
+	// headless 服务器没有浏览器时 openBrowser 仅记日志, 不影响服务。
+	if listenPort != "" {
+		scheme := "https"
+		if *httpMode {
+			scheme = "http"
+		}
+		go openBrowser(scheme + "://l.moonchan.xyz:" + listenPort)
+	}
+
 	if *httpMode {
 		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("启动失败: %v", err)
@@ -162,4 +190,26 @@ func main() {
 	if err := srv.Serve(tlsLn); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("启动失败: %v", err)
 	}
+}
+
+// openBrowser 调系统默认浏览器打开 url。
+// Windows 走 rundll32 (ShellExecute), 避开 cmd start 的引号转义;
+// macOS 用 open, 其余平台用 xdg-open。失败只记日志, 不影响代理服务。
+func openBrowser(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	if err := cmd.Start(); err != nil {
+		log.Printf("打开浏览器失败 (%s): %v", url, err)
+		return
+	}
+	log.Printf("正在打开浏览器: %s", url)
+	// Wait 回收子进程避免僵尸, 挂 goroutine 不阻塞主流程。
+	go func() { _ = cmd.Wait() }()
 }

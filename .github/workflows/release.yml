@@ -22,58 +22,20 @@ jobs:
           go-version: "1.26"
           cache: true
 
-      - name: Build all cmds (static, CGO off for old-glibc/Termux)
+      - name: Build ech-proxy desktop (static, CGO off for old-glibc/Termux)
         run: |
-          for cmd in cmd/*/; do
-            name=$(basename "$cmd")
-            # skip CGo shared library (needs C cross-compiler)
-            [ "$name" = "ech-shared" ] && continue
-            [ "$name" = "ech-proxy-android" ] && continue  # Android 单独构建
-            ext=""
-            [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
-            mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
-            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }} CGO_ENABLED=0 \
-               go build -trimpath -ldflags="-s -w" \
-               -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${cmd}"
-          done
-          # scripts/*.go 单文件工具（无 .go 时跳过, 目录可能已清空）
-          for script in scripts/*.go; do
-            [ -f "$script" ] || continue
-            name=$(basename "$script" .go)
-            ext=""
-            [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
-            mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
-            GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }} CGO_ENABLED=0 \
-               go build -trimpath -ldflags="-s -w" \
-               -o "dist/${{ matrix.os }}/${{ matrix.arch }}/${name}-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./${script}"
-          done
+          ext=""
+          [ "${{ matrix.os }}" = "windows" ] && ext=".exe"
+          mkdir -p "dist/${{ matrix.os }}/${{ matrix.arch }}"
+          GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch == 'aarch64' && 'arm64' || matrix.arch }} CGO_ENABLED=0 \
+             go build -trimpath -ldflags="-s -w" \
+             -o "dist/${{ matrix.os }}/${{ matrix.arch }}/ech-proxy-${{ matrix.os }}-${{ matrix.arch }}${ext}" "./ech-proxy/"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}-${{ matrix.arch }}
           path: dist/${{ matrix.os }}/${{ matrix.arch }}/
-
-  # ech-shared 是 CGo 共享库, 需要本机 gcc, 单独在 Windows runner 上构建
-  # (ubuntu 交叉编译需 mingw-w64, 直接用原生 runner 更稳)
-  build-shared:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
-      - name: Setup MinGW gcc
-        run: choco install mingw -y --no-progress
-      - name: Build ech-shared DLL
-        run: |
-          go build -buildmode=c-shared -trimpath -ldflags="-s -w" `
-            -o echshared.dll ./cmd/ech-shared
-      - uses: actions/upload-artifact@v4
-        with:
-          name: vcshost.dll
-          path: echshared.dll
 
   # Android APK 构建（Go c-shared + JNI wrapper + Java App）
   build-android:
@@ -124,11 +86,6 @@ jobs:
           unzip -q /tmp/gradle-8.5.zip -d /tmp/
           echo "/tmp/gradle-8.5/bin" >> $GITHUB_PATH
 
-      - name: Generate Gradle Wrapper
-        run: |
-          cd ech-proxy-android/android
-          gradle wrapper --gradle-version 8.5
-
       - name: Build APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'android' }}
@@ -149,7 +106,7 @@ jobs:
           path: ech-proxy-android/android/app/build/outputs/apk/release/*.apk
 
   release:
-    needs: [build, build-shared, build-android]
+    needs: [build, build-android]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -166,13 +123,14 @@ jobs:
         run: |
           {
             echo "## 每个 exe 的功能"
-            cat RELEASE.md
+            cat RELEASE.md 2>/dev/null || true
             echo ""
             echo "## Android APK"
-            echo "Twitter Pic Android 客户端，使用 ECH 代理访问 Twitter CDN。"
+            echo "ECH Proxy Android 客户端，使用 ECH 代理访问 各上游站点。"
             echo "下载 app-release.apk 安装到手机。"
           } > release_body.md
-          gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release_body.md
+          gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
+            gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release_body.md
 
       - name: Upload assets
         env:

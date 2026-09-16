@@ -1,7 +1,9 @@
 package echproxy
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -130,6 +132,80 @@ func TestLoadUpstreamJSON(t *testing.T) {
 	}
 	if wildMatch.Headers["Referer"].Value != "https://www.iwara.tv/" {
 		t.Errorf("expected referer in wildcard match, got %v", wildMatch.Headers["Referer"])
+	}
+}
+
+func TestUpstreamOrderAndBanner(t *testing.T) {
+	data, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
+	if err != nil {
+		t.Fatalf("read upstream.json failed: %v", err)
+	}
+	cfg, err := ParseConfig(data)
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+	if len(cfg.UpstreamOrder) == 0 {
+		t.Fatalf("expected UpstreamOrder to be populated via orderedmap")
+	}
+
+	expectedOrder := []string{
+		"l.moonchan.xyz",
+		"twimg.l.moonchan.xyz",
+		"ex.l.moonchan.xyz",
+		"sukebei.l.moonchan.xyz",
+		"ao3.l.moonchan.xyz",
+		"iwara.l.moonchan.xyz",
+		"zen.l.moonchan.xyz",
+		"sensenova.l.moonchan.xyz",
+		"dlsite.l.moonchan.xyz",
+		"dlsite-img.l.moonchan.xyz",
+		"asmr.l.moonchan.xyz",
+		"asmr-api-100.l.moonchan.xyz",
+		"asmr-api-200.l.moonchan.xyz",
+		"asmr-api-300.l.moonchan.xyz",
+		"f95.l.moonchan.xyz",
+		"south.l.moonchan.xyz",
+	}
+
+	if len(cfg.UpstreamOrder) != len(expectedOrder) {
+		t.Fatalf("expected %d entries, got %d (%v)", len(expectedOrder), len(cfg.UpstreamOrder), cfg.UpstreamOrder)
+	}
+	for i, expected := range expectedOrder {
+		if cfg.UpstreamOrder[i] != expected {
+			t.Errorf("at index %d: expected %s, got %s", i, expected, cfg.UpstreamOrder[i])
+		}
+	}
+
+	// 验证 Server.PrintBanner 也是严格按此顺序输出
+	srv := &Server{
+		Options: ServerOptions{Addr: "127.0.0.1:8443"},
+		Config:  cfg,
+		Port:    8443,
+	}
+	oldStdout := os.Stdout
+	rPipe, wPipe, _ := os.Pipe()
+	os.Stdout = wPipe
+
+	srv.PrintBanner("")
+
+	wPipe.Close()
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	io.Copy(&buf, rPipe)
+	bannerOutput := buf.String()
+
+	lastIdx := -1
+	for _, domain := range expectedOrder {
+		idx := strings.Index(bannerOutput, domain)
+		if idx == -1 {
+			t.Errorf("domain %s not found in banner output", domain)
+			continue
+		}
+		if idx <= lastIdx {
+			t.Errorf("domain %s appeared out of order in banner (idx=%d <= lastIdx=%d)", domain, idx, lastIdx)
+		}
+		lastIdx = idx
 	}
 }
 

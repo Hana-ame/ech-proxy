@@ -402,4 +402,86 @@ func TestOldBinaryV102Compatibility(t *testing.T) {
 	}
 }
 
+func TestWildcardCleanKeysAndAutoDerivation(t *testing.T) {
+	// 1. 测试无需配置 suffix 的 clean key 语法: entry + upstream
+	cleanJSON := []byte(`{
+		"upstreams": {
+			"iwara.l.moonchan.xyz": {
+				"host": "iwara.tv",
+				"headers": {
+					"Origin": "https://www.iwara.tv"
+				}
+			}
+		},
+		"wildcards": [
+			{
+				"entry": "iwara-*.l.moonchan.xyz",
+				"upstream": "*.iwara.tv",
+				"headers": {
+					"X-Site": "www.iwara.tv"
+				}
+			}
+		]
+	}`)
+	cfg, err := ParseConfig(cleanJSON)
+	if err != nil {
+		t.Fatalf("ParseConfig cleanJSON failed: %v", err)
+	}
+	match, ok := MatchWildcardForTest(cfg.Upstreams, "iwara-files.l.moonchan.xyz")
+	if !ok {
+		t.Fatalf("expected wildcard match for iwara-files.l.moonchan.xyz")
+	}
+	if match.Host != "files.iwara.tv" {
+		t.Errorf("expected files.iwara.tv, got %s", match.Host)
+	}
+	if match.Headers["X-Site"].Value != "www.iwara.tv" {
+		t.Errorf("expected X-Site www.iwara.tv, got %s", match.Headers["X-Site"].Value)
+	}
+	if match.Headers["Origin"].Value != "https://www.iwara.tv" {
+		t.Errorf("expected inherited Origin, got %s", match.Headers["Origin"].Value)
+	}
+
+	// 2. 测试 upstream 内直接配置 "wildcard": true (全自动推导 suffix 与 prefix)
+	boolJSON := []byte(`{
+		"upstreams": {
+			"dlsite.l.moonchan.xyz": {
+				"host": "dlsite.com",
+				"wildcard": true
+			}
+		}
+	}`)
+	cfg2, err := ParseConfig(boolJSON)
+	if err != nil {
+		t.Fatalf("ParseConfig boolJSON failed: %v", err)
+	}
+	match2, ok := MatchWildcardForTest(cfg2.Upstreams, "dlsite-ci-en.l.moonchan.xyz")
+	if !ok {
+		t.Fatalf("expected wildcard match for dlsite-ci-en.l.moonchan.xyz")
+	}
+	if match2.Host != "ci-en.dlsite.com" {
+		t.Errorf("expected ci-en.dlsite.com, got %s", match2.Host)
+	}
+
+	// 3. 测试 upstream 内配置 "wildcard": "f95-*" 简写
+	strJSON := []byte(`{
+		"upstreams": {
+			"f95.l.moonchan.xyz": {
+				"host": "f95zone.to",
+				"wildcard": "f95-*"
+			}
+		}
+	}`)
+	cfg3, err := ParseConfig(strJSON)
+	if err != nil {
+		t.Fatalf("ParseConfig strJSON failed: %v", err)
+	}
+	match3, ok := MatchWildcardForTest(cfg3.Upstreams, "f95-attachments.l.moonchan.xyz")
+	if !ok {
+		t.Fatalf("expected wildcard match for f95-attachments.l.moonchan.xyz")
+	}
+	if match3.Host != "attachments.f95zone.to" {
+		t.Errorf("expected attachments.f95zone.to, got %s", match3.Host)
+	}
+}
+
 

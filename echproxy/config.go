@@ -63,16 +63,19 @@ func (h HeaderRule) MarshalJSON() ([]byte, error) {
 
 // WildcardRule 通配上游规则:
 // 请求域名 = Prefix + <sub> + EntrySuffix 时, 转发到 <sub> + UpstreamSuffix。
-// 例: iwara-  + filesq + .l.moonchan.xyz → filesq.iwara.tv
+// 例: entry="iwara-*.l.moonchan.xyz" upstream="*.iwara.tv"
 type WildcardRule struct {
-	// 直观别名语法 (例如: entry: "iwara-*.l.moonchan.xyz", upstream: "*.iwara.tv")
-	Entry    string `json:"entry,omitempty"`
-	Upstream string `json:"upstream,omitempty"`
+	// 直观现代语法 (完全摒弃 prefix / suffix 等实现细节泄露 key):
+	Entry    string `json:"entry,omitempty"`    // 入口模式, 如 "iwara-*.l.moonchan.xyz" 或 "iwara-*"
+	Upstream string `json:"upstream,omitempty"` // 上游模式, 如 "*.iwara.tv" 或 "iwara.tv"
+	Host     string `json:"host,omitempty"`     // 关联的目标主机, 如 "iwara.tv"
+	Match    string `json:"match,omitempty"`    // 别名 (同 entry)
+	Target   string `json:"target,omitempty"`   // 别名 (同 upstream)
 
-	// 标准三段式语法 (完全向后兼容):
-	Prefix          string                `json:"prefix,omitempty"`           // 入口前缀, 如 "iwara-"
-	EntrySuffix     string                `json:"entry_suffix,omitempty"`     // 入口后缀, 如 ".l.moonchan.xyz"
-	UpstreamSuffix  string                `json:"upstream_suffix,omitempty"`  // 上游后缀, 如 ".iwara.tv"
+	// 历史兼容字段 (仅用于向后兼容旧配置中的底层切片参数):
+	Prefix          string                `json:"prefix,omitempty"`           // 历史切片前缀, 如 "iwara-"
+	EntrySuffix     string                `json:"entry_suffix,omitempty"`     // 历史切片入口后缀, 如 ".l.moonchan.xyz"
+	UpstreamSuffix  string                `json:"upstream_suffix,omitempty"`  // 历史切片上游后缀, 如 ".iwara.tv"
 	Headers         map[string]HeaderRule `json:"headers,omitempty"`          // 自定义请求头覆盖/替换/删除 (含 Referer, Origin, X-Site 等)
 	ResponseHeaders map[string]HeaderRule `json:"response_headers,omitempty"` // 自定义响应头覆盖/替换/删除
 	Cookie          string                `json:"cookie,omitempty"`
@@ -85,6 +88,31 @@ type WildcardRule struct {
 	Referer string `json:"referer,omitempty"`
 	Origin  string `json:"origin,omitempty"`
 	XSite   string `json:"x_site,omitempty"`
+}
+
+func (w *WildcardRule) UnmarshalJSON(data []byte) error {
+	// 1. 支持布尔值: "wildcard": true (自动从上游配置推导全部前缀与后缀)
+	var b bool
+	if err := json.Unmarshal(data, &b); err == nil {
+		if !b {
+			*w = WildcardRule{}
+		}
+		return nil
+	}
+	// 2. 支持字符串简写: "wildcard": "iwara-*" 或 "iwara-*.l.moonchan.xyz"
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		w.Entry = s
+		return nil
+	}
+	// 3. 支持常规对象反序列化
+	type alias WildcardRule
+	var a alias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	*w = WildcardRule(a)
+	return nil
 }
 
 // UpstreamConfig 表示一条上游转发规则。
@@ -130,7 +158,10 @@ func (wl *WildcardList) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	res := make([]WildcardRule, 0, len(m))
-	for _, v := range m {
+	for k, v := range m {
+		if v.Entry == "" {
+			v.Entry = k
+		}
 		res = append(res, v)
 	}
 	*wl = res
@@ -142,7 +173,7 @@ type Config struct {
 	CertPath      string       `json:"cert_path"`
 	KeyPath       string       `json:"key_path"`
 	Upstreams     UpstreamMap  `json:"upstreams"`
-	Wildcards     WildcardList `json:"wildcards,omitempty"` // 独立通配列表
+	Wildcards     WildcardList `json:"wildcards,omitempty"` // 独立通配列表 (支持数组或字典)
 	BlockedHosts  []string     `json:"blocked_hosts"`
 	UpstreamOrder []string     `json:"-"`
 }
@@ -263,8 +294,18 @@ func ApplyHeaderRules(h http.Header, rules map[string]HeaderRule, isRequest bool
 // normalizeConfig 对上游配置做归一化收敛:
 // 1. 将历史配置中的 referer, origin, x_site 收敛到通用的 Headers 字典;
 // 2. 若未显式配置 Origin, 则自动从 Headers["Referer"] 或 referer 推导出上游 Origin;
-// 3. 反向同步补全结构体历史字段, 保证向前向后双向兼容。
+// 3. 自动根据上游主机名推导省略的 suffix 与 prefix，消除冗余配置项;
+// 4. 反向同步补全结构体历史字段, 保证向前向后双向兼容。
 func normalizeConfig(cfg *Config) {
+	// 从已有上游提取公共 entry 根域名 (例如 ".l.moonchan.xyz")
+	var defaultEntrySuffix string
+	for hostKey := range cfg.Upstreams {
+		if idx := strings.Index(hostKey, "."); idx >= 0 {
+			defaultEntrySuffix = hostKey[idx:]
+			break
+		}
+	}
+
 	for host, uc := range cfg.Upstreams {
 		if uc.Headers == nil {
 			uc.Headers = make(map[string]HeaderRule)
@@ -302,6 +343,21 @@ func normalizeConfig(cfg *Config) {
 		}
 
 		if w := uc.Wildcard; w != nil {
+			// 如果未手动写 entry_suffix，从当前 host 自动推断 (如 "iwara.l.moonchan.xyz" -> ".l.moonchan.xyz")
+			if w.EntrySuffix == "" {
+				if idx := strings.Index(host, "."); idx >= 0 {
+					w.EntrySuffix = host[idx:]
+					if w.Prefix == "" {
+						w.Prefix = host[:idx] + "-"
+					}
+				} else if defaultEntrySuffix != "" {
+					w.EntrySuffix = defaultEntrySuffix
+				}
+			}
+			// 如果未手动写 upstream_suffix，从 uc.Host 自动推断 (如 "iwara.tv" -> ".iwara.tv")
+			if w.UpstreamSuffix == "" && uc.Host != "" {
+				w.UpstreamSuffix = "." + strings.TrimPrefix(uc.Host, ".")
+			}
 			normalizeWildcardRule(w)
 		}
 		cfg.Upstreams[host] = uc
@@ -311,12 +367,45 @@ func normalizeConfig(cfg *Config) {
 	for i := range cfg.Wildcards {
 		w := &cfg.Wildcards[i]
 		normalizeWildcardRule(w)
+		if w.EntrySuffix == "" && defaultEntrySuffix != "" {
+			w.EntrySuffix = defaultEntrySuffix
+		}
 
-		// 检查是否有关联的 upstream 匹配该通配规则 (prefix 与 entry_suffix 相同)
+		// 检查是否有关联的 upstream 匹配该通配规则
 		matched := false
 		for host, uc := range cfg.Upstreams {
-			if uc.Wildcard != nil && uc.Wildcard.Prefix == w.Prefix && uc.Wildcard.EntrySuffix == w.EntrySuffix {
+			isMatch := false
+			if uc.Wildcard != nil {
+				if w.Prefix != "" && w.EntrySuffix != "" && uc.Wildcard.Prefix == w.Prefix && uc.Wildcard.EntrySuffix == w.EntrySuffix {
+					isMatch = true
+				} else if w.UpstreamSuffix != "" && uc.Wildcard.UpstreamSuffix == w.UpstreamSuffix {
+					isMatch = true
+				} else if w.Host != "" && uc.Host == w.Host {
+					isMatch = true
+				}
+			} else if (w.Host != "" && uc.Host == w.Host) || (w.UpstreamSuffix != "" && w.UpstreamSuffix == "."+strings.TrimPrefix(uc.Host, ".")) {
+				isMatch = true
+			}
+
+			if isMatch {
 				matched = true
+				if uc.Wildcard == nil {
+					wCopy := *w
+					if wCopy.EntrySuffix == "" {
+						if idx := strings.Index(host, "."); idx >= 0 {
+							wCopy.EntrySuffix = host[idx:]
+						}
+					}
+					if wCopy.Prefix == "" {
+						if idx := strings.Index(host, "."); idx >= 0 {
+							wCopy.Prefix = host[:idx] + "-"
+						}
+					}
+					if wCopy.UpstreamSuffix == "" && uc.Host != "" {
+						wCopy.UpstreamSuffix = "." + strings.TrimPrefix(uc.Host, ".")
+					}
+					uc.Wildcard = &wCopy
+				}
 				if len(w.Headers) > 0 {
 					if uc.Wildcard.Headers == nil {
 						uc.Wildcard.Headers = make(map[string]HeaderRule)
@@ -357,7 +446,10 @@ func normalizeConfig(cfg *Config) {
 
 		// 若无关联的现有 upstream，作为独立通配上游注册进 cfg.Upstreams
 		if !matched {
-			virtualHost := w.Prefix + "*" + w.EntrySuffix
+			virtualHost := w.Entry
+			if virtualHost == "" {
+				virtualHost = w.Prefix + "*" + w.EntrySuffix
+			}
 			wCopy := *w
 			cfg.Upstreams[virtualHost] = UpstreamConfig{
 				Host:            w.UpstreamSuffix,
@@ -375,24 +467,42 @@ func normalizeConfig(cfg *Config) {
 }
 
 // normalizeWildcardRule 规范化通配规则:
-// 1. 支持直观别名: entry: "iwara-*.l.moonchan.xyz" 自动解析出 prefix 和 entry_suffix
-// 2. 支持直观别名: upstream: "*.iwara.tv" 自动解析出 upstream_suffix
+// 1. 支持直观 entry/upstream 模式 (如 entry: "iwara-*.l.moonchan.xyz", upstream: "*.iwara.tv")
+// 2. 支持 match/target/host 别名，完全消除底层切片字段对配置的侵入
 // 3. 将 referer, origin, x_site 收敛到 Headers 字典中
 func normalizeWildcardRule(w *WildcardRule) {
 	if w == nil {
 		return
 	}
+	if w.Entry == "" && w.Match != "" {
+		w.Entry = w.Match
+	}
+	if w.Upstream == "" {
+		if w.Target != "" {
+			w.Upstream = w.Target
+		} else if w.Host != "" {
+			w.Upstream = w.Host
+		}
+	}
+	// 从 Entry 模式解析 Prefix 与 EntrySuffix
 	if w.Entry != "" && (w.Prefix == "" && w.EntrySuffix == "") {
 		if idx := strings.Index(w.Entry, "*"); idx >= 0 {
 			w.Prefix = w.Entry[:idx]
 			w.EntrySuffix = w.Entry[idx+1:]
+		} else if strings.HasSuffix(w.Entry, "-") {
+			w.Prefix = w.Entry
 		}
 	}
+	// 从 Upstream 模式解析 UpstreamSuffix
 	if w.Upstream != "" && w.UpstreamSuffix == "" {
 		if idx := strings.Index(w.Upstream, "*"); idx >= 0 {
 			w.UpstreamSuffix = w.Upstream[idx+1:]
 		} else {
-			w.UpstreamSuffix = w.Upstream
+			if strings.HasPrefix(w.Upstream, ".") {
+				w.UpstreamSuffix = w.Upstream
+			} else {
+				w.UpstreamSuffix = "." + w.Upstream
+			}
 		}
 	}
 	if w.Entry == "" && w.Prefix != "" && w.EntrySuffix != "" {

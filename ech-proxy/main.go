@@ -18,7 +18,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Hana-ame/ech-proxy/apifwd"
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/ech"
 	"github.com/Hana-ame/ech-proxy/echproxy"
 )
@@ -62,7 +61,7 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
-	r.Use(apifwd.CORSMiddleware())
+	r.Use(echproxy.CORSMiddleware())
 
 	// 配置单一来源: 无论 TLS 还是 --http 模式, 都从 GitHub 拉取同一份
 	// upstream.json (避免 embeddedConfig 与仓库配置双份漂移)。
@@ -129,6 +128,12 @@ func main() {
 		fmt.Printf("  域名: %s -> %s (%s)", entry, uc.Host, echproxy.ModeName(uc.Mode))
 		if uc.Referer != "" {
 			fmt.Printf(" (referer: %s)", uc.Referer)
+		}
+		if len(uc.Headers) > 0 {
+			fmt.Printf(" (headers: %d)", len(uc.Headers))
+		}
+		if len(uc.ResponseHeaders) > 0 {
+			fmt.Printf(" (resp_headers: %d)", len(uc.ResponseHeaders))
 		}
 		// 通配入口一并显示: iwara-* → *.iwara.tv, 让 banner 反映真实覆盖范围。
 		if w := uc.Wildcard; w != nil {

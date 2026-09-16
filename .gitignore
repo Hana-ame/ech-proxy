@@ -1,6 +1,8 @@
 # Ignore Go build artifacts
 ech-proxy
 ech-proxy-*
+!ech-proxy/
+!ech-proxy-android/
 *.exe
 *.so
 *.apk

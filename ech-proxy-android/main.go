@@ -18,7 +18,6 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/Hana-ame/ech-proxy/apifwd"
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/ech"
 	"github.com/Hana-ame/ech-proxy/echproxy"
 )
@@ -119,7 +118,7 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 
 	r := gin.New()
 	r.Use(gin.Recovery())
-	r.Use(apifwd.CORSMiddleware())
+	r.Use(echproxy.CORSMiddleware())
 
 	// 分流路由（桌面版与 Android 版共用 echproxy.SetupRouter）
 	echproxy.SetupRouter(r, cfg)

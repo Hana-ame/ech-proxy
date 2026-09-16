@@ -34,6 +34,10 @@
         "iwara.l.moonchan.xyz": {
             "host": "iwara.tv",
             "referer": "https://www.iwara.tv/",
+            "headers": {
+                "Origin": "https://www.iwara.tv",
+                "X-Site": "www.iwara.tv"
+            },
             "describe": "Iwara 视频站（支持通配子域名）",
             "display": true,
             "wildcard": {
@@ -132,6 +136,17 @@
             "display": false
         }
     },
+    "wildcards": [
+        {
+            "prefix": "iwara-",
+            "entry_suffix": ".l.moonchan.xyz",
+            "upstream_suffix": ".iwara.tv",
+            "headers": {
+                "Origin": "https://www.iwara.tv",
+                "X-Site": "www.iwara.tv"
+            }
+        }
+    ],
     "blocked_hosts": [
         "https://fonts.googleapis.com",
         "https://fonts.gstatic.com",

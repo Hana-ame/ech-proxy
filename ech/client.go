@@ -168,6 +168,13 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 	return cfg, nil
 }
 
+// QueryDoH 统一执行 DoH DNS 查询 (按当前配置的 dohURL、bootstrap IP 与 IP 栈偏好发起 HTTP 请求)。
+func QueryDoH(ctx context.Context, name string, qtype int) (*http.Response, error) {
+	dohURL := currentConfig().dohURL
+	u := fmt.Sprintf("%s?name=%s&type=%d", dohURL, url.QueryEscape(name), qtype)
+	return doDohRequest(ctx, u)
+}
+
 // fetchECHConfigOnce 执行一次 DoH 拉取与解析 (无重试, 由 fetchECHConfig 包重试)。
 func fetchECHConfigOnce(ctx context.Context, domain, dohURL string) ([]byte, error) {
 	u := fmt.Sprintf("%s?name=%s&type=65", dohURL, url.QueryEscape(domain))

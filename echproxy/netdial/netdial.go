@@ -111,15 +111,26 @@ func rootCAs() *x509.CertPool {
 	return pool
 }
 
+var (
+	transportOnce sync.Once
+	cachedTransport *http.Transport
+)
+
 // Transport returns an http.Transport suitable for Termux (public DNS + Termux CA).
-// The certificate pool is globally cached and reused (SystemCertPool loading is non-trivial).
+// The transport is globally cached and reused to share connection pools across callers.
 func Transport() *http.Transport {
-	return &http.Transport{
-		DialContext: Dialer().DialContext,
-		TLSClientConfig: &tls.Config{
-			RootCAs: getRootPool(),
-		},
-	}
+	transportOnce.Do(func() {
+		cachedTransport = &http.Transport{
+			DialContext: Dialer().DialContext,
+			TLSClientConfig: &tls.Config{
+				RootCAs: getRootPool(),
+			},
+			MaxIdleConns:        100,
+			IdleConnTimeout:     OpTimeout,
+			ForceAttemptHTTP2:   true,
+		}
+	})
+	return cachedTransport
 }
 
 // Client returns an http.Client suitable for Termux.

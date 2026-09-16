@@ -20,6 +20,7 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:8443", "listen address")
 	httpMode := flag.Bool("http", false, "run in HTTP mode (no TLS, local proxy)")
 	verbose := flag.Bool("v", false, "verbose per-request logging")
+	noBrowser := flag.Bool("no-browser", false, "do not auto-open browser on startup")
 	flag.Parse()
 
 	// Per-request logging switch: silent by default in remote deployment, enable with -v for troubleshooting
@@ -38,11 +39,13 @@ func main() {
 	srv.PrintBanner(os.Getenv("LOCALIP"))
 
 	// Automatically open browser to entry list once listening successfully (PC usage)
-	scheme := "https"
-	if *httpMode {
-		scheme = "http"
+	if !*noBrowser {
+		scheme := "https"
+		if *httpMode {
+			scheme = "http"
+		}
+		go openBrowser(fmt.Sprintf("%s://l.moonchan.xyz:%d", scheme, srv.Port))
 	}
-	go openBrowser(fmt.Sprintf("%s://l.moonchan.xyz:%d", scheme, srv.Port))
 
 	// Graceful shutdown: on Ctrl+C / SIGTERM stop accepting new connections, wait up to 5s for in-flight requests
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

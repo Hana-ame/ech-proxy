@@ -10,15 +10,15 @@ import (
 )
 
 // hopByHopHeaders are headers that must be stripped during proxy forwarding according to RFC 2616.
-var hopByHopHeaders = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"TE",
-	"Trailer",
-	"Transfer-Encoding",
-	"Upgrade",
+var hopByHopHeaders = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
 }
 
 // copyHeaders copies request/response headers from src to dst, stripping hop-by-hop headers and upstream CORS headers
@@ -99,10 +99,5 @@ func rewriteSetCookieDomains(h http.Header, proxyHost string, httpMode bool) {
 }
 
 func isHopByHop(name string) bool {
-	for _, h := range hopByHopHeaders {
-		if http.CanonicalHeaderKey(name) == h {
-			return true
-		}
-	}
-	return false
+	return hopByHopHeaders[http.CanonicalHeaderKey(name)]
 }

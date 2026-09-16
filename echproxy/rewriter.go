@@ -2,7 +2,6 @@ package echproxy
 
 import (
 	"bytes"
-	"regexp"
 	"sort"
 	"strings"
 )
@@ -25,6 +24,8 @@ func buildEntryRewriter(uc UpstreamConfig, blocked []string) func([]byte, string
 		rules["."+bare] = base + w.EntrySuffix
 	}
 	base := buildRewriter(rules)
+	// Ensure body replace rules have pre-compiled regexes (defensive: handles ad-hoc configs not from ParseConfig)
+	compileBodyReplaceRules(uc.BodyReplace)
 	return func(body []byte, port string) []byte {
 		body = stripBlockedURLs(body, blocked)
 		body = base(body, port)
@@ -42,15 +43,15 @@ func applyBodyReplace(body []byte, rules []BodyReplaceRule) []byte {
 			continue
 		}
 		if r.Regex {
-			if re, err := regexp.Compile(r.Old); err == nil {
-				body = re.ReplaceAll(body, []byte(r.New))
-				continue
+			if r.compiled != nil {
+				body = r.compiled.ReplaceAll(body, []byte(r.New))
 			}
+			continue
 		}
 		if bytes.Contains(body, []byte(r.Old)) {
 			body = bytes.ReplaceAll(body, []byte(r.Old), []byte(r.New))
-		} else if re, err := regexp.Compile(r.Old); err == nil {
-			body = re.ReplaceAll(body, []byte(r.New))
+		} else if r.compiled != nil {
+			body = r.compiled.ReplaceAll(body, []byte(r.New))
 		}
 	}
 	return body

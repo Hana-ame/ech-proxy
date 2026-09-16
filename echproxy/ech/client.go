@@ -119,6 +119,9 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 	cfg := currentConfig()
 	dialIP := cfg.dialIP
 	if dialIP != "" {
+		// Shallow copy to avoid mutating the shared cached transport
+		trCopy := *tr
+		tr = &trCopy
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			_, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -132,6 +135,9 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 			tr.TLSClientConfig = &tls.Config{ServerName: uParsed.Host}
 		}
 	} else if cfg.ipMode != "" {
+		// Shallow copy to avoid mutating the shared cached transport
+		trCopy := *tr
+		tr = &trCopy
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {

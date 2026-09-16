@@ -20,9 +20,10 @@ import (
 //  - Delete: {"delete": true}
 //  - Replace: {"replace": ["before", "after"]}
 type HeaderRule struct {
-	Value   string   `json:"value,omitempty"`
-	Delete  bool     `json:"delete,omitempty"`
-	Replace []string `json:"replace,omitempty"` // [before, after]
+	Value           string         `json:"value,omitempty"`
+	Delete          bool           `json:"delete,omitempty"`
+	Replace         []string       `json:"replace,omitempty"` // [before, after]
+	compiledReplace *regexp.Regexp // pre-compiled regex for Replace[0]; nil if not a valid regex
 }
 
 func (h *HeaderRule) UnmarshalJSON(data []byte) error {
@@ -66,9 +67,10 @@ func (h HeaderRule) MarshalJSON() ([]byte, error) {
 // Supports advanced object: {"replace": ["old", "new"]}
 // Supports explicit key-value: {"from": "old", "to": "new"}
 type BodyReplaceRule struct {
-	Old   string `json:"old,omitempty"`
-	New   string `json:"new,omitempty"`
-	Regex bool   `json:"regex,omitempty"`
+	Old      string         `json:"old,omitempty"`
+	New      string         `json:"new,omitempty"`
+	Regex    bool           `json:"regex,omitempty"`
+	compiled *regexp.Regexp // pre-compiled regex for Old; nil if not a valid regex
 }
 
 func (r *BodyReplaceRule) UnmarshalJSON(data []byte) error {
@@ -320,12 +322,10 @@ func ApplyHeaderRules(h http.Header, rules map[string]HeaderRule, isRequest bool
 		if len(rule.Replace) >= 2 {
 			cur := h.Get(k)
 			if cur != "" {
-				before := rule.Replace[0]
-				after := rule.Replace[1]
-				if re, err := regexp.Compile(before); err == nil {
-					h.Set(k, re.ReplaceAllString(cur, after))
+				if rule.compiledReplace != nil {
+					h.Set(k, rule.compiledReplace.ReplaceAllString(cur, rule.Replace[1]))
 				} else {
-					h.Set(k, strings.ReplaceAll(cur, before, after))
+					h.Set(k, strings.ReplaceAll(cur, rule.Replace[0], rule.Replace[1]))
 				}
 			}
 			continue
@@ -562,6 +562,47 @@ func normalizeConfig(cfg *Config) {
 				SWInject:        w.SWInject,
 				Wildcard:        &wCopy,
 			}
+		}
+	}
+
+	compilePatterns(cfg)
+}
+
+// compilePatterns pre-compiles all regex patterns in the config so they are not
+// recompiled on every request. Covers HeaderRule.Replace and BodyReplaceRule.Old
+// across upstreams, response headers, and wildcard rules.
+func compilePatterns(cfg *Config) {
+	for host, uc := range cfg.Upstreams {
+		compileBodyReplaceRules(uc.BodyReplace)
+		compileHeaderRules(uc.Headers)
+		compileHeaderRules(uc.ResponseHeaders)
+		if w := uc.Wildcard; w != nil {
+			compileBodyReplaceRules(w.BodyReplace)
+			compileHeaderRules(w.Headers)
+			compileHeaderRules(w.ResponseHeaders)
+		}
+		// BodyReplace slice elements are modified in-place via index;
+		// Headers/ResponseHeaders maps are reference types. No reassign needed
+		// unless struct-level fields were changed — they weren't.
+		_ = host
+	}
+}
+
+// compileBodyReplaceRules pre-compiles regex patterns for body replacement rules.
+func compileBodyReplaceRules(rules []BodyReplaceRule) {
+	for i := range rules {
+		if rules[i].Old != "" {
+			rules[i].compiled, _ = regexp.Compile(rules[i].Old)
+		}
+	}
+}
+
+// compileHeaderRules pre-compiles regex patterns for header replacement rules.
+func compileHeaderRules(rules map[string]HeaderRule) {
+	for k, rule := range rules {
+		if len(rule.Replace) >= 2 {
+			rule.compiledReplace, _ = regexp.Compile(rule.Replace[0])
+			rules[k] = rule
 		}
 	}
 }

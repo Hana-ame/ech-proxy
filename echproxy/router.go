@@ -5,6 +5,7 @@ package echproxy
 
 import (
 	_ "embed"
+	"html"
 	"net"
 	"strings"
 
@@ -109,12 +110,12 @@ func renderUpstreamList(cfg *Config, requestHost string) string {
 			desc = "Access " + uc.Host + " via ECH Proxy"
 		}
 		badge := strings.ToUpper(entry[:1])
-		sb.WriteString(`<a class="item" href="https://` + entry + port + `/">`)
-		sb.WriteString(`<div class="badge" style="background:` + color + `">` + badge + `</div>`)
-		sb.WriteString(`<div class="info"><div class="entry">` + entry + `</div>`)
-		sb.WriteString(`<div class="desc">` + desc + `</div>`)
-		sb.WriteString(`<div class="target">→ ` + uc.Host + `</div></div>`)
-		sb.WriteString(`<div class="mode">` + mode + `</div>`)
+		sb.WriteString(`<a class="item" href="https://` + html.EscapeString(entry) + port + `/">`)
+		sb.WriteString(`<div class="badge" style="background:` + color + `">` + html.EscapeString(badge) + `</div>`)
+		sb.WriteString(`<div class="info"><div class="entry">` + html.EscapeString(entry) + `</div>`)
+		sb.WriteString(`<div class="desc">` + html.EscapeString(desc) + `</div>`)
+		sb.WriteString(`<div class="target">→ ` + html.EscapeString(uc.Host) + `</div></div>`)
+		sb.WriteString(`<div class="mode">` + html.EscapeString(mode) + `</div>`)
 		sb.WriteString(`</a>`)
 	}
 	return sb.String()

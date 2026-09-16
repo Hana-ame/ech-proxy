@@ -519,6 +519,41 @@ func TestWildcardCleanKeysAndAutoDerivation(t *testing.T) {
 	if match4.Headers["Origin"].Value != "https://www.iwara.tv" {
 		t.Errorf("expected Origin https://www.iwara.tv, got %s", match4.Headers["Origin"].Value)
 	}
+
+	// 5. 测试 prefix + upstream 显式保留前缀且去除冗余 suffix 的写法
+	prefixUpstreamJSON := []byte(`{
+		"upstreams": {
+			"iwara.l.moonchan.xyz": {
+				"host": "iwara.tv",
+				"headers": {
+					"Origin": "https://www.iwara.tv"
+				}
+			}
+		},
+		"wildcards": [
+			{
+				"prefix": "iwara-",
+				"upstream": "*.iwara.tv",
+				"headers": {
+					"X-Site": "www.iwara.tv"
+				}
+			}
+		]
+	}`)
+	cfg5, err := ParseConfig(prefixUpstreamJSON)
+	if err != nil {
+		t.Fatalf("ParseConfig prefixUpstreamJSON failed: %v", err)
+	}
+	match5, ok := MatchWildcardForTest(cfg5.Upstreams, "iwara-video.l.moonchan.xyz")
+	if !ok {
+		t.Fatalf("expected wildcard match for iwara-video.l.moonchan.xyz")
+	}
+	if match5.Host != "video.iwara.tv" {
+		t.Errorf("expected video.iwara.tv, got %s", match5.Host)
+	}
+	if match5.Headers["X-Site"].Value != "www.iwara.tv" {
+		t.Errorf("expected X-Site www.iwara.tv, got %s", match5.Headers["X-Site"].Value)
+	}
 }
 
 

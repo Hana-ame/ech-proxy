@@ -138,7 +138,8 @@
     },
     "wildcards": [
         {
-            "entry": "*.iwara.tv",
+            "prefix": "iwara-",
+            "upstream": "*.iwara.tv",
             "headers": {
                 "Origin": "https://www.iwara.tv",
                 "X-Site": "www.iwara.tv"

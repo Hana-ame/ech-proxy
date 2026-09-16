@@ -32,9 +32,9 @@ jobs:
 
       - name: Write keystore from Secret
         run: |
-          mkdir -p ech-proxy-android/android
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > ech-proxy-android/android/release.keystore
-          ls -la ech-proxy-android/android/release.keystore
+          mkdir -p android
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/release.keystore
+          ls -la android/release.keystore
 
       # 签名凭证必须显式存在于 Secrets（不依赖默认值兜底），缺失则立即失败
       - name: Validate signing secrets
@@ -54,7 +54,7 @@ jobs:
 
       - name: Build ECH shared library (arm64)
         run: |
-          cd ech-proxy-android
+          cd android
           CGO_ENABLED=1 \
           GOOS=android \
           GOARCH=arm64 \
@@ -64,8 +64,8 @@ jobs:
 
       - name: Copy library to Android project
         run: |
-          mkdir -p ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a
-          cp ech-proxy-android/libechproxy.so ech-proxy-android/android/app/src/main/jniLibs/arm64-v8a/
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          cp android/libechproxy.so android/app/src/main/jniLibs/arm64-v8a/
 
       # ubuntu-latest runner 预装 Android SDK 与 cmdline-tools, 但 sdkmanager 不在 PATH。
       # android-actions/setup-android@v3 会执行 `sdkmanager tools`, 而 Google 已把
@@ -93,7 +93,7 @@ jobs:
 
       - name: Generate Gradle Wrapper
         run: |
-          cd ech-proxy-android/android
+          cd android
           gradle wrapper --gradle-version 8.5
 
       - name: Build APK
@@ -102,15 +102,15 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'release' }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
         run: |
-          cd ech-proxy-android/android
+          cd android
           ./gradlew assembleRelease --no-daemon
 
       - name: List APK output
         run: |
-          find ech-proxy-android/android/app/build/outputs -name "*.apk" -type f
+          find android/app/build/outputs -name "*.apk" -type f
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: twitter-pic-android
-          path: ech-proxy-android/android/app/build/outputs/apk/release/*.apk
+          path: android/app/build/outputs/apk/release/*.apk

@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/Hana-ame/ech-proxy/netdial"
+	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	"github.com/Hana-ame/orderedmap"
 )
 

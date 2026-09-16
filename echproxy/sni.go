@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	cloudflare_ech "github.com/Hana-ame/ech-proxy/ech"
-	"github.com/Hana-ame/ech-proxy/netdial"
+	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
+	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 )

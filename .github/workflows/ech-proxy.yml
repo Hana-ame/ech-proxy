@@ -4,11 +4,8 @@ on:
   push:
     branches: [main]
     paths:
-      - "ech-proxy/**"
-      - "ech/**"
+      - "win/**"
       - "echproxy/**"
-      - "apifwd/**"
-      - "netdial/**"
       - "go.mod"
       - "go.sum"
       - ".github/workflows/ech-proxy.yml"
@@ -29,10 +26,10 @@ jobs:
           go-version: "1.26"
 
       - name: Build ech-proxy (Windows amd64)
-        run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-proxy-windows-amd64.exe ./ech-proxy/
+        run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-proxy-windows-amd64.exe ./win/
 
       - name: Build ech-proxy (Linux amd64)
-        run: GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ech-proxy-linux-amd64 ./ech-proxy/
+        run: GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ech-proxy-linux-amd64 ./win/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

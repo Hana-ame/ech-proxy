@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	cloudflare_ech "github.com/Hana-ame/ech-proxy/ech"
-	"github.com/Hana-ame/ech-proxy/netdial"
+	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
+	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	"github.com/gin-gonic/gin"
 )
 

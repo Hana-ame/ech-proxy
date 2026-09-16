@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Hana-ame/ech-proxy/netdial"
+	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 )
 
 // Client 是一个基于 cloudflare-ech.com ECH 域前置的 HTTP 客户端。

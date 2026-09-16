@@ -13,21 +13,21 @@ ECH (Encrypted Client Hello) 代理，支持多上游路由和 Android APK 部�
 
 ## 构建
 
-### Go 二进制
+### Go 二进制 (Windows / Linux)
 
 ```bash
-go build -o ech-proxy ./cmd/ech-proxy/
+go build -o ech-proxy ./win/
 ```
 
 ### Android APK
 
 ```bash
-# 需要 Android NDK r27
+# 1. 编译 Go 动态库 (需要 Android NDK r27)
+cd android
 GOOS=android GOARCH=arm64 CC=aarch64-linux-android21-clang \
-  go build -buildmode=c-shared -o cmd/ech-proxy-android/libechproxy.so \
-  ./cmd/ech-proxy-android/
+  go build -buildmode=c-shared -o app/src/main/jniLibs/arm64-v8a/libechproxy.so .
 
-cd cmd/ech-proxy-android/android
+# 2. 打包 APK
 ./gradlew assembleRelease
 ```
 

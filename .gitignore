@@ -1,9 +1,13 @@
 # Ignore Go build artifacts
+ech-proxy
+ech-proxy-*
 *.exe
 *.so
 *.apk
+*.bin
 
 # Ignore Android build outputs
+.gradle/
 ech-proxy-android/android/.gradle/
 ech-proxy-android/android/app/build/
 ech-proxy-android/android/local.properties

@@ -115,6 +115,16 @@
             "rewrites": {
                 "api.asmr-300.com": "asmr-api-300.l.moonchan.xyz"
             }
+        },
+        "f95.l.moonchan.xyz": {
+            "host": "f95zone.to",
+            "describe": "F95Zone 论坛（支持通配子域名）",
+            "display": true,
+            "wildcard": {
+                "prefix": "f95-",
+                "entry_suffix": ".l.moonchan.xyz",
+                "upstream_suffix": ".f95zone.to"
+            }
         }
     },
     "blocked_hosts": [

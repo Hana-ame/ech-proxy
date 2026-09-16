@@ -61,6 +61,54 @@ func (h HeaderRule) MarshalJSON() ([]byte, error) {
 	return json.Marshal(h.Value)
 }
 
+// BodyReplaceRule 定义单个正文替换规则:
+// 支持数组简写: ["old", "new"]
+// 支持高级对象: {"replace": ["old", "new"]}
+// 支持显式键值: {"from": "old", "to": "new"}
+type BodyReplaceRule struct {
+	Old   string `json:"old,omitempty"`
+	New   string `json:"new,omitempty"`
+	Regex bool   `json:"regex,omitempty"`
+}
+
+func (r *BodyReplaceRule) UnmarshalJSON(data []byte) error {
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err == nil && len(arr) >= 2 {
+		r.Old = arr[0]
+		r.New = arr[1]
+		return nil
+	}
+	var objReplace struct {
+		Replace []string `json:"replace"`
+		Regex   bool     `json:"regex"`
+	}
+	if err := json.Unmarshal(data, &objReplace); err == nil && len(objReplace.Replace) >= 2 {
+		r.Old = objReplace.Replace[0]
+		r.New = objReplace.Replace[1]
+		r.Regex = objReplace.Regex
+		return nil
+	}
+	var raw struct {
+		Old   string `json:"old"`
+		New   string `json:"new"`
+		From  string `json:"from"`
+		To    string `json:"to"`
+		Regex bool   `json:"regex"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.Old != "" {
+		r.Old = raw.Old
+		r.New = raw.New
+	} else {
+		r.Old = raw.From
+		r.New = raw.To
+	}
+	r.Regex = raw.Regex
+	return nil
+}
+
 // WildcardRule 通配上游规则:
 // 请求域名 = Prefix + <sub> + EntrySuffix 时, 转发到 <sub> + UpstreamSuffix。
 // 例: entry="iwara-*.l.moonchan.xyz" upstream="*.iwara.tv"
@@ -83,6 +131,7 @@ type WildcardRule struct {
 	Mode            string                `json:"mode,omitempty"`
 	SWInject        bool                  `json:"sw_inject,omitempty"`
 	Rewrites        map[string]string     `json:"rewrites,omitempty"`
+	BodyReplace     []BodyReplaceRule     `json:"body_replace,omitempty"` // 通用响应体替换规则 [ ["old", "new"], ... ]
 
 	// 历史兼容字段 (加载时自动合入 Headers)
 	Referer string `json:"referer,omitempty"`
@@ -133,6 +182,7 @@ type UpstreamConfig struct {
 	SWInject        bool                  `json:"sw_inject,omitempty"`
 	Mode            string                `json:"mode,omitempty"`
 	Rewrites        map[string]string     `json:"rewrites,omitempty"`
+	BodyReplace     []BodyReplaceRule     `json:"body_replace,omitempty"` // 通用响应体替换规则 [ ["old", "new"], ... ]
 	Wildcard        *WildcardRule         `json:"wildcard,omitempty"`
 
 	// 历史兼容字段 (加载时自动合入 Headers)

@@ -2,12 +2,14 @@ package echproxy
 
 import (
 	"bytes"
+	"regexp"
 	"sort"
 	"strings"
 )
 
 // buildEntryRewriter 从单条 UpstreamConfig 构造响应域名重写器:
-// 精确 rewrites 原样使用; wildcard 非空时自动推导通配条目。
+// 精确 rewrites 原样使用; wildcard 非空时自动推导通配条目;
+// body_replace 执行通用文本或正则替换规则。
 // blocked 为全局剔除域名列表 (Config.BlockedHosts, upstream.json 可配)。
 func buildEntryRewriter(uc UpstreamConfig, blocked []string) func([]byte, string) []byte {
 	rules := make(map[string]string, len(uc.Rewrites)+2)
@@ -24,8 +26,34 @@ func buildEntryRewriter(uc UpstreamConfig, blocked []string) func([]byte, string
 	}
 	base := buildRewriter(rules)
 	return func(body []byte, port string) []byte {
-		return base(stripBlockedURLs(body, blocked), port)
+		body = stripBlockedURLs(body, blocked)
+		body = base(body, port)
+		if len(uc.BodyReplace) > 0 {
+			body = applyBodyReplace(body, uc.BodyReplace)
+		}
+		return body
 	}
+}
+
+// applyBodyReplace 对响应正文执行通用替换规则（支持字面量快速替换与正则替换）。
+func applyBodyReplace(body []byte, rules []BodyReplaceRule) []byte {
+	for _, r := range rules {
+		if r.Old == "" {
+			continue
+		}
+		if r.Regex {
+			if re, err := regexp.Compile(r.Old); err == nil {
+				body = re.ReplaceAll(body, []byte(r.New))
+				continue
+			}
+		}
+		if bytes.Contains(body, []byte(r.Old)) {
+			body = bytes.ReplaceAll(body, []byte(r.Old), []byte(r.New))
+		} else if re, err := regexp.Compile(r.Old); err == nil {
+			body = re.ReplaceAll(body, []byte(r.New))
+		}
+	}
+	return body
 }
 
 // stripBlockedURLs 从响应文本中移除被墙第三方域名的完整 URL 值。

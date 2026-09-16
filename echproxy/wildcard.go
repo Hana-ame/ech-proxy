@@ -75,6 +75,9 @@ func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 		if !out.SWInject {
 			out.SWInject = uc.SWInject
 		}
+		if len(w.BodyReplace) > 0 {
+			out.BodyReplace = append(out.BodyReplace, w.BodyReplace...)
+		}
 		if out.Mode == "" || out.Mode == "ech" {
 			out.Mode = wildcardMode(context.Background(), out.Host)
 		}

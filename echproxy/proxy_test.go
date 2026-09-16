@@ -230,6 +230,37 @@ func TestBuildEntryRewriter(t *testing.T) {
 	}
 }
 
+func TestBodyReplace(t *testing.T) {
+	jsonCfg := []byte(`{
+		"host": "example.com",
+		"body_replace": [
+			["https://cdn.upstream.com/", "https://cdn.proxy.com/"],
+			{"replace": ["v[0-9]+\\.[0-9]+", "v9.9.9"]}
+		]
+	}`)
+	var uc UpstreamConfig
+	if err := json.Unmarshal(jsonCfg, &uc); err != nil {
+		t.Fatalf("unmarshal error: %v", err)
+	}
+	if len(uc.BodyReplace) != 2 {
+		t.Fatalf("expected 2 rules, got %d", len(uc.BodyReplace))
+	}
+	if uc.BodyReplace[0].Old != "https://cdn.upstream.com/" || uc.BodyReplace[0].New != "https://cdn.proxy.com/" {
+		t.Errorf("rule 0 mismatch: %+v", uc.BodyReplace[0])
+	}
+	if uc.BodyReplace[1].Old != `v[0-9]+\.[0-9]+` || uc.BodyReplace[1].New != "v9.9.9" {
+		t.Errorf("rule 1 mismatch: %+v", uc.BodyReplace[1])
+	}
+
+	rewriter := buildEntryRewriter(uc, nil)
+	input := []byte(`<script src="https://cdn.upstream.com/app.js?v=v1.2"></script>`)
+	output := rewriter(input, "")
+	expected := `<script src="https://cdn.proxy.com/app.js?v=v9.9.9"></script>`
+	if string(output) != expected {
+		t.Errorf("expected: %s\ngot: %s", expected, string(output))
+	}
+}
+
 func TestRewriteSetCookieDomains(t *testing.T) {
 	h := http.Header{}
 	h.Add("Set-Cookie", "sid=123; Domain=.iwara.tv; Path=/; Secure")

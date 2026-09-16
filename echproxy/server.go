@@ -230,3 +230,52 @@ func (s *Server) Close() error {
 	}
 	return nil
 }
+
+// PrintBanner 按照 orderedmap 记录的 upstream 书写顺序打印启动 Banner（严格按配置顺序，不自行排序）。
+func (s *Server) PrintBanner(localIP string) {
+	listenPort := fmt.Sprintf("%d", s.Port)
+	fmt.Printf("=== ECH Proxy ===\n")
+	fmt.Printf("  模式: %s\n", map[bool]string{true: "HTTP (本地代理)", false: "TLS (远程)"}[s.Options.HTTPMode])
+	fmt.Printf("  监听: %s\n", s.Options.Addr)
+	if localIP != "" {
+		fmt.Printf("  DoH IP: %s\n", localIP)
+	}
+
+	upstreamCfg := s.Config.Upstreams
+	domains := s.Config.UpstreamOrder
+	if len(domains) == 0 {
+		for host := range upstreamCfg {
+			domains = append(domains, host)
+		}
+	}
+
+	for _, d := range domains {
+		uc, ok := upstreamCfg[d]
+		if !ok {
+			continue
+		}
+		entry := d
+		if listenPort != "" {
+			entry += ":" + listenPort
+		}
+		fmt.Printf("  域名: %s -> %s (%s)", entry, uc.Host, ModeName(uc.Mode))
+		if uc.Referer != "" {
+			fmt.Printf(" (referer: %s)", uc.Referer)
+		}
+		if len(uc.Headers) > 0 {
+			fmt.Printf(" (headers: %d)", len(uc.Headers))
+		}
+		if len(uc.ResponseHeaders) > 0 {
+			fmt.Printf(" (resp_headers: %d)", len(uc.ResponseHeaders))
+		}
+		if w := uc.Wildcard; w != nil {
+			we := w.Prefix + "*" + w.EntrySuffix
+			if listenPort != "" {
+				we += ":" + listenPort
+			}
+			fmt.Printf(" [+通配 %s -> *%s]", we, w.UpstreamSuffix)
+		}
+		fmt.Println()
+	}
+	fmt.Printf("=================\n")
+}

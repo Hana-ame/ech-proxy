@@ -239,7 +239,10 @@ func ParseConfig(buf []byte) (*Config, error) {
 	om := orderedmap.New()
 	if err := json.Unmarshal(buf, om); err == nil {
 		if us, ok := om.Get("upstreams"); ok {
-			if usMap, ok := us.(orderedmap.OrderedMap); ok {
+			switch usMap := us.(type) {
+			case orderedmap.OrderedMap:
+				cfg.UpstreamOrder = usMap.Keys()
+			case *orderedmap.OrderedMap:
 				cfg.UpstreamOrder = usMap.Keys()
 			}
 		}

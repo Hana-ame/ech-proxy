@@ -10,7 +10,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"runtime"
-	"sort"
 	"syscall"
 	"time"
 
@@ -36,7 +35,7 @@ func main() {
 		log.Fatalf("代理服务器初始化失败: %v", err)
 	}
 
-	printBanner(srv.Config, *addr, *httpMode, srv.Port, os.Getenv("LOCALIP"))
+	srv.PrintBanner(os.Getenv("LOCALIP"))
 
 	// 监听成功即自动打开浏览器访问列表入口 (PC 使用场景)
 	scheme := "https"
@@ -60,48 +59,6 @@ func main() {
 	if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("启动失败: %v", err)
 	}
-}
-
-func printBanner(cfg *echproxy.Config, addr string, httpMode bool, port uint16, localIP string) {
-	listenPort := fmt.Sprintf("%d", port)
-	fmt.Printf("=== ECH Proxy ===\n")
-	fmt.Printf("  模式: %s\n", map[bool]string{true: "HTTP (本地代理)", false: "TLS (远程)"}[httpMode])
-	fmt.Printf("  监听: %s\n", addr)
-	if localIP != "" {
-		fmt.Printf("  DoH IP: %s\n", localIP)
-	}
-	upstreamCfg := cfg.Upstreams
-	var domains []string
-	for host := range upstreamCfg {
-		domains = append(domains, host)
-	}
-	sort.Strings(domains)
-	for _, d := range domains {
-		uc := upstreamCfg[d]
-		entry := d
-		if listenPort != "" {
-			entry += ":" + listenPort
-		}
-		fmt.Printf("  域名: %s -> %s (%s)", entry, uc.Host, echproxy.ModeName(uc.Mode))
-		if uc.Referer != "" {
-			fmt.Printf(" (referer: %s)", uc.Referer)
-		}
-		if len(uc.Headers) > 0 {
-			fmt.Printf(" (headers: %d)", len(uc.Headers))
-		}
-		if len(uc.ResponseHeaders) > 0 {
-			fmt.Printf(" (resp_headers: %d)", len(uc.ResponseHeaders))
-		}
-		if w := uc.Wildcard; w != nil {
-			we := w.Prefix + "*" + w.EntrySuffix
-			if listenPort != "" {
-				we += ":" + listenPort
-			}
-			fmt.Printf(" [+通配 %s -> *%s]", we, w.UpstreamSuffix)
-		}
-		fmt.Println()
-	}
-	fmt.Printf("=================\n")
 }
 
 func openBrowser(url string) {

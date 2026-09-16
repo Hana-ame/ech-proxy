@@ -136,16 +136,6 @@
             "display": false
         }
     },
-    "wildcards": [
-        {
-            "prefix": "iwara-",
-            "upstream": "*.iwara.tv",
-            "headers": {
-                "Origin": "https://www.iwara.tv",
-                "X-Site": "www.iwara.tv"
-            }
-        }
-    ],
     "blocked_hosts": [
         "https://fonts.googleapis.com",
         "https://fonts.gstatic.com",

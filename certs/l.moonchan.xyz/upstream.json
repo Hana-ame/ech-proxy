@@ -6,7 +6,7 @@
             "host": "reminder.moonchan.xyz",
             "mode": "direct",
             "describe": "主入口 / 提醒服务",
-            "display": true
+            "display": false
         },
         "twimg.l.moonchan.xyz": {
             "host": "video-cf.twimg.com",
@@ -125,6 +125,11 @@
                 "entry_suffix": ".l.moonchan.xyz",
                 "upstream_suffix": ".f95zone.to"
             }
+        },
+        "south.l.moonchan.xyz": {
+            "host": "south-plus.org",
+            "describe": "南+ South Plus 论坛",
+            "display": false
         }
     },
     "blocked_hosts": [

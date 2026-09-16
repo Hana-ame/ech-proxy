@@ -1,13 +1,15 @@
 package main
 
+// #include <stdlib.h>
+import "C"
+
 import (
 	"context"
 	"log"
 	"strings"
 	"sync"
 	"time"
-
-	"C"
+	"unsafe"
 
 	"github.com/Hana-ame/ech-proxy/echproxy"
 )
@@ -112,7 +114,13 @@ func IsEchReady() C.int {
 func GetLogs() *C.char {
 	logMu.RLock()
 	defer logMu.RUnlock()
-	return C.CString(strings.Join(logBuffer, "\n"))
+	raw := strings.Join(logBuffer, "\n")
+	return C.CString(strings.ToValidUTF8(raw, ""))
+}
+
+//export FreeCString
+func FreeCString(s *C.char) {
+	C.free(unsafe.Pointer(s))
 }
 
 func main() {}

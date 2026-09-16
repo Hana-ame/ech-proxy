@@ -18,7 +18,7 @@ func isJavascriptResponse(resp *http.Response) bool {
 func buildSWProxyMap(cfg UpstreamMap, port string) map[string]string {
 	m := map[string]string{}
 	for entry, uc := range cfg {
-		if uc.Host != "" && !strings.Contains(uc.Host, "moonchan.xyz") {
+		if uc.Host != "" && !strings.Contains(uc.Host, indexHost) {
 			target := entry
 			if port != "" && !strings.Contains(target, ":") {
 				target += ":" + port

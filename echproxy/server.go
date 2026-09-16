@@ -18,6 +18,12 @@ import (
 // DefaultUpstreamConfigURL is the default remote upstream configuration address (global single source of truth).
 const DefaultUpstreamConfigURL = "https://proxy.moonchan.xyz/Hana-ame/ech-proxy/refs/heads/main/certs/l.moonchan.xyz/upstream.json?proxy_host=raw.githubusercontent.com"
 
+// dohHost is the DNS-over-HTTPS hostname used for ECH bootstrapping.
+const dohHost = "moonchan.xyz"
+
+// defaultListenAddr is the fallback listen address when none is specified.
+const defaultListenAddr = "127.0.0.1:8443"
+
 // ServerOptions encapsulates parameters required to start the ECH proxy server.
 type ServerOptions struct {
 	Addr            string // Listen address, defaults to "127.0.0.1:8443"
@@ -43,11 +49,11 @@ type Server struct {
 // InitECH initializes the underlying Cloudflare ECH and DoH client.
 func InitECH(bootstrapIP, ipMode string) error {
 	if bootstrapIP != "" {
-		log.Printf("ECH: DoH=moonchan.xyz, bootstrapIP=%s", bootstrapIP)
-		cloudflare_ech.SetDoHConfig("moonchan.xyz", bootstrapIP)
+		log.Printf("ECH: DoH=%s, bootstrapIP=%s", dohHost, bootstrapIP)
+		cloudflare_ech.SetDoHConfig(dohHost, bootstrapIP)
 	} else {
-		log.Printf("ECH: DoH=https://moonchan.xyz/doh")
-		cloudflare_ech.SetDohURL("https://moonchan.xyz/doh")
+		log.Printf("ECH: DoH=https://%s/doh", dohHost)
+		cloudflare_ech.SetDohURL("https://" + dohHost + "/doh")
 	}
 
 	if ipMode != "" {
@@ -146,7 +152,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	// 5. Bind network listener
 	addr := opts.Addr
 	if addr == "" {
-		addr = "127.0.0.1:8443"
+		addr = defaultListenAddr
 	}
 	network := "tcp"
 	if strings.HasPrefix(addr, "127.0.0.1") {

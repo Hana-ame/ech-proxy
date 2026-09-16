@@ -53,6 +53,167 @@ func proxyRoundTrip(req *http.Request, mode string) (*http.Response, error) {
 	}
 }
 
+// buildUpstreamRequest constructs the outgoing upstream HTTP request from the client's gin context:
+// copies and filters headers, strips proxy-tracking headers, applies declarative header rules,
+// merges cookies (jar + client + fixed), and sets the upstream Host.
+func buildUpstreamRequest(c *gin.Context, uc UpstreamConfig, urlStr string) (*http.Request, error) {
+	outReq, err := http.NewRequest(c.Request.Method, urlStr, c.Request.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// 1. Capture JS-set cookies sent by the browser before overwriting the Cookie header.
+	saveClientCookies(uc.Host, c.Request)
+
+	// 2. Copy client request headers, stripping RFC 2616 hop-by-hop headers.
+	copyHeaders(outReq.Header, c.Request.Header)
+
+	// 3. Strip proxy-identity headers unless explicitly configured via header rules.
+	if _, ok := uc.Headers["X-Forwarded-For"]; !ok {
+		outReq.Header.Del("X-Forwarded-For")
+	}
+	if _, ok := uc.Headers["X-Forwarded-Proto"]; !ok {
+		outReq.Header.Del("X-Forwarded-Proto")
+	}
+
+	// 4. Apply declarative header rules (set/delete/regex-replace).
+	ApplyHeaderRules(outReq.Header, uc.Headers, true, c.Request)
+
+	outReq.Host = uc.Host
+	outReq.ContentLength = c.Request.ContentLength
+
+	// 5. Merge cookie jar + client cookies + fixed/file cookies into the outgoing Cookie header.
+	applyCookies(uc.Host, outReq, getFixedCookie(uc))
+
+	return outReq, nil
+}
+
+// handleSWFallback serves the generated Service Worker JavaScript when the upstream does not
+// return a JavaScript response for /sw.js.
+func handleSWFallback(c *gin.Context, cfg UpstreamMap, blocked []string, clientIP, method, rawPath string) {
+	port := ""
+	if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
+		port = p
+	}
+	swProxyMap := buildSWProxyMap(cfg, port)
+	swRules := collectWildcardRules(cfg)
+	c.Writer.Header().Del("Content-Length")
+	c.Writer.Header().Set("Content-Type", "application/javascript")
+	c.Writer.WriteHeader(200)
+	c.Writer.Write([]byte(swOverrideJS(swProxyMap, swRules, blocked)))
+	debugLogf("[%s] %s %s -> SW fallback generated %d rules, %d wildcards, %d blocked",
+		clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
+}
+
+// rewriteAndSendBody handles the response body pipeline:
+// For text content within the size limit: decompresses, rewrites domains/URLs, optionally
+// injects the SW registration snippet, re-compresses (gzip if client accepts it), and
+// sets accurate Content-Length.
+// For binary or oversized content: streams raw bytes in 32 KB chunks with flushing.
+func rewriteAndSendBody(c *gin.Context, uc UpstreamConfig, resp *http.Response,
+	rewriter func([]byte, string) []byte, rc *http.ResponseController, clientIP, rawPath string) {
+
+	port := ""
+	if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
+		port = p
+	}
+
+	// Rewrite redirect headers in-place before writing the status line.
+	if rewriter != nil {
+		if loc := resp.Header.Get("Location"); loc != "" {
+			c.Writer.Header().Set("Location", string(rewriter([]byte(loc), port)))
+		}
+		if refresh := resp.Header.Get("Refresh"); refresh != "" {
+			c.Writer.Header().Set("Refresh", string(rewriter([]byte(refresh), port)))
+		}
+	}
+
+	// Text body rewriting path (decompress → rewrite → optionally re-compress).
+	if rewriter != nil &&
+		isTextContent(resp.Header.Get("Content-Type")) &&
+		(resp.ContentLength <= 0 || resp.ContentLength <= maxRewriteSize) {
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRewriteSize+1))
+		if err != nil {
+			log.Printf("[%s] Body read error for %s: %v", clientIP, rawPath, err)
+			if len(body) > 0 {
+				setWriteDeadline(rc)
+				c.Writer.Write(body)
+			}
+			return
+		}
+		if len(body) > maxRewriteSize {
+			// Exceeds rewrite size limit; stream unmodified.
+			if len(body) > 0 {
+				setWriteDeadline(rc)
+				c.Writer.Write(body)
+			}
+			return
+		}
+
+		origEncoding := resp.Header.Get("Content-Encoding")
+		decompressed, derr := decompressBody(body, origEncoding)
+		if derr != nil {
+			log.Printf("[%s] Decompression error for %s (%s): %v", clientIP, rawPath, origEncoding, derr)
+			if len(body) > 0 {
+				setWriteDeadline(rc)
+				c.Writer.Write(body)
+			}
+			return
+		}
+
+		decompressed = rewriter(decompressed, port)
+
+		// Inject Service Worker registration snippet into HTML pages that don't already have one.
+		if uc.SWInject &&
+			strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
+			!bytes.Contains(decompressed, []byte("serviceWorker")) {
+			reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
+			if idx := bytes.Index(decompressed, []byte("</head>")); idx >= 0 {
+				decompressed = append(decompressed[:idx], append(reg, decompressed[idx:]...)...)
+			} else {
+				decompressed = append(decompressed, reg...)
+			}
+			debugLogf("[%s] %s -> HTML injected SW registration", clientIP, rawPath)
+		}
+
+		// Re-compress using gzip if the client accepts it and the original was gzip-encoded.
+		c.Writer.Header().Del("Content-Encoding")
+		if compressed, enc := compressBody(decompressed, origEncoding, c.Request.Header.Get("Accept-Encoding")); enc != "" {
+			decompressed = compressed
+			c.Writer.Header().Set("Content-Encoding", enc)
+		}
+		c.Writer.Header().Set("Content-Length", strconv.Itoa(len(decompressed)))
+		setWriteDeadline(rc)
+		c.Writer.Write(decompressed)
+		return
+	}
+
+	// Binary / large body streaming path: copy in 32 KB chunks with per-chunk flush.
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			setWriteDeadline(rc)
+			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
+				break
+			}
+			if f, ok := c.Writer.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+}
+
+// ProxyHandler returns a gin.HandlerFunc that resolves the upstream for each request,
+// constructs and sends an outgoing request, then writes the (optionally rewritten) response
+// back to the client. The pipeline is split across three helpers:
+//   - buildUpstreamRequest: header/cookie construction
+//   - handleSWFallback:     service worker JS generation
+//   - rewriteAndSendBody:   body decompression, rewriting, re-compression, and streaming
 func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 	blocked := append([]string(nil), blockedHosts...)
 	return func(c *gin.Context) {
@@ -62,11 +223,11 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		rawPath := c.Request.URL.Path
 		rawQuery := c.Request.URL.RawQuery
 
+		// --- Step 1: Resolve upstream config ---
 		host := c.Request.Host
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}
-
 		uc, ok := cfg[host]
 		if !ok {
 			uc, ok = matchWildcard(cfg, host)
@@ -82,51 +243,20 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 			ucForRewrite.Wildcard = inheritWildcard(cfg, host)
 		}
 		rewriter := buildEntryRewriter(ucForRewrite, blocked)
-
 		swWant := uc.SWInject && rawPath == "/sw.js"
 
-		targetURL := &url.URL{
-			Scheme:   "https",
-			Host:     uc.Host,
-			Path:     rawPath,
-			RawQuery: rawQuery,
-		}
-		urlStr := targetURL.String()
-
+		// --- Step 2: Build outgoing upstream request ---
+		urlStr := (&url.URL{Scheme: "https", Host: uc.Host, Path: rawPath, RawQuery: rawQuery}).String()
 		debugLogf("[%s] %s %s -> %s", clientIP, method, rawPath, urlStr)
 
-		outReq, err := http.NewRequest(method, urlStr, c.Request.Body)
+		outReq, err := buildUpstreamRequest(c, uc, urlStr)
 		if err != nil {
 			log.Printf("[%s] Failed to create request: %v", clientIP, err)
 			c.String(http.StatusInternalServerError, "create request: %v", err)
 			return
 		}
 
-		// 1. Save all cookies carried by client request (capturing new credentials written by frontend JS document.cookie)
-		saveClientCookies(uc.Host, c.Request)
-
-		// 2. Copy client request headers (stripping RFC hop-by-hop headers)
-		copyHeaders(outReq.Header, c.Request.Header)
-
-		// 3. Do not forge/inject X-Forwarded-For and X-Forwarded-Proto by default to prevent leaking proxy identity and real IP;
-		// Client proxy tracking headers are stripped by default (unless explicitly configured in headers rules)
-		if _, ok := uc.Headers["X-Forwarded-For"]; !ok {
-			outReq.Header.Del("X-Forwarded-For")
-		}
-		if _, ok := uc.Headers["X-Forwarded-Proto"]; !ok {
-			outReq.Header.Del("X-Forwarded-Proto")
-		}
-
-		// 4. Apply generic declarative request header rules (supports string override, {delete:true} stripping, {replace:[a,b]} substitution)
-		ApplyHeaderRules(outReq.Header, uc.Headers, true, c.Request)
-
-		outReq.Host = uc.Host
-		outReq.ContentLength = c.Request.ContentLength
-
-		// 5. Apply cookies (merging Jar + current client request cookies + local file/fixed cookies)
-		fixedCookie := getFixedCookie(uc)
-		applyCookies(uc.Host, outReq, fixedCookie)
-
+		// --- Step 3: Round-trip to upstream ---
 		resp, err := proxyRoundTrip(outReq, uc.Mode)
 		if err != nil {
 			log.Printf("[%s] Upstream request failed: %v (elapsed: %v)", clientIP, err, time.Since(start))
@@ -136,104 +266,24 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		defer resp.Body.Close()
 
 		saveCookies(uc.Host, resp)
-
 		debugLogf("[%s] <- %s (elapsed: %v)", clientIP, resp.Status, time.Since(start))
 
+		// --- Step 4: Prepare response headers ---
 		copyHeaders(c.Writer.Header(), resp.Header)
 		rewriteSetCookieDomains(c.Writer.Header(), host, c.Request.TLS == nil)
-
-		// 6. Apply generic declarative response header rules (supports string override, {delete:true} stripping, {replace:[a,b]} substitution)
 		ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)
 
+		// --- Step 5: SW fallback injection ---
 		if swWant && !isJavascriptResponse(resp) {
-			port := ""
-			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
-				port = p
-			}
-			swProxyMap := buildSWProxyMap(cfg, port)
-			swRules := collectWildcardRules(cfg)
-			c.Writer.Header().Del("Content-Length")
-			c.Writer.Header().Set("Content-Type", "application/javascript")
-			c.Writer.WriteHeader(200)
-			c.Writer.Write([]byte(swOverrideJS(swProxyMap, swRules, blocked)))
-			debugLogf("[%s] %s %s -> SW fallback generated %d rules, %d wildcards, %d blocked", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
+			handleSWFallback(c, cfg, blocked, clientIP, method, rawPath)
 			return
 		}
 
 		c.Status(resp.StatusCode)
-
 		rc := http.NewResponseController(c.Writer)
 
-		if rewriter != nil {
-			port := ""
-			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
-				port = p
-			}
-			if loc := resp.Header.Get("Location"); loc != "" {
-				c.Writer.Header().Set("Location", string(rewriter([]byte(loc), port)))
-			}
-			if refresh := resp.Header.Get("Refresh"); refresh != "" {
-				c.Writer.Header().Set("Refresh", string(rewriter([]byte(refresh), port)))
-			}
-
-			if isTextContent(resp.Header.Get("Content-Type")) &&
-				(resp.ContentLength <= 0 || resp.ContentLength <= maxRewriteSize) {
-				body, err := io.ReadAll(io.LimitReader(resp.Body, maxRewriteSize+1))
-				if err != nil {
-					if len(body) > 0 {
-						setWriteDeadline(rc)
-						c.Writer.Write(body)
-					}
-					return
-				}
-				if len(body) > maxRewriteSize {
-					if len(body) > 0 {
-						setWriteDeadline(rc)
-						c.Writer.Write(body)
-					}
-				} else if body, err = decompressBody(body, resp.Header.Get("Content-Encoding")); err == nil {
-					body = rewriter(body, port)
-					if uc.SWInject && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
-						!bytes.Contains(body, []byte("serviceWorker")) {
-						reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
-						if idx := bytes.Index(body, []byte("</head>")); idx >= 0 {
-							body = append(body[:idx], append(reg, body[idx:]...)...)
-						} else {
-							body = append(body, reg...)
-						}
-						debugLogf("[%s] %s -> HTML injected SW registration", clientIP, rawPath)
-					}
-					c.Writer.Header().Del("Content-Encoding")
-					c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
-					setWriteDeadline(rc)
-					if _, werr := c.Writer.Write(body); werr == nil {
-						return
-					}
-				} else {
-					if len(body) > 0 {
-						setWriteDeadline(rc)
-						c.Writer.Write(body)
-					}
-					return
-				}
-			}
-		}
-
-		buf := make([]byte, 32*1024)
-		for {
-			n, rerr := resp.Body.Read(buf)
-			if n > 0 {
-				setWriteDeadline(rc)
-				if _, werr := c.Writer.Write(buf[:n]); werr != nil {
-					break
-				}
-				if f, ok := c.Writer.(http.Flusher); ok {
-					f.Flush()
-				}
-			}
-			if rerr != nil {
-				break
-			}
-		}
+		// --- Step 6: Stream / rewrite response body ---
+		rewriteAndSendBody(c, uc, resp, rewriter, rc, clientIP, rawPath)
 	}
 }
+

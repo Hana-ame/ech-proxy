@@ -99,20 +99,79 @@ func resolveHostIPs(ctx context.Context, host string) ([]string, error) {
 	return ips, nil
 }
 
-var (
-	sniTransportsMu sync.Mutex
-	sniTransports   = map[string]*http2.Transport{}
+const (
+	maxSNITransports = 256
+	sniTransportTTL  = 30 * time.Minute
 )
 
+type sniTransportEntry struct {
+	transport *http2.Transport
+	lastUsed  time.Time
+}
+
+var (
+	sniTransportsMu   sync.Mutex
+	sniTransports     = map[string]*sniTransportEntry{}
+	sniReaperOnce     sync.Once
+)
+
+// getSNITransport returns a cached or new http2.Transport for the given IP.
+// Evicts the oldest entry when the cache exceeds maxSNITransports, and replaces
+// stale entries older than sniTransportTTL. The background reaper goroutine
+// periodically purges expired entries.
 func getSNITransport(ip string) *http2.Transport {
+	sniReaperOnce.Do(func() { go sniTransportReaper() })
 	sniTransportsMu.Lock()
 	defer sniTransportsMu.Unlock()
-	if t, ok := sniTransports[ip]; ok {
-		return t
+	now := time.Now()
+	if e, ok := sniTransports[ip]; ok {
+		if now.Sub(e.lastUsed) < sniTransportTTL {
+			e.lastUsed = now
+			return e.transport
+		}
+		// Entry expired; close and replace.
+		e.transport.CloseIdleConnections()
+		delete(sniTransports, ip)
 	}
+
 	t := newSNIFrontTransport(ip)
-	sniTransports[ip] = t
+	sniTransports[ip] = &sniTransportEntry{transport: t, lastUsed: now}
+
+	// Evict oldest entry if cache exceeds max size.
+	if len(sniTransports) > maxSNITransports {
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, e := range sniTransports {
+			if first || e.lastUsed.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = e.lastUsed
+				first = false
+			}
+		}
+		if oldestKey != "" {
+			sniTransports[oldestKey].transport.CloseIdleConnections()
+			delete(sniTransports, oldestKey)
+		}
+	}
+
 	return t
+}
+
+func sniTransportReaper() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		sniTransportsMu.Lock()
+		now := time.Now()
+		for k, e := range sniTransports {
+			if now.Sub(e.lastUsed) >= sniTransportTTL {
+				e.transport.CloseIdleConnections()
+				delete(sniTransports, k)
+			}
+		}
+		sniTransportsMu.Unlock()
+	}
 }
 
 func newSNIFrontTransport(ip string) *http2.Transport {
@@ -164,7 +223,10 @@ func sniFrontDo(req *http.Request) (*http.Response, error) {
 		}
 		lastErr = err
 		sniTransportsMu.Lock()
-		delete(sniTransports, ip)
+		if e, ok := sniTransports[ip]; ok {
+			e.transport.CloseIdleConnections()
+			delete(sniTransports, ip)
+		}
 		sniTransportsMu.Unlock()
 	}
 	clearIPCache(host)

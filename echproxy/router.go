@@ -19,6 +19,9 @@ var indexHTML string
 // l.moonchan.xyz root path "/" displays the portal list; other host root paths route to proxy.
 const indexHost = "l.moonchan.xyz"
 
+// defaultPort is the fallback port used in portal links when the Host header lacks one.
+const defaultPort = "8443"
+
 // SetupRouter registers all routing handlers on the Gin engine.
 //
 // Routing rules (both root path "/" and NoRoute follow the same host evaluation):
@@ -83,8 +86,8 @@ func renderUpstreamList(cfg *Config, requestHost string) string {
 	if _, p, err := net.SplitHostPort(requestHost); err == nil {
 		port = ":" + p
 	} else {
-		// Default to 8443 if Host header lacks port
-		port = ":8443"
+		// Default to defaultPort if Host header lacks port
+		port = ":" + defaultPort
 	}
 	entries := cfg.UpstreamOrder
 	if len(entries) == 0 {

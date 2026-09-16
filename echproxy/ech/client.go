@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 // Client is an HTTP client based on cloudflare-ech.com ECH domain fronting.
@@ -119,9 +121,8 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 	cfg := currentConfig()
 	dialIP := cfg.dialIP
 	if dialIP != "" {
-		// Shallow copy to avoid mutating the shared cached transport
-		trCopy := *tr
-		tr = &trCopy
+		// Clone transport to avoid mutating the shared cached transport and avoid lock copy
+		tr = tr.Clone()
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			_, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -135,9 +136,8 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 			tr.TLSClientConfig = &tls.Config{ServerName: uParsed.Host}
 		}
 	} else if cfg.ipMode != "" {
-		// Shallow copy to avoid mutating the shared cached transport
-		trCopy := *tr
-		tr = &trCopy
+		// Clone transport to avoid mutating the shared cached transport and avoid lock copy
+		tr = tr.Clone()
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -346,46 +346,50 @@ func SetDoHConfig(host, bootstrapIP string) {
 	cfgPtr.Store(&nc)
 }
 
-// newTransport constructs an ECH domain fronting transport: DialTLSContext uses ECH config
-// to dial shellDomain. Shared by New and refreshLoop to avoid duplication.
-func newTransport(echConfig []byte) *http.Transport {
-	return &http.Transport{
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+// newTransport constructs an ECH domain fronting transport using utls with HelloChrome_120
+// to impersonate a real Chrome browser TLS fingerprint. Cloudflare checks JA3/JA4 fingerprints
+// to detect non-browser clients; using crypto/tls directly exposes the Go runtime fingerprint.
+// utls v1.8.2 supports EncryptedClientHelloConfigList, so ECH encryption is preserved.
+func newTransport(echConfig []byte) *http2.Transport {
+	return &http2.Transport{
+		AllowHTTP: false,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
 			}
 
-			tlsCfg := &tls.Config{
+			uCfg := &utls.Config{
 				ServerName:                     host,
 				EncryptedClientHelloConfigList: echConfig,
 				MinVersion:                     tls.VersionTLS13,
 				NextProtos:                     []string{"h2", "http/1.1"},
 			}
 
-			// Retry dialing shell domain + TLS handshake as a whole: retries transient RST/timeouts
-			// to avoid failing requests on single jitter events.
+			// Retry dialing shell domain + TLS handshake to handle transient RST/timeouts.
 			conn, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
 				rawConn, derr := dialTCP(ctx, shellDomain, "443", dialTimeout)
 				if derr != nil {
 					return nil, derr
 				}
-				tc := tls.Client(rawConn, tlsCfg)
-				if herr := tc.HandshakeContext(ctx); herr != nil {
+				// Use utls with HelloChrome_120 so Cloudflare sees a Chrome-grade TLS fingerprint
+				// (JA3/JA4) rather than the distinctive Go standard library fingerprint.
+				uConn := utls.UClient(rawConn, uCfg, utls.HelloChrome_120)
+				if herr := uConn.HandshakeContext(ctx); herr != nil {
 					rawConn.Close()
 					return nil, herr
 				}
-				return tc, nil
+				if uConn.ConnectionState().NegotiatedProtocol != "h2" {
+					rawConn.Close()
+					return nil, fmt.Errorf("upstream did not negotiate h2")
+				}
+				return uConn, nil
 			})
 			if err != nil {
 				return nil, fmt.Errorf("dial shell: %w", err)
 			}
 			return conn, nil
 		},
-		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        100,
-		IdleConnTimeout:     netdial.OpTimeout,
-		TLSHandshakeTimeout: dialTimeout,
 	}
 }
 
@@ -487,7 +491,7 @@ func refreshLoop() {
 		// Close idle connections of the previous transport when replacing the default client,
 		// otherwise old connection pools hold TCP connections until IdleConnTimeout.
 		if old := defaultClient.Swap(c); old != nil {
-			if tr, ok := old.inner.Transport.(*http.Transport); ok {
+			if tr, ok := old.inner.Transport.(*http2.Transport); ok {
 				tr.CloseIdleConnections()
 			}
 		}

@@ -20,6 +20,7 @@ extern void StopProxy(void);
 extern uint16_t GetProxyPort(void);
 extern int IsEchReady(void);
 extern char* GetLogs(void);
+extern void FreeCString(char* s);
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,7 +82,7 @@ Java_xyz_moonchan_echproxy_MainActivity_GetLogs(
     }
 
     jstring result = (*env)->NewStringUTF(env, logs);
-    free(logs);
+    FreeCString(logs);
 
     return result;
 }

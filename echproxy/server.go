@@ -20,7 +20,7 @@ const DefaultUpstreamConfigURL = "https://proxy.moonchan.xyz/Hana-ame/ech-proxy/
 
 // ServerOptions 封装启动 ECH 代理服务器所需的参数。
 type ServerOptions struct {
-	Addr            string // 监听地址，如 "0.0.0.0:8443" 或 "127.0.0.1:8443"
+	Addr            string // 监听地址，默认为 "127.0.0.1:8443"
 	AllowRandomPort bool   // 若 Addr 指定端口被占用，是否回退到随机可用端口（Android 等移动端场景）
 	HTTPMode        bool   // 是否强制 HTTP 模式（不启用 TLS）
 	ConfigURL       string // upstream.json 远程地址，若为空则使用 DefaultUpstreamConfigURL
@@ -146,7 +146,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	// 5. 绑定网络监听
 	addr := opts.Addr
 	if addr == "" {
-		addr = "0.0.0.0:8443"
+		addr = "127.0.0.1:8443"
 	}
 	network := "tcp"
 	if strings.HasPrefix(addr, "127.0.0.1") {

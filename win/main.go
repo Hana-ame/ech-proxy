@@ -18,7 +18,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", "0.0.0.0:8443", "listen address")
+	addr := flag.String("addr", "127.0.0.1:8443", "listen address")
 	httpMode := flag.Bool("http", false, "run in HTTP mode (no TLS, local proxy)")
 	verbose := flag.Bool("v", false, "verbose per-request logging")
 	flag.Parse()

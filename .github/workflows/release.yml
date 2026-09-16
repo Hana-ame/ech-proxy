@@ -37,7 +37,7 @@ jobs:
           name: ${{ matrix.os }}-${{ matrix.arch }}
           path: dist/${{ matrix.os }}/${{ matrix.arch }}/
 
-  # Android APK 构建（Go c-shared + JNI wrapper + Java App）
+  # Android APK build (Go c-shared + JNI wrapper + Java App)
   build-android:
     runs-on: ubuntu-latest
     steps:
@@ -88,13 +88,13 @@ jobs:
           test -s android/release.keystore
           echo "Keystore written: $(wc -c < android/release.keystore) bytes"
 
-      # ubuntu-latest runner 预装 Android SDK 与 cmdline-tools, 但 sdkmanager 不在 PATH。
-      # android-actions/setup-android@v3 会执行 `sdkmanager tools`, 而 Google 已把
-      # 过时的 tools 包从 SDK 仓库移除, 因此这里直接使用预装的 sdkmanager。
-      - name: Setup Android SDK (runner 预装)
+      # ubuntu-latest runner preinstalls Android SDK and cmdline-tools, but sdkmanager is not in PATH.
+      # android-actions/setup-android@v3 executes `sdkmanager tools`, which Google removed
+      # as obsolete from the SDK repository. Therefore, use preinstalled sdkmanager directly.
+      - name: Setup Android SDK (runner preinstalled)
         run: |
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          # 优先使用带版本号的 cmdline-tools (如 16.0), 避免 runner 上可能有问题的 latest 桩
+          # Prefer versioned cmdline-tools (e.g. 16.0) to avoid potential latest stub issues on runner
           SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager 2>/dev/null | grep -v '/latest/' | sort -V | tail -n1)"
           [ -n "$SDKMANAGER" ] || SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager 2>/dev/null | sort -V | tail -n1)"
           if [ -z "$SDKMANAGER" ]; then
@@ -153,12 +153,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           {
-            echo "## 每个 exe 的功能"
+            echo "## Executable Features"
             cat RELEASE.md 2>/dev/null || true
             echo ""
             echo "## Android APK"
-            echo "ECH Proxy Android 客户端，使用 ECH 代理访问 各上游站点。"
-            echo "下载 app-release.apk 安装到手机。"
+            echo "ECH Proxy Android client, accessing upstream sites via ECH proxy."
+            echo "Download app-release.apk and install on your phone."
           } > release_body.md
           gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
             gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release_body.md

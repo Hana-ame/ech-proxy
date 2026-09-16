@@ -1,20 +1,20 @@
-// cmd/ech-proxy-android/android/app/src/main/cpp/jni_wrapper.c
-// JNI 包装层：Java native 方法 → Go 导出函数
+// android/app/src/main/cpp/jni_wrapper.c
+// JNI wrapper layer: Java native methods -> Go exported functions
 //
-// Go 导出函数（//export）:
+// Go exported functions (//export):
 //   StartProxy(char* bootstrapIP) -> uint16
 //   StopProxy() -> void
 //   GetProxyPort() -> uint16
 //   IsEchReady() -> int
 //   GetLogs() -> char*
 //
-// JNI 函数名规则: Java_xyz_moonchan_echproxy_MainActivity_<method>
+// JNI function naming rule: Java_xyz_moonchan_echproxy_MainActivity_<method>
 
 #include <jni.h>
 #include <stdlib.h>
 #include <string.h>
 
-// Go 导出函数声明（在 libechproxy.so 中）
+// Go exported function declarations (in libechproxy.so)
 extern uint16_t StartProxy(const char* bootstrapIP);
 extern void StopProxy(void);
 extern uint16_t GetProxyPort(void);

@@ -116,7 +116,7 @@ func TestLoadUpstreamJSON(t *testing.T) {
 		t.Errorf("expected headers Referer, got %v", iwara.Headers["Referer"])
 	}
 
-	// 验证从独立 wildcards 列表中合入并生效的通配子域名匹配:
+	// Verify wildcard subdomain matching merged from standalone wildcards list:
 	wildMatch, ok := MatchWildcardForTest(cfg.Upstreams, "iwara-api.l.moonchan.xyz")
 	if !ok {
 		t.Fatalf("expected wildcard match for iwara-api.l.moonchan.xyz")
@@ -176,7 +176,7 @@ func TestUpstreamOrderAndBanner(t *testing.T) {
 		}
 	}
 
-	// 验证 Server.PrintBanner 也是严格按此顺序输出
+	// Verify Server.PrintBanner outputs in the exact same order
 	srv := &Server{
 		Options: ServerOptions{Addr: "127.0.0.1:8443"},
 		Config:  cfg,
@@ -478,7 +478,7 @@ func TestOldBinaryV102Compatibility(t *testing.T) {
 		t.Fatalf("Old binary parsed 0 upstreams")
 	}
 
-	// 1. Iwara: 确保旧二进制解析出完整的 host, referer 及原有未修改的 wildcard
+	// 1. Iwara: Ensure legacy binary parses complete host, referer, and unmodified wildcard
 	iwara, ok := oldCfg.Upstreams["iwara.l.moonchan.xyz"]
 	if !ok {
 		t.Fatalf("old binary missing iwara entry")
@@ -493,7 +493,7 @@ func TestOldBinaryV102Compatibility(t *testing.T) {
 		t.Errorf("expected intact wildcard for old binary, got %+v", iwara.Wildcard)
 	}
 
-	// 2. DLsite: 确保原有 wildcard 未修改，防盗链 referer 完好
+	// 2. DLsite: Ensure legacy wildcard remains unmodified and anti-hotlinking referer is intact
 	dlsite, ok := oldCfg.Upstreams["dlsite.l.moonchan.xyz"]
 	if !ok || dlsite.Referer != "https://www.dlsite.com/" {
 		t.Errorf("expected dlsite referer for old binary, got %s", dlsite.Referer)
@@ -510,7 +510,7 @@ func TestOldBinaryV102Compatibility(t *testing.T) {
 }
 
 func TestWildcardCleanKeysAndAutoDerivation(t *testing.T) {
-	// 1. 测试无需配置 suffix 的 clean key 语法: entry + upstream
+	// 1. Test clean key syntax without requiring suffix configuration: entry + upstream
 	cleanJSON := []byte(`{
 		"upstreams": {
 			"iwara.l.moonchan.xyz": {
@@ -548,7 +548,7 @@ func TestWildcardCleanKeysAndAutoDerivation(t *testing.T) {
 		t.Errorf("expected inherited Origin, got %s", match.Headers["Origin"].Value)
 	}
 
-	// 2. 测试 upstream 内直接配置 "wildcard": true (全自动推导 suffix 与 prefix)
+	// 2. Test direct "wildcard": true configuration inside upstream (auto-deriving suffix and prefix)
 	boolJSON := []byte(`{
 		"upstreams": {
 			"dlsite.l.moonchan.xyz": {
@@ -569,7 +569,7 @@ func TestWildcardCleanKeysAndAutoDerivation(t *testing.T) {
 		t.Errorf("expected ci-en.dlsite.com, got %s", match2.Host)
 	}
 
-	// 3. 测试 upstream 内配置 "wildcard": "f95-*" 简写
+	// 3. Test shorthand "wildcard": "f95-*" configuration inside upstream
 	strJSON := []byte(`{
 		"upstreams": {
 			"f95.l.moonchan.xyz": {
@@ -590,7 +590,7 @@ func TestWildcardCleanKeysAndAutoDerivation(t *testing.T) {
 		t.Errorf("expected attachments.f95zone.to, got %s", match3.Host)
 	}
 
-	// 4. 测试用户最推荐的 entry: "*.iwara.tv" 极简写法
+	// 4. Test recommended minimal syntax entry: "*.iwara.tv"
 	targetPatternJSON := []byte(`{
 		"upstreams": {
 			"iwara.l.moonchan.xyz": {
@@ -627,7 +627,7 @@ func TestWildcardCleanKeysAndAutoDerivation(t *testing.T) {
 		t.Errorf("expected Origin https://www.iwara.tv, got %s", match4.Headers["Origin"].Value)
 	}
 
-	// 5. 测试 prefix + upstream 显式保留前缀且去除冗余 suffix 的写法
+	// 5. Test prefix + upstream syntax preserving explicit prefix while omitting redundant suffix
 	prefixUpstreamJSON := []byte(`{
 		"upstreams": {
 			"iwara.l.moonchan.xyz": {
@@ -683,10 +683,10 @@ func TestSWProxyMapAndRewritesCooperation(t *testing.T) {
 		},
 	}
 
-	// 1. 测试 swProxyMap: 包含 uc.Host 及 rewrites 中的 kv 对，且带有端口
+	// 1. Test swProxyMap: contains uc.Host and rewrites key-value pairs with ports
 	swMap := buildSWProxyMap(cfg, "8443")
 
-	// 主机名映射 (uc.Host -> entry)
+	// Host mapping (uc.Host -> entry)
 	if swMap["www.dlsite.com"] != "dlsite.l.moonchan.xyz:8443" {
 		t.Errorf("expected www.dlsite.com -> dlsite.l.moonchan.xyz:8443, got %s", swMap["www.dlsite.com"])
 	}
@@ -694,7 +694,7 @@ func TestSWProxyMapAndRewritesCooperation(t *testing.T) {
 		t.Errorf("expected asmr.one -> asmr.l.moonchan.xyz:8443, got %s", swMap["asmr.one"])
 	}
 
-	// rewrites 中的 kv 对 (必须用于 sw.js)
+	// Key-value pairs in rewrites (must be used in sw.js)
 	if swMap["img.dlsite.jp"] != "dlsite-img.l.moonchan.xyz:8443" {
 		t.Errorf("expected img.dlsite.jp -> dlsite-img.l.moonchan.xyz:8443, got %s", swMap["img.dlsite.jp"])
 	}
@@ -702,12 +702,12 @@ func TestSWProxyMapAndRewritesCooperation(t *testing.T) {
 		t.Errorf("expected api.asmr-200.com -> asmr-api-200.l.moonchan.xyz:8443, got %s", swMap["api.asmr-200.com"])
 	}
 
-	// body_replace 的内容绝不进入 sw.js
+	// Entries in body_replace must never enter sw.js
 	if _, ok := swMap["old-script-cdn.com"]; ok {
 		t.Errorf("body_replace should NOT enter sw.js proxy map")
 	}
 
-	// 2. 测试 body rewrite: rewrites 与 body_replace 均用于正文重写
+	// 2. Test body rewrite: both rewrites and body_replace are applied to body content
 	rewriter := buildEntryRewriter(cfg["dlsite.l.moonchan.xyz"], nil)
 	input := []byte(`Visit https://img.dlsite.jp/cover.jpg and script from https://old-script-cdn.com/app.js`)
 	output := string(rewriter(input, "8443"))

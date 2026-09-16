@@ -18,14 +18,14 @@ import (
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 )
 
-// Client 是一个基于 cloudflare-ech.com ECH 域前置的 HTTP 客户端。
-// 所有请求通过 cloudflare-ech.com 的 IP 发出，真正的目标域名
-// 通过 ECH (Encrypted Client Hello) 加密传输给 Cloudflare 路由。
+// Client is an HTTP client based on cloudflare-ech.com ECH domain fronting.
+// All requests are dispatched through cloudflare-ech.com IPs, while the true
+// target domain is transmitted encrypted to Cloudflare routing via ECH (Encrypted Client Hello).
 type Client struct {
 	inner *http.Client
 }
 
-// ---- ECH 配置缓存 ----
+// ---- ECH Configuration Cache ----
 
 type echEntry struct {
 	config []byte
@@ -113,8 +113,8 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 	}
 	req.Header.Set("Accept", "application/dns-json")
 
-	// 默认用 netdial.Transport (固定公共 DNS + Termux CA): Termux 无
-	// /etc/resolv.conf, 裸 http.Transport 走 [::1]:53 会 connection refused。
+	// Default to netdial.Transport (fixed public DNS + Termux CA): Termux lacks
+	// /etc/resolv.conf, so bare http.Transport using [::1]:53 causes connection refused.
 	tr := netdial.Transport()
 	cfg := currentConfig()
 	dialIP := cfg.dialIP
@@ -144,16 +144,16 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 	return dohClient.Do(req)
 }
 
-// fetchECHConfig 用到的正则: 每次 DoH 都执行, 提为包级避免反复编译
-// (refresh 每 5 分钟跑一次)。
+// Regular expressions used by fetchECHConfig: compiled at package level to avoid
+// recompiling on each DoH request (refresh runs every 5 minutes).
 var (
 	echSvcParamRE = regexp.MustCompile(`ech="?([A-Za-z0-9+/=]+)"?`)
 	wsvcWireRE    = regexp.MustCompile(`\\#\s+(\d+)\s+([0-9a-fA-F\s]+)`)
 	nonHexRE      = regexp.MustCompile(`[^0-9a-fA-F]`)
 )
 
-// fetchECHConfig 通过 DoH 获取域名的 ECH 配置 (type=65 SVCB 记录), 带 TTL 缓存,
-// 瞬时失败时重试 (netdial.Retry)。解析优先认 base64 的 ech= SvcParam, 兜底 wire。
+// fetchECHConfig fetches ECH configuration for a domain via DoH (type=65 SVCB record) with TTL caching,
+// retrying on transient failures (netdial.Retry). Parses base64 ech= SvcParam first, falling back to wire format.
 func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 	if cached := getCachedECH(domain); cached != nil {
 		return cached, nil
@@ -168,14 +168,14 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 	return cfg, nil
 }
 
-// QueryDoH 统一执行 DoH DNS 查询 (按当前配置的 dohURL、bootstrap IP 与 IP 栈偏好发起 HTTP 请求)。
+// QueryDoH executes a unified DoH DNS query (dispatches HTTP requests using current dohURL, bootstrap IP, and IP stack preferences).
 func QueryDoH(ctx context.Context, name string, qtype int) (*http.Response, error) {
 	dohURL := currentConfig().dohURL
 	u := fmt.Sprintf("%s?name=%s&type=%d", dohURL, url.QueryEscape(name), qtype)
 	return doDohRequest(ctx, u)
 }
 
-// fetchECHConfigOnce 执行一次 DoH 拉取与解析 (无重试, 由 fetchECHConfig 包重试)。
+// fetchECHConfigOnce executes a single DoH fetch and parse (without retries; retried by caller fetchECHConfig).
 func fetchECHConfigOnce(ctx context.Context, domain, dohURL string) ([]byte, error) {
 	u := fmt.Sprintf("%s?name=%s&type=65", dohURL, url.QueryEscape(domain))
 	resp, err := doDohRequest(ctx, u)
@@ -231,19 +231,19 @@ func fetchECHConfigOnce(ctx context.Context, domain, dohURL string) ([]byte, err
 
 const (
 	shellDomain = "cloudflare-ech.com"
-	// 操作级超时统一 5 分钟 (拨号 / TLS 握手 / DoH), 原 5s/10s/15s 在 DoH 端点
-	// 偶发慢或网络抖动时频繁 context deadline exceeded 导致 ECH 初始化失败。
+	// Operation timeouts unified to 5 minutes (dialing / TLS handshake / DoH). Original 5s/10s/15s
+	// caused frequent context deadline exceeded on slow DoH endpoints or network jitter, breaking ECH initialization.
 	dialTimeout = netdial.OpTimeout
 	dohTimeout  = netdial.OpTimeout
 )
 
-// config 保存 DoH 端点与 IP 偏好等可变全局配置。
-// 通过 atomic.Pointer 无锁安全读写，避免 SetXxx 与请求 goroutine 之间的 data race。
+// config stores mutable global configuration such as DoH endpoints and IP preferences.
+// Uses atomic.Pointer for lock-free safe read/write, avoiding data races between SetXxx and request goroutines.
 type config struct {
 	dohURL string
-	// dialIP 非空时 DoH 直接使用该 IP 拨号（绕过本地 DNS）。
+	// dialIP directly dials this IP for DoH when non-empty (bypassing local DNS).
 	dialIP string
-	// ipMode 为 "v4"、"v6" 或 ""（自动）。
+	// ipMode is "v4", "v6", or "" (automatic).
 	ipMode string
 }
 
@@ -260,7 +260,7 @@ func currentConfig() *config {
 	return c
 }
 
-// SetIPMode 设置 IP 协议偏好。mode 为 "v4"、"v6" 或 ""（自动）。
+// SetIPMode sets IP protocol preference. mode is "v4", "v6", or "" (automatic).
 func SetIPMode(mode string) {
 	nc := *currentConfig()
 	switch mode {
@@ -292,9 +292,9 @@ func resolvePreferredIP(ctx context.Context, host string) (string, error) {
 	return "", fmt.Errorf("no %s address for %s", ipMode, host)
 }
 
-// dialTCP 按 ipMode 偏好拨号。ipMode 为空(自动)时用 netdial 固定公共
-// DNS 解析, 否则用偏好 IP 直连。Termux 等无 resolv.conf 环境必须走
-// netdial, 裸 net.Dialer 默认解析器会连 [::1]:53 失败。
+// dialTCP dials according to ipMode preference. When ipMode is empty (automatic), it uses netdial
+// fixed public DNS resolution; otherwise connects directly to the preferred IP. Environments without
+// resolv.conf like Termux must use netdial, as bare net.Dialer defaults to failing at [::1]:53.
 func dialTCP(ctx context.Context, host, port string, timeout time.Duration) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: timeout}
 	if currentConfig().ipMode == "" {
@@ -307,8 +307,8 @@ func dialTCP(ctx context.Context, host, port string, timeout time.Duration) (net
 	return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
 }
 
-// CheckDualStack 检测本地 IPv4/IPv6 连通性。
-// 用 netdial 解析器 (公共 DNS): Termux 上 net.DefaultResolver 不可用。
+// CheckDualStack detects local IPv4/IPv6 connectivity.
+// Uses netdial resolver (public DNS): net.DefaultResolver is unusable on Termux.
 func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
 	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, "moonchan.xyz")
 	if err != nil {
@@ -340,8 +340,8 @@ func SetDoHConfig(host, bootstrapIP string) {
 	cfgPtr.Store(&nc)
 }
 
-// newTransport 构造 ECH 域前置 transport: DialTLSContext 用 ECH 配置
-// 拨 shellDomain。New 与 refreshLoop 共用, 避免两份重复实现。
+// newTransport constructs an ECH domain fronting transport: DialTLSContext uses ECH config
+// to dial shellDomain. Shared by New and refreshLoop to avoid duplication.
 func newTransport(echConfig []byte) *http.Transport {
 	return &http.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -357,8 +357,8 @@ func newTransport(echConfig []byte) *http.Transport {
 				NextProtos:                     []string{"h2", "http/1.1"},
 			}
 
-			// 拨 shell 域 + TLS 握手整体重试: 瞬时 RST/超时重试,
-			// 避免单次抖动直接让请求失败。
+			// Retry dialing shell domain + TLS handshake as a whole: retries transient RST/timeouts
+			// to avoid failing requests on single jitter events.
 			conn, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
 				rawConn, derr := dialTCP(ctx, shellDomain, "443", dialTimeout)
 				if derr != nil {
@@ -383,9 +383,9 @@ func newTransport(echConfig []byte) *http.Transport {
 	}
 }
 
-// newClient 构造 ECH 客户端 (New 与 refreshLoop 共用)。
-// 不用总 Timeout: 会砍断 >30s 的大文件/视频下载
-// (浏览器表现为 206 CONTENT_LENGTH_MISMATCH 只传一半)。
+// newClient constructs an ECH client (shared by New and refreshLoop).
+// No global Timeout is set: avoiding prematurely terminating >30s large file/video downloads
+// (which manifest in browsers as 206 CONTENT_LENGTH_MISMATCH truncated midway).
 func newClient(echConfig []byte) *Client {
 	return &Client{
 		inner: &http.Client{
@@ -395,8 +395,8 @@ func newClient(echConfig []byte) *Client {
 	}
 }
 
-// New 初始化一个 ECH 域前置 HTTP 客户端。
-// 首次调用时会通过 DoH 获取 cloudflare-ech.com 的 ECH 密钥并缓存。
+// New initializes an ECH domain-fronting HTTP client.
+// On first call, it retrieves cloudflare-ech.com's ECH keys via DoH and caches them.
 func New() (*Client, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
 	defer cancel()
@@ -409,8 +409,8 @@ func New() (*Client, error) {
 	return newClient(echConfig), nil
 }
 
-// Do 执行 HTTP 请求，请求通过 cloudflare-ech.com ECH 域前置发出。
-// req.Host 会被设置为真正的目标域名用于 Inner SNI。
+// Do executes an HTTP request dispatched via cloudflare-ech.com ECH domain fronting.
+// req.Host is set to the true target domain for Inner SNI.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if req.Host == "" {
 		req.Host = req.URL.Host
@@ -418,19 +418,19 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	return c.inner.Do(req)
 }
 
-// DoWithAddr 同 Do，但允许指定目标域名（用于 IP 直连场景）。
-// host 会作为 Inner SNI 和 HTTP Host 头。
+// DoWithAddr is like Do, but allows specifying a target domain (for direct-IP scenarios).
+// host is used as the Inner SNI and HTTP Host header.
 func (c *Client) DoWithAddr(req *http.Request, host string) (*http.Response, error) {
 	req.Host = host
 	return c.inner.Do(req)
 }
 
-// ---- 便捷函数 ----
+// ---- Convenience Functions ----
 
 var defaultClient atomic.Pointer[Client]
 
-// Do 使用全局默认客户端执行 ECH 请求。
-// 首次调用会触发 New() 初始化。
+// Do executes an ECH request using the global default client.
+// Triggers New() initialization on first call.
 func Do(req *http.Request) (*http.Response, error) {
 	c := defaultClient.Load()
 	if c == nil {
@@ -446,7 +446,7 @@ func Do(req *http.Request) (*http.Response, error) {
 	return c.Do(req)
 }
 
-// InitDefault 显式初始化全局默认客户端（可在程序启动时调用）。
+// InitDefault explicitly initializes the global default client (can be called at startup).
 func InitDefault() error {
 	c, err := New()
 	if err != nil {
@@ -478,8 +478,8 @@ func refreshLoop() {
 		}
 
 		c := newClient(echConfig)
-		// 替换默认客户端时关掉旧 transport 的空闲连接,
-		// 否则旧连接池占着 TCP 直到 IdleConnTimeout 自然回收。
+		// Close idle connections of the previous transport when replacing the default client,
+		// otherwise old connection pools hold TCP connections until IdleConnTimeout.
 		if old := defaultClient.Swap(c); old != nil {
 			if tr, ok := old.inner.Transport.(*http.Transport); ok {
 				tr.CloseIdleConnections()

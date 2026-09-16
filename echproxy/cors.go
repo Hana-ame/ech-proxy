@@ -9,7 +9,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// hopByHopHeaders 是需要按 RFC 2616 处理的逐跳头，转发时必须剔除。
+// hopByHopHeaders are headers that must be stripped during proxy forwarding according to RFC 2616.
 var hopByHopHeaders = []string{
 	"Connection",
 	"Keep-Alive",
@@ -21,8 +21,8 @@ var hopByHopHeaders = []string{
 	"Upgrade",
 }
 
-// copyHeaders 复制 src 的请求/响应头到 dst，剔除逐跳头与上游 CORS 头
-// （CORS 由本代理自定，透传会与 CORSMiddleware 产生重复冲突头）。
+// copyHeaders copies request/response headers from src to dst, stripping hop-by-hop headers and upstream CORS headers
+// (CORS is defined by this proxy; passing upstream CORS through would cause duplicate conflicting headers with CORSMiddleware).
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		l := strings.ToLower(k)
@@ -36,9 +36,9 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
-// CORSMiddleware 统一为反向代理提供 CORS 处理:
-// 动态回显客户端 Origin 并开启 Allow-Credentials (允许携带 Cookie / 认证 Token),
-// 避免客户端在子域间 (如 iwara.l.moonchan.xyz -> iwara-api.l.moonchan.xyz) 发起 API 请求时被浏览器 CORS 拦截。
+// CORSMiddleware provides unified CORS handling for the reverse proxy:
+// Dynamically reflects the client Origin and enables Allow-Credentials (allowing cookies / auth tokens),
+// preventing the browser from blocking cross-subdomain API calls (e.g. iwara.l.moonchan.xyz -> iwara-api.l.moonchan.xyz).
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		origin := c.GetHeader("Origin")
@@ -69,11 +69,11 @@ var (
 	setCookieSecureRE    = regexp.MustCompile(`(?i);\s*Secure`)
 )
 
-// rewriteSetCookieDomains 把响应 Set-Cookie 头规范化, 让浏览器能正常存储:
-//  1. Domain=.dlsite.com 等上游域 → 改写为当前代理域 (dlsite.l.moonchan.xyz),
-//     否则浏览器因域不匹配拒绝存储 → 前端 JS 读不到 cookie → 弹窗无限循环。
-//  2. Secure 标志: 上游 https 下发 Secure cookie, 若代理跑在 http 模式
-//     浏览器不会存 (Secure cookie 只能经 https 传输), 需移除。
+// rewriteSetCookieDomains normalizes Set-Cookie headers in the response so browsers store them properly:
+//  1. Upstream domain (e.g., Domain=.dlsite.com) -> rewritten to current proxy domain (dlsite.l.moonchan.xyz),
+//     otherwise the browser rejects cookies due to domain mismatch -> frontend JS cannot read them -> popup loop.
+//  2. Secure flag: upstream HTTPS sends Secure cookie, but if proxy runs in HTTP mode,
+//     the browser will not store it (Secure cookies can only be sent over HTTPS), so it must be removed.
 func rewriteSetCookieDomains(h http.Header, proxyHost string, httpMode bool) {
 	scs := h.Values("Set-Cookie")
 	if len(scs) == 0 {

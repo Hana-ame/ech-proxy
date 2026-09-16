@@ -17,7 +17,7 @@ public class MainActivity extends AppCompatActivity {
     private ScrollView scrollView;
     private Handler handler;
 
-    // JNI 函数名必须与 Go //export 一致
+    // JNI function names must match Go //export
     private native int StartProxy(String bootstrapIP);
     private native void StopProxy();
     private native int GetProxyPort();
@@ -28,7 +28,7 @@ public class MainActivity extends AppCompatActivity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // 全屏日志界面
+        // Fullscreen log UI
         scrollView = new ScrollView(this);
         logView = new TextView(this);
         logView.setPadding(16, 16, 16, 16);
@@ -39,7 +39,7 @@ public class MainActivity extends AppCompatActivity {
 
         handler = new Handler(Looper.getMainLooper());
 
-        // 加载 JNI 包装库（会自动加载 libechproxy.so）
+        // Load JNI wrapper library (automatically loads libechproxy.so)
         try {
             System.loadLibrary("jni-wrapper");
             appendLog("libjni-wrapper.so loaded");
@@ -48,10 +48,10 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        // 启动代理
+        // Start proxy
         startProxy();
 
-        // 每 500ms 更新日志
+        // Update logs every 500ms
         handler.postDelayed(this::updateLogs, 500);
     }
 
@@ -111,8 +111,8 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void openBrowser(int port) {
-        // HTTPS 模式：访问 l.moonchan.xyz（需要 DNS 解析到 127.0.0.1）
-        // 根路径会展示 upstream 入口列表页
+        // HTTPS mode: visit l.moonchan.xyz (requires DNS resolving to 127.0.0.1)
+        // Root path displays upstream entry list page
         String url = "https://l.moonchan.xyz:" + port + "/";
         appendLog("Opening browser: " + url);
         appendLog("Note: DNS must resolve l.moonchan.xyz to 127.0.0.1");

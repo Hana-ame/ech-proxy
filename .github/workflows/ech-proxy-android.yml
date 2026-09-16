@@ -36,7 +36,7 @@ jobs:
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > android/release.keystore
           ls -la android/release.keystore
 
-      # 签名凭证必须显式存在于 Secrets（不依赖默认值兜底），缺失则立即失败
+      # Signing credentials must explicitly exist in Secrets (no fallback defaults), fail immediately if missing
       - name: Validate signing secrets
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -46,7 +46,7 @@ jobs:
         run: |
           for v in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
             if [ -z "${!v}" ]; then
-              echo "::error::Missing GitHub Secret: $v (APK 签名凭证必须在 Secrets 中显式配置)"
+              echo "::error::Missing GitHub Secret: $v (APK signing credentials must be explicitly configured in Secrets)"
               exit 1
             fi
           done
@@ -67,13 +67,13 @@ jobs:
           mkdir -p android/app/src/main/jniLibs/arm64-v8a
           cp android/libechproxy.so android/app/src/main/jniLibs/arm64-v8a/
 
-      # ubuntu-latest runner 预装 Android SDK 与 cmdline-tools, 但 sdkmanager 不在 PATH。
-      # android-actions/setup-android@v3 会执行 `sdkmanager tools`, 而 Google 已把
-      # 过时的 tools 包从 SDK 仓库移除, 因此这里直接使用预装的 sdkmanager。
-      - name: Setup Android SDK (runner 预装)
+      # ubuntu-latest runner preinstalls Android SDK and cmdline-tools, but sdkmanager is not in PATH.
+      # android-actions/setup-android@v3 executes `sdkmanager tools`, which Google removed
+      # as obsolete from the SDK repository. Therefore, use preinstalled sdkmanager directly.
+      - name: Setup Android SDK (runner preinstalled)
         run: |
           SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
-          # 优先使用带版本号的 cmdline-tools (如 16.0), 避免 runner 上可能有问题的 latest 桩
+          # Prefer versioned cmdline-tools (e.g. 16.0) to avoid potential latest stub issues on runner
           SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager 2>/dev/null | grep -v '/latest/' | sort -V | tail -n1)"
           [ -n "$SDKMANAGER" ] || SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -name sdkmanager 2>/dev/null | sort -V | tail -n1)"
           if [ -z "$SDKMANAGER" ]; then

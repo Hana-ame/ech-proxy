@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// MatchWildcardForTest 导出通配匹配判断, 供 main 路由分发确认
+// MatchWildcardForTest exports wildcard match judgment for testing and routing confirmation
 func MatchWildcardForTest(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 	return matchWildcard(cfg, host)
 }
@@ -81,7 +81,7 @@ func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 		if out.Mode == "" || out.Mode == "ech" {
 			out.Mode = wildcardMode(context.Background(), out.Host)
 		}
-		debugLogf("[通配] %s -> %s (mode=%s referer=%s origin=%s xsite=%s headers=%d)", host, out.Host, out.Mode, out.Referer, out.Origin, out.XSite, len(out.Headers))
+		debugLogf("[wildcard] %s -> %s (mode=%s referer=%s origin=%s xsite=%s headers=%d)", host, out.Host, out.Mode, out.Referer, out.Origin, out.XSite, len(out.Headers))
 		return out, true
 	}
 	return UpstreamConfig{}, false

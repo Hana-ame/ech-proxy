@@ -33,9 +33,9 @@ func setWriteDeadline(rc *http.ResponseController) {
 func ModeName(mode string) string {
 	switch mode {
 	case "sni":
-		return "SNI伪装直连"
+		return "SNI Camouflage"
 	case "direct":
-		return "普通直连"
+		return "Direct"
 	default:
 		return "Cloudflare ECH"
 	}
@@ -72,7 +72,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 			uc, ok = matchWildcard(cfg, host)
 		}
 		if !ok {
-			log.Printf("[%s] 未找到上游配置: %s", clientIP, host)
+			log.Printf("[%s] Upstream config not found: %s", clientIP, host)
 			c.String(http.StatusBadGateway, "no upstream for host: %s", host)
 			return
 		}
@@ -97,19 +97,19 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 
 		outReq, err := http.NewRequest(method, urlStr, c.Request.Body)
 		if err != nil {
-			log.Printf("[%s] 创建请求失败: %v", clientIP, err)
+			log.Printf("[%s] Failed to create request: %v", clientIP, err)
 			c.String(http.StatusInternalServerError, "create request: %v", err)
 			return
 		}
 
-		// 1. 保存客户端请求携带的所有 Cookie (捕获前端 JS document.cookie 写入的新凭证)
+		// 1. Save all cookies carried by client request (capturing new credentials written by frontend JS document.cookie)
 		saveClientCookies(uc.Host, c.Request)
 
-		// 2. 拷贝客户端请求头 (剔除 RFC 逐跳头)
+		// 2. Copy client request headers (stripping RFC hop-by-hop headers)
 		copyHeaders(outReq.Header, c.Request.Header)
 
-		// 3. 默认不伪造/注入 X-Forwarded-For 与 X-Forwarded-Proto，防止暴露反代身份与真实 IP;
-		// 客户端自带的代理追踪头默认抹除 (除非在 headers 规则中显式要求保留或配置)
+		// 3. Do not forge/inject X-Forwarded-For and X-Forwarded-Proto by default to prevent leaking proxy identity and real IP;
+		// Client proxy tracking headers are stripped by default (unless explicitly configured in headers rules)
 		if _, ok := uc.Headers["X-Forwarded-For"]; !ok {
 			outReq.Header.Del("X-Forwarded-For")
 		}
@@ -117,19 +117,19 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 			outReq.Header.Del("X-Forwarded-Proto")
 		}
 
-		// 4. 应用通用声明式请求头规则 (支持 string 覆盖、{delete:true} 剔除、{replace:[a,b]} 替换)
+		// 4. Apply generic declarative request header rules (supports string override, {delete:true} stripping, {replace:[a,b]} substitution)
 		ApplyHeaderRules(outReq.Header, uc.Headers, true, c.Request)
 
 		outReq.Host = uc.Host
 		outReq.ContentLength = c.Request.ContentLength
 
-		// 5. 应用 Cookie (合并 Jar + 客户端当前请求 Cookie + 本地文件/固定 Cookie)
+		// 5. Apply cookies (merging Jar + current client request cookies + local file/fixed cookies)
 		fixedCookie := getFixedCookie(uc)
 		applyCookies(uc.Host, outReq, fixedCookie)
 
 		resp, err := proxyRoundTrip(outReq, uc.Mode)
 		if err != nil {
-			log.Printf("[%s] 上游请求失败: %v (耗时: %v)", clientIP, err, time.Since(start))
+			log.Printf("[%s] Upstream request failed: %v (elapsed: %v)", clientIP, err, time.Since(start))
 			c.String(http.StatusBadGateway, "upstream: %v", err)
 			return
 		}
@@ -137,12 +137,12 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 
 		saveCookies(uc.Host, resp)
 
-		debugLogf("[%s] <- %s (耗时: %v)", clientIP, resp.Status, time.Since(start))
+		debugLogf("[%s] <- %s (elapsed: %v)", clientIP, resp.Status, time.Since(start))
 
 		copyHeaders(c.Writer.Header(), resp.Header)
 		rewriteSetCookieDomains(c.Writer.Header(), host, c.Request.TLS == nil)
 
-		// 6. 应用通用声明式响应头规则 (支持 string 覆盖、{delete:true} 剔除、{replace:[a,b]} 替换)
+		// 6. Apply generic declarative response header rules (supports string override, {delete:true} stripping, {replace:[a,b]} substitution)
 		ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)
 
 		if swWant && !isJavascriptResponse(resp) {
@@ -156,7 +156,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 			c.Writer.Header().Set("Content-Type", "application/javascript")
 			c.Writer.WriteHeader(200)
 			c.Writer.Write([]byte(swOverrideJS(swProxyMap, swRules, blocked)))
-			debugLogf("[%s] %s %s -> SW 兜底生成 %d 条规则 %d 条通配 %d 条屏蔽", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
+			debugLogf("[%s] %s %s -> SW fallback generated %d rules, %d wildcards, %d blocked", clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
 			return
 		}
 
@@ -201,7 +201,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 						} else {
 							body = append(body, reg...)
 						}
-						debugLogf("[%s] %s -> HTML 注入 SW 注册", clientIP, rawPath)
+						debugLogf("[%s] %s -> HTML injected SW registration", clientIP, rawPath)
 					}
 					c.Writer.Header().Del("Content-Encoding")
 					c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))

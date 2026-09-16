@@ -22,7 +22,7 @@ func main() {
 	verbose := flag.Bool("v", false, "verbose per-request logging")
 	flag.Parse()
 
-	// 每请求日志开关: 远程部署默认静默, 排查问题时 -v 打开
+	// Per-request logging switch: silent by default in remote deployment, enable with -v for troubleshooting
 	echproxy.Debug = *verbose
 
 	srv, err := echproxy.NewServer(echproxy.ServerOptions{
@@ -32,32 +32,32 @@ func main() {
 		IPMode:      os.Getenv("IP_MODE"),
 	})
 	if err != nil {
-		log.Fatalf("代理服务器初始化失败: %v", err)
+		log.Fatalf("Proxy server initialization failed: %v", err)
 	}
 
 	srv.PrintBanner(os.Getenv("LOCALIP"))
 
-	// 监听成功即自动打开浏览器访问列表入口 (PC 使用场景)
+	// Automatically open browser to entry list once listening successfully (PC usage)
 	scheme := "https"
 	if *httpMode {
 		scheme = "http"
 	}
 	go openBrowser(fmt.Sprintf("%s://l.moonchan.xyz:%d", scheme, srv.Port))
 
-	// 优雅关闭: Ctrl+C / SIGTERM 时先停接新连接, 在途请求最多等 5s
+	// Graceful shutdown: on Ctrl+C / SIGTERM stop accepting new connections, wait up to 5s for in-flight requests
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	go func() {
 		<-ctx.Done()
-		log.Printf("收到退出信号, 正在优雅关闭 (最多等 5s)...")
+		log.Printf("Received termination signal, shutting down gracefully (up to 5s)...")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
 	}()
 
 	if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("启动失败: %v", err)
+		log.Fatalf("Failed to start server: %v", err)
 	}
 }
 
@@ -72,9 +72,9 @@ func openBrowser(url string) {
 		cmd = exec.Command("xdg-open", url)
 	}
 	if err := cmd.Start(); err != nil {
-		log.Printf("打开浏览器失败 (%s): %v", url, err)
+		log.Printf("Failed to open browser (%s): %v", url, err)
 		return
 	}
-	log.Printf("正在打开浏览器: %s", url)
+	log.Printf("Opening browser: %s", url)
 	go func() { _ = cmd.Wait() }()
 }

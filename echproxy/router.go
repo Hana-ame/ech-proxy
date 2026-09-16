@@ -1,6 +1,6 @@
-// Package echproxy 的 router.go 提供桌面版与 Android 版共用的 gin 分流路由。
-// 两个入口（cmd/ech-proxy 与 cmd/ech-proxy-android）调用同一份 SetupRouter，
-// 避免 gin 路由 / host 分流逻辑写两遍产生漂移。
+// Package echproxy router.go provides gin routing shared by desktop and Android versions.
+// Both entrypoints (win and android) invoke SetupRouter,
+// preventing divergent routing or host dispatching logic.
 package echproxy
 
 import (
@@ -14,17 +14,17 @@ import (
 //go:embed assets/index.html
 var indexHTML string
 
-// indexHost 是显示 upstream 列表页的 host。桌面版与 Android 版统一行为：
-// l.moonchan.xyz 的根路径 "/" 显示列表页，其余 host 根路径按分流走代理。
+// indexHost is the host that displays the upstream list portal.
+// l.moonchan.xyz root path "/" displays the portal list; other host root paths route to proxy.
 const indexHost = "l.moonchan.xyz"
 
-// SetupRouter 在 gin 引擎上注册全部分流路由（桌面版与 Android 版共用同一份逻辑）。
+// SetupRouter registers all routing handlers on the Gin engine.
 //
-// 分流规则（根路径 "/" 与 NoRoute 都走同一套 host 判定）：
-//   - Host == indexHost (l.moonchan.xyz) 的根路径 "/" → 渲染 upstream 列表页
-//   - Host 精确匹配或通配匹配某 upstream → 走代理
-//   - 未知 Host 的根路径 "/" → 原样返回列表页（含 {{UPSTREAMS}} 时渲染列表）
-//   - 其余路径 → NoRoute 直接代理（ProxyHandler 内部按 host 分流到对应 upstream）
+// Routing rules (both root path "/" and NoRoute follow the same host evaluation):
+//   - Host == indexHost (l.moonchan.xyz) root path "/" -> renders upstream portal list
+//   - Host exact match or wildcard match an upstream -> routes through proxy
+//   - Unknown Host root path "/" -> fallback to portal list (renders list when {{UPSTREAMS}} present)
+//   - All other paths -> NoRoute proxies directly (ProxyHandler dispatches to upstream by host)
 func SetupRouter(r *gin.Engine, cfg *Config) {
 	upstreamHandler := ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)
 
@@ -33,19 +33,19 @@ func SetupRouter(r *gin.Engine, cfg *Config) {
 	})
 
 	r.GET("/", func(c *gin.Context) {
-		// host 为去掉端口的 hostname，用于匹配 indexHost 与 upstream 表；
-		// 列表页链接的端口直接取自 c.Request.Host（renderUpstreamList 内解析，
-		// Host 头无端口时兜底 :8443）。
+		// host is the hostname stripped of port, used to match indexHost and upstreams table;
+		// portal link ports are extracted directly from c.Request.Host (parsed in renderUpstreamList,
+		// falling back to :8443 if missing).
 		host := c.Request.Host
 		if name, _, err := net.SplitHostPort(host); err == nil {
 			host = name
 		}
-		// 列表入口 host 的根路径 → 渲染列表页
+		// Portal entry host root path -> render portal list
 		if host == indexHost {
 			serveIndex(c, cfg, c.Request.Host)
 			return
 		}
-		// 精确或通配入口 → 走代理
+		// Exact or wildcard upstream entry -> proxy
 		if _, ok := cfg.Upstreams[host]; ok {
 			upstreamHandler(c)
 			return
@@ -54,17 +54,17 @@ func SetupRouter(r *gin.Engine, cfg *Config) {
 			upstreamHandler(c)
 			return
 		}
-		// 未知 host → 兜底列表页
+		// Unknown host -> fallback to portal list
 		serveIndex(c, cfg, c.Request.Host)
 	})
 
-	// 其余所有路径直接代理（ProxyHandler 内部按 host 分流到对应 upstream）
+	// All other paths are proxied directly (ProxyHandler dispatches to corresponding upstream by host)
 	r.NoRoute(func(c *gin.Context) {
 		upstreamHandler(c)
 	})
 }
 
-// serveIndex 返回 indexHTML；若含 {{UPSTREAMS}} 占位符则按 upstream 顺序渲染列表。
+// serveIndex returns indexHTML; replaces {{UPSTREAMS}} placeholder with rendered list.
 func serveIndex(c *gin.Context, cfg *Config, requestHost string) {
 	page := indexHTML
 	if strings.Contains(page, "{{UPSTREAMS}}") {
@@ -74,15 +74,15 @@ func serveIndex(c *gin.Context, cfg *Config, requestHost string) {
 	c.String(200, page)
 }
 
-// renderUpstreamList 按 upstream.json 书写顺序（UpstreamOrder）渲染入口列表，
-// 跳过 display=false 的条目。每项为可点击链接，跳转同端口对应入口。
+// renderUpstreamList renders entry links following upstream.json write order (UpstreamOrder),
+// skipping entries with display=false. Each item is a clickable link to the corresponding entry.
 func renderUpstreamList(cfg *Config, requestHost string) string {
 	var sb strings.Builder
 	port := ""
 	if _, p, err := net.SplitHostPort(requestHost); err == nil {
 		port = ":" + p
 	} else {
-		// Host header 没带端口时兜底 8443（避免链接缺端口打不开）
+		// Default to 8443 if Host header lacks port
 		port = ":8443"
 	}
 	entries := cfg.UpstreamOrder
@@ -106,7 +106,7 @@ func renderUpstreamList(cfg *Config, requestHost string) string {
 		}
 		desc := uc.Describe
 		if desc == "" {
-			desc = "通过 ECH 代理访问 " + uc.Host
+			desc = "Access " + uc.Host + " via ECH Proxy"
 		}
 		badge := strings.ToUpper(entry[:1])
 		sb.WriteString(`<a class="item" href="https://` + entry + port + `/">`)

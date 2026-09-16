@@ -7,10 +7,10 @@ import (
 	"strings"
 )
 
-// buildEntryRewriter 从单条 UpstreamConfig 构造响应域名重写器:
-// 精确 rewrites 原样使用; wildcard 非空时自动推导通配条目;
-// body_replace 执行通用文本或正则替换规则。
-// blocked 为全局剔除域名列表 (Config.BlockedHosts, upstream.json 可配)。
+// buildEntryRewriter constructs a response domain rewriter from a single UpstreamConfig:
+// Exact rewrites are used as-is; wildcard entries are automatically deduced if wildcard is present;
+// body_replace executes generic text or regex replacement rules.
+// blocked is the global list of excluded domains (Config.BlockedHosts, configurable in upstream.json).
 func buildEntryRewriter(uc UpstreamConfig, blocked []string) func([]byte, string) []byte {
 	rules := make(map[string]string, len(uc.Rewrites)+2)
 	for k, v := range uc.Rewrites {
@@ -35,7 +35,7 @@ func buildEntryRewriter(uc UpstreamConfig, blocked []string) func([]byte, string
 	}
 }
 
-// applyBodyReplace 对响应正文执行通用替换规则（支持字面量快速替换与正则替换）。
+// applyBodyReplace performs generic replacement rules on response body (supports fast literal replacement and regex replacement).
 func applyBodyReplace(body []byte, rules []BodyReplaceRule) []byte {
 	for _, r := range rules {
 		if r.Old == "" {
@@ -56,7 +56,7 @@ func applyBodyReplace(body []byte, rules []BodyReplaceRule) []byte {
 	return body
 }
 
-// stripBlockedURLs 从响应文本中移除被墙第三方域名的完整 URL 值。
+// stripBlockedURLs removes complete URL values of blocked third-party domains from response text.
 func stripBlockedURLs(body []byte, blocked []string) []byte {
 	out := body
 	for _, b := range blocked {

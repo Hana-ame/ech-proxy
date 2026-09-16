@@ -13,8 +13,8 @@ var (
 	cookieJar = map[string][]*http.Cookie{}
 )
 
-// saveClientCookies 将客户端请求携带的所有 Cookie (包含浏览器端 JS document.cookie 写入的值)
-// 保存进对应 host 的内存 CookieJar 中，防止客户端通过 JS 产生的新凭证丢失。
+// saveClientCookies saves all cookies carried by the client request (including values written by browser-side JS document.cookie)
+// into the in-memory CookieJar for the corresponding host, preventing newly generated credentials from being lost.
 func saveClientCookies(host string, req *http.Request) {
 	cookies := req.Cookies()
 	if len(cookies) == 0 {
@@ -35,7 +35,7 @@ func saveClientCookies(host string, req *http.Request) {
 		if c.Name == "" {
 			continue
 		}
-		// 客户端请求带过来的 Cookie 通常不带 Expires/MaxAge，赋予默认 30 天有效期
+		// Cookies sent by client requests typically lack Expires/MaxAge; assign default 30-day lifetime
 		if c.Expires.IsZero() && c.MaxAge <= 0 {
 			c.Expires = now.Add(30 * 24 * time.Hour)
 		}
@@ -48,7 +48,7 @@ func saveClientCookies(host string, req *http.Request) {
 	cookieJar[host] = jar
 }
 
-// saveCookies 保存上游响应下发的 Set-Cookie 头到 CookieJar
+// saveCookies saves Set-Cookie headers from upstream responses into the CookieJar
 func saveCookies(host string, resp *http.Response) {
 	sc := resp.Header.Values("Set-Cookie")
 	if len(sc) == 0 {
@@ -100,8 +100,8 @@ func isCookieAlive(c *http.Cookie, now time.Time) bool {
 	return true
 }
 
-// getFixedCookie 读取上游配置中的固定 Cookie 或从本地文件载入。
-// 支持在 json 中写固定字符串、file:// 前缀路径，或直接写绝对/相对路径。
+// getFixedCookie reads fixed cookies from upstream config or loads them from a local file.
+// Supports raw strings in JSON, file:// prefixed paths, or direct absolute/relative paths.
 func getFixedCookie(uc UpstreamConfig) string {
 	cookieVal := uc.Cookie
 	if uc.CookieFile != "" {
@@ -119,7 +119,7 @@ func getFixedCookie(uc UpstreamConfig) string {
 	if strings.HasPrefix(filePath, "file://") {
 		filePath = strings.TrimPrefix(filePath, "file://")
 	}
-	// 若以路径形式存在，尝试从本地文件读取
+	// If it exists in path form, attempt to read from local file
 	if strings.HasPrefix(filePath, "/") || strings.HasPrefix(filePath, "./") || strings.HasPrefix(filePath, "../") || strings.HasPrefix(cookieVal, "file://") {
 		if content, err := os.ReadFile(filePath); err == nil {
 			return strings.TrimSpace(string(content))
@@ -128,8 +128,8 @@ func getFixedCookie(uc UpstreamConfig) string {
 	return cookieVal
 }
 
-// applyCookies 将 CookieJar (上游 Set-Cookie + 客户端 JS Cookie)、客户端当前请求 Cookie、
-// 以及本地固定/文件 Cookie 进行三方合并，写入即将发往上游的请求中。
+// applyCookies performs a three-way merge among CookieJar (upstream Set-Cookie + client JS cookies),
+// the current client request cookies, and local fixed/file cookies, writing them into the outgoing request.
 func applyCookies(host string, req *http.Request, fixedCookie string) {
 	cookieMu.Lock()
 	now := time.Now()
@@ -149,14 +149,14 @@ func applyCookies(host string, req *http.Request, fixedCookie string) {
 	}
 	cookieMu.Unlock()
 
-	// 合并当前请求中的 Cookie (若 Jar 中已有，以当前最新请求优先)
+	// Merge cookies from current request (if already in Jar, current latest request takes priority)
 	for _, c := range req.Cookies() {
 		merged[c.Name] = c.Value
 	}
 
-	// 合并配置中指定的固定/本地文件 Cookie (最高优先级，覆盖前两者同名项)
+	// Merge fixed/local file cookies specified in config (highest priority, overrides previous same-named items)
 	if fixedCookie != "" {
-		// 尝试按 "name=val; name2=val2" 解析
+		// Attempt to parse as "name=val; name2=val2"
 		parts := strings.Split(fixedCookie, ";")
 		for _, part := range parts {
 			part = strings.TrimSpace(part)

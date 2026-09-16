@@ -1,11 +1,12 @@
-// Package netdial 提供在 Android/Termux 等无标准 /etc/resolv.conf 环境下
-// 可用的网络拨号工具。
+// Package netdial provides network dialing utilities for environments lacking standard
+// /etc/resolv.conf, such as Android/Termux.
 //
-// 背景: Termux 没有 /etc/resolv.conf, Go 内置解析器(pure Go)会默认尝试
-// [::1]:53, 导致 DNS lookup 失败 ("read udp [::1]:53: connection refused")。
-// 且 Termux 的 CA 证书位于 $PREFIX/etc/tls/cert.pem, 不在 Go 默认搜索的
-// 系统路径里, https 请求会报 "certificate signed by unknown authority"。
-// 在 Termux 上运行的 proxy 都必须用本包提供的 Dialer/Transport。
+// Background: Termux does not have /etc/resolv.conf, so Go's built-in pure-Go resolver
+// defaults to trying [::1]:53, causing DNS lookups to fail ("read udp [::1]:53: connection refused").
+// Additionally, Termux's CA certificates are located at $PREFIX/etc/tls/cert.pem, outside
+// the system search paths of Go's default cert pool, causing HTTPS requests to fail with
+// "certificate signed by unknown authority".
+// Proxies running under Termux must use the Dialer/Transport provided by this package.
 package netdial
 
 import (
@@ -21,16 +22,16 @@ import (
 	"github.com/coder/websocket"
 )
 
-// 操作级超时与重试: DoH 拉取 / 拨号 / DNS / 配置抓取统一放宽到 5 分钟,
-// 瞬时失败时重试, 避免 moonchan.xyz DoH 端点偶发慢或抖动直接 context
-// deadline exceeded 导致 ECH 初始化 / SNI 解析失败。
+// Operation timeouts and retries: DoH fetching, dialing, DNS, and config loading are unified to 5 minutes
+// with retries on transient failures, preventing context deadline exceeded errors caused by occasional
+// slow responses or jitter from the moonchan.xyz DoH endpoint.
 const (
 	OpTimeout     = 5 * time.Minute
 	RetryAttempts = 3
 	RetryBackoff  = 2 * time.Second
 )
 
-// dnsServers 公共 DNS 列表, 依次尝试。
+// dnsServers is a list of public DNS servers tried sequentially.
 var dnsServers = []string{
 	"8.8.8.8:53",
 	"1.1.1.1:53",
@@ -38,10 +39,9 @@ var dnsServers = []string{
 	"114.114.114.114:53",
 }
 
-// newResolver 构造固定走公共 DNS 的解析器 (绕过本机 [::1]:53)。
-// 按 Go 解析器要求的 network 参数拨号 (udp/tcp): 收到 TC (截断) 响应时
-// Resolver 会以 tcp 重试, 之前忽略 network 参数总是 UDP, 截断响应
-// 无法 fallback 导致解析失败。
+// newResolver constructs a resolver that routes queries via public DNS (bypassing local [::1]:53).
+// Dials with the network parameter requested by Go resolver (udp/tcp): when receiving a TC (truncated)
+// response, Resolver retries over TCP. Previously ignoring network caused truncated responses to fail.
 func newResolver() *net.Resolver {
 	return &net.Resolver{
 		PreferGo: true,
@@ -60,9 +60,9 @@ func newResolver() *net.Resolver {
 	}
 }
 
-// resolver 与 rootPool 全局缓存: Dialer()/Transport() 每次调用都新建
-// 解析器/证书池, 证书池加载 (SystemCertPool + 读文件) 在热路径上不便宜,
-// 且它们都是并发安全的, 全局复用一个即可。
+// resolver and rootPool global caches: Dialer() and Transport() previously constructed
+// new resolvers and cert pools on each call. Cert pool loading (SystemCertPool + reading files)
+// is expensive on hot paths. Both are concurrency-safe, so reusing a single global instance suffices.
 var (
 	resolverOnce sync.Once
 	resolver     *net.Resolver
@@ -81,7 +81,7 @@ func getRootPool() *x509.CertPool {
 	return rootPool
 }
 
-// Dialer 返回使用公共 DNS 的 net.Dialer, 适用于 Termux 等无 resolv.conf 的环境。
+// Dialer returns a net.Dialer using public DNS, suitable for environments without resolv.conf like Termux.
 func Dialer() *net.Dialer {
 	return &net.Dialer{
 		Timeout:   OpTimeout,
@@ -90,7 +90,7 @@ func Dialer() *net.Dialer {
 	}
 }
 
-// rootCAs 加载系统根证书, 并附加 Termux 的 CA bundle (若存在)。
+// rootCAs loads system root certificates and appends Termux's CA bundle if present.
 func rootCAs() *x509.CertPool {
 	pool, _ := x509.SystemCertPool()
 	if pool == nil {
@@ -111,8 +111,8 @@ func rootCAs() *x509.CertPool {
 	return pool
 }
 
-// Transport 返回适用于 Termux 的 http.Transport (公共 DNS + Termux CA)。
-// 证书池全局缓存复用 (SystemCertPool 加载不便宜)。
+// Transport returns an http.Transport suitable for Termux (public DNS + Termux CA).
+// The certificate pool is globally cached and reused (SystemCertPool loading is non-trivial).
 func Transport() *http.Transport {
 	return &http.Transport{
 		DialContext: Dialer().DialContext,
@@ -122,7 +122,7 @@ func Transport() *http.Transport {
 	}
 }
 
-// Client 返回适用于 Termux 的 http.Client。
+// Client returns an http.Client suitable for Termux.
 func Client(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:   timeout,
@@ -130,14 +130,14 @@ func Client(timeout time.Duration) *http.Client {
 	}
 }
 
-// WebsocketDialOptions 返回适用于 Termux 的 websocket.DialOptions。
+// WebsocketDialOptions returns websocket.DialOptions suitable for Termux.
 func WebsocketDialOptions() *websocket.DialOptions {
 	return &websocket.DialOptions{
 		HTTPClient: Client(OpTimeout),
 	}
 }
 
-// sleepCtx 休眠 d，期间响应 ctx 取消；返回 false 表示 ctx 已取消。
+// sleepCtx sleeps for duration d while respecting ctx cancellation; returns false if ctx was cancelled.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
@@ -149,9 +149,9 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// Retry 重试 fn 直到成功、ctx 取消或达到 attempts 次；每次失败后 sleep backoff
-// （受 ctx 取消）。用于 DoH / 拨号 / 配置抓取等易因瞬时网络抖动失败的操作。
-// 返回最后一次错误；ctx 取消时立即返回 ctx.Err()。
+// Retry retries fn until success, context cancellation, or max attempts reached; sleeps backoff between
+// failures (cancellable via ctx). Used for DoH, dialing, and config fetching prone to transient network jitter.
+// Returns the last error, or ctx.Err() immediately if cancelled.
 func Retry[T any](ctx context.Context, attempts int, backoff time.Duration, fn func() (T, error)) (T, error) {
 	var zero T
 	var last error

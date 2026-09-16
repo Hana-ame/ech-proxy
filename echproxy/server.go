@@ -15,20 +15,20 @@ import (
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
 )
 
-// DefaultUpstreamConfigURL 是默认的远程上游配置地址（全局单一可信源）。
+// DefaultUpstreamConfigURL is the default remote upstream configuration address (global single source of truth).
 const DefaultUpstreamConfigURL = "https://proxy.moonchan.xyz/Hana-ame/ech-proxy/refs/heads/main/certs/l.moonchan.xyz/upstream.json?proxy_host=raw.githubusercontent.com"
 
-// ServerOptions 封装启动 ECH 代理服务器所需的参数。
+// ServerOptions encapsulates parameters required to start the ECH proxy server.
 type ServerOptions struct {
-	Addr            string // 监听地址，默认为 "127.0.0.1:8443"
-	AllowRandomPort bool   // 若 Addr 指定端口被占用，是否回退到随机可用端口（Android 等移动端场景）
-	HTTPMode        bool   // 是否强制 HTTP 模式（不启用 TLS）
-	ConfigURL       string // upstream.json 远程地址，若为空则使用 DefaultUpstreamConfigURL
-	BootstrapIP     string // DoH bootstrap IP (可选)
-	IPMode          string // "v4" / "v6" 偏好 (可选)
+	Addr            string // Listen address, defaults to "127.0.0.1:8443"
+	AllowRandomPort bool   // Fall back to random available port if Addr is busy (mobile/Android scenario)
+	HTTPMode        bool   // Force HTTP mode (do not enable TLS)
+	ConfigURL       string // Remote upstream.json URL, defaults to DefaultUpstreamConfigURL if empty
+	BootstrapIP     string // DoH bootstrap IP (optional)
+	IPMode          string // "v4" / "v6" preference (optional)
 }
 
-// Server 代表一个运行中的 ECH 代理服务器实例。
+// Server represents a running ECH proxy server instance.
 type Server struct {
 	Options    ServerOptions
 	Config     *Config
@@ -40,7 +40,7 @@ type Server struct {
 	IsTLS      bool
 }
 
-// InitECH 初始化底层的 Cloudflare ECH 与 DoH 客户端。
+// InitECH initializes the underlying Cloudflare ECH and DoH client.
 func InitECH(bootstrapIP, ipMode string) error {
 	if bootstrapIP != "" {
 		log.Printf("ECH: DoH=moonchan.xyz, bootstrapIP=%s", bootstrapIP)
@@ -58,45 +58,45 @@ func InitECH(bootstrapIP, ipMode string) error {
 	if v4ok || v6ok {
 		suffix := ""
 		if ipMode != "" {
-			suffix = " (强制 " + ipMode + ")"
+			suffix = " (forced " + ipMode + ")"
 		}
-		log.Printf("IP 栈检测: IPv4=%v IPv6=%v%s", v4ok, v6ok, suffix)
+		log.Printf("IP stack check: IPv4=%v IPv6=%v%s", v4ok, v6ok, suffix)
 	} else {
-		log.Printf("IP 栈检测失败（DNS 不可达）")
+		log.Printf("IP stack check failed (DNS unreachable)")
 	}
 
-	log.Printf("正在初始化 ECH 客户端...")
+	log.Printf("Initializing ECH client...")
 	if err := cloudflare_ech.InitDefault(); err != nil {
-		return fmt.Errorf("ECH 客户端初始化失败: %w", err)
+		return fmt.Errorf("ECH client initialization failed: %w", err)
 	}
-	log.Printf("ECH 客户端就绪")
+	log.Printf("ECH client ready")
 	return nil
 }
 
-// LoadTLSCert 根据配置中的 CertPath 和 KeyPath 动态获取并解析 TLS 证书密钥对。
+// LoadTLSCert dynamically fetches and parses TLS certificate and key pair from CertPath and KeyPath in config.
 func LoadTLSCert(cfg *Config) (*tls.Certificate, error) {
 	if cfg.CertPath == "" || cfg.KeyPath == "" {
-		return nil, errors.New("配置中缺少 cert_path 或 key_path")
+		return nil, errors.New("missing cert_path or key_path in config")
 	}
-	log.Printf("正在拉取证书: %s", cfg.CertPath)
+	log.Printf("Fetching TLS certificate: %s", cfg.CertPath)
 	certPEM, err := FetchBytes(cfg.CertPath)
 	if err != nil {
-		return nil, fmt.Errorf("拉取证书失败: %w", err)
+		return nil, fmt.Errorf("failed to fetch certificate: %w", err)
 	}
-	log.Printf("正在拉取密钥: %s", cfg.KeyPath)
+	log.Printf("Fetching TLS key: %s", cfg.KeyPath)
 	keyPEM, err := FetchBytes(cfg.KeyPath)
 	if err != nil {
-		return nil, fmt.Errorf("拉取密钥失败: %w", err)
+		return nil, fmt.Errorf("failed to fetch key: %w", err)
 	}
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return nil, fmt.Errorf("解析证书密钥失败: %w", err)
+		return nil, fmt.Errorf("failed to parse certificate key pair: %w", err)
 	}
-	log.Printf("证书加载成功")
+	log.Printf("TLS certificate loaded successfully")
 	return &cert, nil
 }
 
-// NewEngine 创建并配置包含 Recovery、CORS 及 SetupRouter 的标准 Gin 引擎。
+// NewEngine creates and configures a standard Gin engine with Recovery, CORS, and SetupRouter.
 func NewEngine(cfg *Config) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -106,44 +106,44 @@ func NewEngine(cfg *Config) *gin.Engine {
 	return r
 }
 
-// NewServer 根据给定的 ServerOptions 完成全套初始化流程并绑定端口。
+// NewServer completes full initialization sequence and binds listening port according to given ServerOptions.
 func NewServer(opts ServerOptions) (*Server, error) {
-	// 1. 初始化 ECH 网络客户端
+	// 1. Initialize ECH network client
 	if err := InitECH(opts.BootstrapIP, opts.IPMode); err != nil {
 		return nil, err
 	}
 
-	// 2. 加载远程上游配置
+	// 2. Load remote upstream configuration
 	configURL := opts.ConfigURL
 	if configURL == "" {
 		configURL = DefaultUpstreamConfigURL
 	}
-	log.Printf("正在加载上游配置: %s", configURL)
+	log.Printf("Loading upstream config: %s", configURL)
 	cfg, err := LoadConfig(configURL)
 	if err != nil {
-		return nil, fmt.Errorf("加载上游配置失败: %w", err)
+		return nil, fmt.Errorf("failed to load upstream config: %w", err)
 	}
-	log.Printf("上游配置加载成功: %d 条规则", len(cfg.Upstreams))
+	log.Printf("Upstream config loaded successfully: %d rules", len(cfg.Upstreams))
 
-	// 3. 非 HTTP 模式下拉取 TLS 证书
+	// 3. Fetch TLS certificate if not in HTTP mode
 	var tlsCert *tls.Certificate
 	if !opts.HTTPMode && cfg.CertPath != "" && cfg.KeyPath != "" {
 		cert, err := LoadTLSCert(cfg)
 		if err != nil {
 			if !opts.AllowRandomPort {
-				// 桌面版严格报错
+				// Desktop version strictly errors
 				return nil, err
 			}
-			log.Printf("加载证书失败，将降级运行: %v", err)
+			log.Printf("Failed to load certificate, degrading: %v", err)
 		} else {
 			tlsCert = cert
 		}
 	}
 
-	// 4. 构建统一 Gin 路由引擎
+	// 4. Build unified Gin router engine
 	engine := NewEngine(cfg)
 
-	// 5. 绑定网络监听
+	// 5. Bind network listener
 	addr := opts.Addr
 	if addr == "" {
 		addr = "127.0.0.1:8443"
@@ -156,19 +156,19 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	ln, err := net.Listen(network, addr)
 	if err != nil {
 		if opts.AllowRandomPort {
-			log.Printf("地址 %s 占用或不可用, 尝试随机端口...", addr)
+			log.Printf("Address %s is busy or unavailable, trying random port...", addr)
 			ln, err = net.Listen("tcp4", "127.0.0.1:0")
 			if err != nil {
-				return nil, fmt.Errorf("随机端口监听失败: %w", err)
+				return nil, fmt.Errorf("random port listener failed: %w", err)
 			}
 		} else {
-			return nil, fmt.Errorf("监听 %s 失败: %w", addr, err)
+			return nil, fmt.Errorf("failed to listen on %s: %w", addr, err)
 		}
 	}
 
 	port := uint16(ln.Addr().(*net.TCPAddr).Port)
 
-	// 6. 构建 http.Server
+	// 6. Build http.Server
 	srv := &http.Server{
 		Handler:           engine,
 		ReadHeaderTimeout: 10 * time.Second,
@@ -196,7 +196,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}, nil
 }
 
-// Serve 开始提供 HTTP/HTTPS 服务（阻塞调用）。
+// Serve starts providing HTTP/HTTPS service (blocking call).
 func (s *Server) Serve() error {
 	if s.IsTLS {
 		tlsLn := tls.NewListener(s.Listener, s.HTTPServer.TLSConfig)
@@ -205,7 +205,7 @@ func (s *Server) Serve() error {
 	return s.HTTPServer.Serve(s.Listener)
 }
 
-// ServeAsync 在后台 goroutine 中启动服务。
+// ServeAsync starts providing service in a background goroutine.
 func (s *Server) ServeAsync() error {
 	go func() {
 		if err := s.Serve(); err != nil && err != http.ErrServerClosed {
@@ -215,7 +215,7 @@ func (s *Server) ServeAsync() error {
 	return nil
 }
 
-// Shutdown 优雅关闭服务器。
+// Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.HTTPServer != nil {
 		return s.HTTPServer.Shutdown(ctx)
@@ -223,7 +223,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return nil
 }
 
-// Close 立即关闭服务器。
+// Close immediately closes the server.
 func (s *Server) Close() error {
 	if s.HTTPServer != nil {
 		return s.HTTPServer.Close()
@@ -231,12 +231,12 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// PrintBanner 按照 orderedmap 记录的 upstream 书写顺序打印启动 Banner（严格按配置顺序，不自行排序）。
+// PrintBanner prints the startup banner following the upstream write order recorded in orderedmap (strictly adhering to config order without custom sorting).
 func (s *Server) PrintBanner(localIP string) {
 	listenPort := fmt.Sprintf("%d", s.Port)
 	fmt.Printf("=== ECH Proxy ===\n")
-	fmt.Printf("  模式: %s\n", map[bool]string{true: "HTTP (本地代理)", false: "TLS (远程)"}[s.Options.HTTPMode])
-	fmt.Printf("  监听: %s\n", s.Options.Addr)
+	fmt.Printf("  Mode: %s\n", map[bool]string{true: "HTTP (Local Proxy)", false: "TLS (Remote)"}[s.Options.HTTPMode])
+	fmt.Printf("  Listening: %s\n", s.Options.Addr)
 	if localIP != "" {
 		fmt.Printf("  DoH IP: %s\n", localIP)
 	}
@@ -258,7 +258,7 @@ func (s *Server) PrintBanner(localIP string) {
 		if listenPort != "" {
 			entry += ":" + listenPort
 		}
-		fmt.Printf("  域名: %s -> %s (%s)", entry, uc.Host, ModeName(uc.Mode))
+		fmt.Printf("  Domain: %s -> %s (%s)", entry, uc.Host, ModeName(uc.Mode))
 		if uc.Referer != "" {
 			fmt.Printf(" (referer: %s)", uc.Referer)
 		}
@@ -273,7 +273,7 @@ func (s *Server) PrintBanner(localIP string) {
 			if listenPort != "" {
 				we += ":" + listenPort
 			}
-			fmt.Printf(" [+通配 %s -> *%s]", we, w.UpstreamSuffix)
+			fmt.Printf(" [+wildcard %s -> *%s]", we, w.UpstreamSuffix)
 		}
 		fmt.Println()
 	}

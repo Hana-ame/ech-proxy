@@ -663,4 +663,62 @@ func TestWildcardCleanKeysAndAutoDerivation(t *testing.T) {
 	}
 }
 
+func TestSWProxyMapAndRewritesCooperation(t *testing.T) {
+	cfg := UpstreamMap{
+		"dlsite.l.moonchan.xyz": {
+			Host: "www.dlsite.com",
+			Rewrites: map[string]string{
+				"www.dlsite.com": "dlsite.l.moonchan.xyz",
+				"img.dlsite.jp":  "dlsite-img.l.moonchan.xyz",
+			},
+			BodyReplace: []BodyReplaceRule{
+				{Old: "old-script-cdn.com", New: "proxy-script-cdn.com"},
+			},
+		},
+		"asmr.l.moonchan.xyz": {
+			Host: "asmr.one",
+			Rewrites: map[string]string{
+				"api.asmr-200.com": "asmr-api-200.l.moonchan.xyz",
+			},
+		},
+	}
+
+	// 1. 测试 swProxyMap: 包含 uc.Host 及 rewrites 中的 kv 对，且带有端口
+	swMap := buildSWProxyMap(cfg, "8443")
+
+	// 主机名映射 (uc.Host -> entry)
+	if swMap["www.dlsite.com"] != "dlsite.l.moonchan.xyz:8443" {
+		t.Errorf("expected www.dlsite.com -> dlsite.l.moonchan.xyz:8443, got %s", swMap["www.dlsite.com"])
+	}
+	if swMap["asmr.one"] != "asmr.l.moonchan.xyz:8443" {
+		t.Errorf("expected asmr.one -> asmr.l.moonchan.xyz:8443, got %s", swMap["asmr.one"])
+	}
+
+	// rewrites 中的 kv 对 (必须用于 sw.js)
+	if swMap["img.dlsite.jp"] != "dlsite-img.l.moonchan.xyz:8443" {
+		t.Errorf("expected img.dlsite.jp -> dlsite-img.l.moonchan.xyz:8443, got %s", swMap["img.dlsite.jp"])
+	}
+	if swMap["api.asmr-200.com"] != "asmr-api-200.l.moonchan.xyz:8443" {
+		t.Errorf("expected api.asmr-200.com -> asmr-api-200.l.moonchan.xyz:8443, got %s", swMap["api.asmr-200.com"])
+	}
+
+	// body_replace 的内容绝不进入 sw.js
+	if _, ok := swMap["old-script-cdn.com"]; ok {
+		t.Errorf("body_replace should NOT enter sw.js proxy map")
+	}
+
+	// 2. 测试 body rewrite: rewrites 与 body_replace 均用于正文重写
+	rewriter := buildEntryRewriter(cfg["dlsite.l.moonchan.xyz"], nil)
+	input := []byte(`Visit https://img.dlsite.jp/cover.jpg and script from https://old-script-cdn.com/app.js`)
+	output := string(rewriter(input, "8443"))
+
+	if !strings.Contains(output, "https://dlsite-img.l.moonchan.xyz:8443/cover.jpg") {
+		t.Errorf("expected rewrites kv to be applied to body, got: %s", output)
+	}
+	if !strings.Contains(output, "https://proxy-script-cdn.com/app.js") {
+		t.Errorf("expected body_replace to be applied to body, got: %s", output)
+	}
+}
+
+
 

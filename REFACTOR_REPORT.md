@@ -217,24 +217,38 @@
 
 ## 七、 后续维护与配置规范指南
 
-### 1. 以后如何修改站点规则？
-直接在 `certs/l.moonchan.xyz/upstream.json` 对应的站点节点内修改。**改完直接 `git commit` 并 `git push`**：
-- **无 CI 打扰**：不会触发任何无用的 APK 或桌面构建；
-- **全端即时生效**：所有在线的 PC 端、Android 端客户端下次启动时自动通过 HTTP 拉取最新规则生效。
+### 1. 规则核心机制：`rewrites` vs `body_replace` vs `sw_inject`
 
-### 2. 以后新增站点若需要通配符该怎么写？
-由于 Go 代码已支持自动推导，未来新增站点无需再写又臭又长的 `entry_suffix` 和 `upstream_suffix`，直接在站点内部声明前缀即可：
-```json
-"newsitedemo.l.moonchan.xyz": {
-    "host": "newsitedemo.com",
-    "wildcard": "newsitedemo-"
-}
-```
-或直接写：
-```json
-"newsitedemo.l.moonchan.xyz": {
-    "host": "newsitedemo.com",
-    "wildcard": true
-}
-```
-代码会自动根据 `newsitedemo.l.moonchan.xyz` 推导前缀 `newsitedemo-` 与根域名 `.l.moonchan.xyz`，并根据 `newsitedemo.com` 推导上游后缀 `.newsitedemo.com`，且子域名自动继承主站全部 Headers。
+为彻底杜绝配置混淆，响应重写与 Service Worker 的协作职责明确划分如下：
+
+| 配置项 | 语法格式 | 作用范围 | 核心机制与使用场景 |
+| :--- | :--- | :--- | :--- |
+| **`rewrites`** | `{"target.com": "local.proxy"}` | **Body + sw.js (双重生效)** | **域名级别映射**。<br>1. **静态 Body 替换**：将 HTML、JS、JSON、XML 及响应头 (`Location`/`Refresh`) 中的 `target.com` 替换为本地代理域名（自动附带当前监听端口）。<br>2. **Service Worker 动态拦截**：在开启 `sw_inject` 时，`rewrites` 的全部映射对会自动注入到浏览器端 `sw.js` 的 `__swMap` 中，用于在浏览器网络层实时拦截前端 JS 运行时动态拼接的请求（静态正则替换顾及不到的动态 URL，如 DLsite 图片 CDN）。 |
+| **`body_replace`** | `[["old", "new"]]`<br>`[{"replace": ["old", "new"]}]` | **仅 Body (单向生效)** | **通用文本与正则替换**。<br>专门用于响应正文内容的精准文本替换或正则匹配（如特定脚本地址、版本号、内联代码微调等）。<br>**注意**：`body_replace` 绝对**不会**进入 `sw.js`，避免正则或非域名文本污染 Service Worker 的路由判定。 |
+| **`sw_inject`** | `true` / `false` | **HTML 注册 + sw.js** | **Service Worker 注入开关**。<br>用于自身没有 Service Worker 的站点（如 DLsite）。开启后代理会在返回的 HTML 中自动注入 `/sw.js` 注册代码，并在请求 `/sw.js` 时动态输出包含 `rewrites` 映射与 `blocked_hosts` 拦截规则的脚本。<br>（**警告**：对于自带 Workbox 等 Service Worker 的站点如 Iwara 绝不能开启，避免冲突覆盖）。 |
+
+### 2. 向下兼容铁律（旧客户端 v1.0.0 ~ v1.0.3 运行新 upstream.json）
+
+由于 GitHub `main` 分支的 `upstream.json` 是所有线上版本共同读取的**单一可信源**，更新配置必须死守以下底线：
+
+1. **`rewrites` 必须保持字典格式**：
+   - 只能使用 `{"old.com": "proxy.com"}` 键值对，**绝对不能改写为数组**（旧版结构体定义为 `map[string]string`，改写数组会导致老客户端反序列化当场崩溃）。
+2. **`wildcard` 必须保留完整三段式对象**：
+   - 必须显式提供 `prefix`、`entry_suffix`、`upstream_suffix`。
+   - 虽然新版支持简写 `"wildcard": true` 或 `"wildcard": "prefix-"`，但**老版本（v1.0.0/v1.0.2）拉取简写会报反序列化错误崩溃退出**。
+3. **老字段 `referer` 必须显式保留**：
+   - 虽然新版支持通用 `headers` 自动继承和推导，但老客户端二进制中没有 `headers` 引擎，必须保留各站点的 `referer`，否则旧客户端将彻底失去防盗链伪装能力。
+4. **`headers` 与 `body_replace` 属于纯增量特性**：
+   - 老版本客户端（v1.0.0 ~ v1.0.2）拉取到新字段时会静默忽略，虽然不崩溃，但也无法执行对应高级特性（如 Iwara 登录防 400 重写），新特性只有新版本客户端能够执行。
+
+### 3. 入口与安全收敛状态
+
+1. **目录收敛为三大模块**：
+   - `win/`：PC 桌面端轻量入口。
+   - `android/`：Android JNI 动态库与 App 轻量入口。
+   - `echproxy/`：核心包，通用生命周期与服务器抽象收敛至 `echproxy/server.go`。
+2. **安全第一的默认监听**：
+   - 桌面端默认监听 `127.0.0.1:8443`，不再暴露局域网，需外网访问需显式 `-addr 0.0.0.0:8443`。
+3. **配置原始顺序保持**：
+   - 启动 Banner 移除了字母排序，全面采用 `orderedmap` 按照 `upstream.json` 里的原始书写顺序输出。
+

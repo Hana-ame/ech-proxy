@@ -482,6 +482,43 @@ func TestWildcardCleanKeysAndAutoDerivation(t *testing.T) {
 	if match3.Host != "attachments.f95zone.to" {
 		t.Errorf("expected attachments.f95zone.to, got %s", match3.Host)
 	}
+
+	// 4. 测试用户最推荐的 entry: "*.iwara.tv" 极简写法
+	targetPatternJSON := []byte(`{
+		"upstreams": {
+			"iwara.l.moonchan.xyz": {
+				"host": "iwara.tv",
+				"headers": {
+					"Origin": "https://www.iwara.tv"
+				}
+			}
+		},
+		"wildcards": [
+			{
+				"entry": "*.iwara.tv",
+				"headers": {
+					"X-Site": "www.iwara.tv"
+				}
+			}
+		]
+	}`)
+	cfg4, err := ParseConfig(targetPatternJSON)
+	if err != nil {
+		t.Fatalf("ParseConfig targetPatternJSON failed: %v", err)
+	}
+	match4, ok := MatchWildcardForTest(cfg4.Upstreams, "iwara-api.l.moonchan.xyz")
+	if !ok {
+		t.Fatalf("expected wildcard match for iwara-api.l.moonchan.xyz")
+	}
+	if match4.Host != "api.iwara.tv" {
+		t.Errorf("expected api.iwara.tv, got %s", match4.Host)
+	}
+	if match4.Headers["X-Site"].Value != "www.iwara.tv" {
+		t.Errorf("expected X-Site www.iwara.tv, got %s", match4.Headers["X-Site"].Value)
+	}
+	if match4.Headers["Origin"].Value != "https://www.iwara.tv" {
+		t.Errorf("expected Origin https://www.iwara.tv, got %s", match4.Headers["Origin"].Value)
+	}
 }
 
 

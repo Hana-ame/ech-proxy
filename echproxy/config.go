@@ -367,8 +367,55 @@ func normalizeConfig(cfg *Config) {
 	for i := range cfg.Wildcards {
 		w := &cfg.Wildcards[i]
 		normalizeWildcardRule(w)
+
+		// 若使用 entry: "*.domain.com" 或设置了 Host，从已有同名 upstream 自动推导 Prefix 与 EntrySuffix
+		if w.Prefix == "" || w.EntrySuffix == "" {
+			targetHost := w.Host
+			if targetHost == "" && w.UpstreamSuffix != "" {
+				targetHost = strings.TrimPrefix(w.UpstreamSuffix, ".")
+			}
+			for host, uc := range cfg.Upstreams {
+				if (targetHost != "" && uc.Host == targetHost) || (w.UpstreamSuffix != "" && uc.Wildcard != nil && uc.Wildcard.UpstreamSuffix == w.UpstreamSuffix) {
+					if uc.Wildcard != nil {
+						if w.Prefix == "" {
+							w.Prefix = uc.Wildcard.Prefix
+						}
+						if w.EntrySuffix == "" {
+							w.EntrySuffix = uc.Wildcard.EntrySuffix
+						}
+						if w.UpstreamSuffix == "" {
+							w.UpstreamSuffix = uc.Wildcard.UpstreamSuffix
+						}
+					} else {
+						if idx := strings.Index(host, "."); idx >= 0 {
+							if w.Prefix == "" {
+								w.Prefix = host[:idx] + "-"
+							}
+							if w.EntrySuffix == "" {
+								w.EntrySuffix = host[idx:]
+							}
+						}
+					}
+					break
+				}
+			}
+		}
+
 		if w.EntrySuffix == "" && defaultEntrySuffix != "" {
 			w.EntrySuffix = defaultEntrySuffix
+		}
+		if w.Prefix == "" {
+			targetHost := w.Host
+			if targetHost == "" && w.UpstreamSuffix != "" {
+				targetHost = strings.TrimPrefix(w.UpstreamSuffix, ".")
+			}
+			if targetHost != "" {
+				parts := strings.Split(targetHost, ".")
+				w.Prefix = parts[0] + "-"
+			}
+		}
+		if w.UpstreamSuffix == "" && w.Host != "" {
+			w.UpstreamSuffix = "." + strings.TrimPrefix(w.Host, ".")
 		}
 
 		// 检查是否有关联的 upstream 匹配该通配规则
@@ -447,7 +494,7 @@ func normalizeConfig(cfg *Config) {
 		// 若无关联的现有 upstream，作为独立通配上游注册进 cfg.Upstreams
 		if !matched {
 			virtualHost := w.Entry
-			if virtualHost == "" {
+			if virtualHost == "" || strings.HasPrefix(virtualHost, "*.") {
 				virtualHost = w.Prefix + "*" + w.EntrySuffix
 			}
 			wCopy := *w
@@ -467,9 +514,10 @@ func normalizeConfig(cfg *Config) {
 }
 
 // normalizeWildcardRule 规范化通配规则:
-// 1. 支持直观 entry/upstream 模式 (如 entry: "iwara-*.l.moonchan.xyz", upstream: "*.iwara.tv")
-// 2. 支持 match/target/host 别名，完全消除底层切片字段对配置的侵入
-// 3. 将 referer, origin, x_site 收敛到 Headers 字典中
+// 1. 支持直接指向上游目标的模式: entry: "*.iwara.tv" (极简写法)
+// 2. 支持直观 entry/upstream 模式: entry: "iwara-*.l.moonchan.xyz", upstream: "*.iwara.tv"
+// 3. 支持 match/target/host 别名，完全消除底层切片字段对配置的侵入
+// 4. 将 referer, origin, x_site 收敛到 Headers 字典中
 func normalizeWildcardRule(w *WildcardRule) {
 	if w == nil {
 		return
@@ -484,8 +532,20 @@ func normalizeWildcardRule(w *WildcardRule) {
 			w.Upstream = w.Host
 		}
 	}
-	// 从 Entry 模式解析 Prefix 与 EntrySuffix
-	if w.Entry != "" && (w.Prefix == "" && w.EntrySuffix == "") {
+	// 模式 1: entry 形式为 "*.domain.com" (如 entry: "*.iwara.tv")
+	if strings.HasPrefix(w.Entry, "*.") {
+		targetDomain := strings.TrimPrefix(w.Entry, "*.")
+		if w.Upstream == "" {
+			w.Upstream = w.Entry
+		}
+		if w.UpstreamSuffix == "" {
+			w.UpstreamSuffix = "." + targetDomain
+		}
+		if w.Host == "" {
+			w.Host = targetDomain
+		}
+	} else if w.Entry != "" && (w.Prefix == "" && w.EntrySuffix == "") {
+		// 模式 2: entry 形式为 "iwara-*.l.moonchan.xyz"
 		if idx := strings.Index(w.Entry, "*"); idx >= 0 {
 			w.Prefix = w.Entry[:idx]
 			w.EntrySuffix = w.Entry[idx+1:]

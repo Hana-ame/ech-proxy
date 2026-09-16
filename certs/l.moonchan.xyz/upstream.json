@@ -138,8 +138,7 @@
     },
     "wildcards": [
         {
-            "entry": "iwara-*.l.moonchan.xyz",
-            "upstream": "*.iwara.tv",
+            "entry": "*.iwara.tv",
             "headers": {
                 "Origin": "https://www.iwara.tv",
                 "X-Site": "www.iwara.tv"

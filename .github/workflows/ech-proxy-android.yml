@@ -1,20 +1,6 @@
 name: ech-proxy-android
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "ech-proxy/**"
-      - "ech-proxy-android/**"
-      - "ech/**"
-      - "echproxy/**"
-      - "apifwd/**"
-      - "netdial/**"
-      - "certs/**"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/ech-proxy.yml"
-      - ".github/workflows/ech-proxy-android.yml"
   workflow_dispatch:
 
 jobs:
@@ -128,14 +114,3 @@ jobs:
         with:
           name: twitter-pic-android
           path: ech-proxy-android/android/app/build/outputs/apk/release/*.apk
-
-      # 与桌面版（ech-proxy.yml）上传到同一个 release tag，保证 win/linux/android 同步
-      - name: Upload APK to Release
-        run: |
-          APK=$(find ech-proxy-android/android/app/build/outputs/apk/release -name "*.apk" -type f | head -1)
-          cp "$APK" app-release.apk
-          gh release upload v1.0.0 app-release.apk --clobber
-          echo "=== Release assets ==="
-          gh release view v1.0.0 --json assets --jq '.assets[] | "\(.name)  \(.updatedAt)"'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

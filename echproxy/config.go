@@ -133,6 +133,7 @@ type WildcardRule struct {
 	CookieFile      string                `json:"cookie_file,omitempty"`
 	CookieDomain    string                `json:"cookie_domain,omitempty"` // Shared cookie domain (e.g. "l.moonchan.xyz")
 	Mode            string                `json:"mode,omitempty"`
+	IPMode          string                `json:"ip_mode,omitempty"` // Egress IP family: "v4", "v6", or "auto"
 	SWInject        bool                  `json:"sw_inject,omitempty"`
 	Rewrites        map[string]string     `json:"rewrites,omitempty"`
 	BodyReplace     []BodyReplaceRule     `json:"body_replace,omitempty"` // Generic body replacement rules [ ["old", "new"], ... ]
@@ -186,6 +187,7 @@ type UpstreamConfig struct {
 	CookieDomain    string                `json:"cookie_domain,omitempty"`   // Scoped domain for rewritten Set-Cookie (e.g. "l.moonchan.xyz")
 	SWInject        bool                  `json:"sw_inject,omitempty"`
 	Mode            string                `json:"mode,omitempty"`
+	IPMode          string                `json:"ip_mode,omitempty"` // Egress IP family: "v4", "v6", or "auto"
 	Rewrites        map[string]string     `json:"rewrites,omitempty"`
 	BodyReplace     []BodyReplaceRule     `json:"body_replace,omitempty"` // Generic body replacement rules [ ["old", "new"], ... ]
 	Wildcard        *WildcardRule         `json:"wildcard,omitempty"`
@@ -404,6 +406,9 @@ func normalizeConfig(cfg *Config) {
 			if w.UpstreamSuffix == "" && uc.Host != "" {
 				w.UpstreamSuffix = "." + strings.TrimPrefix(uc.Host, ".")
 			}
+			if w.IPMode == "" && uc.IPMode != "" {
+				w.IPMode = uc.IPMode
+			}
 			normalizeWildcardRule(w)
 		}
 		cfg.Upstreams[host] = uc
@@ -524,6 +529,12 @@ func normalizeConfig(cfg *Config) {
 				if w.Mode != "" {
 					uc.Wildcard.Mode = w.Mode
 				}
+				if w.IPMode != "" {
+					uc.Wildcard.IPMode = w.IPMode
+				}
+				if uc.Wildcard.IPMode == "" && uc.IPMode != "" {
+					uc.Wildcard.IPMode = uc.IPMode
+				}
 				if len(w.Rewrites) > 0 {
 					if uc.Wildcard.Rewrites == nil {
 						uc.Wildcard.Rewrites = make(map[string]string)
@@ -551,6 +562,7 @@ func normalizeConfig(cfg *Config) {
 				Cookie:          w.Cookie,
 				CookieFile:      w.CookieFile,
 				Mode:            w.Mode,
+				IPMode:          w.IPMode,
 				Rewrites:        w.Rewrites,
 				SWInject:        w.SWInject,
 				Wildcard:        &wCopy,

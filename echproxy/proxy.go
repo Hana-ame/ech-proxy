@@ -41,7 +41,7 @@ func ModeName(mode string) string {
 	}
 }
 
-func proxyRoundTrip(req *http.Request, mode string) (*http.Response, error) {
+func proxyRoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	switch mode {
 	case "direct":
 		client := netdial.Client(netdial.OpTimeout)
@@ -49,7 +49,7 @@ func proxyRoundTrip(req *http.Request, mode string) (*http.Response, error) {
 	case "sni":
 		return sniFrontDo(req)
 	default:
-		return cloudflare_ech.Do(req)
+		return cloudflare_ech.Do(req, ipMode)
 	}
 }
 
@@ -270,7 +270,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 
 		// --- Step 3: Round-trip to upstream ---
-		resp, err := proxyRoundTrip(outReq, uc.Mode)
+		resp, err := proxyRoundTrip(outReq, uc.Mode, uc.IPMode)
 		if err != nil {
 			log.Printf("[%s] Upstream request failed: %v (elapsed: %v)", clientIP, err, time.Since(start))
 			c.String(http.StatusBadGateway, "upstream: %v", err)

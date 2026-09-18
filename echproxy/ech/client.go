@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -144,7 +145,7 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 			if err != nil {
 				return nil, err
 			}
-			return dialTCP(ctx, host, port, dohTimeout)
+			return dialTCP(ctx, host, port, cfg.ipMode, dohTimeout)
 		}
 	}
 	dohClient := &http.Client{Transport: tr, Timeout: dohTimeout}
@@ -267,7 +268,7 @@ func currentConfig() *config {
 	return c
 }
 
-// SetIPMode sets IP protocol preference. mode is "v4", "v6", or "" (automatic).
+// SetIPMode sets the fallback IP protocol preference. mode is "v4", "v6", or "" (automatic).
 func SetIPMode(mode string) {
 	nc := *currentConfig()
 	switch mode {
@@ -277,11 +278,23 @@ func SetIPMode(mode string) {
 		nc.ipMode = ""
 	}
 	cfgPtr.Store(&nc)
+
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+	for _, c := range clients {
+		if tr, ok := c.inner.Transport.(*http2.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+	clients = map[string]*Client{}
 }
 
-func resolvePreferredIP(ctx context.Context, host string) (string, error) {
-	ipMode := currentConfig().ipMode
-	if ipMode == "" {
+func resolvePreferredIP(ctx context.Context, host, ipMode string) (string, error) {
+	mode := ipMode
+	if mode == "" || mode == "auto" {
+		mode = currentConfig().ipMode
+	}
+	if mode == "" || mode == "auto" {
 		return "", nil
 	}
 	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, host)
@@ -289,26 +302,30 @@ func resolvePreferredIP(ctx context.Context, host string) (string, error) {
 		return "", fmt.Errorf("resolve %s: %w", host, err)
 	}
 	for _, addr := range ips {
-		if ipMode == "v4" && addr.IP.To4() != nil {
+		if mode == "v4" && addr.IP.To4() != nil {
 			return addr.IP.String(), nil
 		}
-		if ipMode == "v6" && addr.IP.To4() == nil && addr.IP.To16() != nil {
+		if mode == "v6" && addr.IP.To4() == nil && addr.IP.To16() != nil {
 			return addr.IP.String(), nil
 		}
 	}
-	return "", fmt.Errorf("no %s address for %s", ipMode, host)
+	return "", fmt.Errorf("no %s address for %s", mode, host)
 }
 
 // egressFamilyOnce logs the IP family the OS actually resolves for the upstream dial when IP_MODE
 // is unset, so the egress family is observable instead of silently OS-decided.
 var egressFamilyOnce sync.Once
 
-// dialTCP dials according to ipMode preference. When ipMode is empty (automatic), it uses netdial
+// dialTCP dials according to ipMode preference. When ipMode is empty or "auto", it uses netdial
 // fixed public DNS resolution; otherwise connects directly to the preferred IP. Environments without
 // resolv.conf like Termux must use netdial, as bare net.Dialer defaults to failing at [::1]:53.
-func dialTCP(ctx context.Context, host, port string, timeout time.Duration) (net.Conn, error) {
+func dialTCP(ctx context.Context, host, port, ipMode string, timeout time.Duration) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: timeout}
-	if currentConfig().ipMode == "" {
+	mode := ipMode
+	if mode == "" || mode == "auto" {
+		mode = currentConfig().ipMode
+	}
+	if mode == "" || mode == "auto" {
 		conn, err := netdial.Dialer().DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 		if err != nil {
 			return nil, err
@@ -321,12 +338,12 @@ func dialTCP(ctx context.Context, host, port string, timeout time.Duration) (net
 			egressFamilyOnce.Do(func() {
 				log.Printf("Upstream egress: %s via %s (IP_MODE unset, family chosen by the OS). "+
 					"Some upstreams reject IPv6 sources (e.g. pixiv returns a static 403 'Access blocked'); "+
-					"set IP_MODE=v4 to pin the family.", family, addr)
+					"set ip_mode: v4 in upstream.json or IP_MODE=v4 to pin the family.", family, addr)
 			})
 		}
 		return conn, nil
 	}
-	ip, err := resolvePreferredIP(ctx, host)
+	ip, err := resolvePreferredIP(ctx, host, mode)
 	if err != nil {
 		return nil, err
 	}
@@ -372,7 +389,7 @@ func SetDoHConfig(host, bootstrapIP string) {
 // to impersonate a real Chrome browser TLS fingerprint. Cloudflare checks JA3/JA4 fingerprints
 // to detect non-browser clients; using crypto/tls directly exposes the Go runtime fingerprint.
 // utls v1.8.2 supports EncryptedClientHelloConfigList, so ECH encryption is preserved.
-func newTransport(echConfig []byte) *http2.Transport {
+func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 	return &http2.Transport{
 		AllowHTTP: false,
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
@@ -390,7 +407,7 @@ func newTransport(echConfig []byte) *http2.Transport {
 
 			// Retry dialing shell domain + TLS handshake to handle transient RST/timeouts.
 			conn, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
-				rawConn, derr := dialTCP(ctx, shellDomain, "443", dialTimeout)
+				rawConn, derr := dialTCP(ctx, shellDomain, "443", ipMode, dialTimeout)
 				if derr != nil {
 					return nil, derr
 				}
@@ -418,10 +435,10 @@ func newTransport(echConfig []byte) *http2.Transport {
 // newClient constructs an ECH client (shared by New and refreshLoop).
 // No global Timeout is set: avoiding prematurely terminating >30s large file/video downloads
 // (which manifest in browsers as 206 CONTENT_LENGTH_MISMATCH truncated midway).
-func newClient(echConfig []byte) *Client {
+func newClient(echConfig []byte, ipMode string) *Client {
 	return &Client{
 		inner: &http.Client{
-			Transport: newTransport(echConfig),
+			Transport: newTransport(echConfig, ipMode),
 			Timeout:   0,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
@@ -441,7 +458,7 @@ func New() (*Client, error) {
 		return nil, fmt.Errorf("fetch ECH config: %w", err)
 	}
 
-	return newClient(echConfig), nil
+	return newClient(echConfig, ""), nil
 }
 
 // Do executes an HTTP request dispatched via cloudflare-ech.com ECH domain fronting.
@@ -462,32 +479,73 @@ func (c *Client) DoWithAddr(req *http.Request, host string) (*http.Response, err
 
 // ---- Convenience Functions ----
 
-var defaultClient atomic.Pointer[Client]
+var (
+	clientsMu     sync.Mutex
+	clients       = map[string]*Client{}
+	lastECHConfig []byte
+)
 
-// Do executes an ECH request using the global default client.
-// Triggers New() initialization on first call.
-func Do(req *http.Request) (*http.Response, error) {
-	c := defaultClient.Load()
-	if c == nil {
-		var err error
-		c, err = New()
+func getECHClient(ipMode string) (*Client, error) {
+	mode := strings.ToLower(strings.TrimSpace(ipMode))
+	if mode == "" || mode == "auto" {
+		mode = currentConfig().ipMode
+	}
+	if mode != "v4" && mode != "v6" {
+		mode = "auto"
+	}
+
+	clientsMu.Lock()
+	defer clientsMu.Unlock()
+
+	if c, ok := clients[mode]; ok {
+		return c, nil
+	}
+
+	if len(lastECHConfig) == 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
+		defer cancel()
+		cfg, err := fetchECHConfig(ctx, shellDomain)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("fetch ECH config: %w", err)
 		}
-		if !defaultClient.CompareAndSwap(nil, c) {
-			c = defaultClient.Load()
-		}
+		lastECHConfig = cfg
+	}
+
+	c := newClient(lastECHConfig, mode)
+	clients[mode] = c
+	return c, nil
+}
+
+// Do executes an ECH request using a client configured for the specified ipMode ("v4", "v6", or "auto").
+// If ipMode is omitted or empty, it falls back to the global configuration.
+func Do(req *http.Request, ipMode ...string) (*http.Response, error) {
+	mode := ""
+	if len(ipMode) > 0 {
+		mode = ipMode[0]
+	}
+	c, err := getECHClient(mode)
+	if err != nil {
+		return nil, err
 	}
 	return c.Do(req)
 }
 
 // InitDefault explicitly initializes the global default client (can be called at startup).
 func InitDefault() error {
-	c, err := New()
+	ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
+	defer cancel()
+	cfg, err := fetchECHConfig(ctx, shellDomain)
 	if err != nil {
 		return err
 	}
-	defaultClient.Store(c)
+	clientsMu.Lock()
+	lastECHConfig = cfg
+	clientsMu.Unlock()
+
+	_, err = getECHClient("")
+	if err != nil {
+		return err
+	}
 	go refreshLoop()
 	return nil
 }
@@ -512,10 +570,16 @@ func refreshLoop() {
 			continue
 		}
 
-		c := newClient(echConfig)
-		// Close idle connections of the previous transport when replacing the default client,
-		// otherwise old connection pools hold TCP connections until IdleConnTimeout.
-		if old := defaultClient.Swap(c); old != nil {
+		clientsMu.Lock()
+		lastECHConfig = echConfig
+		oldClients := make([]*Client, 0, len(clients))
+		for mode, old := range clients {
+			oldClients = append(oldClients, old)
+			clients[mode] = newClient(echConfig, mode)
+		}
+		clientsMu.Unlock()
+
+		for _, old := range oldClients {
 			if tr, ok := old.inner.Transport.(*http2.Transport); ok {
 				tr.CloseIdleConnections()
 			}

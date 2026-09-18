@@ -880,3 +880,35 @@ func TestNoFollowRedirectAndRewriteLocation(t *testing.T) {
 		t.Errorf("expected rewritten Location:\n  %s\ngot:\n  %s", expectedLoc, loc)
 	}
 }
+
+func TestUpstreamIPModeConfiguration(t *testing.T) {
+	data, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
+	if err != nil {
+		t.Fatalf("read upstream.json failed: %v", err)
+	}
+	cfg, err := ParseConfig(data)
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+
+	pixiv := cfg.Upstreams["pixiv.l.moonchan.xyz"]
+	if pixiv.IPMode != "v4" {
+		t.Errorf("expected pixiv.IPMode=v4, got %s", pixiv.IPMode)
+	}
+
+	// Wildcard matching pixiv-accounts should inherit IPMode=v4
+	uc, ok := MatchWildcardForTest(cfg.Upstreams, "pixiv-accounts.l.moonchan.xyz")
+	if !ok {
+		t.Fatalf("expected wildcard match for pixiv-accounts")
+	}
+	if uc.IPMode != "v4" {
+		t.Errorf("expected wildcard match to inherit IPMode=v4, got %s", uc.IPMode)
+	}
+
+	// Other services without ip_mode should be empty / auto
+	dlsite := cfg.Upstreams["dlsite.l.moonchan.xyz"]
+	if dlsite.IPMode != "" {
+		t.Errorf("expected dlsite.IPMode empty (auto), got %s", dlsite.IPMode)
+	}
+}
+

@@ -126,11 +126,8 @@ jobs:
         run: |
           cd android
           ./gradlew assembleRelease --no-daemon
-          cd app/build/outputs/apk/release
-          v_apk=$(find . -name "ech-proxy-android-*.apk" | head -n1)
-          if [ -n "$v_apk" ]; then
-            cp "$v_apk" app-release.apk
-          fi
+          mkdir -p app/build/outputs/apk/release
+          find app/build/outputs/apk -type f -name "ech-proxy-android-*.apk" -exec cp {} app/build/outputs/apk/release/ \;
 
       - name: List APK output
         run: |
@@ -158,15 +155,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          apk_filename=$(find dist -name "*.apk" -type f -exec basename {} \; | head -n1)
-          [ -n "$apk_filename" ] || apk_filename="ech-proxy-android.apk"
           {
             echo "## Executable Features"
             cat RELEASE.md 2>/dev/null || true
             echo ""
-            echo "## Android APK"
-            echo "ECH Proxy Android client, accessing upstream sites via ECH proxy."
-            echo "Download ${apk_filename} and install on your phone."
+            echo "## Android APKs"
+            echo "Two versions of the Android APK are provided in this release:"
+            echo "- **Standard (`ech-proxy-android-<version>.apk`)**: Background-safe with Foreground Service & WakeLock (exempt from Android 11+ Cached Apps Freezer and Doze mode)."
+            echo "- **Lite / No-Perm (`ech-proxy-android-lite-<version>.apk`)**: Zero runtime permissions required, no notifications or background service."
           } > release_body.md
           gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
             gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release_body.md

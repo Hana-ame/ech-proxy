@@ -82,9 +82,25 @@ android {
         }
     }
 
+    flavorDimensions "tier"
+    productFlavors {
+        standard {
+            dimension "tier"
+            buildConfigField "boolean", "ENABLE_FOREGROUND_SERVICE", "true"
+        }
+        lite {
+            dimension "tier"
+            buildConfigField "boolean", "ENABLE_FOREGROUND_SERVICE", "false"
+        }
+    }
+
     applicationVariants.all { variant ->
         variant.outputs.all {
-            outputFileName = "ech-proxy-android-${variant.versionName}.apk"
+            if (variant.flavorName == "lite") {
+                outputFileName = "ech-proxy-android-lite-${variant.versionName}.apk"
+            } else {
+                outputFileName = "ech-proxy-android-${variant.versionName}.apk"
+            }
         }
     }
 

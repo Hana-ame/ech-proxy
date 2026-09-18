@@ -18,6 +18,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import androidx.appcompat.app.AppCompatActivity;
+import java.net.InetAddress;
 
 public class MainActivity extends AppCompatActivity {
 
@@ -63,8 +64,9 @@ public class MainActivity extends AppCompatActivity {
         controlPanel.setBackgroundColor(Color.parseColor("#252526"));
 
         // Title & Version
+        String flavorTag = BuildConfig.ENABLE_FOREGROUND_SERVICE ? "" : " [Lite / No-Perm]";
         TextView titleView = new TextView(this);
-        titleView.setText("ECH Proxy v" + BuildConfig.VERSION_NAME + " (build " + BuildConfig.VERSION_CODE + ")");
+        titleView.setText("ECH Proxy v" + BuildConfig.VERSION_NAME + flavorTag + " (build " + BuildConfig.VERSION_CODE + ")");
         titleView.setTextColor(Color.parseColor("#CCCCCC"));
         titleView.setTextSize(14);
         titleView.setTypeface(Typeface.DEFAULT_BOLD);
@@ -86,9 +88,9 @@ public class MainActivity extends AppCompatActivity {
         btnToggle.setText("Stop Proxy");
         btnToggle.setOnClickListener(v -> {
             if (isRunning) {
-                stopProxyService();
+                stopProxy();
             } else {
-                startProxyService();
+                startProxy();
             }
         });
         LinearLayout.LayoutParams btnToggleParams = new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1.0f);
@@ -127,35 +129,36 @@ public class MainActivity extends AppCompatActivity {
 
         setContentView(root);
 
-        appendLog("App started. Initializing Foreground Service...");
+        if (BuildConfig.ENABLE_FOREGROUND_SERVICE) {
+            appendLog("App started (Standard Mode: Foreground Service)");
+            checkNotificationPermission();
+            checkBatteryOptimizations();
 
-        // Check permissions & battery optimization exemption to prevent background freeze
-        checkNotificationPermission();
-        checkBatteryOptimizations();
-
-        // Listen for service status changes
-        ProxyService.setStatusListener((running, port) -> {
-            runOnUiThread(() -> {
-                this.isRunning = running;
-                this.currentPort = port;
-                updateUIState(running, port);
-                if (running && port > 0 && !hasOpenedBrowser) {
-                    hasOpenedBrowser = true;
-                    openBrowser(port);
-                }
+            ProxyService.setStatusListener((running, port) -> {
+                runOnUiThread(() -> {
+                    this.isRunning = running;
+                    this.currentPort = port;
+                    updateUIState(running, port);
+                    if (running && port > 0 && !hasOpenedBrowser) {
+                        hasOpenedBrowser = true;
+                        openBrowser(port);
+                    }
+                });
             });
-        });
 
-        // Start Foreground Service
-        startProxyService();
+            startProxy();
+        } else {
+            appendLog("App started (Lite Mode: No permissions required)");
+            startProxy();
+        }
 
-        // Schedule log stream updates
         handler.postDelayed(this::updateLogs, 500);
     }
 
     private void updateUIState(boolean running, int port) {
         if (running && port > 0) {
-            statusView.setText("Status: Running on port " + port + " (Foreground Service active)");
+            String modeStr = BuildConfig.ENABLE_FOREGROUND_SERVICE ? "Foreground Service active" : "Lite Mode (No permissions)";
+            statusView.setText("Status: Running on port " + port + " (" + modeStr + ")");
             statusView.setTextColor(Color.parseColor("#4EC9B0"));
             btnToggle.setText("Stop Proxy");
             btnOpenBrowser.setEnabled(true);
@@ -167,26 +170,97 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    private void startProxyService() {
-        appendLog("Starting Foreground Service (anti-freeze)...");
-        Intent intent = new Intent(this, ProxyService.class);
-        intent.setAction(ProxyService.ACTION_START);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent);
+    private void startProxy() {
+        if (BuildConfig.ENABLE_FOREGROUND_SERVICE) {
+            appendLog("Starting Foreground Service (anti-freeze)...");
+            Intent intent = new Intent(this, ProxyService.class);
+            intent.setAction(ProxyService.ACTION_START);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
         } else {
-            startService(intent);
+            // Lite Mode: runs directly in background thread with zero permissions
+            new Thread(() -> {
+                appendLog("Resolving bootstrap IP...");
+                String bootstrapIP = resolveBootstrapIP();
+                appendLog("Bootstrap IP: " + (bootstrapIP != null ? bootstrapIP : "null"));
+
+                int port = GetProxyPort();
+                if (port > 0) {
+                    runOnUiThread(() -> {
+                        this.isRunning = true;
+                        this.currentPort = port;
+                        updateUIState(true, port);
+                        appendLog("Proxy already running on port " + port);
+                        if (!hasOpenedBrowser) {
+                            hasOpenedBrowser = true;
+                            openBrowser(port);
+                        }
+                    });
+                    return;
+                }
+
+                appendLog("Starting proxy (lite thread)...");
+                int newPort = StartProxy(bootstrapIP);
+
+                runOnUiThread(() -> {
+                    if (newPort > 0) {
+                        this.isRunning = true;
+                        this.currentPort = newPort;
+                        updateUIState(true, newPort);
+                        appendLog("Proxy started on port " + newPort);
+                        if (!hasOpenedBrowser) {
+                            hasOpenedBrowser = true;
+                            openBrowser(newPort);
+                        }
+                    } else {
+                        this.isRunning = false;
+                        this.currentPort = 0;
+                        updateUIState(false, 0);
+                        appendLog("ERROR: Failed to start proxy");
+                    }
+                });
+            }).start();
         }
     }
 
-    private void stopProxyService() {
-        appendLog("Stopping Proxy Service...");
-        Intent intent = new Intent(this, ProxyService.class);
-        intent.setAction(ProxyService.ACTION_STOP);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent);
+    private void stopProxy() {
+        if (BuildConfig.ENABLE_FOREGROUND_SERVICE) {
+            appendLog("Stopping Proxy Service...");
+            Intent intent = new Intent(this, ProxyService.class);
+            intent.setAction(ProxyService.ACTION_STOP);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(intent);
+            } else {
+                startService(intent);
+            }
         } else {
-            startService(intent);
+            appendLog("Stopping proxy...");
+            new Thread(() -> {
+                StopProxy();
+                runOnUiThread(() -> {
+                    this.isRunning = false;
+                    this.currentPort = 0;
+                    updateUIState(false, 0);
+                    appendLog("Proxy stopped");
+                });
+            }).start();
         }
+    }
+
+    private String resolveBootstrapIP() {
+        try {
+            InetAddress[] addresses = InetAddress.getAllByName("moonchan.xyz");
+            for (InetAddress addr : addresses) {
+                String host = addr.getHostAddress();
+                if (host != null && !host.contains(":")) {
+                    return host;
+                }
+            }
+        } catch (Exception ignored) {}
+        return null;
     }
 
     private void checkBatteryOptimizations() {
@@ -246,7 +320,9 @@ public class MainActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
-        ProxyService.setStatusListener(null);
+        if (BuildConfig.ENABLE_FOREGROUND_SERVICE) {
+            ProxyService.setStatusListener(null);
+        }
         super.onDestroy();
     }
 }

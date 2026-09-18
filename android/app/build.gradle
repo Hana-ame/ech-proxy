@@ -1,5 +1,43 @@
 apply plugin: 'com.android.application'
 
+def getAppVersionName() {
+    def envTag = System.getenv("VERSION_NAME") ?: System.getenv("GITHUB_REF_NAME")
+    if (envTag) {
+        return envTag.replaceFirst("^v", "")
+    }
+    try {
+        def proc = ['git', 'describe', '--tags', '--always'].execute()
+        proc.waitFor()
+        def desc = proc.text.trim()
+        if (desc.startsWith("v")) {
+            return desc.substring(1)
+        }
+        return desc ?: "1.0"
+    } catch (Exception ignored) {
+        return "1.0"
+    }
+}
+
+def getAppVersionCode() {
+    def envCode = System.getenv("VERSION_CODE")
+    if (envCode && envCode.isInteger()) {
+        return envCode.toInteger()
+    }
+    def vName = getAppVersionName()
+    def matcher = (vName =~ /^(\d+)\.(\d+)(?:\.(\d+))?/)
+    if (matcher.find()) {
+        int major = matcher.group(1).toInteger()
+        int minor = matcher.group(2).toInteger()
+        int patch = matcher.group(3) ? matcher.group(3).toInteger() : 0
+        return major * 10000 + minor * 100 + patch
+    }
+    def runNum = System.getenv("GITHUB_RUN_NUMBER")
+    if (runNum && runNum.isInteger()) {
+        return runNum.toInteger()
+    }
+    return 1
+}
+
 android {
     namespace 'xyz.moonchan.echproxy'
     compileSdk 34
@@ -8,12 +46,16 @@ android {
         applicationId "xyz.moonchan.echproxy"
         minSdk 21
         targetSdk 34
-        versionCode 1
-        versionName "1.0"
+        versionCode getAppVersionCode()
+        versionName getAppVersionName()
 
         ndk {
             abiFilters 'arm64-v8a'
         }
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     // Signing configs (read from environment variables, CI uses GitHub Secrets)
@@ -37,6 +79,12 @@ android {
         debug {
             applicationIdSuffix ".debug"
             signingConfig signingConfigs.release  // Use release signing during development
+        }
+    }
+
+    applicationVariants.all { variant ->
+        variant.outputs.all {
+            outputFileName = "ech-proxy-android-${variant.versionName}.apk"
         }
     }
 

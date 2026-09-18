@@ -101,6 +101,7 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'android' }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'release' }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
+          VERSION_NAME: ${{ github.ref_name }}
         run: |
           cd android
           ./gradlew assembleRelease --no-daemon
@@ -112,5 +113,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: twitter-pic-android
+          name: android-apk
           path: android/app/build/outputs/apk/release/*.apk

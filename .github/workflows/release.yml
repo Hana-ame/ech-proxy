@@ -122,6 +122,7 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD || 'android' }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS || 'release' }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
+          VERSION_NAME: ${{ github.ref_name }}
         run: |
           cd android
           ./gradlew assembleRelease --no-daemon
@@ -152,13 +153,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          apk_filename=$(find dist -name "*.apk" -type f -exec basename {} \; | head -n1)
+          [ -n "$apk_filename" ] || apk_filename="ech-proxy-android.apk"
           {
             echo "## Executable Features"
             cat RELEASE.md 2>/dev/null || true
             echo ""
             echo "## Android APK"
             echo "ECH Proxy Android client, accessing upstream sites via ECH proxy."
-            echo "Download app-release.apk and install on your phone."
+            echo "Download ${apk_filename} and install on your phone."
           } > release_body.md
           gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
             gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release_body.md

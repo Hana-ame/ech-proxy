@@ -39,6 +39,8 @@ public class MainActivity extends AppCompatActivity {
 
         handler = new Handler(Looper.getMainLooper());
 
+        appendLog("ECH Proxy v" + BuildConfig.VERSION_NAME + " (build " + BuildConfig.VERSION_CODE + ")");
+
         // Load JNI wrapper library (automatically loads libechproxy.so)
         try {
             System.loadLibrary("jni-wrapper");

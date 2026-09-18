@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 
@@ -232,8 +233,16 @@ type Config struct {
 	UpstreamOrder []string     `json:"-"`
 }
 
-// FetchBytes retrieves byte data from a remote URL with retry and timeout handling.
+// FetchBytes retrieves byte data from a remote URL or local file with retry and timeout handling.
 func FetchBytes(rawURL string) ([]byte, error) {
+	if strings.HasPrefix(rawURL, "file://") {
+		return os.ReadFile(strings.TrimPrefix(rawURL, "file://"))
+	}
+	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
+		if data, err := os.ReadFile(rawURL); err == nil {
+			return data, nil
+		}
+	}
 	client := netdial.Client(netdial.OpTimeout)
 	resp, err := netdial.Retry(context.Background(), netdial.RetryAttempts, netdial.RetryBackoff, func() (*http.Response, error) {
 		r, e := client.Get(rawURL)
@@ -257,29 +266,11 @@ func FetchBytes(rawURL string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }
 
-// LoadConfig loads the upstream JSON configuration from a remote URL (cert URLs + routing rules).
+// LoadConfig loads the upstream JSON configuration from a remote URL or local file path.
 func LoadConfig(rawURL string) (*Config, error) {
-	client := netdial.Client(netdial.OpTimeout)
-	resp, err := netdial.Retry(context.Background(), netdial.RetryAttempts, netdial.RetryBackoff, func() (*http.Response, error) {
-		r, e := client.Get(rawURL)
-		if e != nil {
-			if r != nil {
-				r.Body.Close()
-			}
-			return nil, e
-		}
-		return r, nil
-	})
+	buf, err := FetchBytes(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch upstream config: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
-	}
-	buf, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
-	if err != nil {
-		return nil, fmt.Errorf("read upstream config: %w", err)
 	}
 	return ParseConfig(buf)
 }

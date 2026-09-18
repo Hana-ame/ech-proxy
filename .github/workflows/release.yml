@@ -126,6 +126,11 @@ jobs:
         run: |
           cd android
           ./gradlew assembleRelease --no-daemon
+          cd app/build/outputs/apk/release
+          v_apk=$(find . -name "ech-proxy-android-*.apk" | head -n1)
+          if [ -n "$v_apk" ]; then
+            cp "$v_apk" app-release.apk
+          fi
 
       - name: List APK output
         run: |

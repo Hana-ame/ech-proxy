@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -782,6 +783,52 @@ func TestCrossSubdomainCookieSharingAndCookieDomain(t *testing.T) {
 		t.Errorf("expected inherited CookieDomain=l.moonchan.xyz, got: %s", uc.CookieDomain)
 	}
 }
+
+func TestPreserveEncodedPathSlash(t *testing.T) {
+	rawTarget := "/api/search/%20%24tag%3A%E4%BA%B2%E7%83%AD%2F%E7%94%9C%E8%9C%9C%24?order=create_date"
+	expectedPrefix := "https://api.asmr-200.com/api/search/%20%24tag%3A%E4%BA%B2%E7%83%AD%2F%E7%94%9C%E8%9C%9C%24"
+
+	// Helper matching the proxy's URL construction
+	buildURL := func(req *http.Request, host string) string {
+		reqURI := req.RequestURI
+		if reqURI == "" {
+			reqURI = req.URL.EscapedPath()
+			if req.URL.RawQuery != "" {
+				reqURI += "?" + req.URL.RawQuery
+			}
+		} else if strings.HasPrefix(reqURI, "http://") || strings.HasPrefix(reqURI, "https://") {
+			if u, err := url.ParseRequestURI(reqURI); err == nil {
+				reqURI = u.RequestURI()
+			}
+		}
+		if !strings.HasPrefix(reqURI, "/") {
+			reqURI = "/" + reqURI
+		}
+		return "https://" + host + reqURI
+	}
+
+	// 1. Real server / httptest request where RequestURI is set
+	req1 := httptest.NewRequest(http.MethodGet, rawTarget, nil)
+	urlStr1 := buildURL(req1, "api.asmr-200.com")
+	if !strings.HasPrefix(urlStr1, expectedPrefix) {
+		t.Errorf("expected urlStr1 to preserve %%2F, got: %s", urlStr1)
+	}
+
+	// 2. Synthetic request where RequestURI is empty
+	req2, _ := http.NewRequest(http.MethodGet, "http://example.com"+rawTarget, nil)
+	urlStr2 := buildURL(req2, "api.asmr-200.com")
+	if !strings.HasPrefix(urlStr2, expectedPrefix) {
+		t.Errorf("expected urlStr2 to preserve %%2F, got: %s", urlStr2)
+	}
+
+	// 3. Forward proxy style absolute RequestURI
+	req3 := httptest.NewRequest(http.MethodGet, "http://proxy.host:8443"+rawTarget, nil)
+	urlStr3 := buildURL(req3, "api.asmr-200.com")
+	if !strings.HasPrefix(urlStr3, expectedPrefix) {
+		t.Errorf("expected urlStr3 to preserve %%2F, got: %s", urlStr3)
+	}
+}
+
 
 
 

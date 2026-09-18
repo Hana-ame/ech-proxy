@@ -6,6 +6,7 @@ import "C"
 import (
 	"context"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -55,12 +56,14 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		proxyServer = nil
 	}
 	echReady = false
+	echproxy.Debug = true
 
 	bootstrap := C.GoString(bootstrapIP)
 	srv, err := echproxy.NewServer(echproxy.ServerOptions{
 		Addr:            "127.0.0.1:8443",
 		AllowRandomPort: true,
 		BootstrapIP:     bootstrap,
+		IPMode:          os.Getenv("IP_MODE"),
 	})
 	if err != nil {
 		log.Printf("Server init failed: %v", err)

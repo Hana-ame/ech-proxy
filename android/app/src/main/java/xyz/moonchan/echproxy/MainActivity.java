@@ -58,26 +58,30 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void startProxy() {
-        appendLog("Resolving bootstrap IP...");
-        String bootstrapIP = resolveBootstrapIP();
-        appendLog("Bootstrap IP: " + (bootstrapIP != null ? bootstrapIP : "null"));
+        new Thread(() -> {
+            appendLog("Resolving bootstrap IP...");
+            String bootstrapIP = resolveBootstrapIP();
+            appendLog("Bootstrap IP: " + (bootstrapIP != null ? bootstrapIP : "null"));
 
-        int port = GetProxyPort();
-        if (port > 0) {
-            appendLog("Proxy already running on port " + port);
-            openBrowser(port);
-            return;
-        }
+            int port = GetProxyPort();
+            if (port > 0) {
+                appendLog("Proxy already running on port " + port);
+                runOnUiThread(() -> openBrowser(port));
+                return;
+            }
 
-        appendLog("Starting proxy...");
-        int newPort = StartProxy(bootstrapIP);
+            appendLog("Starting proxy...");
+            int newPort = StartProxy(bootstrapIP);
 
-        if (newPort > 0) {
-            appendLog("Proxy started on port " + newPort);
-            openBrowser(newPort);
-        } else {
-            appendLog("ERROR: Failed to start proxy");
-        }
+            runOnUiThread(() -> {
+                if (newPort > 0) {
+                    appendLog("Proxy started on port " + newPort);
+                    openBrowser(newPort);
+                } else {
+                    appendLog("ERROR: Failed to start proxy");
+                }
+            });
+        }).start();
     }
 
     private void updateLogs() {

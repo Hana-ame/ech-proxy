@@ -221,7 +221,6 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		clientIP := c.ClientIP()
 		method := c.Request.Method
 		rawPath := c.Request.URL.Path
-		rawQuery := c.Request.URL.RawQuery
 
 		// --- Step 1: Resolve upstream config ---
 		host := c.Request.Host
@@ -246,8 +245,22 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		swWant := uc.SWInject && rawPath == "/sw.js"
 
 		// --- Step 2: Build outgoing upstream request ---
-		urlStr := (&url.URL{Scheme: "https", Host: uc.Host, Path: rawPath, RawQuery: rawQuery}).String()
-		debugLogf("[%s] %s %s -> %s", clientIP, method, rawPath, urlStr)
+		reqURI := c.Request.RequestURI
+		if reqURI == "" {
+			reqURI = c.Request.URL.EscapedPath()
+			if c.Request.URL.RawQuery != "" {
+				reqURI += "?" + c.Request.URL.RawQuery
+			}
+		} else if strings.HasPrefix(reqURI, "http://") || strings.HasPrefix(reqURI, "https://") {
+			if u, err := url.ParseRequestURI(reqURI); err == nil {
+				reqURI = u.RequestURI()
+			}
+		}
+		if !strings.HasPrefix(reqURI, "/") {
+			reqURI = "/" + reqURI
+		}
+		urlStr := "https://" + uc.Host + reqURI
+		debugLogf("[%s] %s %s -> %s", clientIP, method, reqURI, urlStr)
 
 		outReq, err := buildUpstreamRequest(c, uc, urlStr)
 		if err != nil {

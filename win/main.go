@@ -21,6 +21,7 @@ func main() {
 	httpMode := flag.Bool("http", false, "run in HTTP mode (no TLS, local proxy)")
 	verbose := flag.Bool("v", false, "verbose per-request logging")
 	noBrowser := flag.Bool("no-browser", false, "do not auto-open browser on startup")
+	configURL := flag.String("config", "", "upstream config URL (empty for default remote)")
 	flag.Parse()
 
 	// Per-request logging switch: silent by default in remote deployment, enable with -v for troubleshooting
@@ -29,6 +30,7 @@ func main() {
 	srv, err := echproxy.NewServer(echproxy.ServerOptions{
 		Addr:        *addr,
 		HTTPMode:    *httpMode,
+		ConfigURL:   *configURL,
 		BootstrapIP: os.Getenv("LOCALIP"),
 		IPMode:      os.Getenv("IP_MODE"),
 	})

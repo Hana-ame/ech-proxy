@@ -134,6 +134,33 @@
             "host": "south-plus.org",
             "describe": "South Plus Forum",
             "display": false
+        },
+        "pixiv.l.moonchan.xyz": {
+            "host": "www.pixiv.net",
+            "describe": "Pixiv 插画站（支持通配子域名）",
+            "display": false,
+            "wildcard": {
+                "prefix": "pixiv-",
+                "entry_suffix": ".l.moonchan.xyz",
+                "upstream_suffix": ".pixiv.net"
+            },
+            "rewrites": {
+                "www.pixiv.net": "pixiv.l.moonchan.xyz",
+                "i.pximg.net": "pximg.l.moonchan.xyz",
+                "s.pximg.net": "pximg-s.l.moonchan.xyz"
+            }
+        },
+        "pximg.l.moonchan.xyz": {
+            "host": "i.pximg.net",
+            "referer": "https://www.pixiv.net/",
+            "describe": "Pixiv 图片 CDN",
+            "display": false
+        },
+        "pximg-s.l.moonchan.xyz": {
+            "host": "s.pximg.net",
+            "referer": "https://www.pixiv.net/",
+            "describe": "Pixiv 静态资源 CDN",
+            "display": false
         }
     },
     "blocked_hosts": [

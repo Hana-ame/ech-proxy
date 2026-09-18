@@ -1,14 +1,5 @@
 // android/app/src/main/cpp/jni_wrapper.c
 // JNI wrapper layer: Java native methods -> Go exported functions
-//
-// Go exported functions (//export):
-//   StartProxy(char* bootstrapIP) -> uint16
-//   StopProxy() -> void
-//   GetProxyPort() -> uint16
-//   IsEchReady() -> int
-//   GetLogs() -> char*
-//
-// JNI function naming rule: Java_xyz_moonchan_echproxy_MainActivity_<method>
 
 #include <jni.h>
 #include <stdlib.h>
@@ -26,10 +17,12 @@ extern void FreeCString(char* s);
 extern "C" {
 #endif
 
+// --- MainActivity native methods ---
+
 JNIEXPORT jint JNICALL
 Java_xyz_moonchan_echproxy_MainActivity_StartProxy(
     JNIEnv *env,
-    jobject thiz,
+    jclass clazz,
     jstring bootstrapIP) {
 
     const char *ipStr = NULL;
@@ -49,7 +42,7 @@ Java_xyz_moonchan_echproxy_MainActivity_StartProxy(
 JNIEXPORT void JNICALL
 Java_xyz_moonchan_echproxy_MainActivity_StopProxy(
     JNIEnv *env,
-    jobject thiz) {
+    jclass clazz) {
 
     StopProxy();
 }
@@ -57,7 +50,7 @@ Java_xyz_moonchan_echproxy_MainActivity_StopProxy(
 JNIEXPORT jint JNICALL
 Java_xyz_moonchan_echproxy_MainActivity_GetProxyPort(
     JNIEnv *env,
-    jobject thiz) {
+    jclass clazz) {
 
     uint16_t port = GetProxyPort();
     return (jint)port;
@@ -66,7 +59,7 @@ Java_xyz_moonchan_echproxy_MainActivity_GetProxyPort(
 JNIEXPORT jint JNICALL
 Java_xyz_moonchan_echproxy_MainActivity_IsEchReady(
     JNIEnv *env,
-    jobject thiz) {
+    jclass clazz) {
 
     return (jint)IsEchReady();
 }
@@ -74,7 +67,7 @@ Java_xyz_moonchan_echproxy_MainActivity_IsEchReady(
 JNIEXPORT jstring JNICALL
 Java_xyz_moonchan_echproxy_MainActivity_GetLogs(
     JNIEnv *env,
-    jobject thiz) {
+    jclass clazz) {
 
     char *logs = GetLogs();
     if (logs == NULL) {
@@ -85,6 +78,49 @@ Java_xyz_moonchan_echproxy_MainActivity_GetLogs(
     FreeCString(logs);
 
     return result;
+}
+
+// --- ProxyService native methods (forwarding aliases) ---
+
+JNIEXPORT jint JNICALL
+Java_xyz_moonchan_echproxy_ProxyService_StartProxy(
+    JNIEnv *env,
+    jclass clazz,
+    jstring bootstrapIP) {
+
+    return Java_xyz_moonchan_echproxy_MainActivity_StartProxy(env, clazz, bootstrapIP);
+}
+
+JNIEXPORT void JNICALL
+Java_xyz_moonchan_echproxy_ProxyService_StopProxy(
+    JNIEnv *env,
+    jclass clazz) {
+
+    StopProxy();
+}
+
+JNIEXPORT jint JNICALL
+Java_xyz_moonchan_echproxy_ProxyService_GetProxyPort(
+    JNIEnv *env,
+    jclass clazz) {
+
+    return (jint)GetProxyPort();
+}
+
+JNIEXPORT jint JNICALL
+Java_xyz_moonchan_echproxy_ProxyService_IsEchReady(
+    JNIEnv *env,
+    jclass clazz) {
+
+    return (jint)IsEchReady();
+}
+
+JNIEXPORT jstring JNICALL
+Java_xyz_moonchan_echproxy_ProxyService_GetLogs(
+    JNIEnv *env,
+    jclass clazz) {
+
+    return Java_xyz_moonchan_echproxy_MainActivity_GetLogs(env, clazz);
 }
 
 #ifdef __cplusplus

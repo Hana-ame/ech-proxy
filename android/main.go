@@ -7,9 +7,11 @@ import (
 	"context"
 	"log"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 	"unsafe"
 
 	"github.com/Hana-ame/ech-proxy/echproxy"
@@ -45,6 +47,12 @@ func init() {
 
 //export StartProxy
 func StartProxy(bootstrapIP *C.char) uint16 {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in StartProxy: %v\n%s", r, debug.Stack())
+		}
+	}()
+
 	proxyMu.Lock()
 	defer proxyMu.Unlock()
 
@@ -83,6 +91,12 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 
 //export StopProxy
 func StopProxy() {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in StopProxy: %v\n%s", r, debug.Stack())
+		}
+	}()
+
 	proxyMu.Lock()
 	defer proxyMu.Unlock()
 	if proxyServer != nil {
@@ -97,6 +111,12 @@ func StopProxy() {
 
 //export GetProxyPort
 func GetProxyPort() uint16 {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in GetProxyPort: %v", r)
+		}
+	}()
+
 	proxyMu.Lock()
 	defer proxyMu.Unlock()
 	if proxyServer != nil {
@@ -113,12 +133,37 @@ func IsEchReady() C.int {
 	return 0
 }
 
+func sanitizeForJNI(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if r == 0 {
+			continue
+		}
+		if r > 0xFFFF {
+			r1, r2 := utf16.EncodeRune(r)
+			b.WriteRune(r1)
+			b.WriteRune(r2)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
 //export GetLogs
 func GetLogs() *C.char {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC in GetLogs: %v", r)
+		}
+	}()
+
 	logMu.RLock()
 	defer logMu.RUnlock()
 	raw := strings.Join(logBuffer, "\n")
-	return C.CString(strings.ToValidUTF8(raw, ""))
+	clean := sanitizeForJNI(strings.ToValidUTF8(raw, ""))
+	return C.CString(clean)
 }
 
 //export FreeCString

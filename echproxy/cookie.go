@@ -155,6 +155,63 @@ func collectAliveCookiesLocked(key string, now time.Time, merged map[string]stri
 	}
 }
 
+// parseCookieString parses both standard semicolon-separated "name=val; name2=val2" format
+// and Netscape HTTP Cookie File format (tab-delimited lines).
+func parseCookieString(raw string) map[string]string {
+	result := make(map[string]string)
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return result
+	}
+
+	// Netscape / newline separated format
+	if strings.Contains(raw, "\n") {
+		for _, line := range strings.Split(raw, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.Split(line, "\t")
+			if len(parts) >= 7 {
+				name := strings.TrimSpace(parts[5])
+				val := strings.TrimSpace(parts[6])
+				if name != "" {
+					result[name] = val
+				}
+				continue
+			}
+			// Line might be "name=val"
+			if idx := strings.IndexByte(line, '='); idx > 0 {
+				name := strings.TrimSpace(line[:idx])
+				val := strings.TrimSpace(line[idx+1:])
+				val = strings.TrimRight(val, ";")
+				if name != "" {
+					result[name] = val
+				}
+			}
+		}
+		if len(result) > 0 {
+			return result
+		}
+	}
+
+	// Standard semicolon-separated format
+	for _, part := range strings.Split(raw, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if idx := strings.IndexByte(part, '='); idx > 0 {
+			name := strings.TrimSpace(part[:idx])
+			val := strings.TrimSpace(part[idx+1:])
+			if name != "" {
+				result[name] = val
+			}
+		}
+	}
+	return result
+}
+
 // applyCookies performs a four-way merge among parent domain cookies, CookieJar for host,
 // the current client request cookies, and local fixed/file cookies, writing them into the outgoing request.
 func applyCookies(host string, req *http.Request, fixedCookie string) {
@@ -178,17 +235,8 @@ func applyCookies(host string, req *http.Request, fixedCookie string) {
 
 	// Merge fixed/local file cookies specified in config (highest priority, overrides previous same-named items)
 	if fixedCookie != "" {
-		// Attempt to parse as "name=val; name2=val2"
-		parts := strings.Split(fixedCookie, ";")
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			idx := strings.IndexByte(part, '=')
-			if idx > 0 {
-				merged[part[:idx]] = part[idx+1:]
-			}
+		for name, val := range parseCookieString(fixedCookie) {
+			merged[name] = val
 		}
 	}
 

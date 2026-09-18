@@ -2,6 +2,7 @@ package echproxy
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -289,6 +290,9 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 		rewriteSetCookieDomains(c.Writer.Header(), cookieDomain, c.Request.TLS == nil)
 		ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)
+		if fixedCookie := getFixedCookie(uc); fixedCookie != "" {
+			seedFixedCookiesToBrowser(c, cookieDomain, fixedCookie)
+		}
 		if rewriter != nil {
 			port := ""
 			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
@@ -315,4 +319,39 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		rewriteAndSendBody(c, uc, resp, rewriter, rc, clientIP, rawPath)
 	}
 }
+
+// seedFixedCookiesToBrowser sets Set-Cookie headers for fixed cookies configured on the upstream
+// if the client's request did not already provide them, ensuring browser-side JavaScript and
+// future navigation requests carry them under the shared cookie domain.
+func seedFixedCookiesToBrowser(c *gin.Context, cookieDomain, fixedCookie string) {
+	if cookieDomain == "" {
+		cookieDomain = c.Request.Host
+	}
+	if h, _, err := net.SplitHostPort(cookieDomain); err == nil {
+		cookieDomain = h
+	}
+
+	fixedMap := parseCookieString(fixedCookie)
+	if len(fixedMap) == 0 {
+		return
+	}
+
+	clientCookies := map[string]bool{}
+	for _, ck := range c.Request.Cookies() {
+		clientCookies[ck.Name] = true
+	}
+
+	secure := "; Secure"
+	if c.Request.TLS == nil && c.Request.Header.Get("X-Forwarded-Proto") != "https" {
+		secure = ""
+	}
+
+	for name, val := range fixedMap {
+		if !clientCookies[name] {
+			c.Writer.Header().Add("Set-Cookie", fmt.Sprintf("%s=%s; Domain=%s; Path=/; Max-Age=2592000; SameSite=Lax%s",
+				name, val, cookieDomain, secure))
+		}
+	}
+}
+
 

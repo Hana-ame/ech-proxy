@@ -912,3 +912,69 @@ func TestUpstreamIPModeConfiguration(t *testing.T) {
 	}
 }
 
+func TestNetscapeCookieParsingAndBrowserSeeding(t *testing.T) {
+	netscape := `# Netscape HTTP Cookie File
+www.pixiv.net	FALSE	/	TRUE	1824283823	first_visit_datetime_pc	2026-09-18%2018%3A30%3A41
+.pixiv.net	TRUE	/	TRUE	1792315846	PHPSESSID	69100606_testsession
+.pixiv.net	TRUE	/	TRUE	1792315845	device_token	testtoken123
+`
+	parsed := parseCookieString(netscape)
+	if parsed["PHPSESSID"] != "69100606_testsession" {
+		t.Errorf("expected PHPSESSID=69100606_testsession, got: %s", parsed["PHPSESSID"])
+	}
+	if parsed["device_token"] != "testtoken123" {
+		t.Errorf("expected device_token=testtoken123, got: %s", parsed["device_token"])
+	}
+	if parsed["first_visit_datetime_pc"] != "2026-09-18%2018%3A30%3A41" {
+		t.Errorf("expected first_visit_datetime_pc parsed, got: %s", parsed["first_visit_datetime_pc"])
+	}
+
+	// Test applyCookies with Netscape format
+	req, _ := http.NewRequest(http.MethodGet, "https://www.pixiv.net/", nil)
+	applyCookies("www.pixiv.net", req, netscape)
+	cHeader := req.Header.Get("Cookie")
+	if !strings.Contains(cHeader, "PHPSESSID=69100606_testsession") || !strings.Contains(cHeader, "device_token=testtoken123") {
+		t.Errorf("expected outgoing Cookie header to contain credentials, got: %s", cHeader)
+	}
+
+	// Test seedFixedCookiesToBrowser
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodGet, "/", nil)
+	c.Request.Host = "pixiv.l.moonchan.xyz:8443"
+
+	seedFixedCookiesToBrowser(c, "l.moonchan.xyz", "PHPSESSID=69100606_testsession; device_token=testtoken123")
+	setCookies := w.Header().Values("Set-Cookie")
+	if len(setCookies) < 2 {
+		t.Fatalf("expected at least 2 Set-Cookie headers seeded, got: %d", len(setCookies))
+	}
+	foundPHP := false
+	for _, sc := range setCookies {
+		if strings.Contains(sc, "PHPSESSID=69100606_testsession") && strings.Contains(sc, "Domain=l.moonchan.xyz") {
+			foundPHP = true
+		}
+	}
+	if !foundPHP {
+		t.Errorf("expected Set-Cookie to contain PHPSESSID with Domain=l.moonchan.xyz, got: %v", setCookies)
+	}
+
+	// Verify upstream.json has cookies configured
+	data, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
+	if err != nil {
+		t.Fatalf("read upstream.json failed: %v", err)
+	}
+	cfg, err := ParseConfig(data)
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+	pixiv := cfg.Upstreams["pixiv.l.moonchan.xyz"]
+	if !strings.Contains(pixiv.Cookie, "PHPSESSID=69100606_X2lzRcts9irxNWVoxrN4Gw4Gdn6G0F2G") {
+		t.Errorf("expected pixiv.Cookie to contain configured PHPSESSID")
+	}
+	if pixiv.Wildcard == nil || !strings.Contains(pixiv.Wildcard.Cookie, "PHPSESSID=69100606_X2lzRcts9irxNWVoxrN4Gw4Gdn6G0F2G") {
+		t.Errorf("expected pixiv wildcard to inherit or contain configured PHPSESSID")
+	}
+}
+
+

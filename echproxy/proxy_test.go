@@ -165,6 +165,9 @@ func TestUpstreamOrderAndBanner(t *testing.T) {
 		"asmr-api-300.l.moonchan.xyz",
 		"f95.l.moonchan.xyz",
 		"south.l.moonchan.xyz",
+		"pixiv.l.moonchan.xyz",
+		"pximg.l.moonchan.xyz",
+		"pximg-s.l.moonchan.xyz",
 	}
 
 	if len(cfg.UpstreamOrder) != len(expectedOrder) {

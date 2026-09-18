@@ -270,7 +270,11 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 
 		// --- Step 4: Prepare response headers ---
 		copyHeaders(c.Writer.Header(), resp.Header)
-		rewriteSetCookieDomains(c.Writer.Header(), host, c.Request.TLS == nil)
+		cookieDomain := uc.CookieDomain
+		if cookieDomain == "" {
+			cookieDomain = host
+		}
+		rewriteSetCookieDomains(c.Writer.Header(), cookieDomain, c.Request.TLS == nil)
 		ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)
 
 		// --- Step 5: SW fallback injection ---

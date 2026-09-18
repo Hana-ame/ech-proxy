@@ -139,10 +139,12 @@
             "host": "www.pixiv.net",
             "describe": "Pixiv 插画站（支持通配子域名）",
             "display": false,
+            "cookie_domain": "l.moonchan.xyz",
             "wildcard": {
                 "prefix": "pixiv-",
                 "entry_suffix": ".l.moonchan.xyz",
-                "upstream_suffix": ".pixiv.net"
+                "upstream_suffix": ".pixiv.net",
+                "cookie_domain": "l.moonchan.xyz"
             },
             "rewrites": {
                 "www.pixiv.net": "pixiv.l.moonchan.xyz",

@@ -723,5 +723,66 @@ func TestSWProxyMapAndRewritesCooperation(t *testing.T) {
 	}
 }
 
+func TestCrossSubdomainCookieSharingAndCookieDomain(t *testing.T) {
+	// 1. Test server-side domain cookie sharing:
+	// Upstream "accounts.pixiv.net" sends a Set-Cookie with Domain=.pixiv.net
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Add("Set-Cookie", "PHPSESSID=session_shared_999; Domain=.pixiv.net; Path=/; HttpOnly")
+	resp.Header.Add("Set-Cookie", "local_pref=1; Path=/") // host-only cookie
+	saveCookies("accounts.pixiv.net", resp)
+
+	// Outgoing request to "www.pixiv.net" should receive PHPSESSID via parent domain ".pixiv.net"
+	reqWWW, _ := http.NewRequest(http.MethodGet, "https://www.pixiv.net/", nil)
+	applyCookies("www.pixiv.net", reqWWW, "")
+	cookieWWW := reqWWW.Header.Get("Cookie")
+	if !strings.Contains(cookieWWW, "PHPSESSID=session_shared_999") {
+		t.Errorf("expected PHPSESSID in www.pixiv.net Cookie, got: %s", cookieWWW)
+	}
+	// "local_pref" was host-only for accounts.pixiv.net, should NOT leak to www.pixiv.net
+	if strings.Contains(cookieWWW, "local_pref=1") {
+		t.Errorf("host-only cookie local_pref leaked to www.pixiv.net: %s", cookieWWW)
+	}
+
+	// 2. Test rewriteSetCookieDomains with custom CookieDomain:
+	h := http.Header{}
+	h.Add("Set-Cookie", "PHPSESSID=session_shared_999; Domain=.pixiv.net; Path=/; Secure")
+	h.Add("Set-Cookie", "theme=dark; Path=/")
+
+	// When cookieDomain is "l.moonchan.xyz", domain-scoped cookie should be rewritten to l.moonchan.xyz
+	rewriteSetCookieDomains(h, "l.moonchan.xyz", false)
+	scs := h.Values("Set-Cookie")
+	if len(scs) != 2 {
+		t.Fatalf("expected 2 Set-Cookie headers, got %d", len(scs))
+	}
+	if !strings.Contains(scs[0], "Domain=l.moonchan.xyz") {
+		t.Errorf("expected Domain=l.moonchan.xyz, got: %s", scs[0])
+	}
+	// Host-only cookie without Domain attribute should NOT have Domain added
+	if strings.Contains(scs[1], "Domain=") {
+		t.Errorf("host-only cookie should not have Domain attribute, got: %s", scs[1])
+	}
+
+	// 3. Test wildcard CookieDomain inheritance:
+	cfg := UpstreamMap{
+		"pixiv.l.moonchan.xyz": UpstreamConfig{
+			Host:         "www.pixiv.net",
+			CookieDomain: "l.moonchan.xyz",
+			Wildcard: &WildcardRule{
+				Prefix:         "pixiv-",
+				EntrySuffix:    ".l.moonchan.xyz",
+				UpstreamSuffix: ".pixiv.net",
+			},
+		},
+	}
+	uc, ok := MatchWildcardForTest(cfg, "pixiv-accounts.l.moonchan.xyz")
+	if !ok {
+		t.Fatalf("expected wildcard match for pixiv-accounts")
+	}
+	if uc.CookieDomain != "l.moonchan.xyz" {
+		t.Errorf("expected inherited CookieDomain=l.moonchan.xyz, got: %s", uc.CookieDomain)
+	}
+}
+
+
 
 

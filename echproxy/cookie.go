@@ -13,6 +13,33 @@ var (
 	cookieJar = map[string][]*http.Cookie{}
 )
 
+// parentDomains returns domain suffixes of host that contain at least one dot,
+// e.g., "accounts.pixiv.net" -> [".pixiv.net"], "a.b.example.com" -> [".b.example.com", ".example.com"].
+func parentDomains(host string) []string {
+	var domains []string
+	parts := strings.Split(host, ".")
+	for i := 1; i < len(parts)-1; i++ {
+		domains = append(domains, "."+strings.Join(parts[i:], "."))
+	}
+	return domains
+}
+
+func saveOneCookieLocked(key string, c *http.Cookie, now time.Time) {
+	jar := cookieJar[key]
+	keep := make(map[string]*http.Cookie, len(jar)+1)
+	for _, existing := range jar {
+		if isCookieAlive(existing, now) {
+			keep[existing.Name] = existing
+		}
+	}
+	keep[c.Name] = c
+	jar = jar[:0]
+	for _, cookie := range keep {
+		jar = append(jar, cookie)
+	}
+	cookieJar[key] = jar
+}
+
 // saveClientCookies saves all cookies carried by the client request (including values written by browser-side JS document.cookie)
 // into the in-memory CookieJar for the corresponding host, preventing newly generated credentials from being lost.
 func saveClientCookies(host string, req *http.Request) {
@@ -23,14 +50,7 @@ func saveClientCookies(host string, req *http.Request) {
 	cookieMu.Lock()
 	defer cookieMu.Unlock()
 
-	jar := cookieJar[host]
-	keep := make(map[string]*http.Cookie, len(jar)+len(cookies))
 	now := time.Now()
-	for _, c := range jar {
-		if isCookieAlive(c, now) {
-			keep[c.Name] = c
-		}
-	}
 	for _, c := range cookies {
 		if c.Name == "" {
 			continue
@@ -39,16 +59,13 @@ func saveClientCookies(host string, req *http.Request) {
 		if c.Expires.IsZero() && c.MaxAge <= 0 {
 			c.Expires = now.Add(30 * 24 * time.Hour)
 		}
-		keep[c.Name] = c
+		saveOneCookieLocked(host, c, now)
 	}
-	jar = jar[:0]
-	for _, c := range keep {
-		jar = append(jar, c)
-	}
-	cookieJar[host] = jar
 }
 
-// saveCookies saves Set-Cookie headers from upstream responses into the CookieJar
+// saveCookies saves Set-Cookie headers from upstream responses into the CookieJar.
+// If a cookie specifies a Domain attribute (e.g. Domain=.pixiv.net), it is stored under the domain key
+// so that all subdomains sharing that parent domain can access it.
 func saveCookies(host string, resp *http.Response) {
 	sc := resp.Header.Values("Set-Cookie")
 	if len(sc) == 0 {
@@ -57,15 +74,7 @@ func saveCookies(host string, resp *http.Response) {
 	cookieMu.Lock()
 	defer cookieMu.Unlock()
 
-	jar := cookieJar[host]
-	keep := make(map[string]*http.Cookie, len(jar)+len(sc))
 	now := time.Now()
-	for _, c := range jar {
-		if !isCookieAlive(c, now) {
-			continue
-		}
-		keep[c.Name] = c
-	}
 	for _, s := range sc {
 		c, err := http.ParseSetCookie(s)
 		if err != nil {
@@ -77,17 +86,15 @@ func saveCookies(host string, resp *http.Response) {
 		if !isCookieAlive(c, now) {
 			continue
 		}
-		keep[c.Name] = c
+		key := host
+		if c.Domain != "" {
+			d := strings.TrimPrefix(c.Domain, ".")
+			if strings.Contains(d, ".") {
+				key = "." + d
+			}
+		}
+		saveOneCookieLocked(key, c, now)
 	}
-	if len(keep) == 0 {
-		delete(cookieJar, host)
-		return
-	}
-	jar = jar[:0]
-	for _, c := range keep {
-		jar = append(jar, c)
-	}
-	cookieJar[host] = jar
 }
 
 func isCookieAlive(c *http.Cookie, now time.Time) bool {
@@ -128,14 +135,13 @@ func getFixedCookie(uc UpstreamConfig) string {
 	return cookieVal
 }
 
-// applyCookies performs a three-way merge among CookieJar (upstream Set-Cookie + client JS cookies),
-// the current client request cookies, and local fixed/file cookies, writing them into the outgoing request.
-func applyCookies(host string, req *http.Request, fixedCookie string) {
-	cookieMu.Lock()
-	now := time.Now()
-	merged := map[string]string{}
-	alive := cookieJar[host][:0]
-	for _, c := range cookieJar[host] {
+func collectAliveCookiesLocked(key string, now time.Time, merged map[string]string) {
+	jar, ok := cookieJar[key]
+	if !ok {
+		return
+	}
+	alive := jar[:0]
+	for _, c := range jar {
 		if !isCookieAlive(c, now) {
 			continue
 		}
@@ -143,10 +149,26 @@ func applyCookies(host string, req *http.Request, fixedCookie string) {
 		merged[c.Name] = c.Value
 	}
 	if len(alive) == 0 {
-		delete(cookieJar, host)
+		delete(cookieJar, key)
 	} else {
-		cookieJar[host] = alive
+		cookieJar[key] = alive
 	}
+}
+
+// applyCookies performs a four-way merge among parent domain cookies, CookieJar for host,
+// the current client request cookies, and local fixed/file cookies, writing them into the outgoing request.
+func applyCookies(host string, req *http.Request, fixedCookie string) {
+	cookieMu.Lock()
+	now := time.Now()
+	merged := map[string]string{}
+
+	// 1. Merge domain-level cookies from parent domains of host (e.g. ".pixiv.net" for "www.pixiv.net")
+	for _, d := range parentDomains(host) {
+		collectAliveCookiesLocked(d, now, merged)
+	}
+
+	// 2. Merge host-specific cookies (e.g. "www.pixiv.net" overrides ".pixiv.net")
+	collectAliveCookiesLocked(host, now, merged)
 	cookieMu.Unlock()
 
 	// Merge cookies from current request (if already in Jar, current latest request takes priority)

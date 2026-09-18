@@ -70,20 +70,22 @@ var (
 )
 
 // rewriteSetCookieDomains normalizes Set-Cookie headers in the response so browsers store them properly:
-//  1. Upstream domain (e.g., Domain=.dlsite.com) -> rewritten to current proxy domain (dlsite.l.moonchan.xyz),
-//     otherwise the browser rejects cookies due to domain mismatch -> frontend JS cannot read them -> popup loop.
+//  1. Upstream domain (e.g., Domain=.dlsite.com) -> rewritten to current proxy domain or shared cookie domain
+//     (e.g., dlsite.l.moonchan.xyz or l.moonchan.xyz), otherwise the browser rejects cookies due to domain mismatch
+//     -> frontend JS cannot read them -> popup loop.
 //  2. Secure flag: upstream HTTPS sends Secure cookie, but if proxy runs in HTTP mode,
 //     the browser will not store it (Secure cookies can only be sent over HTTPS), so it must be removed.
-func rewriteSetCookieDomains(h http.Header, proxyHost string, httpMode bool) {
+func rewriteSetCookieDomains(h http.Header, cookieDomain string, httpMode bool) {
 	scs := h.Values("Set-Cookie")
 	if len(scs) == 0 {
 		return
 	}
 	h.Del("Set-Cookie")
-	domain := proxyHost
-	if hh, _, err := net.SplitHostPort(proxyHost); err == nil {
+	domain := cookieDomain
+	if hh, _, err := net.SplitHostPort(cookieDomain); err == nil {
 		domain = hh
 	}
+	domain = strings.TrimPrefix(domain, ".")
 	hasDomain := setCookieHasDomainRE
 	replaceDomain := setCookieReplaceRE
 	secureRE := setCookieSecureRE

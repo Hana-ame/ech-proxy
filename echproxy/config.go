@@ -130,6 +130,7 @@ type WildcardRule struct {
 	ResponseHeaders map[string]HeaderRule `json:"response_headers,omitempty"` // Custom response header override/replace/delete
 	Cookie          string                `json:"cookie,omitempty"`
 	CookieFile      string                `json:"cookie_file,omitempty"`
+	CookieDomain    string                `json:"cookie_domain,omitempty"` // Shared cookie domain (e.g. "l.moonchan.xyz")
 	Mode            string                `json:"mode,omitempty"`
 	SWInject        bool                  `json:"sw_inject,omitempty"`
 	Rewrites        map[string]string     `json:"rewrites,omitempty"`
@@ -181,6 +182,7 @@ type UpstreamConfig struct {
 	ResponseHeaders map[string]HeaderRule `json:"response_headers,omitempty"` // Generic response headers (to client: override/inject/delete)
 	Cookie          string                `json:"cookie,omitempty"`           // Fixed cookie string or local file path
 	CookieFile      string                `json:"cookie_file,omitempty"`      // Local cookie file path
+	CookieDomain    string                `json:"cookie_domain,omitempty"`   // Scoped domain for rewritten Set-Cookie (e.g. "l.moonchan.xyz")
 	SWInject        bool                  `json:"sw_inject,omitempty"`
 	Mode            string                `json:"mode,omitempty"`
 	Rewrites        map[string]string     `json:"rewrites,omitempty"`

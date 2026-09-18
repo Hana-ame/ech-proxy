@@ -36,6 +36,21 @@ GOOS=android GOARCH=arm64 CC=aarch64-linux-android21-clang \
 Upstream configurations reside in `certs/l.moonchan.xyz/upstream.json` and are dynamically fetched at runtime from the GitHub `main` branch (forwarded via `proxy.moonchan.xyz` to `raw.githubusercontent.com`).
 Changes pushed to the `main` branch immediately affect running proxies without pinning to specific commits/tags.
 
+### Runtime Options: CLI Flags (Desktop) and Environment Variables (Desktop / Android)
+
+Both set the same two fields of `echproxy.ServerOptions`. The flags live in `win/main.go`; the env vars are the flags' defaults, so a flag always wins when both are given. Android has no CLI, so `android/main.go` reads the env vars only.
+
+| Meaning | CLI flag (desktop) | Env var | Default |
+| :--- | :--- | :--- | :--- |
+| Upstream egress IP family | `-ip-mode v4` | `IP_MODE=v4` | *(unset)* = `auto` |
+| DoH bootstrap IP | `-local-ip 1.1.1.1` | `LOCALIP=1.1.1.1` | *(unset)* |
+
+**`-ip-mode` / `IP_MODE`.** `v4` or `v6` forces the IP family of the **upstream egress** dial; unset = `auto`, where the shell hostname (`cloudflare-ech.com`) is handed to the OS resolver and the OS picks the family.
+
+**Being unset is a live trap.** In `auto` the egress family is silently OS-decided. Observed 2026-09-18: an instance egressing over IPv6 received a static **403 "Access blocked"** from `www.pixiv.net`, while the same build over IPv4 received **200** — `www.pixiv.net` publishes no AAAA record, but the ECH shell domain `cloudflare-ech.com` does (`2606:4700::6812:a76` / `2606:4700::6812:b76`), so the TCP leg follows whatever family the OS resolves. Easy to miss because other upstreams on the same IPv6 egress (`archiveofourown.org`, `f95zone.to`, `i.pximg.net`) all returned 200. Fix: `-ip-mode v4`.
+
+To confirm which family an instance is actually using: with no `-ip-mode`, the first upstream dial logs `Upstream egress: IPv4 via <addr> (IP_MODE unset, family chosen by the OS)`; and `https://<entry>.l.moonchan.xyz:8443/cdn-cgi/trace` reports the egress address in `ip=` and the attributed country in `loc=`.
+
 ### Core Mechanisms: `rewrites` vs `body_replace` vs `sw_inject`
 
 To prevent configuration ambiguity, response rewriting and Service Worker responsibilities are partitioned as follows:

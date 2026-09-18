@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -298,13 +299,32 @@ func resolvePreferredIP(ctx context.Context, host string) (string, error) {
 	return "", fmt.Errorf("no %s address for %s", ipMode, host)
 }
 
+// egressFamilyOnce logs the IP family the OS actually resolves for the upstream dial when IP_MODE
+// is unset, so the egress family is observable instead of silently OS-decided.
+var egressFamilyOnce sync.Once
+
 // dialTCP dials according to ipMode preference. When ipMode is empty (automatic), it uses netdial
 // fixed public DNS resolution; otherwise connects directly to the preferred IP. Environments without
 // resolv.conf like Termux must use netdial, as bare net.Dialer defaults to failing at [::1]:53.
 func dialTCP(ctx context.Context, host, port string, timeout time.Duration) (net.Conn, error) {
 	dialer := &net.Dialer{Timeout: timeout}
 	if currentConfig().ipMode == "" {
-		return netdial.Dialer().DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+		conn, err := netdial.Dialer().DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+		if err != nil {
+			return nil, err
+		}
+		if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+			family := "IPv6"
+			if addr.IP.To4() != nil {
+				family = "IPv4"
+			}
+			egressFamilyOnce.Do(func() {
+				log.Printf("Upstream egress: %s via %s (IP_MODE unset, family chosen by the OS). "+
+					"Some upstreams reject IPv6 sources (e.g. pixiv returns a static 403 'Access blocked'); "+
+					"set IP_MODE=v4 to pin the family.", family, addr)
+			})
+		}
+		return conn, nil
 	}
 	ip, err := resolvePreferredIP(ctx, host)
 	if err != nil {
@@ -313,8 +333,10 @@ func dialTCP(ctx context.Context, host, port string, timeout time.Duration) (net
 	return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
 }
 
-// CheckDualStack detects local IPv4/IPv6 connectivity.
-// Uses netdial resolver (public DNS): net.DefaultResolver is unusable on Termux.
+// CheckDualStack reports whether the probe hostname publishes A / AAAA records. It does NOT probe
+// the local network stack, so its result is identical on every machine — it only says "what
+// families could we possibly dial". The family actually used for the upstream egress is logged by
+// dialTCP. Uses netdial resolver (public DNS): net.DefaultResolver is unusable on Termux.
 func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
 	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, "moonchan.xyz")
 	if err != nil {

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
+	"github.com/gin-gonic/gin"
 )
 
 // DefaultUpstreamConfigURL is the default remote upstream configuration address (global single source of truth).
@@ -60,15 +60,18 @@ func InitECH(bootstrapIP, ipMode string) error {
 		cloudflare_ech.SetIPMode(ipMode)
 	}
 
+	// CheckDualStack reports the probe hostname's published record families, not the local stack,
+	// so this line cannot tell you which family the upstream egress will use. dialTCP logs the
+	// actual egress address instead (see ech/client.go).
 	v4ok, v6ok := cloudflare_ech.CheckDualStack(context.Background())
 	if v4ok || v6ok {
 		suffix := ""
 		if ipMode != "" {
 			suffix = " (forced " + ipMode + ")"
 		}
-		log.Printf("IP stack check: IPv4=%v IPv6=%v%s", v4ok, v6ok, suffix)
+		log.Printf("Upstream DNS records (moonchan.xyz): A=%v AAAA=%v%s", v4ok, v6ok, suffix)
 	} else {
-		log.Printf("IP stack check failed (DNS unreachable)")
+		log.Printf("Upstream DNS probe failed (DNS unreachable)")
 	}
 
 	log.Printf("Initializing ECH client...")
@@ -245,6 +248,11 @@ func (s *Server) PrintBanner(localIP string) {
 	fmt.Printf("  Listening: %s\n", s.Options.Addr)
 	if localIP != "" {
 		fmt.Printf("  DoH IP: %s\n", localIP)
+	}
+	if s.Options.IPMode != "" {
+		fmt.Printf("  IP Mode: %s (upstream egress family pinned)\n", s.Options.IPMode)
+	} else {
+		fmt.Printf("  IP Mode: auto (upstream egress family OS-decided)\n")
 	}
 
 	upstreamCfg := s.Config.Upstreams

@@ -22,6 +22,10 @@ func main() {
 	verbose := flag.Bool("v", false, "verbose per-request logging")
 	noBrowser := flag.Bool("no-browser", false, "do not auto-open browser on startup")
 	configURL := flag.String("config", "", "upstream config URL (empty for default remote)")
+	ipMode := flag.String("ip-mode", os.Getenv("IP_MODE"),
+		"force upstream egress IP family: v4 or v6; empty lets the OS decide")
+	localIP := flag.String("local-ip", os.Getenv("LOCALIP"),
+		"DoH bootstrap IP; empty bootstraps through the hostname")
 	flag.Parse()
 
 	// Per-request logging switch: silent by default in remote deployment, enable with -v for troubleshooting
@@ -31,14 +35,14 @@ func main() {
 		Addr:        *addr,
 		HTTPMode:    *httpMode,
 		ConfigURL:   *configURL,
-		BootstrapIP: os.Getenv("LOCALIP"),
-		IPMode:      os.Getenv("IP_MODE"),
+		BootstrapIP: *localIP,
+		IPMode:      *ipMode,
 	})
 	if err != nil {
 		log.Fatalf("Proxy server initialization failed: %v", err)
 	}
 
-	srv.PrintBanner(os.Getenv("LOCALIP"))
+	srv.PrintBanner(*localIP)
 
 	// Automatically open browser to entry list once listening successfully (PC usage)
 	if !*noBrowser {

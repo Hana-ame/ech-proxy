@@ -138,6 +138,9 @@ func Client(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:   timeout,
 		Transport: Transport(),
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 }
 

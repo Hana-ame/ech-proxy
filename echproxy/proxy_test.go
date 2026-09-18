@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	"github.com/gin-gonic/gin"
 )
 
@@ -829,7 +830,53 @@ func TestPreserveEncodedPathSlash(t *testing.T) {
 	}
 }
 
+func TestNoFollowRedirectAndRewriteLocation(t *testing.T) {
+	// Upstream test server returning 302
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login.php" {
+			http.Redirect(w, r, "https://accounts.pixiv.net/login?return_to=https%3A%2F%2Fwww.pixiv.net%2F&lang=ja", http.StatusFound)
+			return
+		}
+		w.WriteHeader(200)
+		w.Write([]byte("should not reach here automatically"))
+	}))
+	defer ts.Close()
 
+	netdial.Transport().TLSClientConfig.RootCAs.AddCert(ts.Certificate())
 
+	u, _ := url.Parse(ts.URL)
+	cfg := UpstreamMap{
+		"pixiv.l.moonchan.xyz": {
+			Host: u.Host,
+			Mode: "direct",
+			Wildcard: &WildcardRule{
+				Prefix:         "pixiv-",
+				EntrySuffix:    ".l.moonchan.xyz",
+				UpstreamSuffix: ".pixiv.net",
+			},
+			Rewrites: map[string]string{
+				"www.pixiv.net": "pixiv.l.moonchan.xyz",
+			},
+		},
+	}
 
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(ProxyHandler(cfg, nil))
 
+	req := httptest.NewRequest(http.MethodGet, "/login.php?return_to=%2F", nil)
+	req.Host = "pixiv.l.moonchan.xyz:8443"
+	w := httptest.NewRecorder()
+
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected proxy to return 302 Found, got %d", w.Code)
+	}
+
+	loc := w.Header().Get("Location")
+	expectedLoc := "https://pixiv-accounts.l.moonchan.xyz:8443/login?return_to=https%3A%2F%2Fpixiv.l.moonchan.xyz:8443%2F&lang=ja"
+	if loc != expectedLoc {
+		t.Errorf("expected rewritten Location:\n  %s\ngot:\n  %s", expectedLoc, loc)
+	}
+}

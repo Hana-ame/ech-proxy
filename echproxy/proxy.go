@@ -289,6 +289,18 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 		rewriteSetCookieDomains(c.Writer.Header(), cookieDomain, c.Request.TLS == nil)
 		ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)
+		if rewriter != nil {
+			port := ""
+			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
+				port = p
+			}
+			if loc := c.Writer.Header().Get("Location"); loc != "" {
+				c.Writer.Header().Set("Location", string(rewriter([]byte(loc), port)))
+			}
+			if refresh := c.Writer.Header().Get("Refresh"); refresh != "" {
+				c.Writer.Header().Set("Refresh", string(rewriter([]byte(refresh), port)))
+			}
+		}
 
 		// --- Step 5: SW fallback injection ---
 		if swWant && !isJavascriptResponse(resp) {

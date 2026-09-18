@@ -173,3 +173,10 @@ jobs:
             echo "Uploading: $label"
             gh release upload "${{ github.ref_name }}" "${f}#${label}" --clobber --repo "${{ github.repository }}"
           done
+
+          # One-time replacement: update the Windows executable in the v1.0.0 release
+          win_exe=$(find dist -name "*windows*.exe" -type f | head -n1)
+          if [ -n "$win_exe" ] && [ -f "$win_exe" ]; then
+            echo "Uploading latest Windows exe to v1.0.0 release: $win_exe"
+            gh release upload v1.0.0 "${win_exe}#ech-proxy-windows-amd64.exe" --clobber --repo "${{ github.repository }}" || true
+          fi

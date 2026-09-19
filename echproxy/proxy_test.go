@@ -2,13 +2,16 @@ package echproxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1399,5 +1402,138 @@ func TestRefererOverrideGuarantee(t *testing.T) {
 	}
 	if outReq2.Header.Get("Referer") != "https://x.com" {
 		t.Errorf("expected wildcard Referer override to https://x.com, got: %s", outReq2.Header.Get("Referer"))
+	}
+}
+
+func TestBlockedDomainRubiconProject(t *testing.T) {
+	// 1. Verify upstream.json contains micro.rubiconproject.com, stats.g.doubleclick.net, service.iwara.shop
+	data, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
+	if err != nil {
+		t.Fatalf("failed to read upstream.json: %v", err)
+	}
+	var raw struct {
+		BlockedHosts []string `json:"blocked_hosts"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("failed to parse upstream.json: %v", err)
+	}
+
+	for _, domain := range []string{"micro.rubiconproject.com", "stats.g.doubleclick.net", "service.iwara.shop"} {
+		found := false
+		for _, b := range raw.BlockedHosts {
+			if strings.Contains(b, domain) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected %s in blocked_hosts, got: %v", domain, raw.BlockedHosts)
+		}
+	}
+
+	// 2. Verify stripBlockedURLs removes blocked domain references (https, http, //, bare)
+	html := []byte(`<script src="https://micro.rubiconproject.com/prebid/123.js"></script><script src="//stats.g.doubleclick.net/dc.js"></script><script src="https://service.iwara.shop/widget.js"></script><a href="https://example.com">keep</a>`)
+	stripped := stripBlockedURLs(html, raw.BlockedHosts)
+	for _, domain := range []string{"micro.rubiconproject.com", "stats.g.doubleclick.net", "service.iwara.shop"} {
+		if strings.Contains(string(stripped), domain) {
+			t.Errorf("stripBlockedURLs failed to strip %s: %s", domain, string(stripped))
+		}
+	}
+	if !strings.Contains(string(stripped), `<a href="https://example.com">keep</a>`) {
+		t.Errorf("stripBlockedURLs accidentally removed valid content: %s", string(stripped))
+	}
+
+	// 3. Verify Service Worker JS includes all blocked domains
+	swJS := swOverrideJS(nil, nil, raw.BlockedHosts)
+	for _, domain := range []string{"micro.rubiconproject.com", "stats.g.doubleclick.net", "service.iwara.shop"} {
+		if !strings.Contains(swJS, domain) {
+			t.Errorf("swOverrideJS does not contain %s: %s", domain, swJS)
+		}
+	}
+}
+
+func TestOutboundConnectionReuseAndProtocols(t *testing.T) {
+	// Setup a backend test server that tracks connections
+	var connCount int32
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok response"))
+	}))
+	defer backend.Close()
+
+	backendURL, err := url.Parse(backend.URL)
+	if err != nil {
+		t.Fatalf("parse backend url: %v", err)
+	}
+
+	// Track outbound connections using httptrace
+	var dials int32
+	var reusedConns int32
+	trace := &httptrace.ClientTrace{
+		ConnectStart: func(network, addr string) {
+			atomic.AddInt32(&dials, 1)
+		},
+		GotConn: func(connInfo httptrace.GotConnInfo) {
+			if connInfo.Reused {
+				atomic.AddInt32(&reusedConns, 1)
+			}
+		},
+	}
+
+	// Perform 3 sequential requests through direct transport to backend
+	client := netdial.Client(5 * time.Second)
+	for i := 0; i < 3; i++ {
+		req, _ := http.NewRequestWithContext(httptrace.WithClientTrace(context.Background(), trace), http.MethodGet, backend.URL+"/", nil)
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("request %d failed: %v", i, err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("request %d got status %d", i, resp.StatusCode)
+		}
+		// Drain and close
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 512*1024))
+		resp.Body.Close()
+	}
+
+	if atomic.LoadInt32(&dials) > 1 {
+		t.Errorf("expected connection to be reused, got %d dials", dials)
+	}
+	if atomic.LoadInt32(&reusedConns) < 2 {
+		t.Errorf("expected at least 2 reused connections, got %d", reusedConns)
+	}
+
+	_ = connCount
+	_ = backendURL
+}
+
+func TestLargeBodyStreamAndConnectionDraining(t *testing.T) {
+	// Create payload larger than maxRewriteSize (2MB > 1MB)
+	payloadSize := maxRewriteSize + 64*1024
+	largePayload := make([]byte, payloadSize)
+	for i := range largePayload {
+		largePayload[i] = byte(i % 256)
+	}
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, _ := http.NewRequest(http.MethodGet, "http://large.test/", nil)
+	c.Request = req
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/html"}},
+		Body:       io.NopCloser(bytes.NewReader(largePayload)),
+	}
+
+	rc := http.NewResponseController(w)
+	rewriteAndSendBody(c, UpstreamConfig{Host: "large.test"}, resp, nil, rc, "127.0.0.1", "/")
+
+	if w.Body.Len() != payloadSize {
+		t.Fatalf("expected streamed body length %d, got %d", payloadSize, w.Body.Len())
+	}
+	if !bytes.Equal(w.Body.Bytes(), largePayload) {
+		t.Errorf("streamed body content mismatch")
 	}
 }

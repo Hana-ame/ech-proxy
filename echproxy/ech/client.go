@@ -19,7 +19,6 @@ import (
 
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	utls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http2"
 )
 
 // Client is an HTTP client based on cloudflare-ech.com ECH domain fronting.
@@ -282,7 +281,7 @@ func SetIPMode(mode string) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
 	for _, c := range clients {
-		if tr, ok := c.inner.Transport.(*http2.Transport); ok {
+		if tr, ok := c.inner.Transport.(interface{ CloseIdleConnections() }); ok {
 			tr.CloseIdleConnections()
 		}
 	}
@@ -385,14 +384,52 @@ func SetDoHConfig(host, bootstrapIP string) {
 	cfgPtr.Store(&nc)
 }
 
+// UTLSConnWrapper wraps a utls.UConn to expose crypto/tls.ConnectionState
+// so that Go's standard http.Transport detects negotiated ALPN protocols (h2, http/1.1)
+// and enables transparent connection pooling and HTTP/2 multiplexing.
+type UTLSConnWrapper struct {
+	*utls.UConn
+}
+
+// ConnectionState returns crypto/tls.ConnectionState instead of utls.ConnectionState.
+func (w *UTLSConnWrapper) ConnectionState() tls.ConnectionState {
+	ucs := w.UConn.ConnectionState()
+	return tls.ConnectionState{
+		Version:                     ucs.Version,
+		HandshakeComplete:          ucs.HandshakeComplete,
+		DidResume:                  ucs.DidResume,
+		CipherSuite:                ucs.CipherSuite,
+		NegotiatedProtocol:          ucs.NegotiatedProtocol,
+		NegotiatedProtocolIsMutual:  ucs.NegotiatedProtocolIsMutual,
+		ServerName:                  ucs.ServerName,
+		PeerCertificates:            ucs.PeerCertificates,
+		VerifiedChains:              ucs.VerifiedChains,
+		SignedCertificateTimestamps: ucs.SignedCertificateTimestamps,
+		OCSPResponse:                ucs.OCSPResponse,
+		TLSUnique:                   ucs.TLSUnique,
+	}
+}
+
+// WrapUTLSConn wraps a utls.UConn into a net.Conn that returns crypto/tls.ConnectionState.
+func WrapUTLSConn(uConn *utls.UConn) net.Conn {
+	return &UTLSConnWrapper{UConn: uConn}
+}
+
 // newTransport constructs an ECH domain fronting transport using utls with HelloChrome_120
 // to impersonate a real Chrome browser TLS fingerprint. Cloudflare checks JA3/JA4 fingerprints
 // to detect non-browser clients; using crypto/tls directly exposes the Go runtime fingerprint.
 // utls v1.8.2 supports EncryptedClientHelloConfigList, so ECH encryption is preserved.
-func newTransport(echConfig []byte, ipMode string) *http2.Transport {
-	return &http2.Transport{
-		AllowHTTP: false,
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+// Supports both HTTP/2 and HTTP/1.1 with connection reuse and pooling.
+func newTransport(echConfig []byte, ipMode string) *http.Transport {
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			return dialTCP(ctx, host, port, ipMode, dialTimeout)
+		},
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
@@ -418,17 +455,17 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 					rawConn.Close()
 					return nil, herr
 				}
-				if uConn.ConnectionState().NegotiatedProtocol != "h2" {
-					rawConn.Close()
-					return nil, fmt.Errorf("upstream did not negotiate h2")
-				}
-				return uConn, nil
+				return WrapUTLSConn(uConn), nil
 			})
 			if err != nil {
 				return nil, fmt.Errorf("dial shell: %w", err)
 			}
 			return conn, nil
 		},
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        200,
+		MaxIdleConnsPerHost: 50,
+		IdleConnTimeout:     netdial.OpTimeout,
 	}
 }
 
@@ -584,7 +621,7 @@ func refreshLoop() {
 		clientsMu.Unlock()
 
 		for _, old := range oldClients {
-			if tr, ok := old.inner.Transport.(*http2.Transport); ok {
+			if tr, ok := old.inner.Transport.(interface{ CloseIdleConnections() }); ok {
 				tr.CloseIdleConnections()
 			}
 		}

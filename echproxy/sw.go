@@ -80,7 +80,10 @@ self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
 self.addEventListener('fetch', (e) => {
   try {
     const u = new URL(e.request.url);
-    if (__swBlock.some((b) => (u.hostname + u.pathname).startsWith(b))) {
+    if (__swBlock.some((b) => {
+      const bare = b.replace(/^https?:\/\//, '').replace(/^\/\//, '');
+      return u.hostname === bare || u.hostname.endsWith('.' + bare) || (u.hostname + u.pathname).startsWith(bare) || e.request.url.startsWith(b);
+    })) {
       e.respondWith(new Response('', { status: 204 }));
       return;
     }

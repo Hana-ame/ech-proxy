@@ -2,7 +2,6 @@ package echproxy
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -13,7 +12,6 @@ import (
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	utls "github.com/refraction-networking/utls"
-	"golang.org/x/net/http2"
 )
 
 const fakeSNI = "cloudflare-ech.com"
@@ -105,7 +103,7 @@ const (
 )
 
 type sniTransportEntry struct {
-	transport *http2.Transport
+	transport *http.Transport
 	lastUsed  time.Time
 }
 
@@ -115,11 +113,11 @@ var (
 	sniReaperOnce     sync.Once
 )
 
-// getSNITransport returns a cached or new http2.Transport for the given IP.
+// getSNITransport returns a cached or new *http.Transport for the given IP.
 // Evicts the oldest entry when the cache exceeds maxSNITransports, and replaces
 // stale entries older than sniTransportTTL. The background reaper goroutine
 // periodically purges expired entries.
-func getSNITransport(ip string) *http2.Transport {
+func getSNITransport(ip string) *http.Transport {
 	sniReaperOnce.Do(func() { go sniTransportReaper() })
 	sniTransportsMu.Lock()
 	defer sniTransportsMu.Unlock()
@@ -174,10 +172,10 @@ func sniTransportReaper() {
 	}
 }
 
-func newSNIFrontTransport(ip string) *http2.Transport {
-	return &http2.Transport{
-		AllowHTTP: false,
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+func newSNIFrontTransport(ip string) *http.Transport {
+	return &http.Transport{
+		DialContext: netdial.Dialer().DialContext,
+		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			rawConn, err := netdial.Dialer().DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
 			if err != nil {
 				return nil, fmt.Errorf("dial %s: %w", ip, err)
@@ -191,12 +189,12 @@ func newSNIFrontTransport(ip string) *http2.Transport {
 				rawConn.Close()
 				return nil, fmt.Errorf("TLS handshake %s: %w", ip, err)
 			}
-			if uConn.ConnectionState().NegotiatedProtocol != "h2" {
-				rawConn.Close()
-				return nil, fmt.Errorf("upstream did not negotiate h2")
-			}
-			return uConn, nil
+			return cloudflare_ech.WrapUTLSConn(uConn), nil
 		},
+		ForceAttemptHTTP2:   true,
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 20,
+		IdleConnTimeout:     netdial.OpTimeout,
 	}
 }
 

@@ -63,7 +63,17 @@ func stripBlockedURLs(body []byte, blocked []string) []byte {
 	for _, b := range blocked {
 		out = stripOneBlockedURL(out, []byte(b))
 		if strings.HasPrefix(b, "https://") {
-			out = stripOneBlockedURL(out, []byte("//"+b[len("https://"):]))
+			bare := b[len("https://"):]
+			out = stripOneBlockedURL(out, []byte("//"+bare))
+			out = stripOneBlockedURL(out, []byte("http://"+bare))
+		} else if strings.HasPrefix(b, "http://") {
+			bare := b[len("http://"):]
+			out = stripOneBlockedURL(out, []byte("//"+bare))
+			out = stripOneBlockedURL(out, []byte("https://"+bare))
+		} else {
+			out = stripOneBlockedURL(out, []byte("https://"+b))
+			out = stripOneBlockedURL(out, []byte("http://"+b))
+			out = stripOneBlockedURL(out, []byte("//"+b))
 		}
 	}
 	return out

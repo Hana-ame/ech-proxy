@@ -1,3 +1,16 @@
+## v1.1.5
+
+### Fixes & Improvements
+
+- **HTTP outbound connection reuse & keep-alive pooling** — Replaced rigid `http2.Transport` instances with Go standard library `http.Transport` instances configured with `MaxIdleConns: 200`, `MaxIdleConnsPerHost: 50`, and `IdleConnTimeout: netdial.OpTimeout`. Outbound connections to upstream servers are now properly retained and reused across consecutive requests.
+- **Full HTTP/1.1 and HTTP/2 dual-protocol compatibility** — Eliminated errors where upstream servers negotiating HTTP/1.1 (e.g. `token.sensenova.cn`) failed with `upstream did not negotiate h2`. The proxy transparently negotiates either HTTP/2 or HTTP/1.1 based on ALPN while maintaining persistent connection pooling for both protocols.
+- **UTLS connection state adapter (`UTLSConnWrapper`)** — Implemented `UTLSConnWrapper` and `WrapUTLSConn` to bridge `utls.UConn`'s `ConnectionState` to standard `crypto/tls.ConnectionState`. This allows `http.Transport` to detect negotiated ALPN protocols (`h2`, `http/1.1`) while preserving the Chrome JA3/JA4 TLS fingerprint and ECH encapsulation.
+- **Response body draining & large body streaming** — Ensured all response bodies (including SW fallback and non-2xx responses) are drained before closing, preventing TCP sockets from being prematurely terminated by the transport pool. Fixed body streaming when response sizes exceed `maxRewriteSize` by streaming remaining bytes to EOF without truncation.
+- **Blocked domain updates** — Added `micro.rubiconproject.com`, `stats.g.doubleclick.net`, and `service.iwara.shop` to `blocked_hosts` in `upstream.json`. Enhanced HTML body stripping and Service Worker request interception to handle bare domains, subdomains, and varied URL schemes.
+- **Comprehensive upstream verification** — Successfully validated all 19 upstream services in `upstream.json` across `direct`, `sni`, and `ech` egress modes, verifying 100% connectivity and connection reuse.
+
+---
+
 ## v1.1.4
 
 ### Fixes & Improvements

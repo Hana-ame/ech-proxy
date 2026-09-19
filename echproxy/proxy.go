@@ -53,6 +53,11 @@ func proxyRoundTrip(req *http.Request, mode, ipMode string) (*http.Response, err
 	}
 }
 
+// ProxyRoundTripForTest exports proxyRoundTrip for external test runners and integration checks.
+func ProxyRoundTripForTest(req *http.Request, mode, ipMode string) (*http.Response, error) {
+	return proxyRoundTrip(req, mode, ipMode)
+}
+
 // buildUpstreamRequest constructs the outgoing upstream HTTP request from the client's gin context:
 // copies and filters headers, strips proxy-tracking headers, applies declarative header rules,
 // merges cookies (jar + client + fixed), and sets the upstream Host.
@@ -120,6 +125,25 @@ func handleSWFallback(c *gin.Context, cfg UpstreamMap, blocked []string, clientI
 		clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
 }
 
+func streamRemaining(w io.Writer, r io.Reader, rc *http.ResponseController) {
+	buf := make([]byte, 32*1024)
+	for {
+		n, rerr := r.Read(buf)
+		if n > 0 {
+			setWriteDeadline(rc)
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				break
+			}
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+		if rerr != nil {
+			break
+		}
+	}
+}
+
 // rewriteAndSendBody handles the response body pipeline:
 // For text content within the size limit: decompresses, rewrites domains/URLs, optionally
 // injects the SW registration snippet, re-compresses (gzip if client accepts it), and
@@ -148,11 +172,15 @@ func rewriteAndSendBody(c *gin.Context, uc UpstreamConfig, resp *http.Response,
 			return
 		}
 		if len(body) > maxRewriteSize {
-			// Exceeds rewrite size limit; stream unmodified.
-			if len(body) > 0 {
-				setWriteDeadline(rc)
-				c.Writer.Write(body)
+			// Exceeds rewrite size limit; write the read bytes and stream the rest to EOF.
+			setWriteDeadline(rc)
+			if _, werr := c.Writer.Write(body); werr != nil {
+				return
 			}
+			if f, ok := c.Writer.(http.Flusher); ok {
+				f.Flush()
+			}
+			streamRemaining(c.Writer, resp.Body, rc)
 			return
 		}
 
@@ -195,22 +223,7 @@ func rewriteAndSendBody(c *gin.Context, uc UpstreamConfig, resp *http.Response,
 	}
 
 	// Binary / large body streaming path: copy in 32 KB chunks with per-chunk flush.
-	buf := make([]byte, 32*1024)
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			setWriteDeadline(rc)
-			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
-				break
-			}
-			if f, ok := c.Writer.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-		if rerr != nil {
-			break
-		}
-	}
+	streamRemaining(c.Writer, resp.Body, rc)
 }
 
 // ProxyHandler returns a gin.HandlerFunc that resolves the upstream for each request,
@@ -298,7 +311,11 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 			c.String(http.StatusBadGateway, "upstream: %v", err)
 			return
 		}
-		defer resp.Body.Close()
+		defer func() {
+			// Drain remaining unread body (up to 512KB) to allow underlying TCP connection reuse
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 512*1024))
+			resp.Body.Close()
+		}()
 
 		saveCookies(uc.Host, resp)
 		debugLogf("[%s] <- %s (elapsed: %v)", clientIP, resp.Status, time.Since(start))
@@ -321,6 +338,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 
 		// --- Step 5: SW fallback injection ---
 		if swWant && !isJavascriptResponse(resp) {
+			io.Copy(io.Discard, io.LimitReader(resp.Body, 512*1024))
 			handleSWFallback(c, cfg, blocked, clientIP, method, rawPath)
 			return
 		}

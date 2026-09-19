@@ -126,6 +126,7 @@ func Transport() *http.Transport {
 				RootCAs: getRootPool(),
 			},
 			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 50,
 			IdleConnTimeout:     OpTimeout,
 			ForceAttemptHTTP2:   true,
 		}

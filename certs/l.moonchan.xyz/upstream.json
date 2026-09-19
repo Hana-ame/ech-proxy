@@ -188,6 +188,9 @@
         "https://www.google.com/jsapi",
         "https://ajax.googleapis.com",
         "https://www.googletagmanager.com",
-        "https://media.dlsite.com"
+        "https://media.dlsite.com",
+        "https://micro.rubiconproject.com",
+        "https://stats.g.doubleclick.net",
+        "https://service.iwara.shop"
     ]
 }

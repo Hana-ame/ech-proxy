@@ -270,15 +270,74 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 
 		// --- Step 3: Round-trip to upstream ---
-		resp, err := proxyRoundTrip(outReq, uc.Mode, uc.IPMode)
-		if err != nil {
-			log.Printf("[%s] Upstream request failed: %v (elapsed: %v)", clientIP, err, time.Since(start))
-			c.String(http.StatusBadGateway, "upstream: %v", err)
-			return
+		// Internally handle http redirects (e.g. scheme downgrades from upstream),
+		// but do NOT follow https redirects directly (return them to browser with rewritten Location).
+		const maxHTTPRedirects = 10
+		var resp *http.Response
+		for hops := 0; ; hops++ {
+			var tripErr error
+			resp, tripErr = proxyRoundTrip(outReq, uc.Mode, uc.IPMode)
+			if tripErr != nil {
+				log.Printf("[%s] Upstream request failed: %v (elapsed: %v)", clientIP, tripErr, time.Since(start))
+				c.String(http.StatusBadGateway, "upstream: %v", tripErr)
+				return
+			}
+
+			saveCookies(uc.Host, resp)
+
+			// Only internally handle redirects if it's a 3xx response and within hop limit
+			if resp.StatusCode/100 != 3 || hops >= maxHTTPRedirects {
+				break
+			}
+
+			loc := resp.Header.Get("Location")
+			if loc == "" {
+				break
+			}
+
+			locURL, err := outReq.URL.Parse(loc)
+			if err != nil {
+				break
+			}
+
+			// "https redirect 不要直接follow": pass https redirects directly to browser
+			if locURL.Scheme == "https" {
+				break
+			}
+
+			// "http 自己处理": follow http redirects internally by upgrading to https
+			if locURL.Scheme == "http" {
+				if locURL.Host != "" && locURL.Host != uc.Host {
+					break // External host redirect, let browser handle
+				}
+				locURL.Scheme = "https"
+				debugLogf("[%s] Internally handling http redirect %d: %s -> %s", clientIP, hops+1, resp.Status, locURL.String())
+				resp.Body.Close()
+
+				nextMethod := c.Request.Method
+				if resp.StatusCode == http.StatusSeeOther || resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound {
+					nextMethod = http.MethodGet
+				}
+
+				nextReq, nerr := http.NewRequest(nextMethod, locURL.String(), nil)
+				if nerr != nil {
+					break
+				}
+				copyHeaders(nextReq.Header, c.Request.Header)
+				if nextMethod == http.MethodGet {
+					nextReq.Header.Del("Content-Length")
+					nextReq.Header.Del("Content-Type")
+				}
+				nextReq.Host = uc.Host
+				applyCookies(uc.Host, nextReq, getFixedCookie(uc))
+				outReq = nextReq
+				continue
+			}
+
+			break
 		}
 		defer resp.Body.Close()
 
-		saveCookies(uc.Host, resp)
 		debugLogf("[%s] <- %s (elapsed: %v)", clientIP, resp.Status, time.Since(start))
 
 		// --- Step 4: Prepare response headers ---

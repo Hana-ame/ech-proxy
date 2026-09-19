@@ -1098,3 +1098,72 @@ func TestDynamicCookieNotClobberedByStaticConfig(t *testing.T) {
 	}
 }
 
+func TestClientGuestCookieCannotPoisonJarAndSyncsToBrowser(t *testing.T) {
+	resetCookieJar()
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieHeader := r.Header.Get("Cookie")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("received_cookie:" + cookieHeader))
+	}))
+	defer ts.Close()
+
+	netdial.Transport().TLSClientConfig.RootCAs.AddCert(ts.Certificate())
+
+	u, _ := url.Parse(ts.URL)
+
+	cfg := &Config{
+		Upstreams: UpstreamMap{
+			"test-sync.l.moonchan.xyz": UpstreamConfig{
+				Host:         u.Host,
+				Mode:         "direct",
+				Cookie:       "PHPSESSID=server_auth_token_777; device_token=dev_token_888",
+				CookieDomain: "l.moonchan.xyz",
+			},
+		},
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	SetupRouter(engine, cfg)
+
+	// 1. Client browser sends request with STALE guest cookie
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "test-sync.l.moonchan.xyz:8443"
+	req.AddCookie(&http.Cookie{Name: "PHPSESSID", Value: "guest_stale_cookie_999"})
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	// Outgoing request to upstream MUST have received the server_auth_token_777, NOT guest_stale_cookie_999
+	body := w.Body.String()
+	if !strings.Contains(body, "PHPSESSID=server_auth_token_777") {
+		t.Errorf("upstream did not receive server authenticated session: %s", body)
+	}
+	if strings.Contains(body, "guest_stale_cookie_999") {
+		t.Errorf("guest cookie was forwarded to upstream, overriding jar session: %s", body)
+	}
+
+	// Response to browser MUST have Set-Cookie syncing PHPSESSID=server_auth_token_777 to domain l.moonchan.xyz
+	scHeaders := w.Header().Values("Set-Cookie")
+	foundSync := false
+	for _, sc := range scHeaders {
+		if strings.Contains(sc, "PHPSESSID=server_auth_token_777") && strings.Contains(sc, "Domain=l.moonchan.xyz") {
+			foundSync = true
+		}
+	}
+	if !foundSync {
+		t.Errorf("expected Set-Cookie to sync server session to browser, got: %v", scHeaders)
+	}
+
+	// 2. Next request from fresh client should still have server_auth_token_777 (jar not poisoned)
+	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
+	req2.Host = "test-sync.l.moonchan.xyz:8443"
+	w2 := httptest.NewRecorder()
+	engine.ServeHTTP(w2, req2)
+
+	body2 := w2.Body.String()
+	if !strings.Contains(body2, "PHPSESSID=server_auth_token_777") {
+		t.Errorf("jar was poisoned by previous guest cookie: %s", body2)
+	}
+}
+

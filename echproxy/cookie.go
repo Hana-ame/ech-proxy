@@ -1,12 +1,16 @@
 package echproxy
 
 import (
+	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gin-gonic/gin"
 )
 
 var (
@@ -43,6 +47,10 @@ func saveOneCookieLocked(key string, c *http.Cookie, now time.Time) {
 
 // saveClientCookies saves all cookies carried by the client request (including values written by browser-side JS document.cookie)
 // into the in-memory CookieJar for the corresponding host, preventing newly generated credentials from being lost.
+// saveClientCookies saves cookies carried by the client request into the in-memory CookieJar
+// for new keys (e.g. client-side JS preference tokens). It DOES NOT overwrite already-active
+// credentials in the jar (e.g. pre-configured or upstream-authenticated sessions like PHPSESSID),
+// preventing stale/guest browser cookies from de-authenticating the proxy session.
 func saveClientCookies(host string, req *http.Request) {
 	cookies := req.Cookies()
 	if len(cookies) == 0 {
@@ -54,6 +62,10 @@ func saveClientCookies(host string, req *http.Request) {
 	now := time.Now()
 	for _, c := range cookies {
 		if c.Name == "" {
+			continue
+		}
+		// Do not overwrite cookies already held and alive in jar for this host or its parent domains
+		if isCookieInJarLocked(host, c.Name, now) {
 			continue
 		}
 		// Cookies sent by client requests typically lack Expires/MaxAge; assign default 30-day lifetime
@@ -152,6 +164,24 @@ func collectAliveCookiesLocked(key string, now time.Time, merged map[string]stri
 	} else {
 		cookieJar[key] = alive
 	}
+}
+
+// isCookieInJarLocked reports whether cookieJar already contains an active cookie for name
+// under host or any of its parent domains. Must be called while holding cookieMu.
+func isCookieInJarLocked(host, name string, now time.Time) bool {
+	for _, c := range cookieJar[host] {
+		if c.Name == name && isCookieAlive(c, now) {
+			return true
+		}
+	}
+	for _, d := range parentDomains(host) {
+		for _, c := range cookieJar[d] {
+			if c.Name == name && isCookieAlive(c, now) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // hasJarCookies checks whether cookieJar already contains any alive cookies for the host or its parent domains.
@@ -367,12 +397,15 @@ func applyCookies(host string, req *http.Request, fixedCookie string) {
 	collectAliveCookiesLocked(host, now, merged)
 	cookieMu.Unlock()
 
-	// Merge cookies from current request (if already in Jar, current latest request takes priority)
+	// 3. Merge client cookies: only supplement cookies NOT already managed by server/jar
+	// (Prevents stale/guest browser cookies from overriding authenticated server sessions like PHPSESSID)
 	for _, c := range req.Cookies() {
-		merged[c.Name] = c.Value
+		if _, exists := merged[c.Name]; !exists {
+			merged[c.Name] = c.Value
+		}
 	}
 
-	// Merge fixed/local file cookies specified in config (highest priority, overrides previous same-named items)
+	// 4. Merge fixed/local file cookies specified in config (highest priority, overrides previous same-named items)
 	if fixedCookie != "" {
 		for name, val := range parseCookieString(fixedCookie) {
 			merged[name] = val
@@ -387,4 +420,54 @@ func applyCookies(host string, req *http.Request, fixedCookie string) {
 		parts = append(parts, name+"="+val)
 	}
 	req.Header.Set("Cookie", strings.Join(parts, "; "))
+}
+
+// syncJarCookiesToBrowser ensures critical session and preference cookies stored in cookieJar
+// are synced to the browser via Set-Cookie headers under cookieDomain if the client
+// is missing them or sent different (e.g. stale/guest) values.
+func syncJarCookiesToBrowser(c *gin.Context, host, cookieDomain string, httpMode bool) {
+	if cookieDomain == "" {
+		return
+	}
+	if hh, _, err := net.SplitHostPort(cookieDomain); err == nil {
+		cookieDomain = hh
+	}
+	cookieDomain = strings.TrimPrefix(cookieDomain, ".")
+
+	cookieMu.Lock()
+	now := time.Now()
+	jarCookies := map[string]string{}
+	for _, d := range parentDomains(host) {
+		collectAliveCookiesLocked(d, now, jarCookies)
+	}
+	collectAliveCookiesLocked(host, now, jarCookies)
+	cookieMu.Unlock()
+
+	if len(jarCookies) == 0 {
+		return
+	}
+
+	clientCookies := map[string]string{}
+	for _, ck := range c.Request.Cookies() {
+		clientCookies[ck.Name] = ck.Value
+	}
+
+	secure := "; Secure"
+	if httpMode {
+		secure = ""
+	}
+
+	// Critical session and identity cookies that browser-side JS and navigation need:
+	syncKeys := []string{"PHPSESSID", "device_token", "first_visit_datetime_pc", "yuid_b", "c_type"}
+	for _, name := range syncKeys {
+		jarVal, ok := jarCookies[name]
+		if !ok || jarVal == "" {
+			continue
+		}
+		clientVal, has := clientCookies[name]
+		if !has || clientVal != jarVal {
+			c.Writer.Header().Add("Set-Cookie", fmt.Sprintf("%s=%s; Domain=%s; Path=/; Max-Age=2592000; SameSite=Lax%s",
+				name, jarVal, cookieDomain, secure))
+		}
+	}
 }

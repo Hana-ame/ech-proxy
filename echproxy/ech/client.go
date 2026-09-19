@@ -440,6 +440,13 @@ func newClient(echConfig []byte, ipMode string) *Client {
 		inner: &http.Client{
 			Transport: newTransport(echConfig, ipMode),
 			Timeout:   0,
+			// Return redirects to the proxy layer so it can rewrite Location headers
+			// (e.g. accounts.pixiv.net → pixiv-accounts.l.moonchan.xyz) and re-inject
+			// cookies on each hop. The h2-only ECH transport also cannot follow
+			// scheme downgrades (https → http).
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }

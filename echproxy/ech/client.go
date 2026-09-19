@@ -440,9 +440,6 @@ func newClient(echConfig []byte, ipMode string) *Client {
 		inner: &http.Client{
 			Transport: newTransport(echConfig, ipMode),
 			Timeout:   0,
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
 		},
 	}
 }

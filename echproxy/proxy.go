@@ -303,7 +303,9 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 							resp.Body.Close()
 							resp = nextResp
 							saveCookies(rawTarget.Host, resp)
-							c.Writer.Header().Del("Location")
+							for k := range c.Writer.Header() {
+								delete(c.Writer.Header(), k)
+							}
 							copyHeaders(c.Writer.Header(), resp.Header)
 							rewriteSetCookieDomains(c.Writer.Header(), cookieDomain, c.Request.TLS == nil)
 							ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)

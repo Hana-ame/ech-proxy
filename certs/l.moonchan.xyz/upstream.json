@@ -32,7 +32,7 @@
             "display": true
         },
         "iwara.l.moonchan.xyz": {
-            "host": "iwara.tv",
+            "host": "www.iwara.tv",
             "referer": "https://www.iwara.tv/",
             "headers": {
                 "Origin": "https://www.iwara.tv",

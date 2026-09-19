@@ -488,8 +488,8 @@ func TestOldBinaryV102Compatibility(t *testing.T) {
 	if !ok {
 		t.Fatalf("old binary missing iwara entry")
 	}
-	if iwara.Host != "iwara.tv" {
-		t.Errorf("expected iwara.tv, got %s", iwara.Host)
+	if iwara.Host != "www.iwara.tv" && iwara.Host != "iwara.tv" {
+		t.Errorf("expected www.iwara.tv, got %s", iwara.Host)
 	}
 	if iwara.Referer != "https://www.iwara.tv/" {
 		t.Errorf("expected referer https://www.iwara.tv/, got %s", iwara.Referer)

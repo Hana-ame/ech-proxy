@@ -66,7 +66,7 @@ func saveClientCookies(host string, req *http.Request, priority ...string) {
 
 	now := time.Now()
 	for _, c := range cookies {
-		if c.Name == "" {
+		if c.Name == "" || strings.HasPrefix(c.Name, "_ech_") {
 			continue
 		}
 		// Do not overwrite cookies already held and alive in jar for this host or its parent domains unless priority is browser
@@ -80,6 +80,7 @@ func saveClientCookies(host string, req *http.Request, priority ...string) {
 		saveOneCookieLocked(host, c, now)
 	}
 }
+
 
 // saveCookies saves Set-Cookie headers from upstream responses into the CookieJar.
 // If a cookie specifies a Domain attribute (e.g. Domain=.pixiv.net), it is stored under the domain key
@@ -404,22 +405,32 @@ func applyCookies(host string, req *http.Request, fixedCookie string, priority .
 	cookieMu.Unlock()
 
 	// 3. Merge client cookies:
-	// If priority is "browser", client cookies override jar cookies.
+	// If priority is "browser", client cookies override jar cookies (and empty/deleted values delete them).
 	// Otherwise (default / "seed"), client cookies only supplement keys NOT already in jar.
 	if p == "browser" {
 		for _, c := range req.Cookies() {
-			merged[c.Name] = c.Value
+			if strings.HasPrefix(c.Name, "_ech_") {
+				continue
+			}
+			if c.Value == "" || c.Value == "deleted" {
+				delete(merged, c.Name)
+			} else {
+				merged[c.Name] = c.Value
+			}
 		}
 	} else {
 		for _, c := range req.Cookies() {
+			if strings.HasPrefix(c.Name, "_ech_") {
+				continue
+			}
 			if _, exists := merged[c.Name]; !exists {
 				merged[c.Name] = c.Value
 			}
 		}
 	}
 
-	// 4. Merge fixed/local file cookies specified in config (highest priority, overrides previous same-named items)
-	if fixedCookie != "" {
+	// 4. Merge fixed/local file cookies specified in config (only in seed mode)
+	if p != "browser" && fixedCookie != "" {
 		for name, val := range parseCookieString(fixedCookie) {
 			merged[name] = val
 		}
@@ -435,6 +446,7 @@ func applyCookies(host string, req *http.Request, fixedCookie string, priority .
 	req.Header.Set("Cookie", strings.Join(parts, "; "))
 }
 
+
 // syncJarCookiesToBrowser ensures critical session and preference cookies stored in cookieJar
 // are synced to the browser via Set-Cookie headers under cookieDomain if the client
 // is missing them or sent different (e.g. stale/guest) values.
@@ -448,6 +460,10 @@ func syncJarCookiesToBrowser(c *gin.Context, host, cookieDomain string, httpMode
 	cookieDomain = strings.TrimPrefix(cookieDomain, ".")
 
 	p := getCookiePriority(priority...)
+	// In browser mode, do not force-sync jar credentials back to the client.
+	if p == "browser" {
+		return
+	}
 
 	cookieMu.Lock()
 	now := time.Now()
@@ -481,10 +497,118 @@ func syncJarCookiesToBrowser(c *gin.Context, host, cookieDomain string, httpMode
 		}
 		clientVal, has := clientCookies[name]
 		// In "seed" mode: sync if missing or differing from jar.
-		// In "browser" mode: only sync if browser completely lacks the cookie (bootstrap only).
-		if !has || (p != "browser" && clientVal != jarVal) {
+		if !has || clientVal != jarVal {
 			c.Writer.Header().Add("Set-Cookie", fmt.Sprintf("%s=%s; Domain=%s; Path=/; Max-Age=2592000; SameSite=Lax%s",
 				name, jarVal, cookieDomain, secure))
 		}
 	}
 }
+
+// getEffectiveCookiePriority resolves whether "seed" or "browser" priority applies for the request.
+// Priority resolution order:
+// 1. Explicit URL parameter: ?_cookie_mode=seed or ?_cookie_mode=browser
+// 2. Client cookie for exact entry: _ech_cookie_mode_<entry>=seed|browser
+// 3. Client cookie for prefix (e.g. "pixiv" for "pixiv.l.moonchan.xyz" or "pixiv-accounts"): _ech_cookie_mode_<prefix>=seed|browser
+// 4. Global client cookie: _ech_cookie_mode=seed|browser
+// 5. Configured uc.CookiePriority ("seed" or "browser")
+// 6. Default: if upstream has pre-configured cookie/cookie_file, default to "seed", otherwise "browser"
+func getEffectiveCookiePriority(c *gin.Context, uc UpstreamConfig, entry string) string {
+	if c != nil && c.Request != nil {
+		if q := strings.ToLower(strings.TrimSpace(c.Query("_cookie_mode"))); q == "seed" || q == "browser" {
+			return q
+		}
+		if val, err := c.Cookie("_ech_cookie_mode_" + entry); err == nil {
+			val = strings.ToLower(strings.TrimSpace(val))
+			if val == "seed" || val == "browser" {
+				return val
+			}
+		}
+		prefix := entry
+		if idx := strings.Index(entry, "."); idx > 0 {
+			prefix = entry[:idx]
+		}
+		if dashIdx := strings.Index(prefix, "-"); dashIdx > 0 {
+			prefix = prefix[:dashIdx]
+		}
+		if prefix != "" {
+			if val, err := c.Cookie("_ech_cookie_mode_" + prefix); err == nil {
+				val = strings.ToLower(strings.TrimSpace(val))
+				if val == "seed" || val == "browser" {
+					return val
+				}
+			}
+		}
+		if val, err := c.Cookie("_ech_cookie_mode"); err == nil {
+			val = strings.ToLower(strings.TrimSpace(val))
+			if val == "seed" || val == "browser" {
+				return val
+			}
+		}
+	}
+
+	if uc.CookiePriority != "" {
+		return strings.ToLower(strings.TrimSpace(uc.CookiePriority))
+	}
+	if uc.Cookie != "" || uc.CookieFile != "" {
+		return "seed"
+	}
+	return "browser"
+}
+
+// applyCookieModeSwitch modifies client cookies to activate either "seed" or "browser" mode for entry.
+// In "seed" mode, it sets the mode cookie and pushes seed cookies to the browser.
+// In "browser" mode, it sets the mode cookie and removes seed credentials from the browser.
+func applyCookieModeSwitch(c *gin.Context, uc UpstreamConfig, entry, mode string) {
+	cookieDomain := uc.CookieDomain
+	if cookieDomain == "" {
+		cookieDomain = entry
+	}
+	if hh, _, err := net.SplitHostPort(cookieDomain); err == nil {
+		cookieDomain = hh
+	}
+	cookieDomain = strings.TrimPrefix(cookieDomain, ".")
+
+	secure := "; Secure"
+	if c.Request.TLS == nil {
+		secure = ""
+	}
+
+	prefix := entry
+	if idx := strings.Index(entry, "."); idx > 0 {
+		prefix = entry[:idx]
+	}
+	if dashIdx := strings.Index(prefix, "-"); dashIdx > 0 {
+		prefix = prefix[:dashIdx]
+	}
+
+	// Set mode tracking cookies on cookieDomain
+	c.Writer.Header().Add("Set-Cookie", fmt.Sprintf("_ech_cookie_mode_%s=%s; Domain=%s; Path=/; Max-Age=31536000; SameSite=Lax%s",
+		entry, mode, cookieDomain, secure))
+	if prefix != entry && prefix != "" {
+		c.Writer.Header().Add("Set-Cookie", fmt.Sprintf("_ech_cookie_mode_%s=%s; Domain=%s; Path=/; Max-Age=31536000; SameSite=Lax%s",
+			prefix, mode, cookieDomain, secure))
+	}
+
+	rawCookie := getFixedCookie(uc)
+	if rawCookie == "" {
+		rawCookie = uc.Cookie
+	}
+
+	if mode == "seed" {
+		if rawCookie != "" {
+			seedCookieRaw(uc.Host, rawCookie)
+			for name, val := range parseCookieString(rawCookie) {
+				c.Writer.Header().Add("Set-Cookie", fmt.Sprintf("%s=%s; Domain=%s; Path=/; Max-Age=2592000; SameSite=Lax%s",
+					name, val, cookieDomain, secure))
+			}
+		}
+	} else if mode == "browser" {
+		if rawCookie != "" {
+			for name := range parseCookieString(rawCookie) {
+				c.Writer.Header().Add("Set-Cookie", fmt.Sprintf("%s=; Domain=%s; Path=/; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax%s",
+					name, cookieDomain, secure))
+			}
+		}
+	}
+}
+

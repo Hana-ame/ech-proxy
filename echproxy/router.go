@@ -7,6 +7,7 @@ import (
 	_ "embed"
 	"html"
 	"net"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -35,6 +36,13 @@ func SetupRouter(r *gin.Engine, cfg *Config) {
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.String(200, "ok")
+	})
+
+	r.Any("/control/cookie", func(c *gin.Context) {
+		handleControlCookie(c, cfg)
+	})
+	r.Any("/_ech/cookie", func(c *gin.Context) {
+		handleControlCookie(c, cfg)
 	})
 
 	r.GET("/", func(c *gin.Context) {
@@ -114,6 +122,22 @@ func renderUpstreamList(cfg *Config, requestHost string) string {
 			desc = "Access " + uc.Host + " via ECH Proxy"
 		}
 		badge := strings.ToUpper(entry[:1])
+		hasCookie := uc.Cookie != "" || uc.CookieFile != "" || uc.CookiePriority != ""
+		defaultMode := uc.CookiePriority
+		if defaultMode == "" {
+			if uc.Cookie != "" || uc.CookieFile != "" {
+				defaultMode = "seed"
+			} else {
+				defaultMode = "browser"
+			}
+		}
+
+		sb.WriteString(`<div class="card"`)
+		if hasCookie {
+			sb.WriteString(` data-cookie-entry="` + html.EscapeString(entry) + `" data-default-mode="` + html.EscapeString(defaultMode) + `"`)
+		}
+		sb.WriteString(`>`)
+
 		sb.WriteString(`<a class="item" href="https://` + html.EscapeString(entry) + port + `/">`)
 		sb.WriteString(`<div class="badge" style="background:` + color + `">` + html.EscapeString(badge) + `</div>`)
 		sb.WriteString(`<div class="info"><div class="entry">` + html.EscapeString(entry) + `</div>`)
@@ -121,6 +145,111 @@ func renderUpstreamList(cfg *Config, requestHost string) string {
 		sb.WriteString(`<div class="target">→ ` + html.EscapeString(uc.Host) + `</div></div>`)
 		sb.WriteString(`<div class="mode">` + html.EscapeString(mode) + `</div>`)
 		sb.WriteString(`</a>`)
+
+		if hasCookie {
+			sb.WriteString(`<div class="cookie-ctrl">`)
+			sb.WriteString(`<div class="cookie-meta">`)
+			sb.WriteString(`<span class="cookie-label">Cookie 控制面:</span>`)
+			sb.WriteString(`<span class="c-status" id="c-status-` + html.EscapeString(entry) + `"></span>`)
+			sb.WriteString(`</div>`)
+			sb.WriteString(`<div class="cookie-actions">`)
+			sb.WriteString(`<button type="button" class="c-btn c-seed" onclick="switchCookie(event, '` + html.EscapeString(entry) + `', 'seed')">🍪 使用公用 Cookie</button>`)
+			sb.WriteString(`<button type="button" class="c-btn c-browser" onclick="switchCookie(event, '` + html.EscapeString(entry) + `', 'browser')">👤 使用本地 Cookie</button>`)
+			sb.WriteString(`</div>`)
+			sb.WriteString(`</div>`)
+		}
+
+		sb.WriteString(`</div>`)
 	}
 	return sb.String()
 }
+
+func handleControlCookie(c *gin.Context, cfg *Config) {
+	entry := strings.TrimSpace(c.Query("entry"))
+	if entry == "" {
+		entry = strings.TrimSpace(c.PostForm("entry"))
+	}
+	if entry == "" {
+		h := c.Request.Host
+		if nh, _, err := net.SplitHostPort(h); err == nil {
+			h = nh
+		}
+		if h != indexHost {
+			entry = h
+		}
+	}
+
+	uc, matchedEntry, ok := findUpstreamConfig(cfg, entry)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "upstream entry not found", "entry": entry})
+		return
+	}
+
+	mode := strings.ToLower(strings.TrimSpace(c.Query("mode")))
+	if mode == "" {
+		mode = strings.ToLower(strings.TrimSpace(c.PostForm("mode")))
+	}
+
+	if mode == "" || mode == "status" {
+		currentMode := getEffectiveCookiePriority(c, uc, matchedEntry)
+		c.JSON(http.StatusOK, gin.H{
+			"ok":    true,
+			"entry": matchedEntry,
+			"mode":  currentMode,
+			"host":  uc.Host,
+		})
+		return
+	}
+
+	if mode != "seed" && mode != "browser" && mode != "reset" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid mode, must be 'seed' or 'browser'"})
+		return
+	}
+
+	if mode == "reset" {
+		mode = "seed"
+	}
+
+	applyCookieModeSwitch(c, uc, matchedEntry, mode)
+
+	if c.Query("redirect") == "1" || c.Query("return_to") != "" {
+		target := c.Query("return_to")
+		if target == "" {
+			port := ""
+			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
+				port = ":" + p
+			} else {
+				port = ":" + defaultPort
+			}
+			target = "https://" + matchedEntry + port + "/"
+		}
+		c.Redirect(http.StatusFound, target)
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"ok":      true,
+		"entry":   matchedEntry,
+		"mode":    mode,
+		"message": "Cookie mode successfully updated to " + mode,
+	})
+}
+
+func findUpstreamConfig(cfg *Config, entry string) (UpstreamConfig, string, bool) {
+	if cfg == nil || len(cfg.Upstreams) == 0 {
+		return UpstreamConfig{}, "", false
+	}
+	if uc, ok := cfg.Upstreams[entry]; ok {
+		return uc, entry, true
+	}
+	if uc, ok := matchWildcard(cfg.Upstreams, entry); ok {
+		return uc, entry, true
+	}
+	for k, uc := range cfg.Upstreams {
+		if strings.HasPrefix(k, entry+".") || k == entry {
+			return uc, k, true
+		}
+	}
+	return UpstreamConfig{}, "", false
+}
+

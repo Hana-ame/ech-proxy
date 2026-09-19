@@ -1221,4 +1221,125 @@ func TestCookiePriorityBrowser(t *testing.T) {
 	}
 }
 
+func TestControlCookieEndpointAndPortalUI(t *testing.T) {
+	resetCookieJar()
+
+	cfg := &Config{
+		Upstreams: UpstreamMap{
+			"pixiv.l.moonchan.xyz": UpstreamConfig{
+				Host:           "www.pixiv.net",
+				Mode:           "ech",
+				Display:        true,
+				Cookie:         "PHPSESSID=seed_token_123; device_token=dev_456",
+				CookieDomain:   "l.moonchan.xyz",
+				CookiePriority: "seed",
+			},
+			"dlsite.l.moonchan.xyz": UpstreamConfig{
+				Host:    "www.dlsite.com",
+				Mode:    "direct",
+				Display: true,
+			},
+		},
+		UpstreamOrder: []string{"pixiv.l.moonchan.xyz", "dlsite.l.moonchan.xyz"},
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	SetupRouter(engine, cfg)
+
+	// 1. Test Portal UI rendering (indexHost)
+	reqPortal := httptest.NewRequest(http.MethodGet, "/", nil)
+	reqPortal.Host = "l.moonchan.xyz:8443"
+	wPortal := httptest.NewRecorder()
+	engine.ServeHTTP(wPortal, reqPortal)
+
+	portalHTML := wPortal.Body.String()
+	if !strings.Contains(portalHTML, "cookie-ctrl") {
+		t.Fatalf("expected portal HTML to contain cookie-ctrl bar, got: %s", portalHTML)
+	}
+	if !strings.Contains(portalHTML, "switchCookie(event, &#39;pixiv.l.moonchan.xyz&#39;, &#39;seed&#39;)") &&
+		!strings.Contains(portalHTML, "switchCookie(event, 'pixiv.l.moonchan.xyz', 'seed')") {
+		t.Fatalf("expected portal HTML to contain seed switcher button for pixiv, got: %s", portalHTML)
+	}
+	if !strings.Contains(portalHTML, "switchCookie(event, &#39;pixiv.l.moonchan.xyz&#39;, &#39;browser&#39;)") &&
+		!strings.Contains(portalHTML, "switchCookie(event, 'pixiv.l.moonchan.xyz', 'browser')") {
+		t.Fatalf("expected portal HTML to contain browser switcher button for pixiv, got: %s", portalHTML)
+	}
+
+	// 2. Test /control/cookie?entry=pixiv.l.moonchan.xyz&mode=seed
+	reqSeed := httptest.NewRequest(http.MethodGet, "/control/cookie?entry=pixiv.l.moonchan.xyz&mode=seed", nil)
+	wSeed := httptest.NewRecorder()
+	engine.ServeHTTP(wSeed, reqSeed)
+
+	if wSeed.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", wSeed.Code, wSeed.Body.String())
+	}
+	bodySeed := wSeed.Body.String()
+	if !strings.Contains(bodySeed, `"mode":"seed"`) {
+		t.Errorf("expected JSON response mode: seed, got %s", bodySeed)
+	}
+	scSeed := wSeed.Header().Values("Set-Cookie")
+	hasModeSeedCookie := false
+	hasPHPSESSIDSeed := false
+	for _, sc := range scSeed {
+		if strings.Contains(sc, "_ech_cookie_mode_pixiv=seed") || strings.Contains(sc, "_ech_cookie_mode_pixiv.l.moonchan.xyz=seed") {
+			hasModeSeedCookie = true
+		}
+		if strings.Contains(sc, "PHPSESSID=seed_token_123") && strings.Contains(sc, "Domain=l.moonchan.xyz") {
+			hasPHPSESSIDSeed = true
+		}
+	}
+	if !hasModeSeedCookie {
+		t.Errorf("expected Set-Cookie with _ech_cookie_mode, got: %v", scSeed)
+	}
+	if !hasPHPSESSIDSeed {
+		t.Errorf("expected Set-Cookie syncing PHPSESSID to browser, got: %v", scSeed)
+	}
+
+	// 3. Test /control/cookie?entry=pixiv.l.moonchan.xyz&mode=browser
+	reqBrowser := httptest.NewRequest(http.MethodGet, "/control/cookie?entry=pixiv.l.moonchan.xyz&mode=browser", nil)
+	wBrowser := httptest.NewRecorder()
+	engine.ServeHTTP(wBrowser, reqBrowser)
+
+	if wBrowser.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d: %s", wBrowser.Code, wBrowser.Body.String())
+	}
+	bodyBrowser := wBrowser.Body.String()
+	if !strings.Contains(bodyBrowser, `"mode":"browser"`) {
+		t.Errorf("expected JSON response mode: browser, got %s", bodyBrowser)
+	}
+	scBrowser := wBrowser.Header().Values("Set-Cookie")
+	hasModeBrowserCookie := false
+	hasClearPHPSESSID := false
+	for _, sc := range scBrowser {
+		if strings.Contains(sc, "_ech_cookie_mode_pixiv=browser") || strings.Contains(sc, "_ech_cookie_mode_pixiv.l.moonchan.xyz=browser") {
+			hasModeBrowserCookie = true
+		}
+		if strings.Contains(sc, "PHPSESSID=") && strings.Contains(sc, "Max-Age=0") {
+			hasClearPHPSESSID = true
+		}
+	}
+	if !hasModeBrowserCookie {
+		t.Errorf("expected Set-Cookie with _ech_cookie_mode_...=browser, got: %v", scBrowser)
+	}
+	if !hasClearPHPSESSID {
+		t.Errorf("expected Set-Cookie clearing PHPSESSID (Max-Age=0), got: %v", scBrowser)
+	}
+
+	// 4. Test /control/cookie?entry=pixiv.l.moonchan.xyz&mode=seed&redirect=1
+	reqRedirect := httptest.NewRequest(http.MethodGet, "/control/cookie?entry=pixiv.l.moonchan.xyz&mode=seed&redirect=1", nil)
+	reqRedirect.Host = "l.moonchan.xyz:8443"
+	wRedirect := httptest.NewRecorder()
+	engine.ServeHTTP(wRedirect, reqRedirect)
+
+	if wRedirect.Code != http.StatusFound {
+		t.Fatalf("expected status 302 redirect, got %d", wRedirect.Code)
+	}
+	loc := wRedirect.Header().Get("Location")
+	if !strings.Contains(loc, "https://pixiv.l.moonchan.xyz:8443/") {
+		t.Errorf("expected redirect to pixiv site, got: %s", loc)
+	}
+}
+
+
 

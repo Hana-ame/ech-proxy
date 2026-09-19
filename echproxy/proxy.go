@@ -56,14 +56,15 @@ func proxyRoundTrip(req *http.Request, mode, ipMode string) (*http.Response, err
 // buildUpstreamRequest constructs the outgoing upstream HTTP request from the client's gin context:
 // copies and filters headers, strips proxy-tracking headers, applies declarative header rules,
 // merges cookies (jar + client + fixed), and sets the upstream Host.
-func buildUpstreamRequest(c *gin.Context, uc UpstreamConfig, urlStr string) (*http.Request, error) {
+func buildUpstreamRequest(c *gin.Context, uc UpstreamConfig, urlStr string, priority ...string) (*http.Request, error) {
+	p := getCookiePriority(priority...)
 	outReq, err := http.NewRequest(c.Request.Method, urlStr, c.Request.Body)
 	if err != nil {
 		return nil, err
 	}
 
 	// 1. Capture JS-set cookies sent by the browser before overwriting the Cookie header.
-	saveClientCookies(uc.Host, c.Request, uc.CookiePriority)
+	saveClientCookies(uc.Host, c.Request, p)
 
 	// 2. Copy client request headers, stripping RFC 2616 hop-by-hop headers.
 	copyHeaders(outReq.Header, c.Request.Header)
@@ -83,19 +84,19 @@ func buildUpstreamRequest(c *gin.Context, uc UpstreamConfig, urlStr string) (*ht
 	outReq.ContentLength = c.Request.ContentLength
 
 	// 5. Merge cookie jar + client cookies + fixed/file cookies into the outgoing Cookie header.
-	// If cookieJar already has cookies (seeded at startup or dynamically maintained),
-	// do not pass static fixedCookie to avoid clobbering dynamic updates / session rotation.
+	// If priority is browser, do not inject server's static fixedCookie.
 	fixedCookie := ""
-	if !hasJarCookies(uc.Host) {
+	if p != "browser" && !hasJarCookies(uc.Host) {
 		fixedCookie = getFixedCookie(uc)
 		if fixedCookie != "" {
 			seedCookieRaw(uc.Host, fixedCookie)
 		}
 	}
-	applyCookies(uc.Host, outReq, fixedCookie, uc.CookiePriority)
+	applyCookies(uc.Host, outReq, fixedCookie, p)
 
 	return outReq, nil
 }
+
 
 // handleSWFallback serves the generated Service Worker JavaScript when the upstream does not
 // return a JavaScript response for /sw.js.
@@ -236,6 +237,23 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 			return
 		}
 
+		// URL parameter trigger for cookie mode switch (?_cookie_mode=seed or ?_cookie_mode=browser)
+		if mode := strings.ToLower(strings.TrimSpace(c.Query("_cookie_mode"))); mode == "seed" || mode == "browser" {
+			applyCookieModeSwitch(c, uc, host, mode)
+			u := *c.Request.URL
+			q := u.Query()
+			q.Del("_cookie_mode")
+			u.RawQuery = q.Encode()
+			target := u.RequestURI()
+			if target == "" {
+				target = "/"
+			}
+			c.Redirect(http.StatusFound, target)
+			return
+		}
+
+		cookiePriority := getEffectiveCookiePriority(c, uc, host)
+
 		ucForRewrite := uc
 		if ucForRewrite.Wildcard == nil {
 			ucForRewrite.Wildcard = inheritWildcard(cfg, host)
@@ -261,7 +279,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		urlStr := "https://" + uc.Host + reqURI
 		debugLogf("[%s] %s %s -> %s", clientIP, method, reqURI, urlStr)
 
-		outReq, err := buildUpstreamRequest(c, uc, urlStr)
+		outReq, err := buildUpstreamRequest(c, uc, urlStr, cookiePriority)
 		if err != nil {
 			log.Printf("[%s] Failed to create request: %v", clientIP, err)
 			c.String(http.StatusInternalServerError, "create request: %v", err)
@@ -288,7 +306,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 		rewriteSetCookieDomains(c.Writer.Header(), cookieDomain, c.Request.TLS == nil)
 		ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)
-		syncJarCookiesToBrowser(c, uc.Host, cookieDomain, c.Request.TLS == nil, uc.CookiePriority)
+		syncJarCookiesToBrowser(c, uc.Host, cookieDomain, c.Request.TLS == nil, cookiePriority)
 
 		port := ""
 		if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {

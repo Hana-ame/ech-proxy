@@ -11,13 +11,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; b
 header { margin-bottom: 20px; }
 header h1 { font-size: 22px; color: #5ce1e6; letter-spacing: 0.5px; }
 header .sub { font-size: 12px; color: #888; margin-top: 4px; }
-.list { display: flex; flex-direction: column; gap: 10px; }
-.item {
-  display: flex; text-decoration: none; color: inherit; align-items: center; gap: 14px;
+.list { display: flex; flex-direction: column; gap: 12px; }
+.card {
   background: #171a21; border: 1px solid #232733; border-radius: 10px;
-  padding: 14px 16px; transition: border-color 0.15s;
+  overflow: hidden; transition: border-color 0.15s, box-shadow 0.15s;
 }
-.item:hover { border-color: #5ce1e6; }
+.card:hover { border-color: #5ce1e6; box-shadow: 0 4px 16px rgba(92, 225, 230, 0.08); }
+.card .item {
+  display: flex; text-decoration: none; color: inherit; align-items: center; gap: 14px;
+  padding: 14px 16px; transition: background 0.15s;
+}
+.card .item:hover { background: rgba(255, 255, 255, 0.02); }
 .item .badge {
   width: 42px; height: 42px; border-radius: 10px; flex-shrink: 0;
   display: flex; align-items: center; justify-content: center;
@@ -31,6 +35,37 @@ header .sub { font-size: 12px; color: #888; margin-top: 4px; }
   flex-shrink: 0; font-size: 11px; padding: 3px 8px; border-radius: 20px;
   background: #2a2f3a; color: #8fa3bf; border: 1px solid #333a47;
 }
+.cookie-ctrl {
+  display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 10px; padding: 10px 16px 12px 16px;
+  background: #13161c; border-top: 1px solid #232733;
+}
+.cookie-meta { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.cookie-label { color: #8892b0; font-weight: 500; }
+.pill { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 12px; font-weight: 600; }
+.pill-seed { background: rgba(92, 225, 230, 0.15); color: #5ce1e6; border: 1px solid rgba(92, 225, 230, 0.3); }
+.pill-browser { background: rgba(240, 163, 94, 0.15); color: #f0a35e; border: 1px solid rgba(240, 163, 94, 0.3); }
+.cookie-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.c-btn {
+  background: #232733; color: #e6e6e6; border: 1px solid #333a47;
+  border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer;
+  transition: all 0.15s; display: inline-flex; align-items: center; gap: 5px;
+}
+.c-btn:hover { background: #2f3545; border-color: #5ce1e6; color: #fff; }
+.c-btn.active { border-color: #5ce1e6; background: rgba(92, 225, 230, 0.2); color: #5ce1e6; font-weight: 600; }
+.c-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.toast {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%) translateY(100px);
+  background: #1f2430; color: #fff; border: 1px solid #5ce1e6; border-radius: 8px;
+  padding: 10px 20px; font-size: 13px; box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+  transition: transform 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275); z-index: 9999; pointer-events: none;
+}
+.toast.show { transform: translateX(-50%) translateY(0); }
+@media (max-width: 600px) {
+  .cookie-ctrl { flex-direction: column; align-items: flex-start; }
+  .cookie-actions { width: 100%; }
+  .c-btn { flex: 1; justify-content: center; }
+}
 .footer { margin-top: 24px; text-align: center; font-size: 11px; color: #556; }
 </style>
 </head>
@@ -38,12 +73,76 @@ header .sub { font-size: 12px; color: #888; margin-top: 4px; }
 <div class="container">
   <header>
     <h1>ECH Proxy</h1>
-    <div class="sub">Upstream Portal List · Click domain to visit site</div>
+    <div class="sub">Upstream Portal List · Click domain to visit site · Cookie Control Plane</div>
   </header>
   <div class="list">
     {{UPSTREAMS}}
   </div>
   <div class="footer">ECH Proxy · powered by l.moonchan.xyz</div>
 </div>
+
+<script>
+function getCookie(name) {
+  const match = document.cookie.match(new RegExp('(^|;\\s*)' + name + '=([^;]*)'));
+  return match ? decodeURIComponent(match[2]) : null;
+}
+
+function updateStatusBadges() {
+  document.querySelectorAll('[data-cookie-entry]').forEach(el => {
+    const entry = el.getAttribute('data-cookie-entry');
+    const prefix = entry.split('.')[0];
+    const mode = getCookie('_ech_cookie_mode_' + entry) || getCookie('_ech_cookie_mode_' + prefix) || el.getAttribute('data-default-mode') || 'seed';
+    const statusEl = document.getElementById('c-status-' + entry);
+    const btnSeed = el.querySelector('.c-seed');
+    const btnBrowser = el.querySelector('.c-browser');
+    if (statusEl) {
+      if (mode === 'browser') {
+        statusEl.innerHTML = '<span class="pill pill-browser">当前: 本地 Cookie</span>';
+        if (btnBrowser) btnBrowser.classList.add('active');
+        if (btnSeed) btnSeed.classList.remove('active');
+      } else {
+        statusEl.innerHTML = '<span class="pill pill-seed">当前: 公用 Cookie</span>';
+        if (btnSeed) btnSeed.classList.add('active');
+        if (btnBrowser) btnBrowser.classList.remove('active');
+      }
+    }
+  });
+}
+
+function switchCookie(e, entry, mode) {
+  if (e) { e.preventDefault(); e.stopPropagation(); }
+  const btn = e ? e.target : null;
+  if (btn) btn.disabled = true;
+  fetch('/control/cookie?entry=' + encodeURIComponent(entry) + '&mode=' + encodeURIComponent(mode), { credentials: 'include' })
+    .then(r => r.json())
+    .then(data => {
+      showToast(mode === 'seed' ? '🍪 已切换为【公用Cookie】，登录态已同步！' : '👤 已切换为【本地Cookie】，已清除公用凭据！');
+      updateStatusBadges();
+    })
+    .catch(err => {
+      window.location.href = '/control/cookie?entry=' + encodeURIComponent(entry) + '&mode=' + encodeURIComponent(mode) + '&redirect=1';
+    })
+    .finally(() => {
+      if (btn) btn.disabled = false;
+    });
+}
+
+function showToast(msg) {
+  let toast = document.getElementById('toast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'toast';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = msg;
+  toast.className = 'toast show';
+  clearTimeout(window._toastTimer);
+  window._toastTimer = setTimeout(() => {
+    toast.className = 'toast';
+  }, 3500);
+}
+
+document.addEventListener('DOMContentLoaded', updateStatusBadges);
+</script>
 </body>
 </html>

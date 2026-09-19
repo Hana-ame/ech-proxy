@@ -3,6 +3,7 @@ package echproxy
 import (
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -127,10 +128,8 @@ func getFixedCookie(uc UpstreamConfig) string {
 		filePath = strings.TrimPrefix(filePath, "file://")
 	}
 	// If it exists in path form, attempt to read from local file
-	if strings.HasPrefix(filePath, "/") || strings.HasPrefix(filePath, "./") || strings.HasPrefix(filePath, "../") || strings.HasPrefix(cookieVal, "file://") {
-		if content, err := os.ReadFile(filePath); err == nil {
-			return strings.TrimSpace(string(content))
-		}
+	if content, err := os.ReadFile(filePath); err == nil && len(content) > 0 {
+		return strings.TrimSpace(string(content))
 	}
 	return cookieVal
 }
@@ -152,6 +151,203 @@ func collectAliveCookiesLocked(key string, now time.Time, merged map[string]stri
 		delete(cookieJar, key)
 	} else {
 		cookieJar[key] = alive
+	}
+}
+
+// hasJarCookies checks whether cookieJar already contains any alive cookies for the host or its parent domains.
+func hasJarCookies(host string) bool {
+	cookieMu.Lock()
+	defer cookieMu.Unlock()
+	now := time.Now()
+	for _, c := range cookieJar[host] {
+		if isCookieAlive(c, now) {
+			return true
+		}
+	}
+	for _, d := range parentDomains(host) {
+		for _, c := range cookieJar[d] {
+			if isCookieAlive(c, now) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// parseCookieString parses both standard semicolon-separated "name=val; name2=val2" format
+// and Netscape HTTP Cookie File format (tab-delimited lines).
+func parseCookieString(raw string) map[string]string {
+	result := make(map[string]string)
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return result
+	}
+
+	// Netscape / newline-separated format
+	if strings.Contains(raw, "\n") {
+		for _, line := range strings.Split(raw, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.Split(line, "\t")
+			if len(parts) >= 7 {
+				name := strings.TrimSpace(parts[5])
+				val := strings.TrimSpace(parts[6])
+				if name != "" {
+					result[name] = val
+				}
+				continue
+			}
+			if idx := strings.IndexByte(line, '='); idx > 0 {
+				name := strings.TrimSpace(line[:idx])
+				val := strings.TrimSpace(line[idx+1:])
+				val = strings.TrimRight(val, ";")
+				if name != "" {
+					result[name] = val
+				}
+			}
+		}
+		if len(result) > 0 {
+			return result
+		}
+	}
+
+	// Standard semicolon-separated format
+	for _, part := range strings.Split(raw, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if idx := strings.IndexByte(part, '='); idx > 0 {
+			name := strings.TrimSpace(part[:idx])
+			val := strings.TrimSpace(part[idx+1:])
+			if name != "" {
+				result[name] = val
+			}
+		}
+	}
+	return result
+}
+
+func readCookieFile(path string) string {
+	filePath := path
+	if strings.HasPrefix(filePath, "file://") {
+		filePath = strings.TrimPrefix(filePath, "file://")
+	}
+	if content, err := os.ReadFile(filePath); err == nil {
+		return strings.TrimSpace(string(content))
+	}
+	return path
+}
+
+// seedCookieRawLocked parses and inserts raw cookie content (either standard semicolon-separated
+// or Netscape HTTP Cookie File format) into cookieJar. Must be called while holding cookieMu.
+func seedCookieRawLocked(host, raw string, now time.Time) {
+	if raw == "" {
+		return
+	}
+	// 1. If Netscape HTTP Cookie File format (tab-separated lines)
+	if strings.Contains(raw, "\n") {
+		netscapeFound := false
+		for _, line := range strings.Split(raw, "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.Split(line, "\t")
+			if len(parts) >= 7 {
+				domain := strings.TrimSpace(parts[0])
+				includeSubdomains := strings.ToUpper(strings.TrimSpace(parts[1]))
+				name := strings.TrimSpace(parts[5])
+				val := strings.TrimSpace(parts[6])
+				if name == "" {
+					continue
+				}
+				exp := now.Add(30 * 24 * time.Hour)
+				if expSec, err := strconv.ParseInt(strings.TrimSpace(parts[4]), 10, 64); err == nil && expSec > 0 {
+					exp = time.Unix(expSec, 0)
+				}
+				key := host
+				if domain != "" {
+					if strings.HasPrefix(domain, ".") || includeSubdomains == "TRUE" {
+						key = "." + strings.TrimPrefix(domain, ".")
+					} else {
+						key = strings.TrimPrefix(domain, ".")
+					}
+				}
+				saveOneCookieLocked(key, &http.Cookie{Name: name, Value: val, Expires: exp}, now)
+				netscapeFound = true
+			}
+		}
+		if netscapeFound {
+			return
+		}
+	}
+
+	// 2. Standard format (semicolon-separated or newline-separated key=val)
+	parsed := parseCookieString(raw)
+	for name, val := range parsed {
+		c := &http.Cookie{Name: name, Value: val, Expires: now.Add(30 * 24 * time.Hour)}
+		saveOneCookieLocked(host, c, now)
+		for _, d := range parentDomains(host) {
+			saveOneCookieLocked(d, c, now)
+		}
+		if !strings.HasPrefix(host, ".") && strings.Contains(host, ".") && len(parentDomains(host)) == 0 {
+			saveOneCookieLocked("."+host, c, now)
+		}
+	}
+}
+
+// seedCookieRaw parses and seeds cookie content into cookieJar with mutex synchronization.
+func seedCookieRaw(host, raw string) {
+	if raw == "" {
+		return
+	}
+	cookieMu.Lock()
+	defer cookieMu.Unlock()
+	seedCookieRawLocked(host, raw, time.Now())
+}
+
+// resetCookieJar resets the in-memory cookieJar (primarily used for unit testing).
+func resetCookieJar() {
+	cookieMu.Lock()
+	defer cookieMu.Unlock()
+	cookieJar = map[string][]*http.Cookie{}
+}
+
+// SeedCookiesFromConfig seeds initial cookies from all upstreams in Config (via cookie or cookie_file)
+// into the in-memory cookieJar once at startup. Supports both standard format and Netscape HTTP Cookie File format.
+// Because it seeds the jar only once:
+// 1. Initial login credentials (like PHPSESSID) are available immediately on all subdomains.
+// 2. Upstream Set-Cookie updates (like session rotation or new CF clearance) smoothly update
+//    the jar without being repeatedly clobbered by static config on every request.
+func SeedCookiesFromConfig(cfg *Config) {
+	if cfg == nil {
+		return
+	}
+	cookieMu.Lock()
+	defer cookieMu.Unlock()
+	now := time.Now()
+
+	for _, uc := range cfg.Upstreams {
+		if raw := getFixedCookie(uc); raw != "" {
+			seedCookieRawLocked(uc.Host, raw, now)
+		}
+		if uc.Wildcard != nil {
+			w := uc.Wildcard
+			raw := w.Cookie
+			if raw == "" && w.CookieFile != "" {
+				raw = readCookieFile(w.CookieFile)
+			}
+			if raw != "" {
+				target := w.Host
+				if target == "" {
+					target = strings.TrimPrefix(w.UpstreamSuffix, ".")
+				}
+				seedCookieRawLocked(target, raw, now)
+			}
+		}
 	}
 }
 
@@ -178,17 +374,8 @@ func applyCookies(host string, req *http.Request, fixedCookie string) {
 
 	// Merge fixed/local file cookies specified in config (highest priority, overrides previous same-named items)
 	if fixedCookie != "" {
-		// Attempt to parse as "name=val; name2=val2"
-		parts := strings.Split(fixedCookie, ";")
-		for _, part := range parts {
-			part = strings.TrimSpace(part)
-			if part == "" {
-				continue
-			}
-			idx := strings.IndexByte(part, '=')
-			if idx > 0 {
-				merged[part[:idx]] = part[idx+1:]
-			}
+		for name, val := range parseCookieString(fixedCookie) {
+			merged[name] = val
 		}
 	}
 

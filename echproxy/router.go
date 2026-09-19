@@ -30,6 +30,7 @@ const defaultPort = "8443"
 //   - Unknown Host root path "/" -> fallback to portal list (renders list when {{UPSTREAMS}} present)
 //   - All other paths -> NoRoute proxies directly (ProxyHandler dispatches to upstream by host)
 func SetupRouter(r *gin.Engine, cfg *Config) {
+	SeedCookiesFromConfig(cfg)
 	upstreamHandler := ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)
 
 	r.GET("/healthz", func(c *gin.Context) {

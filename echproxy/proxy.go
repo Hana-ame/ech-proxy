@@ -83,7 +83,16 @@ func buildUpstreamRequest(c *gin.Context, uc UpstreamConfig, urlStr string) (*ht
 	outReq.ContentLength = c.Request.ContentLength
 
 	// 5. Merge cookie jar + client cookies + fixed/file cookies into the outgoing Cookie header.
-	applyCookies(uc.Host, outReq, getFixedCookie(uc))
+	// If cookieJar already has cookies (seeded at startup or dynamically maintained),
+	// do not pass static fixedCookie to avoid clobbering dynamic updates / session rotation.
+	fixedCookie := ""
+	if !hasJarCookies(uc.Host) {
+		fixedCookie = getFixedCookie(uc)
+		if fixedCookie != "" {
+			seedCookieRaw(uc.Host, fixedCookie)
+		}
+	}
+	applyCookies(uc.Host, outReq, fixedCookie)
 
 	return outReq, nil
 }

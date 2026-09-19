@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	"github.com/gin-gonic/gin"
@@ -955,6 +956,145 @@ func TestHTTPRedirectUpgradedToHTTPSAndReturnedToClient(t *testing.T) {
 	expectedLoc := "https://pixiv.l.moonchan.xyz:8443/destination"
 	if loc != expectedLoc {
 		t.Errorf("expected http redirect to be upgraded to https and returned to client:\n  got:  %s\n  want: %s", loc, expectedLoc)
+	}
+}
+
+func TestSeedCookiesStartupAndNetscapeParsing(t *testing.T) {
+	resetCookieJar()
+
+	netscapeContent := `# Netscape HTTP Cookie File
+# Test cookie file
+www.pixiv.net	FALSE	/	TRUE	1824340949	host_only_pref	pref_123
+.pixiv.net	TRUE	/	TRUE	1824340949	PHPSESSID	shared_sess_999
+.pixiv.net	TRUE	/	TRUE	1824340949	device_token	dev_token_456
+`
+	tmpFile, err := os.CreateTemp("", "pixiv_netscape_*.txt")
+	if err != nil {
+		t.Fatalf("create temp file failed: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	tmpFile.WriteString(netscapeContent)
+	tmpFile.Close()
+
+	cfg := &Config{
+		Upstreams: UpstreamMap{
+			"pixiv.l.moonchan.xyz": UpstreamConfig{
+				Host:       "www.pixiv.net",
+				CookieFile: tmpFile.Name(),
+				Wildcard: &WildcardRule{
+					Prefix:         "pixiv-",
+					EntrySuffix:    ".l.moonchan.xyz",
+					UpstreamSuffix: ".pixiv.net",
+				},
+			},
+		},
+	}
+
+	SeedCookiesFromConfig(cfg)
+
+	// 1. Request to www.pixiv.net should receive both .pixiv.net cookies and www.pixiv.net host-only cookies
+	reqWWW, _ := http.NewRequest(http.MethodGet, "https://www.pixiv.net/", nil)
+	applyCookies("www.pixiv.net", reqWWW, "")
+	cWWW := reqWWW.Header.Get("Cookie")
+	if !strings.Contains(cWWW, "PHPSESSID=shared_sess_999") {
+		t.Errorf("expected PHPSESSID on www.pixiv.net, got: %s", cWWW)
+	}
+	if !strings.Contains(cWWW, "device_token=dev_token_456") {
+		t.Errorf("expected device_token on www.pixiv.net, got: %s", cWWW)
+	}
+	if !strings.Contains(cWWW, "host_only_pref=pref_123") {
+		t.Errorf("expected host_only_pref on www.pixiv.net, got: %s", cWWW)
+	}
+
+	// 2. Request to accounts.pixiv.net should receive .pixiv.net cookies but NOT www.pixiv.net host-only cookies
+	reqAcc, _ := http.NewRequest(http.MethodGet, "https://accounts.pixiv.net/", nil)
+	applyCookies("accounts.pixiv.net", reqAcc, "")
+	cAcc := reqAcc.Header.Get("Cookie")
+	if !strings.Contains(cAcc, "PHPSESSID=shared_sess_999") {
+		t.Errorf("expected PHPSESSID on accounts.pixiv.net, got: %s", cAcc)
+	}
+	if !strings.Contains(cAcc, "device_token=dev_token_456") {
+		t.Errorf("expected device_token on accounts.pixiv.net, got: %s", cAcc)
+	}
+	if strings.Contains(cAcc, "host_only_pref=pref_123") {
+		t.Errorf("host-only cookie host_only_pref leaked to accounts.pixiv.net: %s", cAcc)
+	}
+}
+
+func TestDynamicCookieNotClobberedByStaticConfig(t *testing.T) {
+	resetCookieJar()
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		incomingCookie := r.Header.Get("Cookie")
+		if r.URL.Path == "/login" {
+			// Upstream sets a new session cookie
+			http.SetCookie(w, &http.Cookie{
+				Name:    "PHPSESSID",
+				Value:   "rotated_session_token_xyz",
+				Path:    "/",
+				Expires: time.Now().Add(24 * time.Hour),
+			})
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("logged_in"))
+			return
+		}
+		if r.URL.Path == "/profile" {
+			// Echo incoming cookie back in response body for verification
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("cookie:" + incomingCookie))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	}))
+	defer ts.Close()
+
+	netdial.Transport().TLSClientConfig.RootCAs.AddCert(ts.Certificate())
+
+	u, _ := url.Parse(ts.URL)
+
+	cfg := &Config{
+		Upstreams: UpstreamMap{
+			"test.l.moonchan.xyz": UpstreamConfig{
+				Host:   u.Host,
+				Mode:   "direct",
+				Cookie: "PHPSESSID=initial_static_seed_123; first_visit=1",
+			},
+		},
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	SetupRouter(engine, cfg)
+
+	// 1. Initial request: should carry initial seeded cookie
+	req1 := httptest.NewRequest(http.MethodGet, "/profile", nil)
+	req1.Host = "test.l.moonchan.xyz:8443"
+	w1 := httptest.NewRecorder()
+	engine.ServeHTTP(w1, req1)
+	if !strings.Contains(w1.Body.String(), "PHPSESSID=initial_static_seed_123") {
+		t.Fatalf("expected initial seeded cookie in profile, got body: %s", w1.Body.String())
+	}
+
+	// 2. Login request: upstream responds with Set-Cookie: PHPSESSID=rotated_session_token_xyz
+	req2 := httptest.NewRequest(http.MethodPost, "/login", nil)
+	req2.Host = "test.l.moonchan.xyz:8443"
+	w2 := httptest.NewRecorder()
+	engine.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("login failed: %d", w2.Code)
+	}
+
+	// 3. Subsequent request: should carry rotated_session_token_xyz and NOT be clobbered by initial_static_seed_123
+	req3 := httptest.NewRequest(http.MethodGet, "/profile", nil)
+	req3.Host = "test.l.moonchan.xyz:8443"
+	w3 := httptest.NewRecorder()
+	engine.ServeHTTP(w3, req3)
+	if !strings.Contains(w3.Body.String(), "PHPSESSID=rotated_session_token_xyz") {
+		t.Errorf("expected rotated cookie to be sent to upstream, got body: %s", w3.Body.String())
+	}
+	if strings.Contains(w3.Body.String(), "PHPSESSID=initial_static_seed_123") {
+		t.Errorf("static config clobbered dynamic rotated cookie: %s", w3.Body.String())
 	}
 }
 

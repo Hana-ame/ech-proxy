@@ -286,36 +286,6 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 		rewriteRedirectHeaders(c.Writer.Header(), rewriter, port)
 
-		// Self-redirect loop breaker: if upstream returned a redirect that rewrites to the exact
-		// same URL the client just requested (e.g. apex -> www canonical redirect), returning it
-		// to the browser causes an instant ERR_TOO_MANY_REDIRECTS loop. Follow that canonical redirect internally.
-		if resp.StatusCode/100 == 3 {
-			if loc := c.Writer.Header().Get("Location"); loc != "" && isSelfRedirect(loc, c.Request) {
-				rawLoc := resp.Header.Get("Location")
-				if rawTarget, perr := outReq.URL.Parse(rawLoc); perr == nil {
-					debugLogf("[%s] Breaking self-redirect loop: %s redirected to itself, following upstream %s",
-						clientIP, c.Request.URL.Path, rawTarget.String())
-					if nextReq, nerr := http.NewRequest(c.Request.Method, rawTarget.String(), nil); nerr == nil {
-						copyHeaders(nextReq.Header, c.Request.Header)
-						nextReq.Host = rawTarget.Host
-						applyCookies(rawTarget.Host, nextReq, getFixedCookie(uc))
-						if nextResp, terr := proxyRoundTrip(nextReq, uc.Mode, uc.IPMode); terr == nil {
-							resp.Body.Close()
-							resp = nextResp
-							saveCookies(rawTarget.Host, resp)
-							for k := range c.Writer.Header() {
-								delete(c.Writer.Header(), k)
-							}
-							copyHeaders(c.Writer.Header(), resp.Header)
-							rewriteSetCookieDomains(c.Writer.Header(), cookieDomain, c.Request.TLS == nil)
-							ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)
-							rewriteRedirectHeaders(c.Writer.Header(), rewriter, port)
-						}
-					}
-				}
-			}
-		}
-
 		// --- Step 5: SW fallback injection ---
 		if swWant && !isJavascriptResponse(resp) {
 			handleSWFallback(c, cfg, blocked, clientIP, method, rawPath)
@@ -328,28 +298,6 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		// --- Step 6: Stream / rewrite response body ---
 		rewriteAndSendBody(c, uc, resp, rewriter, rc, clientIP, rawPath)
 	}
-}
-
-func isSelfRedirect(rewrittenLoc string, clientReq *http.Request) bool {
-	u, err := url.Parse(rewrittenLoc)
-	if err != nil {
-		return false
-	}
-	if u.Host != "" && !strings.EqualFold(u.Host, clientReq.Host) {
-		return false
-	}
-	reqPath := clientReq.URL.Path
-	if reqPath == "" {
-		reqPath = "/"
-	}
-	locPath := u.Path
-	if locPath == "" {
-		locPath = "/"
-	}
-	if reqPath != locPath {
-		return false
-	}
-	return clientReq.URL.RawQuery == u.RawQuery
 }
 
 // rewriteRedirectHeaders rewrites redirect headers (Location and Refresh):

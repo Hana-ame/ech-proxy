@@ -45,17 +45,22 @@ func saveOneCookieLocked(key string, c *http.Cookie, now time.Time) {
 	cookieJar[key] = jar
 }
 
-// saveClientCookies saves all cookies carried by the client request (including values written by browser-side JS document.cookie)
-// into the in-memory CookieJar for the corresponding host, preventing newly generated credentials from being lost.
-// saveClientCookies saves cookies carried by the client request into the in-memory CookieJar
-// for new keys (e.g. client-side JS preference tokens). It DOES NOT overwrite already-active
-// credentials in the jar (e.g. pre-configured or upstream-authenticated sessions like PHPSESSID),
-// preventing stale/guest browser cookies from de-authenticating the proxy session.
-func saveClientCookies(host string, req *http.Request) {
+func getCookiePriority(priority ...string) string {
+	if len(priority) > 0 && priority[0] != "" {
+		return strings.ToLower(strings.TrimSpace(priority[0]))
+	}
+	return "seed"
+}
+
+// saveClientCookies saves cookies carried by the client request into the in-memory CookieJar.
+// When priority is "seed" (default), it preserves existing active jar credentials and only adds new keys.
+// When priority is "browser", client request cookies can overwrite existing jar credentials.
+func saveClientCookies(host string, req *http.Request, priority ...string) {
 	cookies := req.Cookies()
 	if len(cookies) == 0 {
 		return
 	}
+	p := getCookiePriority(priority...)
 	cookieMu.Lock()
 	defer cookieMu.Unlock()
 
@@ -64,8 +69,8 @@ func saveClientCookies(host string, req *http.Request) {
 		if c.Name == "" {
 			continue
 		}
-		// Do not overwrite cookies already held and alive in jar for this host or its parent domains
-		if isCookieInJarLocked(host, c.Name, now) {
+		// Do not overwrite cookies already held and alive in jar for this host or its parent domains unless priority is browser
+		if p != "browser" && isCookieInJarLocked(host, c.Name, now) {
 			continue
 		}
 		// Cookies sent by client requests typically lack Expires/MaxAge; assign default 30-day lifetime
@@ -383,7 +388,8 @@ func SeedCookiesFromConfig(cfg *Config) {
 
 // applyCookies performs a four-way merge among parent domain cookies, CookieJar for host,
 // the current client request cookies, and local fixed/file cookies, writing them into the outgoing request.
-func applyCookies(host string, req *http.Request, fixedCookie string) {
+func applyCookies(host string, req *http.Request, fixedCookie string, priority ...string) {
+	p := getCookiePriority(priority...)
 	cookieMu.Lock()
 	now := time.Now()
 	merged := map[string]string{}
@@ -397,11 +403,18 @@ func applyCookies(host string, req *http.Request, fixedCookie string) {
 	collectAliveCookiesLocked(host, now, merged)
 	cookieMu.Unlock()
 
-	// 3. Merge client cookies: only supplement cookies NOT already managed by server/jar
-	// (Prevents stale/guest browser cookies from overriding authenticated server sessions like PHPSESSID)
-	for _, c := range req.Cookies() {
-		if _, exists := merged[c.Name]; !exists {
+	// 3. Merge client cookies:
+	// If priority is "browser", client cookies override jar cookies.
+	// Otherwise (default / "seed"), client cookies only supplement keys NOT already in jar.
+	if p == "browser" {
+		for _, c := range req.Cookies() {
 			merged[c.Name] = c.Value
+		}
+	} else {
+		for _, c := range req.Cookies() {
+			if _, exists := merged[c.Name]; !exists {
+				merged[c.Name] = c.Value
+			}
 		}
 	}
 
@@ -425,7 +438,7 @@ func applyCookies(host string, req *http.Request, fixedCookie string) {
 // syncJarCookiesToBrowser ensures critical session and preference cookies stored in cookieJar
 // are synced to the browser via Set-Cookie headers under cookieDomain if the client
 // is missing them or sent different (e.g. stale/guest) values.
-func syncJarCookiesToBrowser(c *gin.Context, host, cookieDomain string, httpMode bool) {
+func syncJarCookiesToBrowser(c *gin.Context, host, cookieDomain string, httpMode bool, priority ...string) {
 	if cookieDomain == "" {
 		return
 	}
@@ -433,6 +446,8 @@ func syncJarCookiesToBrowser(c *gin.Context, host, cookieDomain string, httpMode
 		cookieDomain = hh
 	}
 	cookieDomain = strings.TrimPrefix(cookieDomain, ".")
+
+	p := getCookiePriority(priority...)
 
 	cookieMu.Lock()
 	now := time.Now()
@@ -465,7 +480,9 @@ func syncJarCookiesToBrowser(c *gin.Context, host, cookieDomain string, httpMode
 			continue
 		}
 		clientVal, has := clientCookies[name]
-		if !has || clientVal != jarVal {
+		// In "seed" mode: sync if missing or differing from jar.
+		// In "browser" mode: only sync if browser completely lacks the cookie (bootstrap only).
+		if !has || (p != "browser" && clientVal != jarVal) {
 			c.Writer.Header().Add("Set-Cookie", fmt.Sprintf("%s=%s; Domain=%s; Path=/; Max-Age=2592000; SameSite=Lax%s",
 				name, jarVal, cookieDomain, secure))
 		}

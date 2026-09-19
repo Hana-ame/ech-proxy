@@ -78,6 +78,12 @@ func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 		if out.CookieDomain == "" {
 			out.CookieDomain = uc.CookieDomain
 		}
+		if w.CookiePriority != "" {
+			out.CookiePriority = w.CookiePriority
+		}
+		if out.CookiePriority == "" {
+			out.CookiePriority = uc.CookiePriority
+		}
 		if w.IPMode != "" {
 			out.IPMode = w.IPMode
 		}

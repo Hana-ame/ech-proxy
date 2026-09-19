@@ -132,6 +132,7 @@ type WildcardRule struct {
 	Cookie          string                `json:"cookie,omitempty"`
 	CookieFile      string                `json:"cookie_file,omitempty"`
 	CookieDomain    string                `json:"cookie_domain,omitempty"` // Shared cookie domain (e.g. "l.moonchan.xyz")
+	CookiePriority  string                `json:"cookie_priority,omitempty"` // "seed" or "browser"
 	Mode            string                `json:"mode,omitempty"`
 	IPMode          string                `json:"ip_mode,omitempty"` // Egress IP family: "v4", "v6", or "auto"
 	SWInject        bool                  `json:"sw_inject,omitempty"`
@@ -185,6 +186,7 @@ type UpstreamConfig struct {
 	Cookie          string                `json:"cookie,omitempty"`           // Fixed cookie string or local file path
 	CookieFile      string                `json:"cookie_file,omitempty"`      // Local cookie file path
 	CookieDomain    string                `json:"cookie_domain,omitempty"`   // Scoped domain for rewritten Set-Cookie (e.g. "l.moonchan.xyz")
+	CookiePriority  string                `json:"cookie_priority,omitempty"` // "seed" (default if cookie present) or "browser"
 	SWInject        bool                  `json:"sw_inject,omitempty"`
 	Mode            string                `json:"mode,omitempty"`
 	IPMode          string                `json:"ip_mode,omitempty"` // Egress IP family: "v4", "v6", or "auto"
@@ -408,6 +410,12 @@ func normalizeConfig(cfg *Config) {
 			}
 			if w.IPMode == "" && uc.IPMode != "" {
 				w.IPMode = uc.IPMode
+			}
+			if w.CookiePriority == "" && uc.CookiePriority != "" {
+				w.CookiePriority = uc.CookiePriority
+			}
+			if w.CookieDomain == "" && uc.CookieDomain != "" {
+				w.CookieDomain = uc.CookieDomain
 			}
 			normalizeWildcardRule(w)
 		}

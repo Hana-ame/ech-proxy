@@ -63,7 +63,7 @@ func buildUpstreamRequest(c *gin.Context, uc UpstreamConfig, urlStr string) (*ht
 	}
 
 	// 1. Capture JS-set cookies sent by the browser before overwriting the Cookie header.
-	saveClientCookies(uc.Host, c.Request)
+	saveClientCookies(uc.Host, c.Request, uc.CookiePriority)
 
 	// 2. Copy client request headers, stripping RFC 2616 hop-by-hop headers.
 	copyHeaders(outReq.Header, c.Request.Header)
@@ -92,7 +92,7 @@ func buildUpstreamRequest(c *gin.Context, uc UpstreamConfig, urlStr string) (*ht
 			seedCookieRaw(uc.Host, fixedCookie)
 		}
 	}
-	applyCookies(uc.Host, outReq, fixedCookie)
+	applyCookies(uc.Host, outReq, fixedCookie, uc.CookiePriority)
 
 	return outReq, nil
 }
@@ -288,7 +288,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 		rewriteSetCookieDomains(c.Writer.Header(), cookieDomain, c.Request.TLS == nil)
 		ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)
-		syncJarCookiesToBrowser(c, uc.Host, cookieDomain, c.Request.TLS == nil)
+		syncJarCookiesToBrowser(c, uc.Host, cookieDomain, c.Request.TLS == nil, uc.CookiePriority)
 
 		port := ""
 		if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {

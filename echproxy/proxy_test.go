@@ -1167,3 +1167,58 @@ func TestClientGuestCookieCannotPoisonJarAndSyncsToBrowser(t *testing.T) {
 	}
 }
 
+func TestCookiePriorityBrowser(t *testing.T) {
+	resetCookieJar()
+
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookieHeader := r.Header.Get("Cookie")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("received:" + cookieHeader))
+	}))
+	defer ts.Close()
+
+	netdial.Transport().TLSClientConfig.RootCAs.AddCert(ts.Certificate())
+	u, _ := url.Parse(ts.URL)
+
+	cfg := &Config{
+		Upstreams: UpstreamMap{
+			"browser-pri.l.moonchan.xyz": UpstreamConfig{
+				Host:           u.Host,
+				Mode:           "direct",
+				Cookie:         "session_id=seed_val_111; other=abc",
+				CookieDomain:   "l.moonchan.xyz",
+				CookiePriority: "browser",
+			},
+		},
+	}
+
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	SetupRouter(engine, cfg)
+
+	// Client sends session_id=browser_val_222
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Host = "browser-pri.l.moonchan.xyz:8443"
+	req.AddCookie(&http.Cookie{Name: "session_id", Value: "browser_val_222"})
+	w := httptest.NewRecorder()
+	engine.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	// When priority is "browser", client's browser_val_222 MUST take precedence over seed_val_111
+	if !strings.Contains(body, "session_id=browser_val_222") {
+		t.Errorf("browser cookie should have overridden seed in browser mode, got: %s", body)
+	}
+	// Other non-conflicting cookies like 'other=abc' should still be present
+	if !strings.Contains(body, "other=abc") {
+		t.Errorf("expected other=abc to be preserved, got: %s", body)
+	}
+
+	// Browser should NOT receive a Set-Cookie forcing session_id back to seed_val_111
+	for _, sc := range w.Header().Values("Set-Cookie") {
+		if strings.Contains(sc, "session_id=seed_val_111") {
+			t.Errorf("browser mode should not force seed value on client: %s", sc)
+		}
+	}
+}
+
+

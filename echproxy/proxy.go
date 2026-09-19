@@ -118,16 +118,6 @@ func rewriteAndSendBody(c *gin.Context, uc UpstreamConfig, resp *http.Response,
 		port = p
 	}
 
-	// Rewrite redirect headers in-place before writing the status line.
-	if rewriter != nil {
-		if loc := resp.Header.Get("Location"); loc != "" {
-			c.Writer.Header().Set("Location", string(rewriter([]byte(loc), port)))
-		}
-		if refresh := resp.Header.Get("Refresh"); refresh != "" {
-			c.Writer.Header().Set("Refresh", string(rewriter([]byte(refresh), port)))
-		}
-	}
-
 	// Text body rewriting path (decompress → rewrite → optionally re-compress).
 	if rewriter != nil &&
 		isTextContent(resp.Header.Get("Content-Type")) &&
@@ -270,74 +260,15 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 
 		// --- Step 3: Round-trip to upstream ---
-		// Internally handle http redirects (e.g. scheme downgrades from upstream),
-		// but do NOT follow https redirects directly (return them to browser with rewritten Location).
-		const maxHTTPRedirects = 10
-		var resp *http.Response
-		for hops := 0; ; hops++ {
-			var tripErr error
-			resp, tripErr = proxyRoundTrip(outReq, uc.Mode, uc.IPMode)
-			if tripErr != nil {
-				log.Printf("[%s] Upstream request failed: %v (elapsed: %v)", clientIP, tripErr, time.Since(start))
-				c.String(http.StatusBadGateway, "upstream: %v", tripErr)
-				return
-			}
-
-			saveCookies(uc.Host, resp)
-
-			// Only internally handle redirects if it's a 3xx response and within hop limit
-			if resp.StatusCode/100 != 3 || hops >= maxHTTPRedirects {
-				break
-			}
-
-			loc := resp.Header.Get("Location")
-			if loc == "" {
-				break
-			}
-
-			locURL, err := outReq.URL.Parse(loc)
-			if err != nil {
-				break
-			}
-
-			// "https redirect 不要直接follow": pass https redirects directly to browser
-			if locURL.Scheme == "https" {
-				break
-			}
-
-			// "http 自己处理": follow http redirects internally by upgrading to https
-			if locURL.Scheme == "http" {
-				if locURL.Host != "" && locURL.Host != uc.Host {
-					break // External host redirect, let browser handle
-				}
-				locURL.Scheme = "https"
-				debugLogf("[%s] Internally handling http redirect %d: %s -> %s", clientIP, hops+1, resp.Status, locURL.String())
-				resp.Body.Close()
-
-				nextMethod := c.Request.Method
-				if resp.StatusCode == http.StatusSeeOther || resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound {
-					nextMethod = http.MethodGet
-				}
-
-				nextReq, nerr := http.NewRequest(nextMethod, locURL.String(), nil)
-				if nerr != nil {
-					break
-				}
-				copyHeaders(nextReq.Header, c.Request.Header)
-				if nextMethod == http.MethodGet {
-					nextReq.Header.Del("Content-Length")
-					nextReq.Header.Del("Content-Type")
-				}
-				nextReq.Host = uc.Host
-				applyCookies(uc.Host, nextReq, getFixedCookie(uc))
-				outReq = nextReq
-				continue
-			}
-
-			break
+		resp, err := proxyRoundTrip(outReq, uc.Mode, uc.IPMode)
+		if err != nil {
+			log.Printf("[%s] Upstream request failed: %v (elapsed: %v)", clientIP, err, time.Since(start))
+			c.String(http.StatusBadGateway, "upstream: %v", err)
+			return
 		}
 		defer resp.Body.Close()
 
+		saveCookies(uc.Host, resp)
 		debugLogf("[%s] <- %s (elapsed: %v)", clientIP, resp.Status, time.Since(start))
 
 		// --- Step 4: Prepare response headers ---
@@ -349,18 +280,11 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		rewriteSetCookieDomains(c.Writer.Header(), cookieDomain, c.Request.TLS == nil)
 		ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)
 
-		if rewriter != nil {
-			port := ""
-			if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
-				port = p
-			}
-			if loc := c.Writer.Header().Get("Location"); loc != "" {
-				c.Writer.Header().Set("Location", string(rewriter([]byte(loc), port)))
-			}
-			if refresh := c.Writer.Header().Get("Refresh"); refresh != "" {
-				c.Writer.Header().Set("Refresh", string(rewriter([]byte(refresh), port)))
-			}
+		port := ""
+		if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
+			port = p
 		}
+		rewriteRedirectHeaders(c.Writer.Header(), rewriter, port)
 
 		// --- Step 5: SW fallback injection ---
 		if swWant && !isJavascriptResponse(resp) {
@@ -376,7 +300,27 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 	}
 }
 
-
-
-
-
+// rewriteRedirectHeaders rewrites redirect headers (Location and Refresh):
+// 1. Applies domain and port rewriting through rewriter.
+// 2. Automatically upgrades any http:// scheme in redirects to https:// before sending to the client,
+//    ensuring clients stay on secure HTTPS and preventing protocol downgrade / mixed content loops.
+func rewriteRedirectHeaders(h http.Header, rewriter func([]byte, string) []byte, port string) {
+	if loc := h.Get("Location"); loc != "" {
+		if rewriter != nil {
+			loc = string(rewriter([]byte(loc), port))
+		}
+		if len(loc) >= 7 && strings.EqualFold(loc[:7], "http://") {
+			loc = "https://" + loc[7:]
+		}
+		h.Set("Location", loc)
+	}
+	if refresh := h.Get("Refresh"); refresh != "" {
+		if rewriter != nil {
+			refresh = string(rewriter([]byte(refresh), port))
+		}
+		if idx := strings.Index(strings.ToLower(refresh), "http://"); idx >= 0 {
+			refresh = refresh[:idx] + "https://" + refresh[idx+7:]
+		}
+		h.Set("Refresh", refresh)
+	}
+}

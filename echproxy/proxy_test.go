@@ -912,21 +912,16 @@ func TestUpstreamIPModeConfiguration(t *testing.T) {
 	}
 }
 
-func TestInternalHTTPRedirectHandling(t *testing.T) {
-	// Upstream test server returning 302 with http:// scheme, which should be followed internally
-	var ts *httptest.Server
-	ts = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestHTTPRedirectUpgradedToHTTPSAndReturnedToClient(t *testing.T) {
+	// Upstream test server returning 302 with http:// scheme
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/start" {
-			// Simulate upstream scheme downgrade redirect to http://
-			http.Redirect(w, r, "http://"+r.Host+"/destination", http.StatusFound)
+			// Simulate upstream redirect to http://
+			http.Redirect(w, r, "http://www.pixiv.net/destination", http.StatusFound)
 			return
 		}
-		if r.URL.Path == "/destination" {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("reached destination internally"))
-			return
-		}
-		http.NotFound(w, r)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
 	}))
 	defer ts.Close()
 
@@ -937,6 +932,9 @@ func TestInternalHTTPRedirectHandling(t *testing.T) {
 		"pixiv.l.moonchan.xyz": {
 			Host: u.Host,
 			Mode: "direct",
+			Rewrites: map[string]string{
+				"www.pixiv.net": "pixiv.l.moonchan.xyz",
+			},
 		},
 	}
 
@@ -950,10 +948,13 @@ func TestInternalHTTPRedirectHandling(t *testing.T) {
 
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected proxy to handle http redirect internally and return 200 OK, got %d", w.Code)
+	if w.Code != http.StatusFound {
+		t.Fatalf("expected proxy to return 302 Found, got %d", w.Code)
 	}
-	if !strings.Contains(w.Body.String(), "reached destination internally") {
-		t.Errorf("expected body to contain destination content, got %s", w.Body.String())
+	loc := w.Header().Get("Location")
+	expectedLoc := "https://pixiv.l.moonchan.xyz:8443/destination"
+	if loc != expectedLoc {
+		t.Errorf("expected http redirect to be upgraded to https and returned to client:\n  got:  %s\n  want: %s", loc, expectedLoc)
 	}
 }
+

@@ -77,7 +77,12 @@ func buildUpstreamRequest(c *gin.Context, uc UpstreamConfig, urlStr string, prio
 		outReq.Header.Del("X-Forwarded-Proto")
 	}
 
-	// 4. Apply declarative header rules (set/delete/regex-replace).
+	// 4. Ensure explicit referer override is always enforced even if headers map was unpopulated
+	if uc.Referer != "" {
+		outReq.Header.Set("Referer", uc.Referer)
+	}
+
+	// 5. Apply declarative header rules (set/delete/regex-replace).
 	ApplyHeaderRules(outReq.Header, uc.Headers, true, c.Request)
 
 	outReq.Host = uc.Host

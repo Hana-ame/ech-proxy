@@ -1341,5 +1341,63 @@ func TestControlCookieEndpointAndPortalUI(t *testing.T) {
 	}
 }
 
+func TestRefererOverrideGuarantee(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 
+	// Case 1: Config with explicit uc.Referer and unpopulated Headers map
+	ucDirect := UpstreamConfig{
+		Host:    "video-cf.twimg.com",
+		Referer: "https://x.com",
+	}
 
+	w1 := httptest.NewRecorder()
+	c1, _ := gin.CreateTestContext(w1)
+	req1, _ := http.NewRequest(http.MethodGet, "https://twimg.l.moonchan.xyz:8443/ext_tw_video/123", nil)
+	req1.Header.Set("Referer", "https://twimg.l.moonchan.xyz:8443/videos/test")
+	c1.Request = req1
+
+	outReq1, err := buildUpstreamRequest(c1, ucDirect, "https://video-cf.twimg.com/ext_tw_video/123")
+	if err != nil {
+		t.Fatalf("buildUpstreamRequest failed: %v", err)
+	}
+	if outReq1.Header.Get("Referer") != "https://x.com" {
+		t.Errorf("expected Referer override to https://x.com, got: %s", outReq1.Header.Get("Referer"))
+	}
+
+	// Case 2: Wildcard match inherits w.Referer and properly propagates to Headers
+	cfgWildcard := UpstreamMap{
+		"twimg.l.moonchan.xyz": UpstreamConfig{
+			Host: "video-cf.twimg.com",
+			Wildcard: &WildcardRule{
+				Prefix:         "twimg-",
+				EntrySuffix:    ".l.moonchan.xyz",
+				UpstreamSuffix: ".twimg.com",
+				Referer:        "https://x.com",
+			},
+		},
+	}
+	matched, ok := matchWildcard(cfgWildcard, "twimg-pbs.l.moonchan.xyz")
+	if !ok {
+		t.Fatalf("expected wildcard match for twimg-pbs")
+	}
+	if matched.Referer != "https://x.com" {
+		t.Errorf("expected matched.Referer https://x.com, got: %s", matched.Referer)
+	}
+	if matched.Headers == nil || matched.Headers["Referer"].Value != "https://x.com" {
+		t.Errorf("expected matched.Headers Referer https://x.com, got: %v", matched.Headers)
+	}
+
+	w2 := httptest.NewRecorder()
+	c2, _ := gin.CreateTestContext(w2)
+	req2, _ := http.NewRequest(http.MethodGet, "https://twimg-pbs.l.moonchan.xyz:8443/media/pic.jpg", nil)
+	req2.Header.Set("Referer", "https://twimg-pbs.l.moonchan.xyz:8443/media")
+	c2.Request = req2
+
+	outReq2, err := buildUpstreamRequest(c2, matched, "https://pbs.twimg.com/media/pic.jpg")
+	if err != nil {
+		t.Fatalf("buildUpstreamRequest for wildcard failed: %v", err)
+	}
+	if outReq2.Header.Get("Referer") != "https://x.com" {
+		t.Errorf("expected wildcard Referer override to https://x.com, got: %s", outReq2.Header.Get("Referer"))
+	}
+}

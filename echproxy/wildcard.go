@@ -34,6 +34,16 @@ func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 		out.Host = sub + w.UpstreamSuffix
 		if w.Referer != "" {
 			out.Referer = w.Referer
+			if out.Headers == nil {
+				out.Headers = make(map[string]HeaderRule)
+			} else {
+				cloned := make(map[string]HeaderRule, len(out.Headers)+1)
+				for k, v := range out.Headers {
+					cloned[k] = v
+				}
+				out.Headers = cloned
+			}
+			out.Headers["Referer"] = HeaderRule{Value: w.Referer}
 		}
 		if len(w.Headers) > 0 {
 			merged := make(map[string]HeaderRule, len(out.Headers)+len(w.Headers))

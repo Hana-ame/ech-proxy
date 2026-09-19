@@ -17,7 +17,7 @@
 - **Dual Android release flavors: Standard vs Lite (Zero-Permissions)** — Added Gradle flavor separation to produce two distinct Android APKs in every release:
   - **Standard (`ech-proxy-android-<version>.apk`)**: Background-safe edition with Foreground Service, WakeLock, and battery optimization whitelist prompt to prevent Android 11+ Cached Apps Freezer and LMK kills.
   - **Lite (`ech-proxy-android-lite-<version>.apk`)**: Permissionless edition with zero runtime permissions (no notification permission, no battery optimization dialog, no ongoing notification). Runs the proxy directly on a background thread.
-
+- **Anti-hotlinking Referer override restoration & wildcard propagation** — Restored unconditional explicit `Referer` override in `buildUpstreamRequest` and synchronized `w.Referer` into wildcard headers maps, preventing client request referers from passing through and triggering upstream 403 Forbidden errors on anti-hotlinked CDNs (e.g. `video-cf.twimg.com` and `twimg-*.l.moonchan.xyz`).
 
 ---
 

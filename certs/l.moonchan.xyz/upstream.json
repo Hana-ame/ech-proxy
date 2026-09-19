@@ -11,6 +11,15 @@
         "twimg.l.moonchan.xyz": {
             "host": "video-cf.twimg.com",
             "referer": "https://x.com",
+            "headers": {
+                "Referer": "https://x.com"
+            },
+            "wildcard": {
+                "prefix": "twimg-",
+                "entry_suffix": ".l.moonchan.xyz",
+                "upstream_suffix": ".twimg.com",
+                "referer": "https://x.com"
+            },
             "describe": "Twitter/X Image & Video CDN",
             "display": false
         },

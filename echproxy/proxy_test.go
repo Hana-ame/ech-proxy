@@ -156,6 +156,7 @@ func TestUpstreamOrderAndBanner(t *testing.T) {
 
 	expectedOrder := []string{
 		"l.moonchan.xyz",
+		"xx.l.moonchan.xyz",
 		"twimg.l.moonchan.xyz",
 		"ex.l.moonchan.xyz",
 		"sukebei.l.moonchan.xyz",

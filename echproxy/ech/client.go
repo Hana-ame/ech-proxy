@@ -19,6 +19,7 @@ import (
 
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/http2"
 )
 
 // Client is an HTTP client based on cloudflare-ech.com ECH domain fronting.
@@ -419,17 +420,11 @@ func WrapUTLSConn(uConn *utls.UConn) net.Conn {
 // to impersonate a real Chrome browser TLS fingerprint. Cloudflare checks JA3/JA4 fingerprints
 // to detect non-browser clients; using crypto/tls directly exposes the Go runtime fingerprint.
 // utls v1.8.2 supports EncryptedClientHelloConfigList, so ECH encryption is preserved.
-// Supports both HTTP/2 and HTTP/1.1 with connection reuse and pooling.
-func newTransport(echConfig []byte, ipMode string) *http.Transport {
-	return &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			return dialTCP(ctx, host, port, ipMode, dialTimeout)
-		},
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+// Uses http2.Transport to reliably speak native HTTP/2 over custom uTLS connections with multiplexing.
+func newTransport(echConfig []byte, ipMode string) *http2.Transport {
+	return &http2.Transport{
+		AllowHTTP: false,
+		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
@@ -455,6 +450,10 @@ func newTransport(echConfig []byte, ipMode string) *http.Transport {
 					rawConn.Close()
 					return nil, herr
 				}
+				if uConn.ConnectionState().NegotiatedProtocol != "h2" {
+					rawConn.Close()
+					return nil, fmt.Errorf("upstream did not negotiate h2")
+				}
 				return WrapUTLSConn(uConn), nil
 			})
 			if err != nil {
@@ -462,10 +461,6 @@ func newTransport(echConfig []byte, ipMode string) *http.Transport {
 			}
 			return conn, nil
 		},
-		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        200,
-		MaxIdleConnsPerHost: 50,
-		IdleConnTimeout:     netdial.OpTimeout,
 	}
 }
 

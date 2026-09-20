@@ -1,3 +1,12 @@
+## v1.1.6
+
+### Fixes & Improvements
+
+- **Restore native `http2.Transport` for ECH & SNI Fronting** — Restored `golang.org/x/net/http2.Transport` as the core transport for Cloudflare ECH and SNI camouflaged egress. In v1.1.5, substituting standard library `http.Transport` with custom `DialTLSContext` caused Go's transport layer to fail internal HTTP/2 type assertions on `uTLS` connections (`*tls.Conn`), silently downgrading to plaintext HTTP/1.1 on ALPN `h2` negotiated streams. This triggered immediate protocol resets from Cloudflare edge nodes across all proxied websites. Restoring `http2.Transport` guarantees strict HTTP/2 framing, reliable multiplexing, and full uTLS Chrome JA3/JA4 fingerprint compatibility across all platforms and Go versions.
+- **Upstream Portal Synchronization** — Updated banner ordering test expectations to reflect the addition of `xx.l.moonchan.xyz` (Twitter pic gallery) in `upstream.json`.
+
+---
+
 ## v1.1.5
 
 ### Fixes & Improvements

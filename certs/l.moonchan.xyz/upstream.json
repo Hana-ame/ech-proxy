@@ -8,6 +8,11 @@
             "describe": "Main Portal / Reminder Service",
             "display": false
         },
+        "xx.l.moonchan.xyz": {
+            "host": "xx.4545810.xyz",
+            "describe": "twitter pic gallery",
+            "display": false
+        },
         "twimg.l.moonchan.xyz": {
             "host": "video-cf.twimg.com",
             "referer": "https://x.com",

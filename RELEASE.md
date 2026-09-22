@@ -1,3 +1,13 @@
+## v1.1.7
+
+### Fixes & Improvements
+
+- **Pixiv unreachable: stale seeded cookie caused an endless redirect** — The pixiv entry seeded a session cookie captured on 2026-09-19. Once it expired, pixiv answered every request by clearing the session (`Set-Cookie: PHPSESSID=deleted`) and redirecting to the login page. Because the 302 is handed to the browser with its `Location` rewritten back to the entry host, each hop re-encoded the whole URL into `return_to`, so the parameter compounded without bound (`/` → `/?return_to=%2F` → …). Every pixiv page, including the homepage, was unreachable. The seeded cookie is removed from both the entry and its wildcard, and `cookie_priority` now uses `browser` so the live browser session is used instead of a snapshot that silently rots.
+- **Pixiv SPA crashed on non-standard ports** — pixiv's SPA passes the SSR-injected `services.accounts` value straight into `path-to-regexp` as a route template. With a `:8443` entry the value contained `:8443`, which the library parsed as a *path parameter* named `8443`; supplying it as a number tripped its validator (`TypeError: Expected "8443" to be a string`), aborting rendering and dropping the user on Next.js's `_error` page. A `body_replace` rule now strips the port from `services.accounts` and `services.sketch` only — matched on the escaped JSON keys, so ordinary links and the SNS login form action keep their `:8443` (those hosts resolve to the local proxy and are reachable only on that port).
+- **Note** — these were two independent faults stacked on top of each other; fixing only one left pixiv unusable. Server-side rendering is unaffected by the port fault, so `curl` alone reports 200 and the failure is invisible without a real browser.
+
+---
+
 ## v1.1.6
 
 ### Fixes & Improvements

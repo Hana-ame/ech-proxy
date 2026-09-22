@@ -102,9 +102,6 @@ func saveCookies(host string, resp *http.Response) {
 		if c.MaxAge > 0 && c.Expires.IsZero() {
 			c.Expires = now.Add(time.Duration(c.MaxAge) * time.Second)
 		}
-		if !isCookieAlive(c, now) {
-			continue
-		}
 		key := host
 		if c.Domain != "" {
 			d := strings.TrimPrefix(c.Domain, ".")
@@ -112,7 +109,54 @@ func saveCookies(host string, resp *http.Response) {
 				key = "." + d
 			}
 		}
+		// An expired/deleted cookie (Max-Age<=0 or past Expires) is an explicit instruction from
+		// upstream to DROP the value. It must evict the matching jar entry, not merely be skipped:
+		// keeping a stale session makes every later request replay a dead credential, so the
+		// upstream treats the client as logged out forever (e.g. pixiv answers with a login
+		// redirect whose return_to nests the whole URL, producing an endless redirect loop).
+		if !isCookieAlive(c, now) {
+			// Also evict from the request host: a value stored host-specifically for this
+			// request must not survive just because the deletion carried a Domain attribute.
+			deleteCookieLocked(host, c.Name, now)
+			if key != host {
+				deleteCookieLocked(key, c.Name, now)
+			}
+			continue
+		}
 		saveOneCookieLocked(key, c, now)
+	}
+}
+
+// deleteCookieLocked removes any live jar entry with the given name under key (and, for a
+// host key, under its parent domains) so an upstream deletion takes effect immediately.
+// Must be called while holding cookieMu.
+func deleteCookieLocked(key, name string, now time.Time) {
+	if name == "" {
+		return
+	}
+	keys := []string{key}
+	if !strings.HasPrefix(key, ".") {
+		keys = append(keys, parentDomains(key)...)
+	}
+	for _, k := range keys {
+		jar, ok := cookieJar[k]
+		if !ok {
+			continue
+		}
+		alive := jar[:0]
+		for _, existing := range jar {
+			if existing.Name == name {
+				continue
+			}
+			if isCookieAlive(existing, now) {
+				alive = append(alive, existing)
+			}
+		}
+		if len(alive) == 0 {
+			delete(cookieJar, k)
+		} else {
+			cookieJar[k] = alive
+		}
 	}
 }
 
@@ -357,7 +401,7 @@ func resetCookieJar() {
 // Because it seeds the jar only once:
 // 1. Initial login credentials (like PHPSESSID) are available immediately on all subdomains.
 // 2. Upstream Set-Cookie updates (like session rotation or new CF clearance) smoothly update
-//    the jar without being repeatedly clobbered by static config on every request.
+//     the jar without being repeatedly clobbered by static config on every request.
 func SeedCookiesFromConfig(cfg *Config) {
 	if cfg == nil {
 		return

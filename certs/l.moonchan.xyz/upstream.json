@@ -170,7 +170,17 @@
                 "www.pixiv.net": "pixiv.l.moonchan.xyz",
                 "i.pximg.net": "pximg.l.moonchan.xyz",
                 "s.pximg.net": "pximg-s.l.moonchan.xyz"
-            }
+            },
+            "body_replace": [
+                {
+                    "old": "\\\"accounts\\\":\\\"https://pixiv-accounts.l.moonchan.xyz:8443/\\\"",
+                    "new": "\\\"accounts\\\":\\\"https://pixiv-accounts.l.moonchan.xyz/\\\""
+                },
+                {
+                    "old": "\\\"sketch\\\":\\\"https://pixiv-sketch.l.moonchan.xyz:8443\\\"",
+                    "new": "\\\"sketch\\\":\\\"https://pixiv-sketch.l.moonchan.xyz\\\""
+                }
+            ]
         },
         "pximg.l.moonchan.xyz": {
             "host": "i.pximg.net",

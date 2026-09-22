@@ -1,3 +1,13 @@
+## v1.1.8
+
+### Fixes & Improvements
+
+- **Endless redirect to pixiv (real root cause) — the cookie jar never honoured an upstream deletion.** `saveCookies()` treated an expired or deleted `Set-Cookie` as "skip this value" and left any previously stored cookie of the same name in the jar. A session the upstream had explicitly invalidated therefore stayed cached and was replayed on every later request, so pixiv permanently saw a logged-out client. pixiv answers a dead session with `Set-Cookie: PHPSESSID=deleted` plus a login redirect; because that 302 is handed to the browser with its `Location` rewritten back to the entry host, each hop re-encoded the whole URL into `return_to` (`/` → `/?return_to=%2F` → `/?return_to=%2F%3Freturn_to%3D%252F` → …) until the browser aborted with `ERR_TOO_MANY_REDIRECTS`. An upstream deletion now evicts the matching jar entry, scoped to the cookie name so unrelated cookies are preserved. This also fixes the same class of failure on any other entry whose upstream rotates or clears session cookies.
+- **Why the earlier v1.1.7 config change was not enough** — removing the seeded cookie from `upstream.json` only stopped *seeding* a stale value; it could not clear a stale value the proxy had already cached at runtime, so the loop persisted (it reproduced even in a private window, which ruled out browser-side cookies). v1.1.8 fixes the underlying jar logic; the v1.1.7 config change remains valid and is kept.
+- **Regression tests** — `echproxy/cookie_test.go` covers Domain and non-Domain deletions, negative `Max-Age`, preservation of unrelated cookies, and that live `Set-Cookie` values still store.
+
+---
+
 ## v1.1.7
 
 ### Fixes & Improvements

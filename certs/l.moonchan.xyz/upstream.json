@@ -152,7 +152,7 @@
         "pixiv.l.moonchan.xyz": {
             "host": "www.pixiv.net",
             "describe": "Pixiv 插画站（支持通配子域名）",
-            "display": true,
+            "display": false,
             "ip_mode": "v4",
             "cookie_domain": "l.moonchan.xyz",
             "cookie_priority": "seed",

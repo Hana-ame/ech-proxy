@@ -1,3 +1,12 @@
+## v1.1.9
+
+### Features
+
+- **Self-made login page + same-origin login API proxy** — A self-contained login flow that does not require the user to reach a site's official domain. `/_ech/login` serves a login page that loads the official reCAPTCHA Enterprise (via the wall-reachable `gstatic.cn` first, `recaptcha.net` fallback), executes with the correct `accounts/login` action, and submits through `/_ech/login-api/*`, which proxies to the upstream over the proxy's ECH egress and seeds the returned login cookies (e.g. `PHPSESSID`) into the in-memory cookie jar as Netscape-format entries. Deleted/expired cookies are skipped so a stale session is never replayed. The mechanism is generic for any site behind the proxy.
+- **Note on pixiv** — Credentials verify (`requireExtraVerification`), but pixiv's server never issues a `recaptchaMfaRequestToken` for non-official-domain logins, so the email-verification leg cannot start and a full login state is not reachable from a reverse-proxied domain. This is pixiv server-side gating, not a proxy bug.
+
+---
+
 ## v1.1.8
 
 ### Fixes & Improvements

@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>pixiv 登录 · ech-proxy 自造登录页</title>
+<style>
+  :root{--bg:#0f1115;--card:#1a1e26;--text:#e8eaed;--muted:#9aa0a6;--accent:#4c8bf5;--ok:#34a853;--err:#ea4335;}
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center}
+  .card{background:var(--card);border:1px solid #2a2f3a;border-radius:12px;padding:28px;width:min(420px,calc(100vw-32px))}
+  h1{font-size:17px;margin:0 0 4px}
+  .sub{color:var(--muted);font-size:12px;margin-bottom:18px}
+  label{display:block;font-size:12px;color:var(--muted);margin:12px 0 4px}
+  input{width:100%;padding:10px 12px;border-radius:8px;border:1px solid #333a47;background:#11141a;color:var(--text);font-size:14px}
+  input:focus{outline:none;border-color:var(--accent)}
+  button{margin-top:18px;width:100%;padding:11px;border:0;border-radius:8px;background:var(--accent);color:#fff;font-size:14px;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.5;cursor:wait}
+  button.secondary{background:#2a2f3a;margin-top:10px}
+  .log{margin-top:16px;font-family:ui-monospace,Menlo,monospace;font-size:11px;line-height:1.6;color:var(--muted);white-space:pre-wrap;word-break:break-all;max-height:200px;overflow:auto}
+  .ok{color:var(--ok)}.err{color:var(--err)}.cookies{margin-top:12px;font-family:ui-monospace,Menlo,monospace;font-size:11px;color:#c7f9cc;word-break:break-all}
+  #pinBox{display:none;margin-top:16px;padding-top:16px;border-top:1px solid #2a2f3a}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>pixiv 登录 · ech-proxy 自造登录页</h1>
+  <div class="sub">reCAPTCHA 用官方 site key + 正确 action（accounts/login）生成有效 token，经同源代理完成登录。凭据验证通过后如需邮箱验证码，会发到账号邮箱，填到下面。</div>
+
+  <label>账号 / 邮箱</label>
+  <input id="email" type="text" autocomplete="username" placeholder="pixiv @ / 邮箱">
+  <label>密码</label>
+  <input id="password" type="password" autocomplete="current-password" placeholder="••••••••">
+  <button id="loginBtn">登录</button>
+
+  <div id="pinBox">
+    <label>邮箱验证码（PIN）</label>
+    <input id="pin" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="查收邮箱里的验证码">
+    <button id="pinBtn" class="secondary">提交验证码</button>
+  </div>
+
+  <div class="cookies" id="cookieBox"></div>
+  <div class="log" id="log"></div>
+</div>
+
+<script>
+const SITE_KEY = '6LfF1dcZAAAAAOHQX8v16MX5SktDwmQINVD_6mBF';
+const RC_LOGIN = 'accounts/login';
+const RC_PASSKEY = 'accounts/login_passkey';
+const API = (p)=> '/_ech/login-api' + p;
+let tt = '', mfaToken = '', pendingEmail = '', pendingPwd = '';
+
+const $=id=>document.getElementById(id);
+const log=(m,c)=>{const el=$('log');el.innerHTML+=`<span class="${c||''}">${m}</span>\n`;el.scrollTop=el.scrollHeight;};
+const setBtn=(id,t)=>{const b=$(id);b.textContent=t;b.disabled=t==='…'||t==='处理中…';};
+
+function loadRc(){return new Promise((res,rej)=>{
+  if(window.grecaptcha?.enterprise?.ready) return finishInit(res);
+  const s=document.createElement('script');
+  // 墙内可达：gstatic.cn 优先，recaptcha.net 兜底
+  const urls=[
+    `https://www.gstatic.cn/recaptcha/releases/enterprise.js?render=${SITE_KEY}`,
+    `https://www.recaptcha.net/recaptcha/enterprise.js?render=${SITE_KEY}`,
+    `https://www.google.com/recaptcha/enterprise.js?render=${SITE_KEY}`,
+  ];
+  let i=0;
+  function tryNext(){ if(i>=urls.length){rej(new Error('reCAPTCHA 加载失败（3 个源均不可达）'));return; }
+    const s2=document.createElement('script');
+    s2.src=urls[i++];
+    s2.onload=()=>{ if(window.grecaptcha?.enterprise?.ready){finishInit(res);} else { tryNext(); } };
+    s2.onerror=()=>tryNext();
+    document.head.appendChild(s2);
+  }
+  function finishInit(r){ window.grecaptcha.enterprise.ready(()=>r()); }
+  tryNext();
+});}
+async function getTT(){if(tt)return tt;const r=await fetch(API('/login?lang=zh'),{credentials:'include'});const h=await r.text();const m=h.match(/"pixivAccount\.tt"\s*:\s*"([0-9a-f]+)"/);if(m)tt=m[1];return tt;}
+
+function baseForm(){return{login_id:pendingEmail,password:pendingPwd,source:'accounts',tt:tt||'',ref:'',app_ios:'0',return_to:'https://accounts.pixiv.net/'};}
+async function post(url,obj){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(obj)});return r.json().catch(()=>null);}
+async function postForm(url,form){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},credentials:'include',body:new URLSearchParams(form).toString()});return r.json().catch(()=>null);}
+
+async function doLogin(){
+  pendingEmail=$('email').value.trim();pendingPwd=$('password').value;
+  if(!pendingEmail||!pendingPwd){log('请填账号密码','err');return;}
+  setBtn('loginBtn','处理中…');
+  try{
+    await loadRc();await getTT();
+    log('execute('+RC_LOGIN+')…');
+    const token=await grecaptcha.enterprise.execute(SITE_KEY,{action:RC_LOGIN});
+    log('token='+token.length+'字符','ok');
+    const resp=await postForm(API('/ajax/login?lang=zh'),{...baseForm(),g_recaptcha_response:token,recaptcha_enterprise_score_token:token});
+    await handleLoginResp(resp);
+  }catch(e){log('err: '+e.message,'err');}
+  setBtn('loginBtn','登录');
+}
+
+async function handleLoginResp(resp){
+  if(!resp){log('空响应','err');return;}
+  if(resp.error){log('接口 error: '+JSON.stringify(resp).slice(0,200),'err');return;}
+  const b=resp.body||{};
+  if(b.success&&b.success.returnTo){log('登录成功 → '+b.success.returnTo,'ok');location.assign(b.success.returnTo);return;}
+  if(b.requireExtraVerification){
+    mfaToken=b.requireExtraVerification.recaptchaMfaRequestToken||'';
+    log('凭据正确，需要邮箱验证码（PIN）。已请求发送验证码到 '+pendingEmail+' …','ok');
+    $('pinBox').style.display='block';
+    // 发送 PIN
+    try{
+      const send=await post(API('/ajax/login/mfa/send-pin'),{recaptchaMfaRequestToken:mfaToken});
+      log('验证码已发送（响应: '+JSON.stringify(send).slice(0,120)+'）。查收邮箱。','ok');
+      $('pin').focus();
+    }catch(e){log('发送验证码失败：'+e.message+' —— 请检查邮箱是否已有验证码，或重试','err');}
+    return;
+  }
+  if(b.errors){const msg=Object.entries(b.errors).map(([k,v])=>k+'='+v).join(' ');log((msg.includes('recaptcha')?'reCAPTCHA 被拒：':'错误：')+msg,'err');}
+  showCookies();
+}
+
+async function doPin(){
+  const pin=$('pin').value.trim();
+  if(!pin){log('请填验证码','err');return;}
+  setBtn('pinBtn','处理中…');
+  try{
+    // verifyPin -> 拿 mfaVerdictToken
+    log('验证 PIN…');
+    const vr=await post(API('/ajax/login/mfa/verify-pin'),{recaptchaMfaRequestToken:mfaToken,pin:pin});
+    if(vr&&vr.mfaVerdictToken){
+      log('PIN 通过，mfaVerdictToken 到手','ok');
+      // 用 mfaVerdictToken 再提交登录
+      const token=await grecaptcha.enterprise.execute(SITE_KEY,{action:RC_PASSKEY});
+      const resp=await postForm(API('/ajax/login?lang=zh'),{...baseForm(),recaptcha_enterprise_mfa_verdict_token:vr.mfaVerdictToken,g_recaptcha_response:token,recaptcha_enterprise_score_token:token});
+      await handleLoginResp(resp);
+    }else{
+      log('PIN 验证失败：'+JSON.stringify(vr).slice(0,200),'err');
+    }
+  }catch(e){log('err: '+e.message,'err');}
+  setBtn('pinBtn','提交验证码');
+}
+
+function showCookies(){const cs=document.cookie.split('; ').filter(Boolean).map(c=>{const [n,...v]=c.split('=');return n+'='+(v.join('=')||'').slice(0,20);});$('cookieBox').textContent=cs.length?'cookies: '+cs.join(' ; '):'';}
+
+$('loginBtn').addEventListener('click',doLogin);
+$('pinBtn').addEventListener('click',doPin);
+document.addEventListener('keydown',e=>{if(e.key==='Enter'){($('pinBox').style.display==='block'&&$('pin').value)?doPin():doLogin();}});
+window.addEventListener('load',()=>log('就绪。填账号密码登录；如需邮箱验证码会显示输入框。'));
+</script>
+</body>
+</html>

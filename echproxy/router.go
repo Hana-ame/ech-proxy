@@ -16,6 +16,9 @@ import (
 //go:embed assets/index.html
 var indexHTML string
 
+//go:embed assets/login.html
+var loginHTML string
+
 // indexHost is the host that displays the upstream list portal.
 // l.moonchan.xyz root path "/" displays the portal list; other host root paths route to proxy.
 const indexHost = "l.moonchan.xyz"
@@ -43,6 +46,15 @@ func SetupRouter(r *gin.Engine, cfg *Config) {
 	})
 	r.Any("/_ech/cookie", func(c *gin.Context) {
 		handleControlCookie(c, cfg)
+	})
+
+	// 自造登录页：同源提供，reCAPTCHA 走官方域（合法），登录后的 Set-Cookie 落回本域
+	r.GET("/_ech/login", func(c *gin.Context) {
+		c.Data(200, "text/html; charset=utf-8", []byte(loginHTML))
+	})
+	// 登录 API 同源代理：把 /ajax/login 请求转发到官方域，并透传 Set-Cookie（含 cookie_domain 重写）
+	r.Any("/_ech/login-api/*path", func(c *gin.Context) {
+		handleLoginProxy(c, cfg)
 	})
 
 	r.GET("/", func(c *gin.Context) {
@@ -252,4 +264,3 @@ func findUpstreamConfig(cfg *Config, entry string) (UpstreamConfig, string, bool
 	}
 	return UpstreamConfig{}, "", false
 }
-

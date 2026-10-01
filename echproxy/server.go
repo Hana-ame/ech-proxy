@@ -105,12 +105,11 @@ func LoadTLSCert(cfg *Config) (*tls.Certificate, error) {
 	return &cert, nil
 }
 
-// NewEngine creates and configures a standard Gin engine with Recovery, CORS, and SetupRouter.
+// NewEngine creates and configures a standard Gin engine with Recovery and SetupRouter.
 func NewEngine(cfg *Config) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
-	r.Use(CORSMiddleware())
 	SetupRouter(r, cfg)
 	return r
 }

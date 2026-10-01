@@ -31,6 +31,7 @@ const defaultPort = "8443"
 //   - Unknown Host root path "/" -> fallback to portal list (renders list when {{UPSTREAMS}} present)
 //   - All other paths -> NoRoute proxies directly (ProxyHandler dispatches to upstream by host)
 func SetupRouter(r *gin.Engine, cfg *Config) {
+	r.Use(CORSMiddleware())
 	SeedCookiesFromConfig(cfg)
 	upstreamHandler := ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)
 
@@ -84,6 +85,7 @@ func serveIndex(c *gin.Context, cfg *Config, requestHost string) {
 		page = strings.Replace(page, "{{UPSTREAMS}}", renderUpstreamList(cfg, requestHost), 1)
 	}
 	c.Header("Content-Type", "text/html; charset=utf-8")
+	ApplyCORSHeaders(c.Writer.Header(), c.Request)
 	c.String(200, page)
 }
 

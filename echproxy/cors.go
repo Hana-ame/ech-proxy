@@ -21,13 +21,23 @@ var hopByHopHeaders = map[string]bool{
 	"Upgrade":             true,
 }
 
-// copyHeaders copies request/response headers from src to dst, stripping hop-by-hop headers and upstream CORS headers
-// (CORS is defined by this proxy; passing upstream CORS through would cause duplicate conflicting headers with CORSMiddleware).
+// isCORSOrSecurityHeader reports whether a header key is CORS or security-related
+// and should be defined and managed exclusively by this proxy.
+func isCORSOrSecurityHeader(key string) bool {
+	l := strings.ToLower(key)
+	return strings.HasPrefix(l, "access-control-") ||
+		strings.HasPrefix(l, "content-security-policy") ||
+		l == "cross-origin-resource-policy" ||
+		l == "cross-origin-opener-policy" ||
+		l == "cross-origin-embedder-policy" ||
+		l == "timing-allow-origin"
+}
+
+// copyHeaders copies request/response headers from src to dst, stripping hop-by-hop headers
+// and all upstream CORS/security headers so the proxy's full CORS policy always overrides them.
 func copyHeaders(dst, src http.Header) {
 	for k, vs := range src {
-		l := strings.ToLower(k)
-		if isHopByHop(k) || strings.HasPrefix(l, "access-control-") ||
-			strings.HasPrefix(l, "content-security-policy") {
+		if isHopByHop(k) || isCORSOrSecurityHeader(k) {
 			continue
 		}
 		for _, v := range vs {
@@ -36,30 +46,54 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
-// CORSMiddleware provides unified CORS handling for the reverse proxy:
-// Dynamically reflects the client Origin and enables Allow-Credentials (allowing cookies / auth tokens),
-// preventing the browser from blocking cross-subdomain API calls (e.g. iwara.l.moonchan.xyz -> iwara-api.l.moonchan.xyz).
+// ApplyCORSHeaders applies comprehensive CORS headers to dst based on req,
+// explicitly overriding any original or conflicting CORS headers.
+func ApplyCORSHeaders(dst http.Header, req *http.Request) {
+	var origin string
+	var reqHeaders string
+	if req != nil {
+		origin = req.Header.Get("Origin")
+		reqHeaders = req.Header.Get("Access-Control-Request-Headers")
+	}
+
+	if origin != "" {
+		dst.Set("Access-Control-Allow-Origin", origin)
+		dst.Set("Access-Control-Allow-Credentials", "true")
+		dst.Set("Vary", "Origin")
+	} else {
+		dst.Set("Access-Control-Allow-Origin", "*")
+		dst.Del("Access-Control-Allow-Credentials")
+	}
+
+	dst.Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
+
+	if reqHeaders != "" {
+		dst.Set("Access-Control-Allow-Headers", reqHeaders)
+	} else {
+		dst.Set("Access-Control-Allow-Headers", "*")
+	}
+
+	dst.Set("Access-Control-Expose-Headers", "*, Content-Length, Content-Range, Accept-Ranges, Content-Type, ETag, Last-Modified, Date, Cache-Control")
+	dst.Set("Access-Control-Max-Age", "86400")
+	dst.Set("Access-Control-Allow-Private-Network", "true")
+	dst.Set("Cross-Origin-Resource-Policy", "cross-origin")
+	dst.Set("Timing-Allow-Origin", "*")
+}
+
+// CORSMiddleware provides unified CORS handling for all responses served by the proxy:
+// Dynamically reflects client Origin or provides wildcard origin, allows media/video streaming
+// with range requests and exposes all headers, allowing any website to embed or fetch resources.
 func CORSMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		origin := c.GetHeader("Origin")
-		if origin != "" {
-			c.Header("Access-Control-Allow-Origin", origin)
-			c.Header("Access-Control-Allow-Credentials", "true")
-		} else {
-			c.Header("Access-Control-Allow-Origin", "*")
-		}
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD")
-		if h := c.GetHeader("Access-Control-Request-Headers"); h != "" {
-			c.Header("Access-Control-Allow-Headers", h)
-		} else {
-			c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Origin, X-Requested-With, Cache-Control, User-Agent, X-Site")
-		}
-		c.Header("Access-Control-Max-Age", "86400")
+		ApplyCORSHeaders(c.Writer.Header(), c.Request)
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(204)
 			return
 		}
 		c.Next()
+		// Re-apply after handler execution to guarantee full CORS headers override
+		// any headers set by downstream handlers before body writing.
+		ApplyCORSHeaders(c.Writer.Header(), c.Request)
 	}
 }
 

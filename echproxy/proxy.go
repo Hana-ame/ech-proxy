@@ -41,6 +41,8 @@ func ModeName(mode string) string {
 	}
 }
 
+var roundTripFn = proxyRoundTrip
+
 func proxyRoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	switch mode {
 	case "direct":
@@ -114,6 +116,7 @@ func handleSWFallback(c *gin.Context, cfg UpstreamMap, blocked []string, clientI
 	swRules := collectWildcardRules(cfg)
 	c.Writer.Header().Del("Content-Length")
 	c.Writer.Header().Set("Content-Type", "application/javascript")
+	ApplyCORSHeaders(c.Writer.Header(), c.Request)
 	c.Writer.WriteHeader(200)
 	c.Writer.Write([]byte(swOverrideJS(swProxyMap, swRules, blocked)))
 	debugLogf("[%s] %s %s -> SW fallback generated %d rules, %d wildcards, %d blocked",
@@ -238,6 +241,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		}
 		if !ok {
 			log.Printf("[%s] Upstream config not found: %s", clientIP, host)
+			ApplyCORSHeaders(c.Writer.Header(), c.Request)
 			c.String(http.StatusBadGateway, "no upstream for host: %s", host)
 			return
 		}
@@ -287,14 +291,16 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 		outReq, err := buildUpstreamRequest(c, uc, urlStr, cookiePriority)
 		if err != nil {
 			log.Printf("[%s] Failed to create request: %v", clientIP, err)
+			ApplyCORSHeaders(c.Writer.Header(), c.Request)
 			c.String(http.StatusInternalServerError, "create request: %v", err)
 			return
 		}
 
 		// --- Step 3: Round-trip to upstream ---
-		resp, err := proxyRoundTrip(outReq, uc.Mode, uc.IPMode)
+		resp, err := roundTripFn(outReq, uc.Mode, uc.IPMode)
 		if err != nil {
 			log.Printf("[%s] Upstream request failed: %v (elapsed: %v)", clientIP, err, time.Since(start))
+			ApplyCORSHeaders(c.Writer.Header(), c.Request)
 			c.String(http.StatusBadGateway, "upstream: %v", err)
 			return
 		}
@@ -318,6 +324,7 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 			port = p
 		}
 		rewriteRedirectHeaders(c.Writer.Header(), rewriter, port)
+		ApplyCORSHeaders(c.Writer.Header(), c.Request)
 
 		// --- Step 5: SW fallback injection ---
 		if swWant && !isJavascriptResponse(resp) {

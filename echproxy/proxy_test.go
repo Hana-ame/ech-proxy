@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -79,6 +80,21 @@ func TestCORSMiddleware(t *testing.T) {
 	if w.Header().Get("Access-Control-Allow-Headers") != "Content-Type, X-Site" {
 		t.Errorf("expected echoed headers, got %s", w.Header().Get("Access-Control-Allow-Headers"))
 	}
+	if !strings.Contains(w.Header().Get("Access-Control-Expose-Headers"), "*") {
+		t.Errorf("expected expose headers to contain *, got %s", w.Header().Get("Access-Control-Expose-Headers"))
+	}
+	if w.Header().Get("Access-Control-Max-Age") != "86400" {
+		t.Errorf("expected max age 86400, got %s", w.Header().Get("Access-Control-Max-Age"))
+	}
+	if w.Header().Get("Access-Control-Allow-Private-Network") != "true" {
+		t.Errorf("expected allow private network true, got %s", w.Header().Get("Access-Control-Allow-Private-Network"))
+	}
+	if w.Header().Get("Cross-Origin-Resource-Policy") != "cross-origin" {
+		t.Errorf("expected cross-origin resource policy cross-origin, got %s", w.Header().Get("Cross-Origin-Resource-Policy"))
+	}
+	if w.Header().Get("Timing-Allow-Origin") != "*" {
+		t.Errorf("expected timing allow origin *, got %s", w.Header().Get("Timing-Allow-Origin"))
+	}
 
 	// 2. Simple POST without Origin
 	req2, _ := http.NewRequest(http.MethodPost, "/test", nil)
@@ -90,6 +106,53 @@ func TestCORSMiddleware(t *testing.T) {
 	}
 	if w2.Header().Get("Access-Control-Allow-Origin") != "*" {
 		t.Errorf("expected *, got %s", w2.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if w2.Header().Get("Access-Control-Allow-Credentials") != "" {
+		t.Errorf("expected no allow-credentials when origin is *, got %s", w2.Header().Get("Access-Control-Allow-Credentials"))
+	}
+	if !strings.Contains(w2.Header().Get("Access-Control-Expose-Headers"), "*") {
+		t.Errorf("expected expose headers *, got %s", w2.Header().Get("Access-Control-Expose-Headers"))
+	}
+	if w2.Header().Get("Cross-Origin-Resource-Policy") != "cross-origin" {
+		t.Errorf("expected cross-origin resource policy, got %s", w2.Header().Get("Cross-Origin-Resource-Policy"))
+	}
+
+	// 3. Overriding original/upstream headers
+	dst := make(http.Header)
+	src := make(http.Header)
+	src.Set("Access-Control-Allow-Origin", "https://restricted-twitter.com")
+	src.Set("Cross-Origin-Resource-Policy", "same-origin")
+	src.Set("Timing-Allow-Origin", "https://restricted-twitter.com")
+	src.Set("Access-Control-Expose-Headers", "Content-Length")
+	src.Set("Content-Type", "image/jpeg")
+
+	copyHeaders(dst, src)
+	if dst.Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("copyHeaders should strip upstream Access-Control-Allow-Origin")
+	}
+	if dst.Get("Cross-Origin-Resource-Policy") != "" {
+		t.Errorf("copyHeaders should strip upstream Cross-Origin-Resource-Policy")
+	}
+	if dst.Get("Timing-Allow-Origin") != "" {
+		t.Errorf("copyHeaders should strip upstream Timing-Allow-Origin")
+	}
+	if dst.Get("Content-Type") != "image/jpeg" {
+		t.Errorf("copyHeaders should preserve normal header Content-Type")
+	}
+
+	// When ApplyCORSHeaders is applied, full CORS headers are set
+	req3, _ := http.NewRequest(http.MethodGet, "https://example.com/media/pic.jpg", nil)
+	req3.Header.Set("Origin", "https://my-blog.org")
+	ApplyCORSHeaders(dst, req3)
+
+	if dst.Get("Access-Control-Allow-Origin") != "https://my-blog.org" {
+		t.Errorf("expected mirrored origin, got %s", dst.Get("Access-Control-Allow-Origin"))
+	}
+	if dst.Get("Cross-Origin-Resource-Policy") != "cross-origin" {
+		t.Errorf("expected CORP cross-origin, got %s", dst.Get("Cross-Origin-Resource-Policy"))
+	}
+	if dst.Get("Timing-Allow-Origin") != "*" {
+		t.Errorf("expected Timing-Allow-Origin *, got %s", dst.Get("Timing-Allow-Origin"))
 	}
 }
 
@@ -153,6 +216,7 @@ func TestUpstreamOrderAndBanner(t *testing.T) {
 
 	expectedOrder := []string{
 		"l.moonchan.xyz",
+		"xx.l.moonchan.xyz",
 		"twimg.l.moonchan.xyz",
 		"ex.l.moonchan.xyz",
 		"sukebei.l.moonchan.xyz",
@@ -168,9 +232,6 @@ func TestUpstreamOrderAndBanner(t *testing.T) {
 		"asmr-api-300.l.moonchan.xyz",
 		"f95.l.moonchan.xyz",
 		"south.l.moonchan.xyz",
-		"pixiv.l.moonchan.xyz",
-		"pximg.l.moonchan.xyz",
-		"pximg-s.l.moonchan.xyz",
 	}
 
 	if len(cfg.UpstreamOrder) != len(expectedOrder) {
@@ -892,24 +953,34 @@ func TestUpstreamIPModeConfiguration(t *testing.T) {
 		t.Fatalf("parseConfig failed: %v", err)
 	}
 
-	pixiv := cfg.Upstreams["pixiv.l.moonchan.xyz"]
-	if pixiv.IPMode != "v4" {
-		t.Errorf("expected pixiv.IPMode=v4, got %s", pixiv.IPMode)
-	}
-
-	// Wildcard matching pixiv-accounts should inherit IPMode=v4
-	uc, ok := MatchWildcardForTest(cfg.Upstreams, "pixiv-accounts.l.moonchan.xyz")
-	if !ok {
-		t.Fatalf("expected wildcard match for pixiv-accounts")
-	}
-	if uc.IPMode != "v4" {
-		t.Errorf("expected wildcard match to inherit IPMode=v4, got %s", uc.IPMode)
-	}
-
-	// Other services without ip_mode should be empty / auto
+	// Services without explicit ip_mode should be empty / auto
 	dlsite := cfg.Upstreams["dlsite.l.moonchan.xyz"]
 	if dlsite.IPMode != "" {
 		t.Errorf("expected dlsite.IPMode empty (auto), got %s", dlsite.IPMode)
+	}
+
+	// Verify ip_mode parsing and wildcard inheritance
+	testMap := UpstreamMap{
+		"custom.l.moonchan.xyz": UpstreamConfig{
+			Host:   "custom.upstream.net",
+			IPMode: "v4",
+			Wildcard: &WildcardRule{
+				Prefix:         "custom-",
+				EntrySuffix:    ".l.moonchan.xyz",
+				UpstreamSuffix: ".upstream.net",
+				IPMode:         "v4",
+			},
+		},
+	}
+	if testMap["custom.l.moonchan.xyz"].IPMode != "v4" {
+		t.Errorf("expected custom.IPMode=v4, got %s", testMap["custom.l.moonchan.xyz"].IPMode)
+	}
+	uc, ok := MatchWildcardForTest(testMap, "custom-sub.l.moonchan.xyz")
+	if !ok {
+		t.Fatalf("expected wildcard match for custom-sub")
+	}
+	if uc.IPMode != "v4" {
+		t.Errorf("expected wildcard match to inherit IPMode=v4, got %s", uc.IPMode)
 	}
 }
 
@@ -1400,4 +1471,249 @@ func TestRefererOverrideGuarantee(t *testing.T) {
 	if outReq2.Header.Get("Referer") != "https://x.com" {
 		t.Errorf("expected wildcard Referer override to https://x.com, got: %s", outReq2.Header.Get("Referer"))
 	}
+}
+
+func TestTwimgProxyWithRefererRangeAndCORS(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	data, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
+	if err != nil {
+		t.Fatalf("read upstream.json failed: %v", err)
+	}
+	cfg, err := ParseConfig(data)
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+
+	twimgConfig, ok := cfg.Upstreams["twimg.l.moonchan.xyz"]
+	if !ok {
+		t.Fatalf("expected twimg.l.moonchan.xyz in upstream.json")
+	}
+	if twimgConfig.Host != "video-cf.twimg.com" {
+		t.Errorf("expected host video-cf.twimg.com, got %s", twimgConfig.Host)
+	}
+	if twimgConfig.Referer != "https://x.com" {
+		t.Errorf("expected referer https://x.com, got %s", twimgConfig.Referer)
+	}
+
+	engine := gin.New()
+	SetupRouter(engine, cfg)
+
+	// Save and restore roundTripFn
+	oldRoundTrip := roundTripFn
+	defer func() { roundTripFn = oldRoundTrip }()
+
+	dummyImageBytes := []byte("\xFF\xD8\xFF\xE0\x00\x10JFIF\x00\x01\x01\x01\x00`\x00`\x00\x00\xFF\xDB\x00C\x00image-data")
+	dummyVideoBytes := make([]byte, 1024)
+	for i := range dummyVideoBytes {
+		dummyVideoBytes[i] = byte(i % 256)
+	}
+
+	var capturedUpstreamReferer string
+	var capturedUpstreamRange string
+	var capturedUpstreamURL string
+
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		capturedUpstreamReferer = req.Header.Get("Referer")
+		capturedUpstreamRange = req.Header.Get("Range")
+		capturedUpstreamURL = req.URL.String()
+
+		respHeader := make(http.Header)
+		// Upstream originally sets restricted CORS headers that should be overridden by ech-proxy
+		respHeader.Set("Access-Control-Allow-Origin", "https://twitter.com")
+		respHeader.Set("Access-Control-Expose-Headers", "Content-Length")
+		respHeader.Set("Cross-Origin-Resource-Policy", "same-origin")
+		respHeader.Set("Timing-Allow-Origin", "https://twitter.com")
+		respHeader.Set("Accept-Ranges", "bytes")
+
+		if strings.Contains(req.URL.Path, "HTH6OTsbEAIoXOv") {
+			// True Image endpoint (200 OK)
+			respHeader.Set("Content-Type", "image/jpeg")
+			respHeader.Set("Content-Length", strconv.Itoa(len(dummyImageBytes)))
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        respHeader,
+				Body:          io.NopCloser(bytes.NewReader(dummyImageBytes)),
+				ContentLength: int64(len(dummyImageBytes)),
+			}, nil
+		}
+
+		if capturedUpstreamRange != "" {
+			// Video Range endpoint (206 Partial Content)
+			respHeader.Set("Content-Type", "video/mp4")
+			respHeader.Set("Content-Range", "bytes 0-1023/12091889")
+			respHeader.Set("Content-Length", strconv.Itoa(len(dummyVideoBytes)))
+			return &http.Response{
+				StatusCode:    http.StatusPartialContent,
+				Header:        respHeader,
+				Body:          io.NopCloser(bytes.NewReader(dummyVideoBytes)),
+				ContentLength: int64(len(dummyVideoBytes)),
+			}, nil
+		}
+
+		// Full Video endpoint (200 OK)
+		respHeader.Set("Content-Type", "video/mp4")
+		respHeader.Set("Content-Length", strconv.Itoa(len(dummyVideoBytes)))
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        respHeader,
+			Body:          io.NopCloser(bytes.NewReader(dummyVideoBytes)),
+			ContentLength: int64(len(dummyVideoBytes)),
+		}, nil
+	}
+
+	// 1. Video request with arbitrary Referer -> upstream receives https://x.com, client gets 200 + full CORS
+	videoPath := "/amplify_video/2104135412067467265/vid/avc1/2160x3840/WimAJZn_gSYlrESy.mp4?tag=29"
+	req1 := httptest.NewRequest(http.MethodGet, videoPath, nil)
+	req1.Host = "twimg.l.moonchan.xyz:8443"
+	req1.Header.Set("Referer", "https://unauthorized-third-party.com/embed")
+	req1.Header.Set("Origin", "https://any-website.com")
+	w1 := httptest.NewRecorder()
+	engine.ServeHTTP(w1, req1)
+
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w1.Code)
+	}
+	if capturedUpstreamReferer != "https://x.com" {
+		t.Errorf("expected upstream Referer to be overridden to https://x.com, got %s", capturedUpstreamReferer)
+	}
+	if !strings.Contains(capturedUpstreamURL, "video-cf.twimg.com") {
+		t.Errorf("expected upstream URL to target video-cf.twimg.com, got %s", capturedUpstreamURL)
+	}
+	// Full CORS checks: allow any website to access media
+	if w1.Header().Get("Access-Control-Allow-Origin") != "https://any-website.com" {
+		t.Errorf("expected mirrored Origin, got %s", w1.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if w1.Header().Get("Access-Control-Allow-Credentials") != "true" {
+		t.Errorf("expected Allow-Credentials true, got %s", w1.Header().Get("Access-Control-Allow-Credentials"))
+	}
+	if !strings.Contains(w1.Header().Get("Access-Control-Expose-Headers"), "*") ||
+		!strings.Contains(w1.Header().Get("Access-Control-Expose-Headers"), "Content-Range") {
+		t.Errorf("expected expose headers to include * and Content-Range, got %s", w1.Header().Get("Access-Control-Expose-Headers"))
+	}
+	if w1.Header().Get("Cross-Origin-Resource-Policy") != "cross-origin" {
+		t.Errorf("expected CORP cross-origin (overriding same-origin), got %s", w1.Header().Get("Cross-Origin-Resource-Policy"))
+	}
+	if w1.Header().Get("Timing-Allow-Origin") != "*" {
+		t.Errorf("expected Timing-Allow-Origin * (overriding upstream), got %s", w1.Header().Get("Timing-Allow-Origin"))
+	}
+
+	// 2. Video request with NO Referer -> upstream still receives https://x.com, client gets 200 + CORS
+	req2 := httptest.NewRequest(http.MethodGet, videoPath, nil)
+	req2.Host = "twimg.l.moonchan.xyz:8443"
+	// No Referer and No Origin
+	w2 := httptest.NewRecorder()
+	engine.ServeHTTP(w2, req2)
+
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w2.Code)
+	}
+	if capturedUpstreamReferer != "https://x.com" {
+		t.Errorf("expected upstream Referer https://x.com with no referer, got %s", capturedUpstreamReferer)
+	}
+	if w2.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("expected wildcard origin *, got %s", w2.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if w2.Header().Get("Cross-Origin-Resource-Policy") != "cross-origin" {
+		t.Errorf("expected CORP cross-origin, got %s", w2.Header().Get("Cross-Origin-Resource-Policy"))
+	}
+
+	// 3. Range request (HTTP 206 Partial Content) with arbitrary referer
+	req3 := httptest.NewRequest(http.MethodGet, videoPath, nil)
+	req3.Host = "twimg.l.moonchan.xyz:8443"
+	req3.Header.Set("Referer", "https://blog.example.org")
+	req3.Header.Set("Range", "bytes=0-1023")
+	w3 := httptest.NewRecorder()
+	engine.ServeHTTP(w3, req3)
+
+	if w3.Code != http.StatusPartialContent {
+		t.Fatalf("expected status 206 Partial Content, got %d", w3.Code)
+	}
+	if capturedUpstreamRange != "bytes=0-1023" {
+		t.Errorf("expected Range bytes=0-1023 forwarded, got %s", capturedUpstreamRange)
+	}
+	if w3.Header().Get("Content-Range") != "bytes 0-1023/12091889" {
+		t.Errorf("expected Content-Range header, got %s", w3.Header().Get("Content-Range"))
+	}
+	if w3.Body.Len() != 1024 {
+		t.Errorf("expected 1024 bytes payload for 206, got %d", w3.Body.Len())
+	}
+	if w3.Header().Get("Cross-Origin-Resource-Policy") != "cross-origin" {
+		t.Errorf("expected CORP cross-origin on 206, got %s", w3.Header().Get("Cross-Origin-Resource-Policy"))
+	}
+	if !strings.Contains(w3.Header().Get("Access-Control-Expose-Headers"), "Content-Range") {
+		t.Errorf("expected Content-Range in Expose-Headers on 206, got %s", w3.Header().Get("Access-Control-Expose-Headers"))
+	}
+
+	// 4. True image request (wildcard twimg-pbs.l.moonchan.xyz -> pbs.twimg.com)
+	imagePath := "/media/HTH6OTsbEAIoXOv?format=jpg&name=orig"
+	req4 := httptest.NewRequest(http.MethodGet, imagePath, nil)
+	req4.Host = "twimg-pbs.l.moonchan.xyz:8443"
+	req4.Header.Set("Referer", "https://another-image-viewer.com")
+	req4.Header.Set("Origin", "https://another-image-viewer.com")
+	w4 := httptest.NewRecorder()
+	engine.ServeHTTP(w4, req4)
+
+	if w4.Code != http.StatusOK {
+		t.Fatalf("expected status 200 for true image, got %d", w4.Code)
+	}
+	if capturedUpstreamReferer != "https://x.com" {
+		t.Errorf("expected upstream Referer https://x.com for image, got %s", capturedUpstreamReferer)
+	}
+	if !strings.Contains(capturedUpstreamURL, "pbs.twimg.com") {
+		t.Errorf("expected upstream target pbs.twimg.com, got %s", capturedUpstreamURL)
+	}
+	if w4.Header().Get("Content-Type") != "image/jpeg" {
+		t.Errorf("expected Content-Type image/jpeg, got %s", w4.Header().Get("Content-Type"))
+	}
+	if !bytes.Equal(w4.Body.Bytes(), dummyImageBytes) {
+		t.Errorf("expected real image payload matching dummyImageBytes")
+	}
+	if w4.Header().Get("Access-Control-Allow-Origin") != "https://another-image-viewer.com" {
+		t.Errorf("expected mirrored Origin for image, got %s", w4.Header().Get("Access-Control-Allow-Origin"))
+	}
+	if w4.Header().Get("Cross-Origin-Resource-Policy") != "cross-origin" {
+		t.Errorf("expected CORP cross-origin for image, got %s", w4.Header().Get("Cross-Origin-Resource-Policy"))
+	}
+
+	// 5. Live upstream roundtrip check against real Twitter CDN if network is available
+	t.Run("LiveTwimgCDN", func(t *testing.T) {
+		client := netdial.Client(5 * time.Second)
+		liveReq, err := http.NewRequest(http.MethodGet, "https://video-cf.twimg.com"+videoPath, nil)
+		if err != nil {
+			t.Skipf("cannot create live request: %v", err)
+		}
+		// Proxy guarantees Referer: https://x.com
+		liveReq.Header.Set("Referer", "https://x.com")
+		liveReq.Header.Set("Range", "bytes=0-1023")
+		liveResp, err := client.Do(liveReq)
+		if err != nil {
+			t.Skipf("live twimg network call skipped: %v", err)
+			return
+		}
+		defer liveResp.Body.Close()
+
+		if liveResp.StatusCode != http.StatusPartialContent && liveResp.StatusCode != http.StatusOK {
+			t.Errorf("expected 206 or 200 from live twimg, got %d", liveResp.StatusCode)
+		}
+
+		// Also verify live true image fetch with Referer: https://x.com
+		imgReq, err := http.NewRequest(http.MethodGet, "https://pbs.twimg.com"+imagePath, nil)
+		if err == nil {
+			imgReq.Header.Set("Referer", "https://x.com")
+			imgResp, err := client.Do(imgReq)
+			if err == nil {
+				defer imgResp.Body.Close()
+				if imgResp.StatusCode != http.StatusOK {
+					t.Errorf("expected 200 for live true image, got %d", imgResp.StatusCode)
+				}
+				firstBytes := make([]byte, 3)
+				_, _ = io.ReadFull(imgResp.Body, firstBytes)
+				// JPEG starts with 0xFF, 0xD8, 0xFF
+				if !bytes.Equal(firstBytes, []byte{0xFF, 0xD8, 0xFF}) {
+					t.Errorf("expected JPEG magic bytes [0xFF, 0xD8, 0xFF], got %v", firstBytes)
+				}
+			}
+		}
+	})
 }

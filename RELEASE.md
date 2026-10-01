@@ -1,3 +1,14 @@
+## v1.2.1
+
+### Changes & Features
+
+- **Full CORS headers across all proxy and service responses** — All responses served by the proxy (including media streaming, index portal, service worker fallback, API routes, and error pages) now include comprehensive CORS headers (`Access-Control-Allow-Origin`, `Access-Control-Allow-Methods`, `Access-Control-Allow-Headers`, `Access-Control-Expose-Headers`, `Access-Control-Max-Age`, `Access-Control-Allow-Private-Network`, `Cross-Origin-Resource-Policy: cross-origin`, and `Timing-Allow-Origin: *`).
+- **Strict CORS override over upstream & original headers** — Upstream responses with restrictive CORS headers (such as `Access-Control-Allow-Origin: https://twitter.com`, `Cross-Origin-Resource-Policy: same-origin`, or restrictive `Timing-Allow-Origin`) are now stripped and overridden by the proxy's full CORS policy, allowing any website to embed, stream, or inspect media assets (e.g. `video-cf.twimg.com` and `pbs.twimg.com`).
+- **Support for HTTP 200 & 206 Partial Content Range streaming** — Exposes `Content-Range`, `Content-Length`, and `Accept-Ranges` via `Access-Control-Expose-Headers`, allowing web video players and clients to seek and stream large media without CORS or Range header restrictions.
+- **Unit & Integration tests for Twitter/twimg media proxying** — Verified media proxying to `twimg.l.moonchan.xyz` (`video-cf.twimg.com`) with arbitrary or no client referer (guaranteeing upstream referer override to `https://x.com` to prevent 403 Forbidden anti-hotlink blocks), 200 / 206 response status, true image loading, and full CORS headers.
+
+---
+
 ## v1.1.4
 
 ### Fixes & Improvements

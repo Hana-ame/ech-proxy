@@ -13,6 +13,11 @@
             "describe": "twitter pic gallery",
             "display": true
         },
+        "x.l.moonchan.xyz": {
+            "host": "x.4545810.xyz",
+            "describe": "twitter pic gallery",
+            "display": true
+        },
         "twimg.l.moonchan.xyz": {
             "host": "video-cf.twimg.com",
             "referer": "https://x.com",

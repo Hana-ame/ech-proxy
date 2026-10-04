@@ -10,16 +10,19 @@
         },
         "xx.l.moonchan.xyz": {
             "host": "xx.4545810.xyz",
+            "ip_mode": "v4",
             "describe": "twitter pic gallery",
             "display": true
         },
         "x.l.moonchan.xyz": {
             "host": "x.4545810.xyz",
+            "ip_mode": "v4",
             "describe": "twitter pic gallery",
             "display": true
         },
         "twimg.l.moonchan.xyz": {
             "host": "video-cf.twimg.com",
+            "ip_mode": "v4",
             "referer": "https://x.com",
             "headers": {
                 "Referer": "https://x.com"
@@ -35,6 +38,7 @@
         },
         "ex.l.moonchan.xyz": {
             "host": "e-hentai.org",
+            "ip_mode": "v4",
             "cookie": "ipb_member_id=xxx; ipb_pass_hash=yyy; igneous=zzz",
             "describe": "ExHentai Gallery (Login Cookie Required)",
             "display": false
@@ -47,11 +51,13 @@
         },
         "ao3.l.moonchan.xyz": {
             "host": "archiveofourown.org",
+            "ip_mode": "v4",
             "describe": "AO3 Fanfiction Site",
             "display": true
         },
         "iwara.l.moonchan.xyz": {
             "host": "www.iwara.tv",
+            "ip_mode": "v4",
             "referer": "https://www.iwara.tv/",
             "headers": {
                 "Origin": "https://www.iwara.tv",
@@ -83,6 +89,7 @@
         },
         "dlsite.l.moonchan.xyz": {
             "host": "www.dlsite.com",
+            "ip_mode": "v4",
             "referer": "https://www.dlsite.com/",
             "describe": "DLsite Digital Store (Wildcard Subdomains Supported)",
             "display": true,
@@ -100,12 +107,14 @@
         },
         "dlsite-img.l.moonchan.xyz": {
             "host": "img.dlsite.jp",
+            "ip_mode": "v4",
             "referer": "https://www.dlsite.com/",
             "describe": "DLsite Image CDN",
             "display": false
         },
         "asmr.l.moonchan.xyz": {
             "host": "asmr.one",
+            "ip_mode": "v4",
             "describe": "ASMR Online Voice Site (Wildcard Subdomains Supported)",
             "display": true,
             "sw_inject": true,
@@ -117,6 +126,7 @@
         },
         "asmr-api-100.l.moonchan.xyz": {
             "host": "api.asmr-100.com",
+            "ip_mode": "v4",
             "describe": "none",
             "display": false,
             "rewrites": {
@@ -125,6 +135,7 @@
         },
         "asmr-api-200.l.moonchan.xyz": {
             "host": "api.asmr-200.com",
+            "ip_mode": "v4",
             "describe": "none",
             "display": false,
             "rewrites": {
@@ -133,6 +144,7 @@
         },
         "asmr-api-300.l.moonchan.xyz": {
             "host": "api.asmr-300.com",
+            "ip_mode": "v4",
             "describe": "none",
             "display": false,
             "rewrites": {
@@ -141,6 +153,7 @@
         },
         "f95.l.moonchan.xyz": {
             "host": "f95zone.to",
+            "ip_mode": "v4",
             "describe": "F95Zone Forum (Wildcard Subdomains Supported)",
             "display": true,
             "wildcard": {
@@ -151,6 +164,7 @@
         },
         "south.l.moonchan.xyz": {
             "host": "south-plus.org",
+            "ip_mode": "v4",
             "describe": "South Plus Forum",
             "display": false
         }

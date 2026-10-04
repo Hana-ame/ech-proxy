@@ -153,6 +153,7 @@ func TestUpstreamOrderAndBanner(t *testing.T) {
 
 	expectedOrder := []string{
 		"l.moonchan.xyz",
+		"xx.l.moonchan.xyz",
 		"twimg.l.moonchan.xyz",
 		"ex.l.moonchan.xyz",
 		"sukebei.l.moonchan.xyz",
@@ -168,9 +169,6 @@ func TestUpstreamOrderAndBanner(t *testing.T) {
 		"asmr-api-300.l.moonchan.xyz",
 		"f95.l.moonchan.xyz",
 		"south.l.moonchan.xyz",
-		"pixiv.l.moonchan.xyz",
-		"pximg.l.moonchan.xyz",
-		"pximg-s.l.moonchan.xyz",
 	}
 
 	if len(cfg.UpstreamOrder) != len(expectedOrder) {
@@ -892,15 +890,15 @@ func TestUpstreamIPModeConfiguration(t *testing.T) {
 		t.Fatalf("parseConfig failed: %v", err)
 	}
 
-	pixiv := cfg.Upstreams["pixiv.l.moonchan.xyz"]
-	if pixiv.IPMode != "v4" {
-		t.Errorf("expected pixiv.IPMode=v4, got %s", pixiv.IPMode)
+	twimg := cfg.Upstreams["twimg.l.moonchan.xyz"]
+	if twimg.IPMode != "v4" {
+		t.Errorf("expected twimg.IPMode=v4, got %s", twimg.IPMode)
 	}
 
-	// Wildcard matching pixiv-accounts should inherit IPMode=v4
-	uc, ok := MatchWildcardForTest(cfg.Upstreams, "pixiv-accounts.l.moonchan.xyz")
+	// Wildcard matching twimg-accounts should inherit IPMode=v4
+	uc, ok := MatchWildcardForTest(cfg.Upstreams, "twimg-accounts.l.moonchan.xyz")
 	if !ok {
-		t.Fatalf("expected wildcard match for pixiv-accounts")
+		t.Fatalf("expected wildcard match for twimg-accounts")
 	}
 	if uc.IPMode != "v4" {
 		t.Errorf("expected wildcard match to inherit IPMode=v4, got %s", uc.IPMode)

@@ -15,6 +15,7 @@
         },
         "twimg.l.moonchan.xyz": {
             "host": "video-cf.twimg.com",
+            "ip_mode": "v4",
             "referer": "https://x.com",
             "headers": {
                 "Referer": "https://x.com"

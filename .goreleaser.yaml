@@ -77,20 +77,41 @@ changelog:
       - "^test:"
       - "^chore:"
 
-# --- The draft toggle -------------------------------------------------------
+# --- Release mode: this repository does not produce drafts -------------------
 #
-# Stage 1 (current): draft: true. GoReleaser creates the release as a DRAFT:
-# it is not published, not visible in the releases list to anonymous readers,
-# and assets are not downloadable by unauthenticated users. It can still be
-# inspected and downloaded while authenticated, which is what makes it safe to
-# test a real tag push without publishing anything.
+# Decision (2026-10-04, explicit instruction "no drafts allowed"): a draft is
+# not an acceptable state here. A draft is invisible to unauthenticated
+# readers, so a leftover draft reads as "no release exists" while its assets sit
+# there unpublished. Stage 1 produced exactly that, and it had to be deleted
+# rather than kept.
 #
-# Stage 2: flip to false only after stage 1 has been proven end to end
-# (release created, draft flag observed, artifacts present, one artifact
-# downloaded and checksum verified).
+# draft is hardcoded false below, and the workflow carries a guard that fails the
+# build if a draft is ever produced, so this cannot silently regress.
+#
+# Two more properties this file must keep:
+#
+# 1. An -rc / -beta tag must NOT become the "latest" release. GitHub points
+#    "latest" at the newest non-prerelease, so publishing an rc with
+#    prerelease: false would push a prerelease into every user's update feed.
+#    prerelease: auto derives the flag from the tag instead of hardcoding it.
+#    Note goreleaser check does NOT validate this field's value (a bogus string
+#    also passes), so the property is argued by tag convention plus the
+#    workflow's trigger scope, not by schema.
+#
+# 2. Plain version tags are handled here as well as by release.yml, which also
+#    builds the Android APKs. Both run on such a tag: GoReleaser contributes
+#    the desktop binaries and checksums, release.yml contributes the APKs, and
+#    their asset names do not collide.
 release:
-  draft: true
-  prerelease: false
+  # Hardcoded false on purpose — see the header note. Do not flip this back.
+  draft: false
+  prerelease: auto
+  # Never let a prerelease become the "latest" release. GitHub otherwise points
+  # "latest" at the newest non-prerelease, so an rc published with
+  # prerelease: false would be offered to every user's update feed.
+  # "false" means GoReleaser leaves that decision alone for a plain release and
+  # does not claim latest for an rc one.
+  make_latest: false
   name_template: "{{ .ProjectName }} {{ .Version }}"
   footer: |
     ## Checksums

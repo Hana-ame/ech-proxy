@@ -1,23 +1,31 @@
 name: goreleaser
 
-# Stage 1 of the GoReleaser rollout: build and publish as a DRAFT release.
+# Publishes desktop binaries and checksums with GoReleaser.
 #
-# Tag scope: v*-rc.* and v*-beta.* only.
+# THIS REPOSITORY DOES NOT PRODUCE DRAFTS. A draft is invisible to
+# unauthenticated readers, so a leftover one reads as "no release exists"
+# while its assets sit there unpublished. The first rollout produced exactly
+# that and it had to be deleted rather than kept. `draft: false` is hardcoded
+# in .goreleaser.yaml, and the "Refuse to leave a draft behind" step below turns
+# any future regression into a red build instead of a silent draft.
 #
-# GoReleaser requires the tag itself to parse as semver, so a non-semver prefix
-# (the "goreleaser-draft-" scheme used on the first two trial tags) is rejected
-# outright. Every semver tag, however, matches release.yml's original v* glob.
-# release.yml therefore keeps v* but skips all of its jobs for -rc / -beta tags,
-# so the two publish paths do not overlap.
+# Tag scope: v* — plain releases, rc and beta alike.
 #
-# Stage 2 (dropping draft: false and adopting a plain version tag) is a
-# separate, deliberate change. Do not widen this trigger as part of the trial.
+# On a plain tag this workflow and release.yml both run: release.yml builds the
+# Android APKs, GoReleaser builds the desktop binaries plus checksums. Their
+# asset names do not collide, and both upload to the same release.
+#
+# On -rc / -beta tags release.yml skips all of its jobs, so only GoReleaser
+# publishes and a prerelease can never claim "latest" (make_latest: false).
+#
+# GoReleaser requires the tag to parse as semver, so the original
+# "goreleaser-draft-" tag prefix is not an option; that is why draft was
+# expressed as a config flag rather than as a tag convention.
 
 on:
   push:
     tags:
-      - "v*-rc.*"
-      - "v*-beta.*"
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -46,6 +54,15 @@ jobs:
           version: "~> v2"
           install-only: true
 
+      - name: Refuse to run with draft enabled in config
+        # Fails fast, before publishing anything, if someone re-enables draft.
+        run: |
+          if grep -Eq '^[[:space:]]*draft:[[:space:]]*true' .goreleaser.yaml; then
+            echo "::error::.goreleaser.yaml has draft: true; this repository does not produce drafts"
+            exit 1
+          fi
+          echo "draft is disabled"
+
       - name: Validate GoReleaser config
         run: goreleaser check
 
@@ -56,3 +73,23 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse to leave a draft behind
+        # Post-condition, not a precondition: verifies what actually happened
+        # rather than what the config intended. A draft that appeared anyway
+        # gets published here and fails the build, so it cannot linger.
+        if: ${{ github.event_name == 'push' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          draft_tag=$(gh api "repos/${{ github.repository }}/releases" --paginate \
+            --jq '.[] | select(.draft == true) | .tag_name')
+          if [ -n "$draft_tag" ]; then
+            echo "::error::draft release(s) present after a run: $draft_tag"
+            for t in $draft_tag; do
+              gh release edit "$t" --draft=false --repo "${{ github.repository }}"
+            done
+            echo "published the draft(s) above; build marked failed on purpose"
+            exit 1
+          fi
+          echo "no draft releases"

@@ -77,20 +77,36 @@ changelog:
       - "^test:"
       - "^chore:"
 
-# --- The draft toggle -------------------------------------------------------
+# --- Stage 2: real releases ---------------------------------------------------
 #
-# Stage 1 (current): draft: true. GoReleaser creates the release as a DRAFT:
-# it is not published, not visible in the releases list to anonymous readers,
-# and assets are not downloadable by unauthenticated users. It can still be
-# inspected and downloaded while authenticated, which is what makes it safe to
-# test a real tag push without publishing anything.
+# Stage 1 was proven on tag v1.3.0-rc.1: 6 assets created, draft=true,
+# invisible to the unauthenticated releases API, artifact downloaded and
+# checksum-verified, and the binary ran.
 #
-# Stage 2: flip to false only after stage 1 has been proven end to end
-# (release created, draft flag observed, artifacts present, one artifact
-# downloaded and checksum verified).
+# draft is now false. Two properties this file must keep:
+#
+# 1. An -rc / -beta tag must NOT become the "latest" release. GitHub points
+#    "latest" at the newest non-prerelease, so publishing an rc with
+#    prerelease: false would make every user's update feed offer a prerelease.
+#    prerelease: auto derives the flag from the tag instead of hardcoding it.
+#    Note goreleaser check does NOT validate this field's value (a bogus string
+#    also passes), so the property is argued by tag convention plus the
+#    workflow's trigger scope, not by schema.
+#
+# 2. GoReleaser only handles prerelease tags (v*-rc.*, v*-beta.*). Plain
+#    version tags still go through release.yml, which also builds the Android
+#    APKs. Deliberately not changed: merging the two pipelines is a separate
+#    decision, and picking one of them silently would drop either the APK
+#    builds or the checksums.
 release:
-  draft: true
-  prerelease: false
+  draft: false
+  prerelease: auto
+  # Never let a prerelease become the "latest" release. GitHub otherwise points
+  # "latest" at the newest non-prerelease, so an rc published with
+  # prerelease: false would be offered to every user's update feed.
+  # "false" means GoReleaser leaves that decision alone for a plain release and
+  # does not claim latest for an rc one.
+  make_latest: false
   name_template: "{{ .ProjectName }} {{ .Version }}"
   footer: |
     ## Checksums

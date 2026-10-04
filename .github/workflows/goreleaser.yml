@@ -37,6 +37,15 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # Install first, then validate. A bare `run: goreleaser check` step
+      # placed before this fails with "command not found" (exit 127) — the
+      # first tag push caught exactly that.
+      - name: Install GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          install-only: true
+
       - name: Validate GoReleaser config
         run: goreleaser check
 

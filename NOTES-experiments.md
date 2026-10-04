@@ -67,3 +67,43 @@
 ## 实验日志
 
 （按分支追加，每条记录：试了什么 / 判据 / 真实读数 / 结论）
+
+### exp01 · config 校验（`exp/exp01-config-validate`）
+
+**试了什么**：把 S1/S2/S3/S5/S6 这五个「写了但没生效」的静默失败面变成主动报出的 issue，
+并给 CLI 加 `-check-config` 做独立校验入口。
+
+**判据**：每条新测试都必须能被证伪 —— 逐个故意改坏 validator，确认对应测试会红。
+
+**真实读数**：
+
+| 变异 | 结果 |
+|---|---|
+| `Validate` 直接 return nil | 11 个测试红 |
+| `containsFold` 改成大小写不敏感 | `TestValidateFlagsInvalidIPMode` 红 |
+| `suggestField` 永不建议 | **存活 → 补测试后杀掉** |
+| 空 host 从 error 降级为 warning | **存活 → 补测试后杀掉** |
+| `HasErrors` 恒返回 false | `TestValidateFlagsEmptyHostBlocksCheckConfig` 红 |
+| `FormatIssues` 不再把 error 排前面 | `TestFormatIssuesSortsErrorsFirst` 红 |
+| 重复 host 检测删掉 | `TestValidateFlagsDuplicateHost` 红 |
+| `Validate` 篡改配置（清 ip_mode） | **存活 → 换 fixture 后杀掉** |
+
+两个「存活」是真发现，不是噪声：
+1. hint 断言和 issue 存在性断言挤在一个测试里 → 拆成独立用例，另加「不相关词不得乱建议」的负向用例
+2. 不变性测试拿**线上配置**做基准，而线上配置根本没有 `ip_mode`，所以「清空 ip_mode」这个变异改不动它 → 改用真正填充了这些字段的 fixture
+
+另有一处测试自身写错被测试抓住：`upstream_suffix` 是 wildcard 作用域的键，不在 entry 键表里。
+
+**命令级验证**：
+
+```
+go test ./... -race   →  ok  echproxy 9.717s
+go vet ./...          →  clean
+-check-config 线上配置   →  Entries: 18 / OK: no issues found / exit 0
+-check-config 构造坏配置 →  4 error(s), 2 warning(s) / exit 1（六个静默失败面全部命中）
+-check-config 不存在的文件 →  exit 2
+```
+
+**结论**：路线成立，收益高、风险低（纯只读校验，不改任何运行时行为）。保留，建议优先合。
+唯一遗留的判断题：`-check-config` 目前不进 CI，因为 `go.yml` 的 `paths-ignore` 排除了 `**.json`
+而配置校验只需要 JSON 改动。要在 CI 里跑需要单独加一个 job，那是 exp/arch02 的范围。

@@ -2,22 +2,22 @@ name: goreleaser
 
 # Stage 1 of the GoReleaser rollout: build and publish as a DRAFT release.
 #
-# Trigger scope is deliberately narrow. The existing release.yml already fires
-# on tags v*, and its final step unconditionally re-uploads a Windows binary to
-# the v1.0.0 release with --clobber. A tag matching v* would therefore trigger
-# two publish paths AND mutate a published, unrelated release.
+# Tag scope: v*-rc.* and v*-beta.* only.
 #
-# So this workflow only triggers on tags under goreleaser-draft-*. That prefix
-# cannot match the v* glob, which is what makes a stage-1 trial safe to run for
-# real.
+# GoReleaser requires the tag itself to parse as semver, so a non-semver prefix
+# (the "goreleaser-draft-" scheme used on the first two trial tags) is rejected
+# outright. Every semver tag, however, matches release.yml's original v* glob.
+# release.yml therefore keeps v* but skips all of its jobs for -rc / -beta tags,
+# so the two publish paths do not overlap.
 #
-# Stage 2 (turning draft: false and adopting a real version tag) is a separate,
-# deliberate change. Do not widen this trigger as part of the draft trial.
+# Stage 2 (dropping draft: false and adopting a plain version tag) is a
+# separate, deliberate change. Do not widen this trigger as part of the trial.
 
 on:
   push:
     tags:
-      - "goreleaser-draft-*"
+      - "v*-rc.*"
+      - "v*-beta.*"
   workflow_dispatch:
 
 permissions:

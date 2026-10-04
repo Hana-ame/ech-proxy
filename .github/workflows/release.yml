@@ -2,11 +2,25 @@ name: release
 
 on:
   push:
+    # GitHub tag filters are globs without character classes and without
+    # anchoring, so no pattern can express "v<digits>.<digits>.<digits>" while
+    # excluding prerelease suffixes: every candidate also matches v1.3.0-rc.1.
+    # The exclusion therefore lives in the job guards below, where it can be
+    # expressed. GoReleaser needs semver tags, which is why they must diverge.
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      backfill_v1_0_0_windows:
+        description: "Also overwrite the Windows binary in the v1.0.0 release (historical one-time operation)"
+        type: boolean
+        default: false
 
 jobs:
   build:
+    # Prerelease tags belong to GoReleaser. Removing this guard would let
+    # v1.3.0-rc.1 publish through BOTH release.yml and goreleaser.yml.
+    if: ${{ !contains(github.ref_name, '-rc.') && !contains(github.ref_name, '-beta.') }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -39,6 +53,7 @@ jobs:
 
   # Android APK build (Go c-shared + JNI wrapper + Java App)
   build-android:
+    if: ${{ !contains(github.ref_name, '-rc.') && !contains(github.ref_name, '-beta.') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -140,6 +155,7 @@ jobs:
           path: android/app/build/outputs/apk/release/*.apk
 
   release:
+    if: ${{ !contains(github.ref_name, '-rc.') && !contains(github.ref_name, '-beta.') }}
     needs: [build, build-android]
     runs-on: ubuntu-latest
     permissions:
@@ -179,9 +195,14 @@ jobs:
             gh release upload "${{ github.ref_name }}" "${f}#${label}" --clobber --repo "${{ github.repository }}"
           done
 
-          # One-time replacement: update the Windows executable in the v1.0.0 release
-          win_exe=$(find dist -name "*windows*.exe" -type f | head -n1)
-          if [ -n "$win_exe" ] && [ -f "$win_exe" ]; then
-            echo "Uploading latest Windows exe to v1.0.0 release: $win_exe"
-            gh release upload v1.0.0 "${win_exe}#ech-proxy-windows-amd64.exe" --clobber --repo "${{ github.repository }}" || true
+          # The v1.0.0 Windows-binary replacement that used to run on every
+          # release is now opt-in via the workflow_dispatch input. Leaving it in
+          # the per-release path meant every new tag silently mutated an
+          # already-published, unrelated release.
+          if [ "${{ inputs.backfill_v1_0_0_windows }}" = "true" ]; then
+            win_exe=$(find dist -name "*windows*.exe" -type f | head -n1)
+            if [ -n "$win_exe" ] && [ -f "$win_exe" ]; then
+              echo "Backfilling Windows exe into v1.0.0: $win_exe"
+              gh release upload v1.0.0 "${win_exe}#ech-proxy-windows-amd64.exe" --clobber --repo "${{ github.repository }}" || true
+            fi
           fi

@@ -3,6 +3,7 @@ package echproxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -904,10 +905,41 @@ func TestUpstreamIPModeConfiguration(t *testing.T) {
 		t.Errorf("expected wildcard match to inherit IPMode=v4, got %s", uc.IPMode)
 	}
 
-	// Other services without ip_mode should be empty / auto
-	dlsite := cfg.Upstreams["dlsite.l.moonchan.xyz"]
-	if dlsite.IPMode != "" {
-		t.Errorf("expected dlsite.IPMode empty (auto), got %s", dlsite.IPMode)
+	// Entries on direct / sni mode are deliberately not pinned (those code paths
+	// ignore ip_mode), so sukebei (sni) stays empty / auto.
+	sukebei := cfg.Upstreams["sukebei.l.moonchan.xyz"]
+	if sukebei.IPMode != "" {
+		t.Errorf("expected sukebei.IPMode empty (auto), got %s", sukebei.IPMode)
+	}
+}
+
+// Every upstream that actually routes through the ECH path must be pinned to v4.
+// direct / sni upstreams are excluded on purpose: proxyRoundTrip ignores ipMode
+// for those modes, so pinning them would be pure config noise.
+func TestAllECHUpstreamsPinnedToV4(t *testing.T) {
+	data, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
+	if err != nil {
+		t.Fatalf("read upstream.json failed: %v", err)
+	}
+	cfg, err := ParseConfig(data)
+	if err != nil {
+		t.Fatalf("parseConfig failed: %v", err)
+	}
+
+	var unpinned []string
+	for host, uc := range cfg.Upstreams {
+		if uc.Mode == "direct" || uc.Mode == "sni" {
+			if uc.IPMode != "" {
+				t.Errorf("%s is mode=%s which ignores ip_mode, but has ip_mode=%q", host, uc.Mode, uc.IPMode)
+			}
+			continue
+		}
+		if uc.IPMode != "v4" {
+			unpinned = append(unpinned, fmt.Sprintf("%s(%s)", host, uc.IPMode))
+		}
+	}
+	if len(unpinned) > 0 {
+		t.Errorf("expected every ECH upstream pinned to v4, unpinned: %v", unpinned)
 	}
 }
 

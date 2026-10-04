@@ -1,6 +1,15 @@
 # Ignore Go build artifacts
-ech-proxy
-ech-proxy-*
+/ech-proxy
+/ech-proxy-*
+# 前两条特意用前导 / 锚定在仓库根：原来的 `ech-proxy-*` 会连
+# .github/workflows/ech-proxy-*.yml 一起吞掉，那条本意只是给编译产物
+# （libechproxy.so / ech-proxy-*.tar.gz）用的。已在 git 里的 workflow
+# 是靠规则加出来之前就入库才幸免；新加的会被**静默**忽略
+#（git status 根本不显示，很容易以为文件写丢了）。
+# ...但别把 workflow 文件也一起忽略掉：上面这条原本是给编译产物
+# （libechproxy.so / echproxy-*.tar.gz）用的，模式 `ech-proxy-*` 会连
+# .github/workflows/ech-proxy-*.yml 一起吞掉 —— 已在 git 里的是因为
+# 加这条规则之前就入库了，新加的会被静默忽略（git status 根本不显示）。
 !win/
 !android/
 android/android

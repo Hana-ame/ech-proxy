@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -235,6 +236,11 @@ type Config struct {
 	Wildcards     WildcardList `json:"wildcards,omitempty"` // Standalone wildcard list (supports array or map)
 	BlockedHosts  []string     `json:"blocked_hosts"`
 	UpstreamOrder []string     `json:"-"`
+
+	// rawJSON keeps the bytes ParseConfig decoded, so Validate can report keys
+	// that encoding/json discarded. It is never serialized and never used for
+	// anything else.
+	rawJSON []byte
 }
 
 // FetchBytes retrieves byte data from a remote URL or local file with retry and timeout handling.
@@ -271,12 +277,25 @@ func FetchBytes(rawURL string) ([]byte, error) {
 }
 
 // LoadConfig loads the upstream JSON configuration from a remote URL or local file path.
+// LoadConfig loads the upstream JSON configuration from a remote URL or local file path.
+//
+// Parsing problems are fatal; semantic problems are reported and then ignored,
+// so a config that merely carries a stale key still serves traffic. Callers
+// that want the report without the log line should call ParseConfig and
+// Validate directly instead of going through here.
 func LoadConfig(rawURL string) (*Config, error) {
 	buf, err := FetchBytes(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("fetch upstream config: %w", err)
 	}
-	return ParseConfig(buf)
+	cfg, err := ParseConfig(buf)
+	if err != nil {
+		return nil, err
+	}
+	if issues := Validate(cfg); len(issues) > 0 {
+		log.Printf("upstream config validation: %s", strings.TrimRight(FormatIssues(issues), "\n"))
+	}
+	return cfg, nil
 }
 
 // ParseConfig parses JSON configuration data into a Config object.
@@ -285,6 +304,7 @@ func ParseConfig(buf []byte) (*Config, error) {
 	if err := json.Unmarshal(buf, &cfg); err != nil {
 		return nil, fmt.Errorf("decode upstream config: %w", err)
 	}
+	cfg.rawJSON = buf
 	om := orderedmap.New()
 	if err := json.Unmarshal(buf, om); err == nil {
 		if us, ok := om.Get("upstreams"); ok {

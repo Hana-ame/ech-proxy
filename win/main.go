@@ -26,7 +26,13 @@ func main() {
 		"force upstream egress IP family: v4 or v6; empty lets the OS decide")
 	localIP := flag.String("local-ip", os.Getenv("LOCALIP"),
 		"DoH bootstrap IP; empty bootstraps through the hostname")
+	checkConfig := flag.String("check-config", "",
+		"validate the config at this URL or path, print the report and exit (0 if no errors)")
 	flag.Parse()
+
+	if *checkConfig != "" {
+		os.Exit(runCheckConfig(*checkConfig))
+	}
 
 	// Per-request logging switch: silent by default in remote deployment, enable with -v for troubleshooting
 	echproxy.Debug = *verbose
@@ -68,6 +74,38 @@ func main() {
 	if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Failed to start server: %v", err)
 	}
+}
+
+// runCheckConfig validates a configuration without binding a port or touching
+// the network beyond fetching it. Exit code is 0 when no errors were found, 1
+// when there were errors, 2 when the config could not be loaded at all — so
+// this is usable directly from CI or a pre-deploy hook.
+//
+// It goes through ParseConfig rather than LoadConfig on purpose: LoadConfig
+// logs the report itself, which would print everything twice here.
+func runCheckConfig(target string) int {
+	fmt.Printf("Checking config: %s\n", target)
+	buf, err := echproxy.FetchBytes(target)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: could not fetch config: %v\n", err)
+		return 2
+	}
+	cfg, err := echproxy.ParseConfig(buf)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "FAIL: could not parse config: %v\n", err)
+		return 2
+	}
+	issues := echproxy.Validate(cfg)
+	fmt.Printf("Entries: %d\n", len(cfg.Upstreams))
+	if len(issues) == 0 {
+		fmt.Println("OK: no issues found")
+		return 0
+	}
+	fmt.Print(echproxy.FormatIssues(issues))
+	if echproxy.HasErrors(issues) {
+		return 1
+	}
+	return 0
 }
 
 func openBrowser(url string) {

@@ -26,17 +26,20 @@ func main() {
 		"force upstream egress IP family: v4 or v6; empty lets the OS decide")
 	localIP := flag.String("local-ip", os.Getenv("LOCALIP"),
 		"DoH bootstrap IP; empty bootstraps through the hostname")
+	allowConnect := flag.Bool("allow-connect", false,
+		"enable the HTTP CONNECT tunnel handler (off by default: tunnels are not restricted to configured upstreams)")
 	flag.Parse()
 
 	// Per-request logging switch: silent by default in remote deployment, enable with -v for troubleshooting
 	echproxy.Debug = *verbose
 
 	srv, err := echproxy.NewServer(echproxy.ServerOptions{
-		Addr:        *addr,
-		HTTPMode:    *httpMode,
-		ConfigURL:   *configURL,
-		BootstrapIP: *localIP,
-		IPMode:      *ipMode,
+		Addr:         *addr,
+		HTTPMode:     *httpMode,
+		ConfigURL:    *configURL,
+		BootstrapIP:  *localIP,
+		IPMode:       *ipMode,
+		AllowConnect: *allowConnect,
 	})
 	if err != nil {
 		log.Fatalf("Proxy server initialization failed: %v", err)

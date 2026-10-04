@@ -1,0 +1,107 @@
+# GoReleaser configuration for ech-proxy desktop binaries.
+#
+# Scope: this produces the DESKTOP binaries only (linux/windows/darwin, amd64 +
+# arm64). Android APKs are built by .github/workflows/release.yml via Gradle and
+# are not part of this config.
+#
+# Tag trigger: v*. This deliberately overlaps with release.yml, which also
+# fires on v*. See the note on release.draft below and PR discussion for how
+# the two are kept from fighting over assets.
+
+version: 2
+
+project_name: ech-proxy
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: ech-proxy
+    main: ./win/
+    binary: ech-proxy
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    goarm:
+      - "7"
+    ignore:
+      - goos: darwin
+        goarch: arm64
+    # Explicit binary naming. The existing releases shipped raw binaries named
+    # ech-proxy-<os>-<arch>[.exe]; keeping that shape means a GoReleaser
+    # release is a drop-in replacement rather than a second, differently
+    # shaped set of assets.
+    #
+    # Note: in GoReleaser v2 "format" and "name_template" are archive-level
+    # settings, not build-level ones. Listing them here is a config error and
+    # `goreleaser check` rejects it.
+    #
+    # The actual naming is set under the archives section below.
+
+# In GoReleaser v2 the "format" key moved to the top level of the archives
+# entry; the deprecated per-archive form is what `goreleaser check` flagged.
+archives:
+  # No archive wrapper: consumers fetch the raw binary, matching release.yml's
+  # existing output so a GoReleaser release is a drop-in replacement rather
+  # than a second, differently shaped set of assets.
+  - id: binary
+    formats: ["binary"]
+    # The "binary" format appends the platform extension itself, so the
+    # template must NOT add .exe: doing so produced
+    # ech-proxy-windows-amd64.exe.exe on the first pipeline run.
+    name_template: >-
+      ech-proxy-{{ .Os }}-{{ .Arch }}
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+# --- The draft toggle -------------------------------------------------------
+#
+# Stage 1 (current): draft: true. GoReleaser creates the release as a DRAFT:
+# it is not published, not visible in the releases list to anonymous readers,
+# and assets are not downloadable by unauthenticated users. It can still be
+# inspected and downloaded while authenticated, which is what makes it safe to
+# test a real tag push without publishing anything.
+#
+# Stage 2: flip to false only after stage 1 has been proven end to end
+# (release created, draft flag observed, artifacts present, one artifact
+# downloaded and checksum verified).
+release:
+  draft: true
+  prerelease: false
+  name_template: "{{ .ProjectName }} {{ .Version }}"
+  footer: |
+    ## Checksums
+
+    Verify a download against `checksums.txt`:
+
+    ```
+    sha256sum -c --ignore-missing checksums.txt
+    ```
+  disable: false
+
+# Deliberately not configured: signing (no cosign key), notarization, snapcraft,
+# homebrew, nfpm, docker. Those need credentials or extra infrastructure this
+# repo does not have yet. Add them only when there is something to sign with.

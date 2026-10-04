@@ -32,6 +32,33 @@ const defaultPort = "8443"
 //   - All other paths -> NoRoute proxies directly (ProxyHandler dispatches to upstream by host)
 //   - CONNECT -> tunnel when allowConnect is set, otherwise 405 with an explanation
 func SetupRouter(r *gin.Engine, cfg *Config, allowConnect bool) {
+	setupRouterWithGuard(r, cfg, allowConnect, nil)
+}
+
+// buildEngine is the test-facing constructor: it is SetupRouter's behavior with
+// an explicit destination checker, without the global tunnel policy that
+// production installs at startup.
+func buildEngine(t interface{ Helper() }, allowConnect bool, guard DestinationChecker) *gin.Engine {
+	r := gin.New()
+	r.Use(gin.Recovery())
+	setupRouterWithGuard(r, nil, allowConnect, guard)
+	return r
+}
+
+// setupRouterWithGuard is SetupRouter plus an explicit destination checker for
+// the CONNECT tunnel. A nil guard leaves tunnel destinations unchecked, which is
+// the pre-existing behavior; NewServer always passes a real one.
+func setupRouterWithGuard(r *gin.Engine, cfg *Config, allowConnect bool, guard DestinationChecker) {
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	if allowConnect {
+		setTunnelPolicy(&tunnelPolicy{
+			auth:  TunnelAuth(),
+			guard: guard,
+			limit: TunnelRateLimiter(),
+		})
+	}
 	r.Use(CORSMiddleware())
 	SeedCookiesFromConfig(cfg)
 	upstreamHandler := ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)

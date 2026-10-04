@@ -30,6 +30,16 @@ func main() {
 		"validate the config at this URL or path, print the report and exit (0 if no errors)")
 	allowConnect := flag.Bool("allow-connect", false,
 		"enable the HTTP CONNECT tunnel handler (off by default: tunnels are not restricted to configured upstreams)")
+	proxyToken := flag.String("proxy-token", os.Getenv("ECH_PROXY_TOKEN"),
+		"bearer token required for CONNECT tunnels; empty means unauthenticated")
+	proxyUser := flag.String("proxy-user", os.Getenv("ECH_PROXY_USER"),
+		"HTTP basic auth username for CONNECT tunnels (ignored when -proxy-token is set)")
+	proxyPass := flag.String("proxy-pass", os.Getenv("ECH_PROXY_PASS"),
+		"HTTP basic auth password for CONNECT tunnels")
+	allowLoopback := flag.Bool("allow-loopback-targets", false,
+		"permit CONNECT tunnels to loopback and private addresses (off by default: blocks SSRF into the local network)")
+	allowPrivate := flag.Bool("allow-private-targets", false,
+		"permit CONNECT tunnels to RFC1918 private ranges")
 	flag.Parse()
 
 	if *checkConfig != "" {
@@ -39,6 +49,30 @@ func main() {
 	// Per-request logging switch: silent by default in remote deployment, enable with -v for troubleshooting
 	echproxy.Debug = *verbose
 
+	// Tunnel security: authentication and destination validation.
+	//
+	// A CONNECT tunnel is an open forward proxy unless a credential is
+	// required, so enabling -allow-connect without -proxy-token leaves every
+	// process that can reach the listener able to reach anything the host can.
+	// The warning is printed rather than enforced, because refusing to start
+	// would break existing single-user desktop use.
+	echproxy.ConfigureTunnelAuth(
+		echproxy.NewProxyAuth(echproxy.AuthConfig{
+			Token:    *proxyToken,
+			Username: *proxyUser,
+			Password: *proxyPass,
+		}),
+		echproxy.NewRateLimiter(10, 5*time.Minute),
+	)
+	destGuard := echproxy.NewDestinationGuard(echproxy.DestinationGuardConfig{
+		AllowLoopback: *allowLoopback,
+		AllowPrivate:  *allowPrivate,
+	})
+
+	if *allowConnect && *proxyToken == "" && *proxyUser == "" {
+		log.Printf("WARNING: -allow-connect is on with no -proxy-token; the tunnel is an open forward proxy")
+	}
+
 	srv, err := echproxy.NewServer(echproxy.ServerOptions{
 		Addr:         *addr,
 		HTTPMode:     *httpMode,
@@ -46,6 +80,7 @@ func main() {
 		BootstrapIP:  *localIP,
 		IPMode:       *ipMode,
 		AllowConnect: *allowConnect,
+		DestGuard:    destGuard,
 	})
 	if err != nil {
 		log.Fatalf("Proxy server initialization failed: %v", err)

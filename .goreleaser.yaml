@@ -77,28 +77,33 @@ changelog:
       - "^test:"
       - "^chore:"
 
-# --- Stage 2: real releases ---------------------------------------------------
+# --- Release mode: this repository does not produce drafts -------------------
 #
-# Stage 1 was proven on tag v1.3.0-rc.1: 6 assets created, draft=true,
-# invisible to the unauthenticated releases API, artifact downloaded and
-# checksum-verified, and the binary ran.
+# Decision (2026-10-04, explicit instruction "no drafts allowed"): a draft is
+# not an acceptable state here. A draft is invisible to unauthenticated
+# readers, so a leftover draft reads as "no release exists" while its assets sit
+# there unpublished. Stage 1 produced exactly that, and it had to be deleted
+# rather than kept.
 #
-# draft is now false. Two properties this file must keep:
+# draft is hardcoded false below, and the workflow carries a guard that fails the
+# build if a draft is ever produced, so this cannot silently regress.
+#
+# Two more properties this file must keep:
 #
 # 1. An -rc / -beta tag must NOT become the "latest" release. GitHub points
 #    "latest" at the newest non-prerelease, so publishing an rc with
-#    prerelease: false would make every user's update feed offer a prerelease.
+#    prerelease: false would push a prerelease into every user's update feed.
 #    prerelease: auto derives the flag from the tag instead of hardcoding it.
 #    Note goreleaser check does NOT validate this field's value (a bogus string
 #    also passes), so the property is argued by tag convention plus the
 #    workflow's trigger scope, not by schema.
 #
-# 2. GoReleaser only handles prerelease tags (v*-rc.*, v*-beta.*). Plain
-#    version tags still go through release.yml, which also builds the Android
-#    APKs. Deliberately not changed: merging the two pipelines is a separate
-#    decision, and picking one of them silently would drop either the APK
-#    builds or the checksums.
+# 2. Plain version tags are handled here as well as by release.yml, which also
+#    builds the Android APKs. Both run on such a tag: GoReleaser contributes
+#    the desktop binaries and checksums, release.yml contributes the APKs, and
+#    their asset names do not collide.
 release:
+  # Hardcoded false on purpose — see the header note. Do not flip this back.
   draft: false
   prerelease: auto
   # Never let a prerelease become the "latest" release. GitHub otherwise points

@@ -222,8 +222,8 @@ func ECHInitLastError() (out *C.char) {
 
 // ─── 日志接口 ────────────────────────────────────────────────────────────────
 
-//export ECHGetLogCount
-func ECHGetLogCount() (ret C.int) {
+//export echGetLogCountX
+func echGetLogCountX() (ret C.int) {
 	defer guardPanic("ECHGetLogCount")
 	logMu.RLock()
 	n := len(logBuffer)

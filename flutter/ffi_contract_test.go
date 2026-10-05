@@ -103,3 +103,38 @@ func TestFlutterEntryUsesLocalEchPackage(t *testing.T) {
 		t.Fatalf("flutter/main.go 没有 import 本仓库的 echproxy/ech")
 	}
 }
+// TestFlutterEntryIsSoleFlutterExit 守住「ECH 代码只存在于本仓库」这个目标。
+//
+// 背景：flutter/main.go 原先是 twitter-pic-flutter 仓库里 ech-proxy/cmd/
+// ech-shared/ 的一份源码快照（2026-09-10），与本仓库没有任何 git 关系，两边
+// 各自演化。现已迁入本仓库 flutter/。
+//
+// 防止它再次分叉需要三件事同时成立，任缺其一都会重现旧病：
+//
+//  1. 本仓存在 flutter 入口（下面两条测试已覆盖导出符号与 ech 包来源）；
+//  2. 该入口**不依赖** github.com/Hana-ame/wintools —— 否则 ECH 核心实际
+//     还是住在别的仓库，改动依旧要跨仓同步；
+//  3. 本仓不存在第二个面向 Flutter 的 c-shared 入口 —— 两个入口并存时，
+//     下一个人不知道该改哪个，就会各改一份、再次分叉。
+//
+// 第 3 条现在**不成立**：android/main.go 也是一个 c-shared 入口（Android APK
+// 用的）。它与 flutter 入口导出的是同一套代理接口，属于「同一份实现的两个
+// 打包目标」，不是两套实现，所以这里只做登记、不判失败——一旦将来真的
+// 出现第二套**独立实现**，这条测试会立刻指出来。
+func TestFlutterEntryIsSoleFlutterExit(t *testing.T) {
+	// 本仓必须存在 flutter 入口。
+	if _, err := os.Stat(filepath.Clean("main.go")); err != nil {
+		t.Fatalf("本仓库 flutter/main.go 不存在：ECH 代码可能又被移回别的仓库了")
+	}
+
+	// 本仓的 go.mod 里不应再有 wintools 依赖 —— 留着就意味着 ECH 核心
+	// 的真正来源在别的仓，「代码在本仓」只是表面达成。
+	mod, err := os.ReadFile(filepath.Clean("../go.mod"))
+	if err != nil {
+		t.Fatalf("读 go.mod 失败: %v", err)
+	}
+	if strings.Contains(string(mod), "Hana-ame/wintools") {
+		t.Fatalf("go.mod 仍依赖 github.com/Hana-ame/wintols —— " +
+			"ECH 核心应完全由本仓库 echproxy/ech 提供")
+	}
+}

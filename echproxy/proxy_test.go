@@ -1172,7 +1172,7 @@ func TestDynamicCookieNotClobberedByStaticConfig(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	SetupRouter(engine, cfg)
+	SetupRouter(engine, cfg, false)
 
 	// 1. Initial request: should carry initial seeded cookie
 	req1 := httptest.NewRequest(http.MethodGet, "/profile", nil)
@@ -1232,7 +1232,7 @@ func TestClientGuestCookieCannotPoisonJarAndSyncsToBrowser(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	SetupRouter(engine, cfg)
+	SetupRouter(engine, cfg, false)
 
 	// 1. Client browser sends request with STALE guest cookie
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -1301,7 +1301,7 @@ func TestCookiePriorityBrowser(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	SetupRouter(engine, cfg)
+	SetupRouter(engine, cfg, false)
 
 	// Client sends session_id=browser_val_222
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -1352,7 +1352,7 @@ func TestControlCookieEndpointAndPortalUI(t *testing.T) {
 
 	gin.SetMode(gin.TestMode)
 	engine := gin.New()
-	SetupRouter(engine, cfg)
+	SetupRouter(engine, cfg, false)
 
 	// 1. Test Portal UI rendering (indexHost)
 	reqPortal := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -1533,7 +1533,7 @@ func TestTwimgProxyWithRefererRangeAndCORS(t *testing.T) {
 	}
 
 	engine := gin.New()
-	SetupRouter(engine, cfg)
+	SetupRouter(engine, cfg, false)
 
 	// Save and restore roundTripFn
 	oldRoundTrip := roundTripFn

@@ -30,7 +30,8 @@ const defaultPort = "8443"
 //   - Host exact match or wildcard match an upstream -> routes through proxy
 //   - Unknown Host root path "/" -> fallback to portal list (renders list when {{UPSTREAMS}} present)
 //   - All other paths -> NoRoute proxies directly (ProxyHandler dispatches to upstream by host)
-func SetupRouter(r *gin.Engine, cfg *Config) {
+//   - CONNECT -> tunnel when allowConnect is set, otherwise 405 with an explanation
+func SetupRouter(r *gin.Engine, cfg *Config, allowConnect bool) {
 	r.Use(CORSMiddleware())
 	SeedCookiesFromConfig(cfg)
 	upstreamHandler := ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)
@@ -72,8 +73,21 @@ func SetupRouter(r *gin.Engine, cfg *Config) {
 		serveIndex(c, cfg, c.Request.Host)
 	})
 
-	// All other paths are proxied directly (ProxyHandler dispatches to corresponding upstream by host)
+	// CONNECT is handled ahead of the reverse-proxy fallback, and only when
+	// explicitly enabled. It is never reached implicitly: with tunneling off,
+	// a CONNECT gets a 405 that says how to turn it on, rather than being
+	// relayed somewhere unexpected.
 	r.NoRoute(func(c *gin.Context) {
+		if c.Request.Method == http.MethodConnect {
+			if allowConnect {
+				handleConnect(c)
+				return
+			}
+			ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			c.String(http.StatusMethodNotAllowed,
+				"CONNECT is disabled. Start with -allow-connect to enable tunneling.")
+			return
+		}
 		upstreamHandler(c)
 	})
 }
@@ -254,4 +268,3 @@ func findUpstreamConfig(cfg *Config, entry string) (UpstreamConfig, string, bool
 	}
 	return UpstreamConfig{}, "", false
 }
-

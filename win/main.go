@@ -28,6 +28,8 @@ func main() {
 		"DoH bootstrap IP; empty bootstraps through the hostname")
 	checkConfig := flag.String("check-config", "",
 		"validate the config at this URL or path, print the report and exit (0 if no errors)")
+	allowConnect := flag.Bool("allow-connect", false,
+		"enable the HTTP CONNECT tunnel handler (off by default: tunnels are not restricted to configured upstreams)")
 	flag.Parse()
 
 	if *checkConfig != "" {
@@ -38,11 +40,12 @@ func main() {
 	echproxy.Debug = *verbose
 
 	srv, err := echproxy.NewServer(echproxy.ServerOptions{
-		Addr:        *addr,
-		HTTPMode:    *httpMode,
-		ConfigURL:   *configURL,
-		BootstrapIP: *localIP,
-		IPMode:      *ipMode,
+		Addr:         *addr,
+		HTTPMode:     *httpMode,
+		ConfigURL:    *configURL,
+		BootstrapIP:  *localIP,
+		IPMode:       *ipMode,
+		AllowConnect: *allowConnect,
 	})
 	if err != nil {
 		log.Fatalf("Proxy server initialization failed: %v", err)

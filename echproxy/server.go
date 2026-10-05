@@ -32,6 +32,11 @@ type ServerOptions struct {
 	ConfigURL       string // Remote upstream.json URL, defaults to DefaultUpstreamConfigURL if empty
 	BootstrapIP     string // DoH bootstrap IP (optional)
 	IPMode          string // "v4" / "v6" preference (optional)
+	// AllowConnect enables the HTTP CONNECT tunnel handler. It is off by
+	// default: a tunnel is an open forward proxy, which is a meaningfully
+	// different security posture from the host-restricted reverse proxy this
+	// project normally runs. Enabling it is an explicit operator decision.
+	AllowConnect bool
 }
 
 // Server represents a running ECH proxy server instance.
@@ -106,11 +111,11 @@ func LoadTLSCert(cfg *Config) (*tls.Certificate, error) {
 }
 
 // NewEngine creates and configures a standard Gin engine with Recovery and SetupRouter.
-func NewEngine(cfg *Config) *gin.Engine {
+func NewEngine(cfg *Config, allowConnect bool) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
 	r.Use(gin.Recovery())
-	SetupRouter(r, cfg)
+	SetupRouter(r, cfg, allowConnect)
 	return r
 }
 
@@ -149,7 +154,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 
 	// 4. Build unified Gin router engine
-	engine := NewEngine(cfg)
+	engine := NewEngine(cfg, opts.AllowConnect)
 
 	// 5. Bind network listener
 	addr := opts.Addr

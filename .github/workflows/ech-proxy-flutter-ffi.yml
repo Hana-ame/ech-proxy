@@ -1,0 +1,74 @@
+name: Flutter FFI contract
+
+# Why this exists as a separate job rather than relying on "Go CI" being green:
+#
+# flutter/main.go is compiled with -buildmode=c-shared and loaded by the Flutter
+# client through DynamicLibrary.lookupFunction, which resolves symbols BY NAME
+# and performs no type checking. A mismatch between the Go signature and the
+# Dart signature compiles cleanly, passes every ordinary Go test, and only
+# fails at runtime on a real device.
+#
+# The unit tests in flutter/ffi_contract_test.go check the source text, which
+# catches a missing or renamed //export. They cannot catch a signature whose
+# shape changed. This job closes that gap by building the shared library and
+# checking the real exported symbol table.
+#
+# Release and Android workflows also build c-shared, but only on tag push or
+# manual dispatch — so a PR touching flutter/ would reach a device untested.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "flutter/**"
+      - "echproxy/ech/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/ech-proxy-flutter-ffi.yml"
+  pull_request:
+    paths:
+      - "flutter/**"
+      - "echproxy/ech/**"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/ech-proxy-flutter-ffi.yml"
+  workflow_dispatch:
+
+jobs:
+  ffi-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build c-shared library
+        run: CGO_ENABLED=1 go build -buildmode=c-shared -o libechproxy.so ./flutter/
+
+      - name: Verify exported FFI symbols
+        # The 9 symbols the Dart side resolves with lookupFunction. Missing one
+        # makes the app fail at startup with an ArgumentError that names the
+        # Dart side, not the Go side.
+        run: |
+          missing=0
+          for sym in ECHInitWithBootstrap ECHInitReady ECHInitLastError \
+                      ECHSetDohURL ECHGetLogCount ECHGetLog FreeCString \
+                      StartProxy StopProxy; do
+            if nm -D libechproxy.so | grep -q " ${sym}$"; then
+              echo "ok      ${sym}"
+            else
+              echo "MISSING ${sym}"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::exported symbol table does not satisfy the Dart client"
+            exit 1
+          fi
+
+      - name: Run FFI contract tests
+        run: go test ./flutter/ -v

@@ -9,12 +9,6 @@ on:
     # expressed. GoReleaser needs semver tags, which is why they must diverge.
     tags:
       - "v*"
-  workflow_dispatch:
-    inputs:
-      backfill_v1_0_0_windows:
-        description: "Also overwrite the Windows binary in the v1.0.0 release (historical one-time operation)"
-        type: boolean
-        default: false
 
 jobs:
   build:
@@ -192,17 +186,9 @@ jobs:
             filename=$(basename "$f")
             label="${filename}"
             echo "Uploading: $label"
-            gh release upload "${{ github.ref_name }}" "${f}#${label}" --clobber --repo "${{ github.repository }}"
+            # Never overwrite an asset that already exists in a published release.
+            # On a re-run for the same tag the upload fails with "already exists";
+            # keep the existing asset and warn instead of replacing it.
+            gh release upload "${{ github.ref_name }}" "${f}#${label}" --repo "${{ github.repository }}" || \
+              echo "::warning::asset already exists for ${{ github.ref_name }}: $label (existing asset kept)"
           done
-
-          # The v1.0.0 Windows-binary replacement that used to run on every
-          # release is now opt-in via the workflow_dispatch input. Leaving it in
-          # the per-release path meant every new tag silently mutated an
-          # already-published, unrelated release.
-          if [ "${{ inputs.backfill_v1_0_0_windows }}" = "true" ]; then
-            win_exe=$(find dist -name "*windows*.exe" -type f | head -n1)
-            if [ -n "$win_exe" ] && [ -f "$win_exe" ]; then
-              echo "Backfilling Windows exe into v1.0.0: $win_exe"
-              gh release upload v1.0.0 "${win_exe}#ech-proxy-windows-amd64.exe" --clobber --repo "${{ github.repository }}" || true
-            fi
-          fi

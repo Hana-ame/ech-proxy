@@ -36,6 +36,39 @@ const connectDialTimeout = 15 * time.Second
 // tests can substitute a local listener; production code never reassigns it.
 var connectDialFn = dialConnectTarget
 
+// tunnelPolicy holds the checks that run before a tunnel is opened.
+//
+// Both checks sit here, before dialConnectTarget, and that placement is forced
+// by two facts about this code path:
+//
+//  1. The proxy never terminates TLS for a tunnel, so there is no certificate
+//     and no SNI that could identify or vouch for the destination. The only
+//     thing naming the destination is the parsed target string, so validation
+//     has to happen on that string.
+//  2. The tunnel does not use the ECH or SNI dialers at all — they terminate
+//     TLS and a tunnel must not — so a check folded into them would never run
+//     for CONNECT traffic.
+//
+// Ordering is deliberate: authenticate first (cheapest, and it is the boundary
+// that decides whether this caller may ask for anything at all), then validate
+// the destination, then dial. A refused target never reaches dialConnectTarget.
+type tunnelPolicy struct {
+	auth  *ProxyAuth
+	guard DestinationChecker
+	limit *RateLimiter
+}
+
+var currentTunnelPolicy = &tunnelPolicy{}
+
+// setTunnelPolicy installs the checks. It is called by the router; tests set it
+// directly.
+func setTunnelPolicy(p *tunnelPolicy) {
+	if p == nil {
+		p = &tunnelPolicy{}
+	}
+	currentTunnelPolicy = p
+}
+
 // dialConnectTarget opens a plain TCP connection to host:port.
 //
 // It deliberately does NOT go through the ECH or SNI dialers. Those speak TLS
@@ -74,6 +107,41 @@ func handleConnect(c *gin.Context) {
 		return
 	}
 
+	// Step 1: authenticate. Before anything else, because this is the check
+	// that decides whether the caller may ask for a destination at all.
+	pol := currentTunnelPolicy
+	if err := pol.auth.Check(c.Request); err != nil {
+		code := http.StatusUnauthorized
+		if ae, ok := err.(*AuthError); ok {
+			code = ae.StatusCode()
+		}
+		if !pol.limit.Allow(c.ClientIP()) {
+			// Too many failures from this peer: stop answering in detail so the
+			// token cannot be brute-forced by measuring responses.
+			code = http.StatusTooManyRequests
+		}
+		ApplyCORSHeaders(c.Writer.Header(), c.Request)
+		c.Header("WWW-Authenticate", pol.auth.Challenge())
+		c.String(code, "%v", err)
+		return
+	}
+	pol.limit.Reset(c.ClientIP())
+
+	// Step 2: validate the destination, still before any TCP connection is
+	// opened, so a refused target is never reached.
+	if pol.guard != nil {
+		if err := pol.guard.Check(target); err != nil {
+			ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			code := http.StatusForbidden
+			if ge, ok := err.(*GuardError); ok {
+				code = ge.StatusCode()
+			}
+			c.String(code, "%v", err)
+			return
+		}
+	}
+
+	// Step 3: only now is the connection hijacked and the upstream dialed.
 	hj, ok := c.Writer.(http.Hijacker)
 	if !ok {
 		// HTTP/2 has no hijack. RFC 8441 extended CONNECT would be the way to

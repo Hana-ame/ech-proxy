@@ -37,6 +37,10 @@ type ServerOptions struct {
 	// different security posture from the host-restricted reverse proxy this
 	// project normally runs. Enabling it is an explicit operator decision.
 	AllowConnect bool
+	// DestGuard validates CONNECT tunnel destinations. When nil, NewServer
+	// installs the default guard, which blocks loopback, private, link-local
+	// and cloud-metadata addresses.
+	DestGuard DestinationChecker
 }
 
 // Server represents a running ECH proxy server instance.
@@ -119,6 +123,16 @@ func NewEngine(cfg *Config, allowConnect bool) *gin.Engine {
 	return r
 }
 
+// newEngineWithGuard is NewEngine with an explicit destination checker, so a
+// caller can tighten or relax the tunnel policy without a global.
+func newEngineWithGuard(cfg *Config, allowConnect bool, guard DestinationChecker) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+	setupRouterWithGuard(r, cfg, allowConnect, guard)
+	return r
+}
+
 // NewServer completes full initialization sequence and binds listening port according to given ServerOptions.
 func NewServer(opts ServerOptions) (*Server, error) {
 	// 1. Initialize ECH network client
@@ -154,7 +168,11 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 
 	// 4. Build unified Gin router engine
-	engine := NewEngine(cfg, opts.AllowConnect)
+	guard := opts.DestGuard
+	if guard == nil && opts.AllowConnect {
+		guard = NewDestinationGuard(DestinationGuardConfig{})
+	}
+	engine := newEngineWithGuard(cfg, opts.AllowConnect, guard)
 
 	// 5. Bind network listener
 	addr := opts.Addr

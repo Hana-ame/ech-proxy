@@ -9,15 +9,52 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Hana-ame/ech-proxy/echproxy"
 )
 
+// exeSuffix443 is the exact filename suffix that selects the 443 build.
+const exeSuffix443 = ".443.exe"
+
+// filenameIs443 reports whether a filename marks the build as the 443 listener.
+//
+// The rule is an exact suffix match on ".443.exe", NOT a substring test: the
+// user must rename the binary so it ends with .443.exe (for example
+// ech-proxy.443.exe) to get port 443. A name that merely mentions .443 in the
+// middle (ech-proxy.443.beta.exe) is not the 443 build and keeps the default
+// 8443 port, so a renamed intermediate build cannot silently bind a privileged
+// port. The comparison is case-insensitive because Windows filenames are.
+func filenameIs443(name string) bool {
+	return strings.HasSuffix(strings.ToLower(filepath.Base(name)), exeSuffix443)
+}
+
+// exeNameIs443 applies filenameIs443 to the running executable.
+//
+// The 443 build is not just a port: it also enables local reverse proxy mode,
+// because serving a real hostname (pixiv.net) on port 443 requires TLS
+// termination with a locally trusted CA. See README "Local reverse proxy mode".
+func exeNameIs443() bool {
+	if len(os.Args) < 1 {
+		return false
+	}
+	return filenameIs443(os.Args[0])
+}
+
 func main() {
-	addr := flag.String("addr", "127.0.0.1:8443", "listen address")
+	four443 := exeNameIs443()
+	addr := flag.String("addr",
+		func() string {
+			if four443 {
+				return "127.0.0.1:443"
+			}
+			return "127.0.0.1:8443"
+		}(),
+		"listen address (default from the executable filename: a \".443.exe\" suffix uses 127.0.0.1:443)")
 	httpMode := flag.Bool("http", false, "run in HTTP mode (no TLS, local proxy)")
 	verbose := flag.Bool("v", false, "verbose per-request logging")
 	noBrowser := flag.Bool("no-browser", false, "do not auto-open browser on startup")
@@ -40,6 +77,10 @@ func main() {
 		"permit CONNECT tunnels to loopback and private addresses (off by default: blocks SSRF into the local network)")
 	allowPrivate := flag.Bool("allow-private-targets", false,
 		"permit CONNECT tunnels to RFC1918 private ranges")
+	localProxy := flag.Bool("local", four443,
+		"local reverse proxy mode: terminate TLS with a self-generated CA and forward each Host through sni/ech (auto-enabled by a \".443.exe\" filename suffix)")
+	dataDir := flag.String("data-dir", os.Getenv("ECH_PROXY_DATA_DIR"),
+		"directory for the local CA and issued certificates (default: the platform user config dir/ech-proxy)")
 	flag.Parse()
 
 	if *checkConfig != "" {
@@ -73,6 +114,12 @@ func main() {
 		log.Printf("WARNING: -allow-connect is on with no -proxy-token; the tunnel is an open forward proxy")
 	}
 
+	// Local reverse proxy mode mandates TLS: the whole point is presenting a
+	// certificate the browser already trusts for the redirected hostname.
+	if *localProxy && *httpMode {
+		log.Fatal("-local and -http are mutually exclusive: local proxy mode terminates TLS")
+	}
+
 	srv, err := echproxy.NewServer(echproxy.ServerOptions{
 		Addr:         *addr,
 		HTTPMode:     *httpMode,
@@ -81,6 +128,8 @@ func main() {
 		IPMode:       *ipMode,
 		AllowConnect: *allowConnect,
 		DestGuard:    destGuard,
+		LocalProxy:   *localProxy,
+		DataDir:      *dataDir,
 	})
 	if err != nil {
 		log.Fatalf("Proxy server initialization failed: %v", err)
@@ -88,8 +137,11 @@ func main() {
 
 	srv.PrintBanner(*localIP)
 
-	// Automatically open browser to entry list once listening successfully (PC usage)
-	if !*noBrowser {
+	// Automatically open browser to entry list once listening successfully (PC usage).
+	// Skipped in local proxy mode: the portal is for l.moonchan.xyz entries, and
+	// the local proxy listens on the same port the user's redirected hostnames
+	// already target, so opening a browser here would just hit the proxy itself.
+	if !*noBrowser && !*localProxy {
 		scheme := "https"
 		if *httpMode {
 			scheme = "http"

@@ -13,6 +13,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -90,6 +91,64 @@ func Dialer() *net.Dialer {
 	}
 }
 
+// ResolvePreferredIP returns the first IP address of host matching mode
+// ("v4" or "v6"), or "" when mode is empty/"auto" so the caller can fall back to
+// a hostname dial. Uses the public DNS resolver so it works on Termux.
+func ResolvePreferredIP(ctx context.Context, host, mode string) (string, error) {
+	ips, err := getResolver().LookupIPAddr(ctx, host)
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", host, err)
+	}
+	for _, addr := range ips {
+		if mode == "v4" && addr.IP.To4() != nil {
+			return addr.IP.String(), nil
+		}
+		if mode == "v6" && addr.IP.To4() == nil && addr.IP.To16() != nil {
+			return addr.IP.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no %s address for %s", mode, host)
+}
+
+// TransportWithIPMode returns an http.Transport whose dials are constrained to
+// the requested outbound IP family. It shares the cached root CA pool so
+// upstream certificate verification is identical to Transport's.
+func TransportWithIPMode(mode string) *http.Transport {
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			return DialContextIPMode(ctx, host, port, mode, OpTimeout)
+		},
+		TLSClientConfig: &tls.Config{
+			RootCAs: getRootPool(),
+		},
+		MaxIdleConns:      100,
+		IdleConnTimeout:   OpTimeout,
+		ForceAttemptHTTP2: true,
+	}
+}
+
+// DialContextIPMode dials host:port, resolving to the first IP of the requested
+// family and connecting to it directly. When mode is "" or "auto" it defers to
+// Dialer().DialContext, which lets the OS choose the family.
+func DialContextIPMode(ctx context.Context, host, port, mode string, timeout time.Duration) (net.Conn, error) {
+	if mode == "v4" || mode == "v6" {
+		ip, err := ResolvePreferredIP(ctx, host, mode)
+		if err != nil {
+			return nil, err
+		}
+		return (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+	}
+	return (&net.Dialer{
+		Timeout:   timeout,
+		KeepAlive: 30 * time.Second,
+		Resolver:  getResolver(),
+	}).DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+}
+
 // rootCAs loads system root certificates and appends Termux's CA bundle if present.
 func rootCAs() *x509.CertPool {
 	pool, _ := x509.SystemCertPool()
@@ -112,7 +171,7 @@ func rootCAs() *x509.CertPool {
 }
 
 var (
-	transportOnce sync.Once
+	transportOnce   sync.Once
 	cachedTransport *http.Transport
 )
 
@@ -125,9 +184,9 @@ func Transport() *http.Transport {
 			TLSClientConfig: &tls.Config{
 				RootCAs: getRootPool(),
 			},
-			MaxIdleConns:        100,
-			IdleConnTimeout:     OpTimeout,
-			ForceAttemptHTTP2:   true,
+			MaxIdleConns:      100,
+			IdleConnTimeout:   OpTimeout,
+			ForceAttemptHTTP2: true,
 		}
 	})
 	return cachedTransport

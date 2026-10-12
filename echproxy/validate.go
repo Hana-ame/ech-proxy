@@ -265,12 +265,13 @@ func validateEntry(entry string, uc UpstreamConfig) []ConfigIssue {
 
 	// The one that actually bit during the ip_mode work: ip_mode on a mode
 	// that never reads it is a config line that implies control it does not
-	// have.
-	if uc.IPMode != "" && (uc.Mode == "direct" || uc.Mode == "sni") {
+	// have. ech and direct both honor it; only sni ignores it, because the SNI
+	// front resolves every A record and tries them in turn regardless.
+	if uc.IPMode != "" && uc.Mode == "sni" {
 		issues = append(issues, ConfigIssue{
 			Severity: "warning", Entry: entry, Field: "ip_mode",
 			Message: fmt.Sprintf("ip_mode %q has no effect in mode %q", uc.IPMode, uc.Mode),
-			Hint:    "proxyRoundTrip only forwards ip_mode in the ech branch; sni already tries every resolved address",
+			Hint:    "sni already resolves and tries every A record of the shell hostname, so the egress family cannot be pinned there",
 		})
 	}
 

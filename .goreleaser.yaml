@@ -48,6 +48,28 @@ builds:
     # `goreleaser check` rejects it.
     #
     # The actual naming is set under the archives section below.
+  - id: ech-proxy-443
+    # The convenience variant for the local reverse proxy mode. The binary is
+    # identical — the same source compiled — but the output filename ends in
+    # ".443.exe", which is exactly what win/main.go's filenameIs443 matches:
+    # the artifact auto-starts on 127.0.0.1:443 in local proxy mode with no
+    # flags, straight from the release download.
+    #
+    # Only Windows amd64 is shipped because that is the platform where a
+    # port-443 hosts-file redirect is the most common use case; Linux and
+    # macOS users can rename any existing binary themselves.
+    main: ./win/
+    binary: ech-proxy.443
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - windows
+    goarch:
+      - amd64
 
 # In GoReleaser v2 the "format" key moved to the top level of the archives
 # entry; the deprecated per-archive form is what `goreleaser check` flagged.
@@ -55,13 +77,31 @@ archives:
   # No archive wrapper: consumers fetch the raw binary, matching release.yml's
   # existing output so a GoReleaser release is a drop-in replacement rather
   # than a second, differently shaped set of assets.
+  #
+  # Two entries because the two builds need different filenames, and a
+  # name_template cannot branch on the build id:
+  #
+  #   regular build -> ech-proxy-<os>-<arch>[.exe]  (unchanged from before)
+  #   443 build     -> ech-proxy.443.exe             (the literal filename, so
+  #                        it auto-triggers local proxy mode when run)
+  #
+  # The "binary" format appends the platform extension itself, so the
+  # template must NOT add .exe: doing so produced
+  # ech-proxy-windows-amd64.exe.exe on the first pipeline run. With
+  # name_template = "{{ .Binary }}" and binary = "ech-proxy.443" the 443
+  # artifact becomes exactly ech-proxy.443.exe.
   - id: binary
     formats: ["binary"]
-    # The "binary" format appends the platform extension itself, so the
-    # template must NOT add .exe: doing so produced
-    # ech-proxy-windows-amd64.exe.exe on the first pipeline run.
+    builds:
+      - ech-proxy
     name_template: >-
-      ech-proxy-{{ .Os }}-{{ .Arch }}
+      {{ .Binary }}-{{ .Os }}-{{ .Arch }}
+  - id: binary-443
+    formats: ["binary"]
+    builds:
+      - ech-proxy-443
+    name_template: >-
+      {{ .Binary }}
 
 checksum:
   name_template: checksums.txt

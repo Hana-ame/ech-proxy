@@ -20,7 +20,13 @@ func matchWildcard(cfg UpstreamMap, host string) (UpstreamConfig, bool) {
 			continue
 		}
 		sub := strings.TrimPrefix(host, w.Prefix)
-		if sub == host || sub == "" {
+		if sub == "" {
+			continue
+		}
+		// With an empty prefix (e.g. entry "*.pixiv.net") TrimPrefix returns host
+		// unchanged, so the usual "did the prefix actually match" guard must not
+		// fire: an empty prefix matches everything by design.
+		if w.Prefix != "" && sub == host {
 			continue
 		}
 		if !strings.HasSuffix(sub, w.EntrySuffix) {

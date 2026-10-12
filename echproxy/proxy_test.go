@@ -235,6 +235,7 @@ func TestUpstreamOrderAndBanner(t *testing.T) {
 		"asmr-api-300.l.moonchan.xyz",
 		"f95.l.moonchan.xyz",
 		"south.l.moonchan.xyz",
+		"pixiv.net",
 	}
 
 	if len(cfg.UpstreamOrder) != len(expectedOrder) {
@@ -420,11 +421,11 @@ func TestHeadersNormalization(t *testing.T) {
 
 func TestApplyHeaderRules(t *testing.T) {
 	rules := map[string]HeaderRule{
-		"X-Custom-Add":     {Value: "added_val"},
-		"X-To-Delete":      {Delete: true},
-		"X-Empty-Delete":   {Value: ""},
-		"Referer":          {Replace: []string{"proxy.moonchan.xyz", "upstream.target.com"}},
-		"Origin":           {Value: "https://upstream.target.com"},
+		"X-Custom-Add":   {Value: "added_val"},
+		"X-To-Delete":    {Delete: true},
+		"X-Empty-Delete": {Value: ""},
+		"Referer":        {Replace: []string{"proxy.moonchan.xyz", "upstream.target.com"}},
+		"Origin":         {Value: "https://upstream.target.com"},
 	}
 
 	// Request 1: POST request with existing headers
@@ -989,9 +990,12 @@ func TestUpstreamIPModeConfiguration(t *testing.T) {
 	}
 }
 
-// Every upstream that actually routes through the ECH path must be pinned to v4.
-// direct / sni upstreams are excluded on purpose: proxyRoundTrip ignores ipMode
-// for those modes (proxy.go:44-54), so pinning them would be pure config noise.
+// Every upstream that routes through the ECH path must be pinned to v4: the ECH
+// client dials the resolved preferred IP, so an unpinned entry would fall back
+// to the OS resolver and could pick IPv6. direct and sni are excluded: direct
+// tries every resolved address, and sni resolves every A record of the shell
+// hostname, so v4 pinning is not required there (direct still honors ip_mode
+// when it is set — see TestProxyHandlerPixivPassthrough).
 func TestAllECHUpstreamsPinnedToV4(t *testing.T) {
 	data, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
 	if err != nil {
@@ -1004,10 +1008,8 @@ func TestAllECHUpstreamsPinnedToV4(t *testing.T) {
 
 	var unpinned []string
 	for host, uc := range cfg.Upstreams {
-		if uc.Mode == "direct" || uc.Mode == "sni" {
-			if uc.IPMode != "" {
-				t.Errorf("%s is mode=%s which ignores ip_mode, but has ip_mode=%q", host, uc.Mode, uc.IPMode)
-			}
+		// Only the ECH path requires a pin; direct and sni may be automatic.
+		if uc.Mode != "" && uc.Mode != "ech" {
 			continue
 		}
 		if uc.IPMode != "v4" {
@@ -1017,6 +1019,13 @@ func TestAllECHUpstreamsPinnedToV4(t *testing.T) {
 	if len(unpinned) > 0 {
 		sort.Strings(unpinned)
 		t.Errorf("expected every ECH upstream pinned to v4, unpinned: %v", unpinned)
+	}
+
+	// sni ignores ip_mode entirely, so pinning it would be pure config noise.
+	for host, uc := range cfg.Upstreams {
+		if uc.Mode == "sni" && uc.IPMode != "" {
+			t.Errorf("%s is mode=sni which ignores ip_mode, but has ip_mode=%q", host, uc.IPMode)
+		}
 	}
 }
 

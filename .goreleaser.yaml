@@ -71,8 +71,13 @@ builds:
     goarch:
       - amd64
 
-# In GoReleaser v2 the "format" key moved to the top level of the archives
-# entry; the deprecated per-archive form is what `goreleaser check` flagged.
+# In GoReleaser v2 the "format" and the build-selection key both moved:
+# archives.format -> archives.formats, and archives.builds -> archives.ids.
+# Both deprecated keys still parse, but `goreleaser check` fails the release on
+# deprecations, so they cannot be used. archives.builds was introduced by PR #13
+# to split the 443 variant, and `goreleaser-action@v6` floats `~> v2`, so the
+# bit-rot only bit at v1.4.0 (v1.3.0 had a single archive and no such key): the
+# run died at `goreleaser check` with exit 2 before any binary was built.
 archives:
   # No archive wrapper: consumers fetch the raw binary, matching release.yml's
   # existing output so a GoReleaser release is a drop-in replacement rather
@@ -92,14 +97,24 @@ archives:
   # artifact becomes exactly ech-proxy.443.exe.
   - id: binary
     formats: ["binary"]
-    builds:
+    ids:
       - ech-proxy
     name_template: >-
       {{ .Binary }}-{{ .Os }}-{{ .Arch }}
   - id: binary-443
     formats: ["binary"]
-    builds:
+    ids:
       - ech-proxy-443
+    # Expected log noise, not a misconfiguration: this archive's name resolves to
+    # the same string as the raw build output ("ech-proxy.443.exe"), because the
+    # filename IS the feature — win/main.go's filenameIs443 matches it to auto-run
+    # the local proxy. GoReleaser therefore logs
+    #   "artifact already present in the list  name=ech-proxy.443.exe"
+    # with "please make sure your configuration is correct". It is correct: the
+    # pair is one UploadableBinary (published) and one raw Binary (never
+    # uploaded), both pointing at the same file. Only this archive collides —
+    # the regular template ({{ .Binary }}-{{ .Os }}-{{ .Arch }}) differs from
+    # the raw name.
     name_template: >-
       {{ .Binary }}
 

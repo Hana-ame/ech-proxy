@@ -167,6 +167,16 @@
             "ip_mode": "v4",
             "describe": "South Plus Forum",
             "display": false
+        },
+        "pixiv.net": {
+            "host": "pixiv.net",
+            "ip_mode": "v4",
+            "wildcard": {
+                "entry_suffix": ".pixiv.net",
+                "upstream_suffix": ".pixiv.net"
+            },
+            "describe": "Pixiv (apex + all subdomains via wildcard) — local reverse proxy, ECH forward, force IPv4",
+            "display": false
         }
     },
     "blocked_hosts": [

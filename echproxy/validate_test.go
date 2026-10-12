@@ -206,23 +206,34 @@ func TestValidateAcceptsAllValidIPModes(t *testing.T) {
 	}
 }
 
-// --- S3: ip_mode is ignored on direct / sni entries -----------------------
-
+// --- S3: ip_mode is ignored on sni entries --------------------------------
+//
+// Only sni is ineffective: it resolves and tries every A record of the shell
+// hostname. ech and direct both honor ip_mode (direct via
+// TransportWithIPMode, ech via resolvePreferredIP).
 func TestValidateFlagsIneffectiveIPMode(t *testing.T) {
-	for _, mode := range []string{"direct", "sni"} {
-		cfg := buildTestConfig(t, `{
-            "upstreams": { "a.l.moonchan.xyz": { "host": "example.com", "mode": "`+mode+`", "ip_mode": "v4" } }
-        }`)
+	cfg := buildTestConfig(t, `{
+        "upstreams": { "a.l.moonchan.xyz": { "host": "example.com", "mode": "sni", "ip_mode": "v4" } }
+    }`)
 
-		issues := Validate(cfg)
-		if !hasIssue(issues, "a.l.moonchan.xyz", "ip_mode") {
-			t.Errorf("expected a warning for ip_mode on mode=%s, got: %v", mode, issues)
-		}
-		// It is a warning, not an error: the config still works, the key just
-		// does not do what it looks like it does.
-		if HasErrors(issues) {
-			t.Errorf("expected ip_mode on mode=%s to be a warning, got errors: %v", mode, issues)
-		}
+	issues := Validate(cfg)
+	if !hasIssue(issues, "a.l.moonchan.xyz", "ip_mode") {
+		t.Errorf("expected a warning for ip_mode on mode=sni, got: %v", issues)
+	}
+	// It is a warning, not an error: the config still works, the key just
+	// does not do what it looks like it does.
+	if HasErrors(issues) {
+		t.Errorf("expected ip_mode on mode=sni to be a warning, got errors: %v", issues)
+	}
+}
+
+func TestValidateAcceptsIPModeOnDirectEntry(t *testing.T) {
+	cfg := buildTestConfig(t, `{
+        "upstreams": { "a.l.moonchan.xyz": { "host": "example.com", "mode": "direct", "ip_mode": "v4" } }
+    }`)
+
+	if issues := Validate(cfg); len(issues) != 0 {
+		t.Errorf("expected ip_mode on a direct entry to be accepted, got: %v", issues)
 	}
 }
 

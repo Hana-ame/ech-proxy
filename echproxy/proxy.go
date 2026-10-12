@@ -46,6 +46,20 @@ var roundTripFn = proxyRoundTrip
 func proxyRoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	switch mode {
 	case "direct":
+		// Respect ip_mode: with no family pinning the OS chooses the egress
+		// family, and some upstreams (observed: www.pixiv.net) reject IPv6
+		// sources with a static 403 "Access blocked". A pinned family resolves
+		// the hostname to the preferred family and dials that IP directly.
+		if ipMode == "v4" || ipMode == "v6" {
+			client := &http.Client{
+				Timeout:   netdial.OpTimeout,
+				Transport: netdial.TransportWithIPMode(ipMode),
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+			}
+			return client.Do(req)
+		}
 		client := netdial.Client(netdial.OpTimeout)
 		return client.Do(req)
 	case "sni":
@@ -103,7 +117,6 @@ func buildUpstreamRequest(c *gin.Context, uc UpstreamConfig, urlStr string, prio
 
 	return outReq, nil
 }
-
 
 // handleSWFallback serves the generated Service Worker JavaScript when the upstream does not
 // return a JavaScript response for /sw.js.
@@ -341,9 +354,9 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 }
 
 // rewriteRedirectHeaders rewrites redirect headers (Location and Refresh):
-// 1. Applies domain and port rewriting through rewriter.
-// 2. Automatically upgrades any http:// scheme in redirects to https:// before sending to the client,
-//    ensuring clients stay on secure HTTPS and preventing protocol downgrade / mixed content loops.
+//  1. Applies domain and port rewriting through rewriter.
+//  2. Automatically upgrades any http:// scheme in redirects to https:// before sending to the client,
+//     ensuring clients stay on secure HTTPS and preventing protocol downgrade / mixed content loops.
 func rewriteRedirectHeaders(h http.Header, rewriter func([]byte, string) []byte, port string) {
 	if loc := h.Get("Location"); loc != "" {
 		if rewriter != nil {

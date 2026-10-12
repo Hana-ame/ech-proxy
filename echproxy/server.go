@@ -41,6 +41,21 @@ type ServerOptions struct {
 	// installs the default guard, which blocks loopback, private, link-local
 	// and cloud-metadata addresses.
 	DestGuard DestinationChecker
+	// LocalProxy switches to local reverse proxy mode: the proxy terminates TLS
+	// with a locally generated self-signed CA and forwards each incoming Host
+	// to the same-named upstream. Used when the user points real hostnames
+	// (pixiv.net, account.pixiv.net) at 127.0.0.1 and runs the proxy on port
+	// 443. See README "Local reverse proxy mode".
+	//
+	// In this mode:
+	//   - the TLS material is self-generated and persisted under DataDir, never
+	//     downloaded;
+	//   - ECH/DoH bootstrap is skipped (upstreams use mode "direct");
+	//   - TLS is mandatory (HTTPMode is ignored).
+	LocalProxy bool
+	// DataDir is where the local CA and issued leaf certificates live. Empty
+	// falls back to DefaultDataDir(). Only used when LocalProxy is set.
+	DataDir string
 }
 
 // Server represents a running ECH proxy server instance.
@@ -48,6 +63,7 @@ type Server struct {
 	Options    ServerOptions
 	Config     *Config
 	TLSCert    *tls.Certificate
+	CertStore  *CertStore // non-nil in LocalProxy mode: self-signed CA + issued leaves
 	Engine     *gin.Engine
 	HTTPServer *http.Server
 	Listener   net.Listener
@@ -89,6 +105,24 @@ func InitECH(bootstrapIP, ipMode string) error {
 	}
 	log.Printf("ECH client ready")
 	return nil
+}
+
+// retryInitECH retries ECH bootstrap in the background after a startup failure
+// in local proxy mode. The first minutes matter most: a user who just launched
+// ech-proxy.443.exe and opened pixiv expects it to work, so the early retries
+// are tighter than the 5-minute operation timeout used elsewhere.
+func retryInitECH(bootstrapIP, ipMode string) {
+	waits := []time.Duration{10 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute}
+	for i, wait := range waits {
+		time.Sleep(wait)
+		if err := InitECH(bootstrapIP, ipMode); err == nil {
+			log.Printf("ECH client recovered after %d failed attempt(s)", i+1)
+			return
+		} else if i+1 < len(waits) {
+			log.Printf("ECH retry %d/%d failed: %v (next in %s)", i+1, len(waits), err, waits[i+1])
+		}
+	}
+	log.Printf("ECH client still unavailable after %d retries; sni/ech upstreams will keep failing", len(waits))
 }
 
 // LoadTLSCert dynamically fetches and parses TLS certificate and key pair from CertPath and KeyPath in config.
@@ -135,8 +169,26 @@ func newEngineWithGuard(cfg *Config, allowConnect bool, guard DestinationChecker
 
 // NewServer completes full initialization sequence and binds listening port according to given ServerOptions.
 func NewServer(opts ServerOptions) (*Server, error) {
-	// 1. Initialize ECH network client
-	if err := InitECH(opts.BootstrapIP, opts.IPMode); err != nil {
+	// 1. Initialize the ECH network client.
+	//
+	// Local proxy mode still needs it: only l.moonchan.xyz keeps the original
+	// direct path, every other incoming hostname (pixiv.net and its
+	// subdomains) is forwarded through sni/ech like the remote deployment does.
+	// Without the ECH client those upstreams would fail on the first request.
+	//
+	// The difference is that failure is not fatal here. A remote deployment
+	// cannot serve anything without ECH, but the local proxy still terminates
+	// TLS and can serve any direct-mode upstream even when moonchan.xyz is
+	// unreachable — for example while the DoH endpoint is jittering. So it is
+	// retried in the background and the caller is told what it can and cannot
+	// do.
+	if opts.LocalProxy {
+		log.Printf("Local reverse proxy mode: TLS via self-generated CA (not downloaded); non-l.moonchan.xyz hosts forward via sni/ech")
+		if err := InitECH(opts.BootstrapIP, opts.IPMode); err != nil {
+			log.Printf("WARNING: ECH initialization failed; sni/ech upstreams will fail until it succeeds: %v", err)
+			go retryInitECH(opts.BootstrapIP, opts.IPMode)
+		}
+	} else if err := InitECH(opts.BootstrapIP, opts.IPMode); err != nil {
 		return nil, err
 	}
 
@@ -152,16 +204,35 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 	log.Printf("Upstream config loaded successfully: %d rules", len(cfg.Upstreams))
 
-	// 3. Fetch TLS certificate if not in HTTP mode
-	var tlsCert *tls.Certificate
-	if !opts.HTTPMode && cfg.CertPath != "" && cfg.KeyPath != "" {
-		cert, err := LoadTLSCert(cfg)
-		if err != nil {
+	// 3. TLS material: a self-generated CA in local mode, the configured
+	// certificate pair otherwise.
+	var (
+		tlsCert   *tls.Certificate
+		certStore *CertStore
+	)
+	switch {
+	case opts.LocalProxy:
+		dataDir := opts.DataDir
+		if dataDir == "" {
+			dd, derr := DefaultDataDir()
+			if derr != nil {
+				return nil, derr
+			}
+			dataDir = dd
+		}
+		store, serr := NewCertStore(dataDir)
+		if serr != nil {
+			return nil, fmt.Errorf("failed to initialize certificate store: %w", serr)
+		}
+		certStore = store
+	case !opts.HTTPMode && cfg.CertPath != "" && cfg.KeyPath != "":
+		cert, ferr := LoadTLSCert(cfg)
+		if ferr != nil {
 			if !opts.AllowRandomPort {
 				// Desktop version strictly errors
-				return nil, err
+				return nil, ferr
 			}
-			log.Printf("Failed to load certificate, degrading: %v", err)
+			log.Printf("Failed to load certificate, degrading: %v", ferr)
 		} else {
 			tlsCert = cert
 		}
@@ -207,7 +278,21 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 
 	isTLS := false
-	if !opts.HTTPMode && tlsCert != nil {
+	if opts.LocalProxy {
+		// Local mode terminates TLS for whatever SNI the client presents, so the
+		// certificate is chosen per connection from the self-signed CA. The
+		// first SNI seen for a domain triggers a one-time leaf issuance (RSA key
+		// generation plus an atomic write), which is what the user asked for:
+		// certificates are generated locally and persisted, never downloaded.
+		isTLS = true
+		store := certStore
+		srv.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				return store.CertificateFor(hello.ServerName)
+			},
+		}
+	} else if !opts.HTTPMode && tlsCert != nil {
 		isTLS = true
 		srv.TLSConfig = &tls.Config{
 			Certificates: []tls.Certificate{*tlsCert},
@@ -219,6 +304,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		Options:    opts,
 		Config:     cfg,
 		TLSCert:    tlsCert,
+		CertStore:  certStore,
 		Engine:     engine,
 		HTTPServer: srv,
 		Listener:   ln,
@@ -266,8 +352,22 @@ func (s *Server) Close() error {
 func (s *Server) PrintBanner(localIP string) {
 	listenPort := fmt.Sprintf("%d", s.Port)
 	fmt.Printf("=== ECH Proxy ===\n")
-	fmt.Printf("  Mode: %s\n", map[bool]string{true: "HTTP (Local Proxy)", false: "TLS (Remote)"}[s.Options.HTTPMode])
+	switch {
+	case s.Options.LocalProxy:
+		fmt.Printf("  Mode: Local Reverse Proxy (TLS, self-generated CA)\n")
+	case s.Options.HTTPMode:
+		fmt.Printf("  Mode: HTTP (Local Proxy)\n")
+	default:
+		fmt.Printf("  Mode: TLS (Remote)\n")
+	}
 	fmt.Printf("  Listening: %s\n", s.Options.Addr)
+	if s.Options.LocalProxy && s.CertStore != nil {
+		fmt.Printf("  CA: %s (valid until %s)\n",
+			s.CertStore.CAPath(), s.CertStore.CAValidUntil().Format("2006-01-02"))
+		fmt.Printf("  Data dir: %s\n", s.CertStore.DataDir)
+		fmt.Printf("  Install the CA into the system trust store to trust these domains, then set\n")
+		fmt.Printf("  the hosts entries to 127.0.0.1. See README \"Local reverse proxy mode\".\n")
+	}
 	if localIP != "" {
 		fmt.Printf("  DoH IP: %s\n", localIP)
 	}

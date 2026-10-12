@@ -11,6 +11,192 @@ ECH (Encrypted Client Hello) reverse proxy supporting multi-upstream routing and
 - **Cookie Injection**: Supports persistent and fixed cookies (e.g., exhentai session cookies).
 - **Response Rewriting**: URL rewriting and Service Worker injection.
 
+## Local reverse proxy mode (Pixiv)
+
+`ech-proxy` normally listens on `127.0.0.1:8443` and uses the public cert on `l.moonchan.xyz`.
+The **local proxy mode** (flag `-local`, and the default when the executable filename ends in
+`.443.exe`) instead:
+
+1. Listens on **`127.0.0.1:443`** (so you can point `pixiv.net`, `account.pixiv.net`, and
+   subdomains at `127.0.0.1` in your hosts file).
+2. Serves TLS using **self-generated certificates**: a local self-signed CA plus a per-domain
+   leaf, issued on demand by the TLS `GetCertificate` callback. Nothing is ever downloaded —
+   the CA and leaves are created by `ech-proxy` itself.
+3. Caches everything under a per-user data dir:
+   - `os.UserConfigDir()/ech-proxy/` by default → Windows `%AppData%\ech-proxy\`,
+     Linux `~/.config/ech-proxy/`, macOS `~/Library/Application Support/ech-proxy/`
+   - Overridable with `-data-dir PATH` or the env var `ECH_PROXY_DATA_DIR`
+   - Layout: `ca/ca.pem` (the cert to install into the system/browser trust store) and
+     `ca/ca.key` (the CA private key — never leaves the machine), plus
+     `certs/<registrable-domain>/fullchain.pem` and `privkey.pem` for each domain seen.
+   - Dirs are `0700`, files `0600`.
+4. Forwards each incoming host through the same **sni / ech** tunneling the remote deployment
+   uses — with one exception: `l.moonchan.xyz` itself keeps its original direct path.
+   `pixiv.net` is configured with **IPv4-only egress** (`ip_mode: v4`), because pixiv returns
+   HTTP 403 on IPv6 clients.
+5. Skips the browser auto-open.
+
+### Why
+
+Pixiv returns a static **403 "Access blocked"** for clients that egress over IPv6. A local proxy
+on port 443 with forced IPv4 egress eliminates the problem: the browser connects to
+`127.0.0.1:443`, `ech-proxy` terminates TLS with a locally trusted CA, and forwards the request
+through the **ech** tunnel with `ip_mode: v4`, so the upstream leg always egresses over IPv4.
+
+Local mode follows the same routing rule as the remote deployment:
+
+| Incoming host | TLS termination | Upstream forwarding |
+| :--- | :--- | :--- |
+| `l.moonchan.xyz` (the portal) | existing public cert | unchanged original path (`direct`) |
+| anything else (`pixiv.net`, `account.pixiv.net`, …) | self-generated CA + per-domain leaf | **sni / ech** tunnel, same as remote mode |
+
+### Prerequisites
+
+- **Administrator / root privileges** (binding port 443 requires it on all platforms).
+- **Go is not required** — the binary ships in the release assets.
+
+### Step 1 — Rename the binary
+
+Rename the downloaded binary so that its filename **ends with `.443.exe`**:
+
+```
+ech-proxy-windows-amd64.exe  →  ech-proxy.443.exe
+```
+
+**The `.443.exe` convention — exact suffix, not substring.** The check is
+`strings.HasSuffix(filename, ".443.exe")`, so the filename must *end* with `.443.exe`:
+
+| Filename | 443 mode? |
+| :--- | :--- |
+| `ech-proxy.443.exe` | ✅ yes |
+| `foo.443.exe` | ✅ yes |
+| `ech-proxy.443.EXE` | ✅ yes (case-insensitive) |
+| `ech-proxy.exe` | ❌ no — keeps port 8443 |
+| `ech-proxy.443-windows-amd64.exe` | ❌ no — ends in `-amd64.exe` |
+| `ech-proxy.443.beta.exe` | ❌ no — ends in `.beta.exe` |
+| `ech-proxy.443` | ❌ no — no `.exe` |
+
+A substring match would be dangerous: a renamed intermediate build such as
+`ech-proxy.443.beta.exe` would silently bind a privileged port. Only a filename that genuinely
+*ends* in `.443.exe` triggers the 443 build.
+
+The release ships the Windows amd64 build already named **`ech-proxy.443.exe`**, so you can run
+it straight from the download. Alternatively, any filename works if you pass `-local` and
+`-addr 127.0.0.1:443` explicitly.
+
+### Step 2 — Edit the hosts file
+
+Add these entries to your system hosts file (`C:\Windows\System32\drivers\etc\hosts` on Windows):
+
+```
+127.0.0.1 pixiv.net
+127.0.0.1 www.pixiv.net
+127.0.0.1 account.pixiv.net
+127.0.0.1 api.sec.pixiv.net
+127.0.0.1 manga.pixiv.net
+```
+
+The leaf certificate is issued for the registrable domain `pixiv.net` with a `*.pixiv.net`
+wildcard SAN, so **all subdomains are covered** by the single `pixiv.net` entry in your hosts
+file. The explicit entries above are provided for clarity; you can safely drop the subdomain
+lines and keep only:
+
+```
+127.0.0.1 pixiv.net
+```
+
+**Note:** `pximg.net` (Pixiv's image CDN) is **not** covered by the `pixiv.net` subdomain
+entry — it needs its own hosts line and upstream config entry if you want it proxied.
+
+### Step 3 — Run
+
+Open an **elevated** terminal (Command Prompt / PowerShell as Administrator on Windows) and run:
+
+```
+ech-proxy.443.exe
+```
+
+That's it. The `.443.exe` filename suffix enables local mode and port 443 automatically.
+
+Available flags:
+
+| Flag | Default | Description |
+| :--- | :--- | :--- |
+| `-local` | *from filename* | Enable local reverse proxy mode (auto-enabled by a `.443.exe` filename suffix) |
+| `-http` | `false` | Run in HTTP mode (no TLS) — **mutually exclusive** with `-local` |
+| `-data-dir` | `$ECH_PROXY_DATA_DIR` or platform config dir | Directory for the local CA and issued certificates |
+| `-config` | *(default remote URL)* | Upstream config URL or local path |
+| `-addr` | `127.0.0.1:443` (when `.443.exe`) or `127.0.0.1:8443` | Listen address |
+| `-ip-mode` | `$IP_MODE` | Pin the upstream egress family to `v4` or `v6`; empty lets the OS decide |
+
+Example with explicit flags (no rename needed):
+
+```
+ech-proxy-windows-amd64.exe -local -addr 127.0.0.1:443
+```
+
+### Step 4 — Install the CA certificate
+
+After the first run, `ech-proxy` generates a local self-signed CA and stores it under your
+data directory. You **must** install the CA certificate into your system's trust store for the
+browser to accept the leaf certificates.
+
+**CA certificate path:**
+
+| Platform | Default path | Override |
+| :--- | :--- | :--- |
+| Windows | `%AppData%\ech-proxy\ca\ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
+| Linux | `~/.config/ech-proxy/ca/ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
+| macOS | `~/Library/Application Support/ech-proxy/ca/ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
+
+**Install the CA:**
+
+- **Windows**: Right-click `ca.pem` → "Install Certificate" → Local Machine → "Place all
+  certificates in the following store" → "Trusted Root Certification Authorities" → Finish.
+- **Linux**: Copy `ca.pem` to `/usr/local/share/ca-certificates/ech-proxy-ca.crt` and run
+  `sudo update-ca-certificates`.
+- **macOS**: Open Keychain Access → drag `ca.pem` into "System" → open the cert → expand
+  "Trust" → set "When using this certificate" to "Always Trust".
+
+Browsers may need to be **restarted** after installing the CA (Chrome reads the store at
+startup; Firefox may need `certs.p12` installation separately).
+
+### Security rationale
+
+**`ech-proxy` generates the CA and leaf certificates itself and never downloads any certificate
+from a third party.** This is a deliberate design decision, not an oversight.
+
+Downloading a certificate from a remote host would be a **MITM / supply-chain poisoning
+vector**: if the cert server were compromised, an attacker could serve a malicious CA, and
+every "encrypted" connection through the proxy would be terminated by that attacker's
+certificate — the browser would trust it, and the user would never see a warning. That is a
+worse failure mode than not having the feature at all.
+
+Self-generation eliminates this vector entirely:
+
+- The CA private key (`ca.key`) is **created on your machine** and **never transmitted**.
+- It is stored at `0600` inside a `0700` directory, so only your user account (or root) can
+  read it.
+- Every leaf certificate is signed by your local CA and persisted at `0600`.
+
+**You must still protect your data directory.** Anyone who steals `ca.key` can forge
+certificates for any hostname and MITM your traffic. On Windows, `%AppData%\ech-proxy\` is
+inside your user profile — anyone with access to your account can read it. On shared machines,
+restrict access to the data directory (e.g., `-data-dir /root/ech-proxy` with `chmod 700`).
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+| :--- | :--- | :--- |
+| Browser shows "certificate not trusted" / "your connection is not private" | CA not installed in the system trust store | Install `ca.pem` (Step 4) and restart the browser |
+| Still getting 403 from Pixiv | `pximg.net` is not covered by the `pixiv.net` wildcard | Add `127.0.0.1 pximg.net` to hosts and add an upstream entry for `pximg.net` in the config |
+| Port 443 already in use | Another process is bound to port 443 (e.g., HTTPS proxy, IIS) | Stop the other process, or use `-addr 127.0.0.1:8443` and point hosts at that port instead |
+| IPv6 still leaking | the config entry for `pixiv.net` lacks `ip_mode` | The shipped config sets `"ip_mode": "v4"` on `pixiv.net`; verify with `-check-config`, or add `"mode": "ech", "ip_mode": "v4"` |
+| `ech-proxy` exits with "address already in use" | Not running as admin/root (cannot bind port 443) | Run from an elevated terminal (Windows) or `sudo` (Linux/macOS) |
+| Browser still shows cert error after installing CA | Browser cached the old chain | Clear the browser cache, or restart the browser process entirely |
+| Requests hang / time out and logs say `ECH initialization failed` | Local mode still needs the ECH tunnel for non-`l.moonchan.xyz` hosts, and `moonchan.xyz` was unreachable at startup | It retries in the background (10s, 30s, 2m, 10m); wait, or set `-local-ip` to a reachable bootstrap IP |
+| `ech-proxy` refuses to start, `cannot load CA from ... and will not overwrite it` | A previous data dir is corrupt | Inspect it by hand; do **not** delete it silently, since the browser already trusts that CA |
+
 ## Build
 
 ### Go Binaries (Windows / Linux)
@@ -18,6 +204,16 @@ ECH (Encrypted Client Hello) reverse proxy supporting multi-upstream routing and
 ```bash
 go build -o ech-proxy ./win/
 ```
+
+For the local reverse proxy variant, name the output so it ends in `.443.exe` — that is what
+`win/main.go` matches, so it starts on `127.0.0.1:443` with local proxy mode and no flags:
+
+```bash
+GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ech-proxy.443.exe ./win/
+```
+
+The release builds both (`ech-proxy-windows-amd64.exe` and `ech-proxy.443.exe`) via
+`.goreleaser.yaml`.
 
 ### Android APK
 

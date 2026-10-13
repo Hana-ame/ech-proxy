@@ -309,8 +309,8 @@ func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 			return
 		}
 
-		// --- Step 3: Round-trip to upstream ---
-		resp, err := roundTripFn(outReq, uc.Mode, uc.IPMode)
+		// --- Step 3: Round-trip to upstream (with auto-detection) ---
+		resp, err := autoRoundTrip(outReq, uc.Mode, uc.IPMode)
 		if err != nil {
 			log.Printf("[%s] Upstream request failed: %v (elapsed: %v)", clientIP, err, time.Since(start))
 			ApplyCORSHeaders(c.Writer.Header(), c.Request)

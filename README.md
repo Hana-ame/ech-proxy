@@ -22,9 +22,15 @@ The **local proxy mode** (flag `-local`, and the default when the executable fil
 2. Serves TLS using **self-generated certificates**: a local self-signed CA plus a per-domain
    leaf, issued on demand by the TLS `GetCertificate` callback. Nothing is ever downloaded —
    the CA and leaves are created by `ech-proxy` itself.
-3. Caches everything under a per-user data dir:
-   - `os.UserConfigDir()/ech-proxy/` by default → Windows `%AppData%\ech-proxy\`,
-     Linux `~/.config/ech-proxy/`, macOS `~/Library/Application Support/ech-proxy/`
+3. Caches everything next to the executable:
+   - **The directory holding the executable** by default. The CA is the file you have to
+     install into the trust store, so it sits beside the binary you downloaded and renamed,
+     instead of being buried under `%AppData%`. This also keeps the proxy self-contained when
+     it is run from a single folder or a USB stick.
+   - If that directory is not writable (the binary may live in `C:\Windows\System32` or a
+     read-only extraction folder) it falls back to the platform user config dir:
+     Windows `%AppData%\ech-proxy\`, Linux `~/.config/ech-proxy/`,
+     macOS `~/Library/Application Support/ech-proxy/`
    - Overridable with `-data-dir PATH` or the env var `ECH_PROXY_DATA_DIR`
    - Layout: `ca/ca.pem` (the cert to install into the system/browser trust store) and
      `ca/ca.key` (the CA private key — never leaves the machine), plus
@@ -124,7 +130,7 @@ Available flags:
 | :--- | :--- | :--- |
 | `-local` | *from filename* | Enable local reverse proxy mode (auto-enabled by a `.443.exe` filename suffix) |
 | `-http` | `false` | Run in HTTP mode (no TLS) — **mutually exclusive** with `-local` |
-| `-data-dir` | `$ECH_PROXY_DATA_DIR` or platform config dir | Directory for the local CA and issued certificates |
+| `-data-dir` | `$ECH_PROXY_DATA_DIR` or the executable's own directory | Directory for the local CA and issued certificates |
 | `-config` | *(default remote URL)* | Upstream config URL or local path |
 | `-addr` | `127.0.0.1:443` (when `.443.exe`) or `127.0.0.1:8443` | Listen address |
 | `-ip-mode` | `$IP_MODE` | Pin the upstream egress family to `v4` or `v6`; empty lets the OS decide |
@@ -143,11 +149,20 @@ browser to accept the leaf certificates.
 
 **CA certificate path:**
 
-| Platform | Default path | Override |
+**The default data dir is the folder that holds the executable** (it falls back to the
+platform user config dir only if that folder is not writable), so for a binary at
+`C:\Users\lumin\Downloads\ech-proxy.443.exe` the CA is at
+`C:\Users\lumin\Downloads\ca\ca.pem`:
+
+| Executable location | Default CA path | Override |
 | :--- | :--- | :--- |
-| Windows | `%AppData%\ech-proxy\ca\ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
-| Linux | `~/.config/ech-proxy/ca/ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
-| macOS | `~/Library/Application Support/ech-proxy/ca/ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
+| `%CD%\ech-proxy.443.exe` (Windows) | `%CD%\ca\ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
+| `/opt/ech-proxy/ech-proxy.443` (Linux) | `/opt/ech-proxy/ca/ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
+| `~/ech-proxy.443` (macOS) | `~/ca/ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
+| exe dir not writable (fallback) | `<user config dir>/ech-proxy/ca/ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
+
+The startup banner prints the resolved path on the `Data dir:` line — that is the folder whose
+`ca\ca.pem` (Windows) or `ca/ca.pem` (POSIX) to install.
 
 **Install the CA:**
 

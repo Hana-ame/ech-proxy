@@ -80,7 +80,8 @@ func main() {
 	localProxy := flag.Bool("local", four443,
 		"local reverse proxy mode: terminate TLS with a self-generated CA and forward each Host through sni/ech (auto-enabled by a \".443.exe\" filename suffix)")
 	dataDir := flag.String("data-dir", os.Getenv("ECH_PROXY_DATA_DIR"),
-		"directory for the local CA and issued certificates (default: the platform user config dir/ech-proxy)")
+		"directory for the local CA and issued certificates (default: the directory holding this executable, "+
+			"falling back to the platform user config dir/ech-proxy if that directory is not writable)")
 	flag.Parse()
 
 	if *checkConfig != "" {

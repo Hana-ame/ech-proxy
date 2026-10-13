@@ -225,6 +225,15 @@ func NewServer(opts ServerOptions) (*Server, error) {
 			return nil, fmt.Errorf("failed to initialize certificate store: %w", serr)
 		}
 		certStore = store
+		// The portal (l.moonchan.xyz) keeps its public cert — it is not
+		// self-signed. Everything else (pixiv.net, …) gets a CA-issued leaf.
+		if cfg.CertPath != "" && cfg.KeyPath != "" {
+			if cert, ferr := LoadTLSCert(cfg); ferr == nil {
+				tlsCert = cert
+			} else {
+				log.Printf("Local mode: failed to load portal cert, l.moonchan.xyz will be self-signed: %v", ferr)
+			}
+		}
 	case !opts.HTTPMode && cfg.CertPath != "" && cfg.KeyPath != "":
 		cert, ferr := LoadTLSCert(cfg)
 		if ferr != nil {
@@ -279,16 +288,18 @@ func NewServer(opts ServerOptions) (*Server, error) {
 
 	isTLS := false
 	if opts.LocalProxy {
-		// Local mode terminates TLS for whatever SNI the client presents, so the
-		// certificate is chosen per connection from the self-signed CA. The
-		// first SNI seen for a domain triggers a one-time leaf issuance (RSA key
-		// generation plus an atomic write), which is what the user asked for:
-		// certificates are generated locally and persisted, never downloaded.
+		// Local mode terminates TLS for whatever SNI the client presents.
+		// The portal (l.moonchan.xyz) keeps its public cert; everything else
+		// gets a CA-issued leaf from the local store.
 		isTLS = true
 		store := certStore
+		portalCert := tlsCert
 		srv.TLSConfig = &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
+				if hello.ServerName == indexHost && portalCert != nil {
+					return portalCert, nil
+				}
 				return store.CertificateFor(hello.ServerName)
 			},
 		}

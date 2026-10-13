@@ -247,3 +247,59 @@ func TestCertStoreIssueNotBeforeIsBackdated(t *testing.T) {
 		t.Errorf("leaf NotBefore %v is in the future", leaf.NotBefore)
 	}
 }
+
+// TestCanWrite probes writability without leaving a trace. Permission bits are
+// meaningless on Windows, so the probe must actually create and remove a file.
+func TestCanWrite(t *testing.T) {
+	if !canWrite(t.TempDir()) {
+		t.Error("canWrite reported a temp dir as not writable")
+	}
+	if canWrite("") {
+		t.Error("canWrite(\"\") must fail closed")
+	}
+	if canWrite(filepath.Join(t.TempDir(), "does-not-exist")) {
+		t.Error("canWrite on a non-existent directory must fail closed")
+	}
+}
+
+// TestResolveDataDir pins the priority rule: the executable's directory wins
+// when it is writable, the fallback is used otherwise (empty path, missing
+// directory, or a directory the process cannot write to).
+func TestResolveDataDir(t *testing.T) {
+	fallback := filepath.Join(t.TempDir(), "user-config", "ech-proxy")
+	writable := t.TempDir()
+
+	if got := resolveDataDir(writable, fallback); got != writable {
+		t.Errorf("resolveDataDir(writable, fallback) = %q, want %q", got, writable)
+	}
+	if got := resolveDataDir("", fallback); got != fallback {
+		t.Errorf("resolveDataDir(\"\", fallback) = %q, want %q", got, fallback)
+	}
+	missing := filepath.Join(t.TempDir(), "no-such-dir")
+	if got := resolveDataDir(missing, fallback); got != fallback {
+		t.Errorf("resolveDataDir(missing, fallback) = %q, want %q", got, fallback)
+	}
+}
+
+// TestDefaultDataDirIsWritable guards the invariant NewCertStore depends on:
+// the default data dir must always be writable, otherwise the proxy cannot
+// persist its CA and refuses to start on a machine the user never configured.
+func TestDefaultDataDirIsWritable(t *testing.T) {
+	dir, err := DefaultDataDir()
+	if err != nil {
+		t.Fatalf("DefaultDataDir: %v", err)
+	}
+	if dir == "" {
+		t.Fatal("DefaultDataDir returned an empty path")
+	}
+	if !canWrite(dir) {
+		t.Fatalf("DefaultDataDir returned %q, which is not writable", dir)
+	}
+	st, err := NewCertStore(dir)
+	if err != nil {
+		t.Fatalf("NewCertStore over DefaultDataDir %q: %v", dir, err)
+	}
+	if st.CAPath() != filepath.Join(dir, "ca", caCertName) {
+		t.Errorf("CAPath = %q, want %q", st.CAPath(), filepath.Join(dir, "ca", caCertName))
+	}
+}

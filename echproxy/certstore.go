@@ -80,14 +80,65 @@ type CertStore struct {
 	leaf map[string]*tls.Certificate
 }
 
-// DefaultDataDir returns the platform data directory for ech-proxy. It is
-// overridable with -data-dir or ECH_PROXY_DATA_DIR; this is the fallback.
+// DefaultDataDir returns the directory that holds the local CA and the issued
+// leaf certificates.
+//
+// The directory containing the executable comes first: the CA is the one file
+// the user has to install into the system trust store (see README, "Local
+// reverse proxy mode"), so it belongs next to the binary they downloaded and
+// renamed to ".443.exe" — not buried under %AppData%. This also keeps the proxy
+// self-contained when the user runs it from a single folder or a USB stick.
+//
+// If the executable directory cannot be written (the binary may sit in a
+// read-only location such as C:\Windows\System32, or a read-only extraction
+// folder) the fallback is the platform user config dir, which is always
+// writable for the current user.
+//
+// Both paths are overridable with -data-dir or ECH_PROXY_DATA_DIR; this is only
+// the fallback when neither is given.
 func DefaultDataDir() (string, error) {
+	exeDir := ""
+	if exe, err := os.Executable(); err == nil {
+		exeDir = filepath.Dir(exe)
+	}
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("cannot determine user config dir: %w", err)
 	}
-	return filepath.Join(base, "ech-proxy"), nil
+	return resolveDataDir(exeDir, filepath.Join(base, "ech-proxy")), nil
+}
+
+// resolveDataDir picks the executable's directory when it is writable and the
+// fallback otherwise. It is split out from DefaultDataDir so the priority rule
+// is testable without reaching into os.Executable.
+func resolveDataDir(exeDir, fallback string) string {
+	if exeDir != "" && canWrite(exeDir) {
+		return exeDir
+	}
+	return fallback
+}
+
+// canWrite reports whether a probe file can be created and removed inside dir.
+//
+// Permission bits are meaningless on Windows (NTFS access is decided by ACLs,
+// not by the 0700 field), so the only reliable cross-platform check is to
+// actually try. The probe file is created 0600 and removed immediately; the
+// call fails closed and returns false on any error — an unwritable directory
+// must fall back to the user config dir rather than crash the proxy at startup.
+func canWrite(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	probe, err := os.CreateTemp(dir, ".ech-proxy-write-*")
+	if err != nil {
+		return false
+	}
+	name := probe.Name()
+	if err := probe.Close(); err != nil {
+		os.Remove(name)
+		return false
+	}
+	return os.Remove(name) == nil
 }
 
 // NewCertStore loads an existing CA from dataDir, or generates and persists a

@@ -1,5 +1,5 @@
 // Package netdial 提供基础网络拨号、公共 DNS 解析、IPv4/IPv6 协议族绑定、
-// 远程/本地文件读取与通用重试工具。本模块不依赖项目内任何其他包。
+// Cloudflare IP 识别、远程/本地文件拉取与通用重试工具。本模块不依赖项目内任何其他包。
 package netdial
 
 import (
@@ -29,7 +29,7 @@ var dnsServers = []string{
 	"114.114.114.114:53",
 }
 
-// 统一维护的 Cloudflare IPv4 / IPv6 网段列表（消除原先分散在多处的重复定义）
+// 统一维护的 Cloudflare IPv4 / IPv6 网段列表，用于全自动判断目标站点应走 ECH 还是 SNI 伪装。
 var cloudflareCIDRs = []string{
 	"104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "141.101.64.0/18",
 	"173.245.48.0/20", "188.114.96.0/20", "190.93.240.0/20", "197.234.240.0/22",
@@ -49,7 +49,7 @@ var cloudflareNets = func() []*net.IPNet {
 	return nets
 }()
 
-// IsCloudflareIP 判断给定 IP 是否属于 Cloudflare 节点网段。
+// IsCloudflareIP 判断给定 IP 是否属于 Cloudflare 边缘节点网段。
 func IsCloudflareIP(ip net.IP) bool {
 	if ip == nil {
 		return false
@@ -113,7 +113,7 @@ func getRootPool() *x509.CertPool {
 	return rootPool
 }
 
-// Dialer 返回绑定了公共 DNS 的拨号器（兼容 Android/Termux 等缺少 /etc/resolv.conf 的环境）。
+// Dialer 返回绑定了公共 DNS 的拨号器（兼容 Android/Termux 等无 /etc/resolv.conf 的环境）。
 func Dialer() *net.Dialer {
 	return &net.Dialer{
 		Timeout:   OpTimeout,
@@ -189,7 +189,7 @@ func TransportWithIPMode(mode string) *http.Transport {
 	}
 }
 
-// Client 返回不自动跟随重定向的 HTTP 客户端（由代理层统一改写重定向响应）。
+// Client 返回不自动跟随重定向的 HTTP 客户端。
 func Client(timeout time.Duration) *http.Client {
 	return ClientWithIPMode("", timeout)
 }

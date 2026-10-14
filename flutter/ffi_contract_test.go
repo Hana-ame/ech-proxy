@@ -64,8 +64,8 @@ func TestFlutterEntryExportsAllFFISymbols(t *testing.T) {
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
-		t.Fatalf("flutter/main.go 缺少 Flutter FFI 必需的导出符号: %v\n" +
-			"这些符号由 Dart 侧 lookupFunction 按名字取，缺任何一个都会让真机 App " +
+		t.Fatalf("flutter/main.go 缺少 Flutter FFI 必需的导出符号: %v\n"+
+			"这些符号由 Dart 侧 lookupFunction 按名字取，缺任何一个都会让真机 App "+
 			"启动即崩，且 Dart 侧看不出是 Go 侧的问题。", missing)
 	}
 }
@@ -103,6 +103,7 @@ func TestFlutterEntryUsesLocalEchPackage(t *testing.T) {
 		t.Fatalf("flutter/main.go 没有 import 本仓库的 echproxy/ech")
 	}
 }
+
 // TestFlutterEntryIsSoleFlutterExit 守住「ECH 代码只存在于本仓库」这个目标。
 //
 // 背景：flutter/main.go 原先是 twitter-pic-flutter 仓库里 ech-proxy/cmd/

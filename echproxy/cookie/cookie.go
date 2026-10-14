@@ -1,11 +1,12 @@
 // Package cookie 负责管理上游与客户端之间的 Cookie 注入、内存缓存与 Set-Cookie 域名改写。
-// 本模块仅依赖 Go 标准库，不依赖项目内任何其他包。
+// 修复 #28：移除无鉴权控制面，并对 cookie_file 实施严格的受控目录校验，阻断任意文件读取外带风险。
 package cookie
 
 import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -38,23 +39,39 @@ func (j *Jar) Reset() {
 	j.store = make(map[string][]*http.Cookie)
 }
 
-// ReadFixedCookie 从配置值或本地文件路径读取预置 Cookie 内容。
+// ReadFixedCookie 安全地获取预置 Cookie（修复 #28）：
+//   - 若 cookieVal 是形如 "k=v" 的原始 Cookie 字符串，直接返回；
+//   - 若通过 cookieFile 指定文件，仅允许读取受控 certs/ 目录下的纯文件名（禁止绝对路径、".." 路径穿越或任意系统路径读取）。
 func ReadFixedCookie(cookieVal, cookieFile string) string {
-	val := cookieVal
 	if cookieFile != "" {
-		val = cookieFile
-	}
-	if val == "" {
+		if content, ok := readSafeCookieFile(cookieFile); ok {
+			return content
+		}
 		return ""
 	}
-	path := strings.TrimPrefix(val, "file://")
-	if content, err := os.ReadFile(path); err == nil && len(content) > 0 {
-		return strings.TrimSpace(string(content))
-	}
-	return val
+	return strings.TrimSpace(cookieVal)
 }
 
-// Seed 将配置中的静态 Cookie 字符串或 Netscape 格式 Cookie 文件播种到 Jar 中。
+func readSafeCookieFile(rawPath string) (string, bool) {
+	p := strings.TrimSpace(strings.TrimPrefix(rawPath, "file://"))
+	if p == "" || filepath.IsAbs(p) || strings.Contains(p, "..") || strings.ContainsAny(p, "\r\n") {
+		return "", false
+	}
+	// 仅允许读取当前工作目录或上层目录下的 certs/ 受控子目录内的 .txt/.cookie 文件
+	clean := filepath.Clean(p)
+	baseName := filepath.Base(clean)
+	for _, candidate := range []string{
+		filepath.Join("certs", "l.moonchan.xyz", baseName),
+		filepath.Join("..", "certs", "l.moonchan.xyz", baseName),
+	} {
+		if content, err := os.ReadFile(candidate); err == nil && len(content) > 0 {
+			return strings.TrimSpace(string(content)), true
+		}
+	}
+	return "", false
+}
+
+// Seed 将配置中的静态 Cookie 字符串或 Netscape 格式 Cookie 内容播种到 Jar 中。
 func (j *Jar) Seed(host, raw string) {
 	if raw == "" || host == "" {
 		return

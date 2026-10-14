@@ -1,7 +1,7 @@
-// Package echproxy 组装各语义子模块（config, certstore, ech, rewrite, cookie, netdial），
-// 对外提供统一的服务管理入口，支持两大核心运行模式：
-//  1. 8443 门户反向代理模式（默认）：加载公网证书，提供导航门户与代理子域名访问。
-//  2. 443 本地透明反向代理模式（-local 或 .443.exe）：本机自签 CA 动态签发域名证书，配合 hosts 原网址直连。
+// Package echproxy 组装各语义子模块（config, certstore, ech, rewrite, cookie, netdial）：
+//   - l.moonchan.xyz 及 *.l.moonchan.xyz 使用公网证书提供门户导航与子域反代；
+//   - 除 l.moonchan.xyz 体系外的所有域名（修改 hosts=127.0.0.1 并安装本地自签名 CA 后），
+//     均由 certstore 动态签发证书，并由 ech.RoundTrip 全自动无干预选择 SNI 或 ECH 转发至真实服务器。
 package echproxy
 
 import (
@@ -31,12 +31,12 @@ type (
 )
 
 var (
-	ParseConfig             = config.Parse
-	LoadConfig              = config.Load
-	FetchBytes              = netdial.FetchBytes
-	NewCertStore            = certstore.NewStore
-	DefaultDataDir          = certstore.DefaultDataDir
-	MatchWildcardForTest    = config.MatchWildcard
+	ParseConfig              = config.Parse
+	LoadConfig               = config.Load
+	FetchBytes               = netdial.FetchBytes
+	NewCertStore             = certstore.NewStore
+	DefaultDataDir           = certstore.DefaultDataDir
+	MatchWildcardForTest     = config.MatchWildcard
 	DefaultUpstreamConfigURL = config.DefaultConfigURL
 )
 
@@ -47,14 +47,14 @@ const (
 
 // ServerOptions 定义启动代理服务所需的配置项。
 type ServerOptions struct {
-	Addr            string // 监听地址，默认 127.0.0.1:8443（本地反代模式为 127.0.0.1:443）
+	Addr            string // 监听地址，默认 127.0.0.1:8443（443 模式为 127.0.0.1:443）
 	AllowRandomPort bool   // 端口占用时是否允许回退至随机端口（Android 端使用）
 	HTTPMode        bool   // 纯 HTTP 明文模式（仅用于本地调试，与 LocalProxy 互斥）
 	ConfigURL       string // upstream.json 路径或 URL，留空使用默认远程地址
 	BootstrapIP     string // DoH 引导 IP（可选）
 	IPMode          string // 全局出口协议族锁定："v4" 或 "v6"（可选）
-	LocalProxy      bool   // 是否启用 443 本地透明反向代理模式（自生成 CA + 按需签发原域名证书）
-	DataDir         string // 443 本地模式的 CA 与叶子证书存储目录
+	LocalProxy      bool   // 是否启用 443 本地透明反向代理模式
+	DataDir         string // 本地自签 CA 与叶子证书存储目录
 }
 
 // Server 表示运行中的 ECH 代理服务器实例。
@@ -99,16 +99,16 @@ func retryInitECH(bootstrapIP, ipMode string) {
 	}
 }
 
-// NewServer 根据 ServerOptions 完成 ECH 初始化、配置加载、证书准备与端口监听。
+// NewServer 根据 ServerOptions 完成 ECH 初始化、配置加载、双轨证书准备与端口监听。
 func NewServer(opts ServerOptions) (*Server, error) {
-	// 1. 初始化 ECH 隧道客户端（443 本地模式下若启动瞬间网络不可达则转入后台重试）
-	if opts.LocalProxy {
-		if err := InitECH(opts.BootstrapIP, opts.IPMode); err != nil {
+	// 1. 初始化 ECH/DoH 客户端（启动瞬间若不可达则转入后台重试，不阻塞本地 SNI/Direct 流量）
+	if err := InitECH(opts.BootstrapIP, opts.IPMode); err != nil {
+		if opts.LocalProxy {
 			log.Printf("WARNING: ECH initialization failed, retrying in background: %v", err)
 			go retryInitECH(opts.BootstrapIP, opts.IPMode)
+		} else {
+			return nil, err
 		}
-	} else if err := InitECH(opts.BootstrapIP, opts.IPMode); err != nil {
-		return nil, err
 	}
 
 	// 2. 加载 upstream.json 路由配置
@@ -117,38 +117,36 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		return nil, fmt.Errorf("load upstream config: %w", err)
 	}
 
-	// 3. 准备 TLS 证书：
-	//    - 443 本地模式：初始化本机自签名 CA，同时尝试加载门户公网证书供 l.moonchan.xyz 使用
-	//    - 8443 门户模式：加载配置的公网证书
+	// 3. 准备双轨 TLS 证书：
+	//    - l.moonchan.xyz 及 *.l.moonchan.xyz 使用公网证书（portalCert）
+	//    - 其余所有通过 hosts=127.0.0.1 接入的域名使用本地自签 CA 动态签发证书（store）
 	var (
-		tlsCert   *tls.Certificate
-		store     *certstore.Store
+		portalCert *tls.Certificate
+		store      *certstore.Store
 	)
-	if opts.LocalProxy {
+	if !opts.HTTPMode {
+		if cfg.CertPath != "" && cfg.KeyPath != "" {
+			cert, ferr := certstore.LoadRemoteCert(cfg.CertPath, cfg.KeyPath)
+			if ferr != nil {
+				if !opts.LocalProxy && !opts.AllowRandomPort {
+					return nil, ferr
+				}
+				log.Printf("WARNING: Failed to load portal certificate: %v", ferr)
+			} else {
+				portalCert = cert
+			}
+		}
+		// 初始化本地自签 CA 仓库，确保任何非 l.moonchan.xyz 域名均可动态签发证书
 		dataDir := opts.DataDir
 		if dataDir == "" {
-			var derr error
-			if dataDir, derr = certstore.DefaultDataDir(); derr != nil {
-				return nil, derr
+			dataDir, _ = certstore.DefaultDataDir()
+		}
+		if dataDir != "" {
+			if st, serr := certstore.NewStore(dataDir); serr == nil {
+				store = st
+			} else if opts.LocalProxy {
+				return nil, fmt.Errorf("init cert store: %w", serr)
 			}
-		}
-		st, serr := certstore.NewStore(dataDir)
-		if serr != nil {
-			return nil, fmt.Errorf("init cert store: %w", serr)
-		}
-		store = st
-		if cfg.CertPath != "" && cfg.KeyPath != "" {
-			tlsCert, _ = certstore.LoadRemoteCert(cfg.CertPath, cfg.KeyPath)
-		}
-	} else if !opts.HTTPMode && cfg.CertPath != "" && cfg.KeyPath != "" {
-		cert, ferr := certstore.LoadRemoteCert(cfg.CertPath, cfg.KeyPath)
-		if ferr != nil {
-			if !opts.AllowRandomPort {
-				return nil, ferr
-			}
-			log.Printf("Failed to load certificate, degrading to HTTP: %v", ferr)
-		} else {
-			tlsCert = cert
 		}
 	}
 
@@ -180,21 +178,22 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 
 	isTLS := false
-	if opts.LocalProxy {
+	if !opts.HTTPMode && (store != nil || portalCert != nil) {
 		isTLS = true
-		httpSrv.TLSConfig = store.TLSConfig(indexHost, tlsCert)
-	} else if !opts.HTTPMode && tlsCert != nil {
-		isTLS = true
-		httpSrv.TLSConfig = &tls.Config{
-			Certificates: []tls.Certificate{*tlsCert},
-			MinVersion:   tls.VersionTLS12,
+		if store != nil {
+			httpSrv.TLSConfig = store.TLSConfig(portalCert)
+		} else {
+			httpSrv.TLSConfig = &tls.Config{
+				Certificates: []tls.Certificate{*portalCert},
+				MinVersion:   tls.VersionTLS12,
+			}
 		}
 	}
 
 	return &Server{
 		Options:    opts,
 		Config:     cfg,
-		TLSCert:    tlsCert,
+		TLSCert:    portalCert,
 		CertStore:  store,
 		Engine:     engine,
 		HTTPServer: httpSrv,
@@ -240,14 +239,14 @@ func (s *Server) PrintBanner(localIP string) {
 	fmt.Printf("=== ECH Proxy ===\n")
 	switch {
 	case s.Options.LocalProxy:
-		fmt.Printf("  Mode: Local Reverse Proxy (443 TLS, self-generated CA)\n")
+		fmt.Printf("  Mode: Local Reverse Proxy (443 TLS, self-generated CA + auto SNI/ECH)\n")
 	case s.Options.HTTPMode:
 		fmt.Printf("  Mode: HTTP (Local Proxy)\n")
 	default:
-		fmt.Printf("  Mode: Portal Reverse Proxy (8443 TLS)\n")
+		fmt.Printf("  Mode: Portal & Transparent Reverse Proxy (8443 TLS)\n")
 	}
 	fmt.Printf("  Listening: %s\n", s.Options.Addr)
-	if s.Options.LocalProxy && s.CertStore != nil {
+	if s.CertStore != nil {
 		fmt.Printf("  CA Cert: %s (valid until %s)\n", s.CertStore.CAPath(), s.CertStore.CAValidUntil().Format("2006-01-02"))
 		fmt.Printf("  Data Dir: %s\n", s.CertStore.DataDir)
 	}

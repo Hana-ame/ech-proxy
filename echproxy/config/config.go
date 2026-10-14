@@ -1,10 +1,12 @@
 // Package config 负责解析、归一化与匹配 upstream.json 配置文件。
-// 保持与现有 upstream.json 格式 100% 兼容，仅依赖标准库、netdial 与 orderedmap。
+// 除了 l.moonchan.xyz 及其代理子域名按映射规则转发外，任何通过修改 hosts=127.0.0.1
+// 接入的非 l.moonchan.xyz 域名（无论是否显式写入 upstream.json）均可自动透传转发。
 package config
 
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -16,8 +18,20 @@ import (
 // DefaultConfigURL 是默认远程 upstream.json 配置地址。
 const DefaultConfigURL = "https://proxy.moonchan.xyz/Hana-ame/ech-proxy/refs/heads/main/certs/l.moonchan.xyz/upstream.json?proxy_host=raw.githubusercontent.com"
 
-// HeaderRule 定义单个请求头或响应头的操作规则：
-// 兼容字符串简写（如 "Referer": "https://x.com"）与对象格式（delete / replace）。
+// PortalDomain 是门户与 8443 代理子域名的根域名。
+const PortalDomain = "l.moonchan.xyz"
+
+// IsPortalDomain 判断域名是否为 l.moonchan.xyz 或 *.l.moonchan.xyz。
+// 除该域名体系外，其余所有域名均使用本地自签 CA 证书并通过自动 SNI/ECH 转发至真实服务器。
+func IsPortalDomain(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if name, _, err := net.SplitHostPort(h); err == nil {
+		h = name
+	}
+	return h == PortalDomain || strings.HasSuffix(h, "."+PortalDomain)
+}
+
+// HeaderRule 定义单个请求头或响应头的操作规则。
 type HeaderRule struct {
 	Value           string         `json:"value,omitempty"`
 	Delete          bool           `json:"delete,omitempty"`
@@ -50,7 +64,7 @@ func (h *HeaderRule) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// BodyReplaceRule 定义响应正文替换规则：兼容 ["old", "new"] 与 {"replace": ["old", "new"], "regex": true}。
+// BodyReplaceRule 定义响应正文替换规则。
 type BodyReplaceRule struct {
 	Old      string         `json:"old,omitempty"`
 	New      string         `json:"new,omitempty"`
@@ -87,11 +101,7 @@ func (r *BodyReplaceRule) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// WildcardRule 定义泛子域名映射规则：
-// 1. 8443 门户模式：prefix="iwara-", entry_suffix=".l.moonchan.xyz", upstream_suffix=".iwara.tv"
-//    将 iwara-<sub>.l.moonchan.xyz 转发至 <sub>.iwara.tv
-// 2. 443 本地透明反代模式：prefix="", entry_suffix=".pixiv.net", upstream_suffix=".pixiv.net"
-//    将 <sub>.pixiv.net 原样转发至 <sub>.pixiv.net
+// WildcardRule 定义泛子域名映射规则。
 type WildcardRule struct {
 	Prefix          string                `json:"prefix,omitempty"`
 	EntrySuffix     string                `json:"entry_suffix,omitempty"`
@@ -111,12 +121,12 @@ type WildcardRule struct {
 	BodyReplace     []BodyReplaceRule     `json:"body_replace,omitempty"`
 }
 
-// UpstreamConfig 定义单条上游代理规则（完全对应 upstream.json 中的条目字段）。
+// UpstreamConfig 定义单条上游代理规则。
 type UpstreamConfig struct {
 	Host            string                `json:"host"`
 	Describe        string                `json:"describe,omitempty"`
 	Display         bool                  `json:"display,omitempty"`
-	Mode            string                `json:"mode,omitempty"`    // ""/"ech", "sni", "direct"
+	Mode            string                `json:"mode,omitempty"`    // ""/"auto", "ech", "sni", "direct"
 	IPMode          string                `json:"ip_mode,omitempty"` // ""/"auto", "v4", "v6"
 	Referer         string                `json:"referer,omitempty"`
 	Origin          string                `json:"origin,omitempty"`
@@ -280,12 +290,33 @@ func compileBodyReplace(rules []BodyReplaceRule) {
 	}
 }
 
-// Resolve 根据请求域名查找匹配的上游配置（先精确匹配，再泛域名匹配）。
+// Resolve 根据请求域名查找匹配的上游配置：
+//  1. 优先精确匹配 upstream.json 中的条目；
+//  2. 其次匹配 upstream.json 中的 Wildcard 泛域名规则；
+//  3. 若请求域名不属于 l.moonchan.xyz 体系（即用户通过修改 hosts=127.0.0.1 指向本机的任意真实域名），
+//     即使未显式写入 upstream.json，也自动生成原域名透传配置（Mode: "auto"），交由 SNI/ECH 自动探测转发。
 func Resolve(upstreams UpstreamMap, host string) (UpstreamConfig, bool) {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	if host == "" {
+		return UpstreamConfig{}, false
+	}
 	if uc, ok := upstreams[host]; ok {
 		return uc, true
 	}
-	return MatchWildcard(upstreams, host)
+	if uc, ok := MatchWildcard(upstreams, host); ok {
+		return uc, true
+	}
+	// 非 l.moonchan.xyz 域名（且为合法域名而非纯 IP）：自动启用原域名透明反代，由底层自动选择 SNI/ECH
+	if !IsPortalDomain(host) && net.ParseIP(host) == nil && strings.Contains(host, ".") {
+		return UpstreamConfig{
+			Host: host,
+			Mode: "auto",
+		}, true
+	}
+	return UpstreamConfig{}, false
 }
 
 // MatchWildcard 根据泛域名规则匹配请求域名，并合成对应的目标 UpstreamConfig。

@@ -1,10 +1,10 @@
 // Package rewrite 负责 HTTP 请求头/响应头规则处理、CORS 跨域头设置、
 // 响应体解压/重写/压缩、屏蔽域名剥离以及 Service Worker 动态脚本生成。
-// 本模块仅依赖 config 的数据结构定义与标准压缩库。
 package rewrite
 
 import (
 	"net/http"
+	"regexp"
 	"strings"
 
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
@@ -20,6 +20,11 @@ var hopByHopHeaders = map[string]bool{
 	"Transfer-Encoding":   true,
 	"Upgrade":             true,
 }
+
+var (
+	httpSchemePrefixRE  = regexp.MustCompile(`(?i)^http://`)
+	refreshHTTPSchemeRE = regexp.MustCompile(`(?i)http://`)
+)
 
 func isCORSOrSecurityHeader(key string) bool {
 	l := strings.ToLower(key)
@@ -43,7 +48,7 @@ func CopyHeaders(dst, src http.Header) {
 	}
 }
 
-// ApplyCORSHeaders 为响应注入完整的跨域许可头，确保子域名音视频与前端资源无障碍加载。
+// ApplyCORSHeaders 为响应注入完整的跨域许可头。
 func ApplyCORSHeaders(dst http.Header, req *http.Request) {
 	var origin, reqHeaders string
 	if req != nil {
@@ -102,24 +107,33 @@ func ApplyHeaderRules(h http.Header, rules map[string]config.HeaderRule, isReque
 	}
 }
 
-// RewriteRedirectHeaders 改写 Location 和 Refresh 重定向头中的域名，并强制升级 http:// 为 https://。
+// ForceHTTPSURL 将任意以 http:// 开头的 URL 强制升级为 https://（修复 #23 静默降级 HTTP）。
+func ForceHTTPSURL(raw string) string {
+	return httpSchemePrefixRE.ReplaceAllString(strings.TrimSpace(raw), "https://")
+}
+
+// RewriteRedirectHeaders 改写所有 Location 和 Refresh 重定向头中的域名，并无条件将 http:// 升级为 https://（#23）。
 func RewriteRedirectHeaders(h http.Header, rewriter func([]byte, string) []byte, port string) {
-	if loc := h.Get("Location"); loc != "" {
-		if rewriter != nil {
-			loc = string(rewriter([]byte(loc), port))
+	if locs := h.Values("Location"); len(locs) > 0 {
+		h.Del("Location")
+		for _, loc := range locs {
+			loc = ForceHTTPSURL(loc)
+			if rewriter != nil {
+				loc = string(rewriter([]byte(loc), port))
+			}
+			loc = ForceHTTPSURL(loc)
+			h.Add("Location", loc)
 		}
-		if len(loc) >= 7 && strings.EqualFold(loc[:7], "http://") {
-			loc = "https://" + loc[7:]
-		}
-		h.Set("Location", loc)
 	}
-	if refresh := h.Get("Refresh"); refresh != "" {
-		if rewriter != nil {
-			refresh = string(rewriter([]byte(refresh), port))
+	if refreshes := h.Values("Refresh"); len(refreshes) > 0 {
+		h.Del("Refresh")
+		for _, refresh := range refreshes {
+			refresh = refreshHTTPSchemeRE.ReplaceAllString(refresh, "https://")
+			if rewriter != nil {
+				refresh = string(rewriter([]byte(refresh), port))
+			}
+			refresh = refreshHTTPSchemeRE.ReplaceAllString(refresh, "https://")
+			h.Add("Refresh", refresh)
 		}
-		if idx := strings.Index(strings.ToLower(refresh), "http://"); idx >= 0 {
-			refresh = refresh[:idx] + "https://" + refresh[idx+7:]
-		}
-		h.Set("Refresh", refresh)
 	}
 }

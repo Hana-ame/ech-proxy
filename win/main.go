@@ -37,9 +37,9 @@ func main() {
 	}
 
 	addr := flag.String("addr", defaultAddr, "监听地址（文件名以 .443.exe 结尾时默认为 127.0.0.1:443，否则为 127.0.0.1:8443）")
-	localProxy := flag.Bool("local", is443, "启用 443 本地透明反向代理模式（自签名 CA + 按需签发原域名证书）")
+	localProxy := flag.Bool("local", is443, "启用 443 本地透明反向代理模式（自签名 CA + 按需签发原域名证书 + 自动 SNI/ECH）")
 	dataDir := flag.String("data-dir", os.Getenv("ECH_PROXY_DATA_DIR"), "本地 CA 与叶子证书存储目录（默认：程序所在目录）")
-	configURL := flag.String("config", "", "upstream.json 配置文件路径或 URL（留空使用默认远程地址）")
+	configURL := flag.String("config", os.Getenv("ECH_PROXY_CONFIG"), "upstream.json 配置文件路径或 URL（留空使用默认远程地址）")
 	ipMode := flag.String("ip-mode", os.Getenv("IP_MODE"), "锁定上游出口协议族：v4 或 v6（留空由系统自动选择）")
 	localIP := flag.String("local-ip", os.Getenv("LOCALIP"), "DoH 引导 IP（可选）")
 	httpMode := flag.Bool("http", false, "以纯 HTTP 明文模式运行（与 -local 互斥）")
@@ -68,7 +68,6 @@ func main() {
 
 	srv.PrintBanner(*localIP)
 
-	// 8443 门户模式下自动打开浏览器展示导航页；443 本地模式静默运行
 	if !*noBrowser && !*localProxy {
 		scheme := "https"
 		if *httpMode {

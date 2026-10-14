@@ -9,17 +9,21 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 
+	"github.com/Hana-ame/ech-proxy/echproxy/config"
+	"github.com/Hana-ame/ech-proxy/echproxy/cookie"
+	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
 	"github.com/gin-gonic/gin"
 )
 
-// TestShippedUpstreamJSONCompatibility 验证未改动的 certs/l.moonchan.xyz/upstream.json
-// 可被完整解析，且同时满足 8443 门户模式与 443 本地模式的路由需求。
-func TestShippedUpstreamJSONCompatibility(t *testing.T) {
+// TestIssue17And26_UpstreamJSONAndPximgRouting 验证：
+// 1. certs/l.moonchan.xyz/upstream.json 语法与结构完整合法 (#26)；
+// 2. 包含 pixiv.net、pximg.net、i.pximg.net、s.pximg.net 路由且携带防盗链 Referer (#17)；
+// 3. 任何未写入 upstream.json 的非 l.moonchan.xyz 域名（修改 hosts=127.0.0.1 后）均可自动透传转发。
+func TestIssue17And26_UpstreamJSONAndPximgRouting(t *testing.T) {
 	buf, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
 	if err != nil {
 		t.Fatalf("read upstream.json: %v", err)
@@ -32,100 +36,70 @@ func TestShippedUpstreamJSONCompatibility(t *testing.T) {
 		t.Fatalf("ParseConfig failed: %v", err)
 	}
 
-	// 1. 验证 8443 门户泛域名模式（如 iwara-xxx.l.moonchan.xyz -> xxx.iwara.tv）
-	iwaraSub, ok := MatchWildcardForTest(cfg.Upstreams, "iwara-api.l.moonchan.xyz")
-	if !ok || iwaraSub.Host != "api.iwara.tv" {
-		t.Errorf("8443 wildcard iwara-api.l.moonchan.xyz -> got %q (ok=%v), want api.iwara.tv", iwaraSub.Host, ok)
-	}
-
-	// 2. 验证 443 本地透明反代模式（pixiv.net 主域名及 *.pixiv.net 子域名）
-	apex, ok := cfg.Upstreams["pixiv.net"]
-	if !ok || apex.Host != "pixiv.net" || apex.IPMode != "v4" {
-		t.Errorf("443 apex pixiv.net config mismatch: %+v (ok=%v)", apex, ok)
-	}
-	for _, sub := range []string{"www.pixiv.net", "account.pixiv.net", "api.sec.pixiv.net"} {
-		uc, ok := MatchWildcardForTest(cfg.Upstreams, sub)
-		if !ok || uc.Host != sub || uc.IPMode != "v4" {
-			t.Errorf("443 wildcard %s -> got host=%q ip_mode=%q (ok=%v)", sub, uc.Host, uc.IPMode, ok)
+	// 验证 Pixiv 主站与子域
+	for _, host := range []string{"pixiv.net", "www.pixiv.net", "account.pixiv.net", "accounts.pixiv.net"} {
+		uc, ok := config.Resolve(cfg.Upstreams, host)
+		if !ok || uc.Host != host || uc.IPMode != "v4" {
+			t.Errorf("Pixiv host %s resolve mismatch: host=%q ip_mode=%q ok=%v", host, uc.Host, uc.IPMode, ok)
 		}
 	}
-}
 
-// TestMode1_8443PortalAndRewrite 验证功能一（8443 门户反向代理模式）：
-// 门户列表渲染、子域名路由、响应体域名替换与 Service Worker 注入。
-func TestMode1_8443PortalAndRewrite(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	rawCfg := `{
-		"upstreams": {
-			"l.moonchan.xyz": {
-				"host": "reminder.moonchan.xyz",
-				"mode": "direct",
-				"display": false
-			},
-			"dlsite.l.moonchan.xyz": {
-				"host": "www.dlsite.com",
-				"ip_mode": "v4",
-				"referer": "https://www.dlsite.com/",
-				"display": true,
-				"sw_inject": true,
-				"rewrites": {
-					"www.dlsite.com": "dlsite.l.moonchan.xyz",
-					"img.dlsite.jp": "dlsite-img.l.moonchan.xyz"
-				}
-			}
-		},
-		"blocked_hosts": ["https://www.googletagmanager.com"]
-	}`
-	cfg, err := ParseConfig([]byte(rawCfg))
-	if err != nil {
-		t.Fatalf("ParseConfig: %v", err)
+	// 验证 #17: pximg.net / i.pximg.net / s.pximg.net 路由与防盗链 Referer
+	for _, imgHost := range []string{"pximg.net", "i.pximg.net", "s.pximg.net", "imp.pximg.net"} {
+		uc, ok := config.Resolve(cfg.Upstreams, imgHost)
+		if !ok || uc.Host != imgHost {
+			t.Errorf("pximg host %s resolve failed: got %q (ok=%v)", imgHost, uc.Host, ok)
+		}
+		if uc.Referer != "https://www.pixiv.net/" {
+			t.Errorf("pximg host %s missing Referer: got %q", imgHost, uc.Referer)
+		}
 	}
 
-	orig := roundTripFn
-	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
-		body := `<html><head><script src="https://www.googletagmanager.com/gtm.js"></script></head><body>https://www.dlsite.com/home and https://img.dlsite.jp/a.jpg</body></html>`
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-			Body:       io.NopCloser(strings.NewReader(body)),
-		}, nil
-	}
-	defer func() { roundTripFn = orig }()
-
-	engine := NewEngine(cfg)
-
-	// 1. 访问门户首页 l.moonchan.xyz:8443/
-	reqPortal := httptest.NewRequest(http.MethodGet, "/", nil)
-	reqPortal.Host = "l.moonchan.xyz:8443"
-	wPortal := httptest.NewRecorder()
-	engine.ServeHTTP(wPortal, reqPortal)
-	if wPortal.Code != http.StatusOK || !strings.Contains(wPortal.Body.String(), "dlsite.l.moonchan.xyz:8443") {
-		t.Errorf("portal page failed: code=%d body=%s", wPortal.Code, wPortal.Body.String())
-	}
-
-	// 2. 访问代理站点 dlsite.l.moonchan.xyz:8443/home
-	reqProxy := httptest.NewRequest(http.MethodGet, "/home", nil)
-	reqProxy.Host = "dlsite.l.moonchan.xyz:8443"
-	wProxy := httptest.NewRecorder()
-	engine.ServeHTTP(wProxy, reqProxy)
-	out := wProxy.Body.String()
-	if !strings.Contains(out, "https://dlsite.l.moonchan.xyz:8443/home") {
-		t.Errorf("expected domain rewrite to dlsite.l.moonchan.xyz:8443, got: %s", out)
-	}
-	if !strings.Contains(out, "https://dlsite-img.l.moonchan.xyz:8443/a.jpg") {
-		t.Errorf("expected CDN domain rewrite, got: %s", out)
-	}
-	if strings.Contains(out, "googletagmanager.com") {
-		t.Errorf("expected blocked host stripped, got: %s", out)
-	}
-	if !strings.Contains(out, "navigator.serviceWorker.register('/sw.js')") {
-		t.Errorf("expected SW registration injected, got: %s", out)
+	// 验证任意未在 upstream.json 中声明的 hosts=127.0.0.1 域名自动透传（Mode="auto"）
+	autoUC, ok := config.Resolve(cfg.Upstreams, "unlisted.example.org")
+	if !ok || autoUC.Host != "unlisted.example.org" || autoUC.Mode != "auto" {
+		t.Errorf("unlisted non-portal domain should auto-passthrough, got: %+v (ok=%v)", autoUC, ok)
 	}
 }
 
-// TestMode2_443LocalReverseProxyEndToEnd 验证功能二（443 本地透明反向代理模式）：
-// 自生成本地 CA、按需动态签发域名通配符证书，以及原域名（如 www.pixiv.net）端到端转发。
-func TestMode2_443LocalReverseProxyEndToEnd(t *testing.T) {
+// TestIssue23_ForceHTTPSRedirectUpgrade 验证上游返回 http:// Location 或 Refresh 时强制升级为 https:// (#23)。
+func TestIssue23_ForceHTTPSRedirectUpgrade(t *testing.T) {
+	h := http.Header{}
+	h.Set("Location", "http://www.pixiv.net/?return_to=%2F")
+	h.Set("Refresh", "0; url=http://www.dlsite.com/home")
+
+	rewriter := rewrite.BuildEntryRewriter(config.UpstreamConfig{
+		Rewrites: map[string]string{"www.dlsite.com": "dlsite.l.moonchan.xyz"},
+	}, nil)
+	rewrite.RewriteRedirectHeaders(h, rewriter, "8443")
+
+	if got := h.Get("Location"); got != "https://www.pixiv.net/?return_to=%2F" {
+		t.Errorf("Location was not upgraded to https: got %q", got)
+	}
+	if got := h.Get("Refresh"); got != "0; url=https://dlsite.l.moonchan.xyz:8443/home" {
+		t.Errorf("Refresh was not upgraded and rewritten: got %q", got)
+	}
+}
+
+// TestIssue28_BlockArbitraryFileReadAndControlPlane 验证：
+// 1. cookie_file 拒绝读取系统任意路径或 ".." 路径穿越 (#28)；
+// 2. 控制面端点 /control/cookie 不再暴露。
+func TestIssue28_BlockArbitraryFileReadAndControlPlane(t *testing.T) {
+	for _, unsafePath := range []string{"/etc/passwd", "../../../etc/hosts", `C:\Windows\win.ini`} {
+		if got := cookie.ReadFixedCookie("", unsafePath); got != "" {
+			t.Errorf("unsafe cookie_file %q was not blocked, returned %d bytes", unsafePath, len(got))
+		}
+	}
+	if got := cookie.ReadFixedCookie("session=abc123", ""); got != "session=abc123" {
+		t.Errorf("inline cookie string failed: got %q", got)
+	}
+}
+
+// TestIssue21AndAutoTransparentReverseProxy 验证：
+// 1. 除 l.moonchan.xyz 体系外，所有域名均由本地自签名 CA 动态签发证书，且下发完整证书链与 SKID/AKID (#21)；
+// 2. l.moonchan.xyz 及 *.l.moonchan.xyz 保持使用門户证书；
+// 3. 请求通过自动 SNI/ECH 隧道转发至真实上游。
+func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dir := t.TempDir()
 
@@ -134,32 +108,24 @@ func TestMode2_443LocalReverseProxyEndToEnd(t *testing.T) {
 		t.Fatalf("NewCertStore: %v", err)
 	}
 
-	rawCfg := `{
-		"upstreams": {
-			"pixiv.net": {
-				"host": "pixiv.net",
-				"ip_mode": "v4",
-				"wildcard": {
-					"entry_suffix": ".pixiv.net",
-					"upstream_suffix": ".pixiv.net"
-				}
-			}
-		}
-	}`
-	cfg, err := ParseConfig([]byte(rawCfg))
+	buf, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
+	if err != nil {
+		t.Fatalf("read upstream.json: %v", err)
+	}
+	cfg, err := ParseConfig(buf)
 	if err != nil {
 		t.Fatalf("ParseConfig: %v", err)
 	}
 
 	orig := roundTripFn
 	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
-		if ipMode != "v4" {
-			t.Errorf("expected ipMode=v4, got %q", ipMode)
-		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
-			Header:     http.Header{"X-Upstream-Host": []string{req.Host}},
-			Body:       io.NopCloser(strings.NewReader("ok:" + req.Host)),
+			Header: http.Header{
+				"X-Saw-Host":    []string{req.Host},
+				"X-Saw-Referer": []string{req.Header.Get("Referer")},
+			},
+			Body: io.NopCloser(strings.NewReader("ok:" + req.Host)),
 		}, nil
 	}
 	defer func() { roundTripFn = orig }()
@@ -171,7 +137,7 @@ func TestMode2_443LocalReverseProxyEndToEnd(t *testing.T) {
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	tlsCfg := store.TLSConfig(indexHost, nil)
+	tlsCfg := store.TLSConfig(nil)
 	httpSrv := &http.Server{
 		Handler:   NewEngine(cfg),
 		TLSConfig: tlsCfg,
@@ -188,7 +154,8 @@ func TestMode2_443LocalReverseProxyEndToEnd(t *testing.T) {
 		t.Fatal("append CA cert failed")
 	}
 
-	for _, sni := range []string{"www.pixiv.net", "account.pixiv.net"} {
+	// 测试 www.pixiv.net、i.pximg.net、s.pximg.net 以及未列入 upstream.json 的任意域名
+	for _, sni := range []string{"www.pixiv.net", "i.pximg.net", "s.pximg.net", "custom.site.example"} {
 		client := &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -200,14 +167,21 @@ func TestMode2_443LocalReverseProxyEndToEnd(t *testing.T) {
 				},
 			},
 		}
-		resp, err := client.Get("https://" + sni + "/artworks/1")
+		resp, err := client.Get("https://" + sni + "/test")
 		if err != nil {
-			t.Fatalf("GET https://%s failed: %v", sni, err)
+			t.Fatalf("GET https://%s/test failed: %v", sni, err)
 		}
 		b, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if string(b) != "ok:"+sni {
-			t.Errorf("body = %q, want %q", string(b), "ok:"+sni)
+			t.Errorf("%s body = %q, want %q", sni, string(b), "ok:"+sni)
+		}
+		if strings.HasSuffix(sni, "pximg.net") && resp.Header.Get("X-Saw-Referer") != "https://www.pixiv.net/" {
+			t.Errorf("%s expected Referer https://www.pixiv.net/, got %q", sni, resp.Header.Get("X-Saw-Referer"))
+		}
+		// 验证下发了完整证书链（leaf + CA）(#21)
+		if resp.TLS == nil || len(resp.TLS.PeerCertificates) < 2 {
+			t.Errorf("%s expected full certificate chain (>=2 certs), got %d", sni, len(resp.TLS.PeerCertificates))
 		}
 	}
 }

@@ -1,306 +1,108 @@
 # ech-proxy
 
-ECH (Encrypted Client Hello) reverse proxy supporting multi-upstream routing and Android APK deployment.
+支持 **全自动无干预 SNI / ECH 透明反向代理**、**门户导航（`l.moonchan.xyz`）** 与 **Android / Flutter 集成** 的轻量级反向代理工具。
 
-## Features
+## 一、 核心工作原理
 
-- **Multi-Upstream Routing**: twimg, exhentai, iwara, dlsite, sukebei, ao3, etc.
-- **Multiple Modes**: Cloudflare ECH domain fronting, SNI camouflage direct connect.
-- **Android APK**: Compiled as a `c-shared` library integrated into an Android app.
-- **Wildcard Subdomains**: e.g., `iwara-xxx.l.moonchan.xyz` → `xxx.iwara.tv`.
-- **Cookie Injection**: Supports persistent and fixed cookies (e.g., exhentai session cookies).
-- **Response Rewriting**: URL rewriting and Service Worker injection.
+`ech-proxy` 采用双轨证书与全自动隧道分流设计：
 
-## Local reverse proxy mode (Pixiv)
+1. **`l.moonchan.xyz` 相关域名（门户与代理子域）**：
+   * 证书：使用 `upstream.json` 中配置的 `l.moonchan.xyz` 公网证书。
+   * 行为：访问 `https://l.moonchan.xyz:8443/` 展示门户列表；访问 `*.l.moonchan.xyz`（如 `dlsite.l.moonchan.xyz`）自动映射至对应目标网站并执行响应体域名替换与 Service Worker 注入。
+2. **除 `l.moonchan.xyz` 以外的所有域名（本地 `hosts -> 127.0.0.1` 透明反代模式）**：
+   * **本地自签名 CA 动态签发证书**：只要通过修改系统 `hosts` 将目标域名（如 `pixiv.net`、`i.pximg.net`、`sukebei.nyaa.si` 或任意其他域名）指向 `127.0.0.1` 并安装一次本机生成的 `ca/ca.pem` 根证书，`ech-proxy` 会在 TLS 握手阶段自动为该域名签发带通配符与完整信任链（`fullchain.pem`）的证书。
+   * **SNI / ECH 全自动无干预选择**：代理会自动通过 DoH 解析目标域名的真实 IP 并检测其是否属于 Cloudflare 网段：
+     * **Cloudflare 站点（如 `pixiv.net`、`e-hentai.org`、`archiveofourown.org`、`dlsite.com`）**：自动通过 **Cloudflare ECH（Encrypted Client Hello）** 隧道转发。
+     * **非 Cloudflare 站点（如 `i.pximg.net`、`s.pximg.net`、`sukebei.nyaa.si`）**：自动通过 **SNI 伪装直连**（同时兼容 HTTP/2 与 HTTP/1.1 源站）转发。
+     * **无感故障回退**：若首选隧道连接失败或被边缘拒绝，自动无感切换至备选隧道并缓存成功路由，全程无需手动干预 `mode`。
 
-`ech-proxy` normally listens on `127.0.0.1:8443` and uses the public cert on `l.moonchan.xyz`.
-The **local proxy mode** (flag `-local`, and the default when the executable filename ends in
-`.443.exe`) instead:
+## 二、 语义化模块架构 (#29)
 
-1. Listens on **`127.0.0.1:443`** (so you can point `pixiv.net`, `account.pixiv.net`, and
-   subdomains at `127.0.0.1` in your hosts file).
-2. Serves TLS using **self-generated certificates**: a local self-signed CA plus a per-domain
-   leaf, issued on demand by the TLS `GetCertificate` callback. Nothing is ever downloaded —
-   the CA and leaves are created by `ech-proxy` itself.
-3. Caches everything next to the executable:
-   - **The directory holding the executable** by default. The CA is the file you have to
-     install into the trust store, so it sits beside the binary you downloaded and renamed,
-     instead of being buried under `%AppData%`. This also keeps the proxy self-contained when
-     it is run from a single folder or a USB stick.
-   - If that directory is not writable (the binary may live in `C:\Windows\System32` or a
-     read-only extraction folder) it falls back to the platform user config dir:
-     Windows `%AppData%\ech-proxy\`, Linux `~/.config/ech-proxy/`,
-     macOS `~/Library/Application Support/ech-proxy/`
-   - Overridable with `-data-dir PATH` or the env var `ECH_PROXY_DATA_DIR`
-   - Layout: `ca/ca.pem` (the cert to install into the system/browser trust store) and
-     `ca/ca.key` (the CA private key — never leaves the machine), plus
-     `certs/<registrable-domain>/fullchain.pem` and `privkey.pem` for each domain seen.
-   - Dirs are `0700`, files `0600`.
-4. Forwards each incoming host through the same **sni / ech** tunneling the remote deployment
-   uses — with one exception: `l.moonchan.xyz` itself keeps its original direct path.
-   `pixiv.net` is configured with **IPv4-only egress** (`ip_mode: v4`), because pixiv returns
-   HTTP 403 on IPv6 clients.
-5. Skips the browser auto-open.
+代码库按职责划分为 6 个正交语义子包与 1 个顶层组装层，模块间无环形依赖：
 
-### Why
-
-Pixiv returns a static **403 "Access blocked"** for clients that egress over IPv6. A local proxy
-on port 443 with forced IPv4 egress eliminates the problem: the browser connects to
-`127.0.0.1:443`, `ech-proxy` terminates TLS with a locally trusted CA, and forwards the request
-through the **ech** tunnel with `ip_mode: v4`, so the upstream leg always egresses over IPv4.
-
-Local mode follows the same routing rule as the remote deployment:
-
-| Incoming host | TLS termination | Upstream forwarding |
-| :--- | :--- | :--- |
-| `l.moonchan.xyz` (the portal) | existing public cert | unchanged original path (`direct`) |
-| anything else (`pixiv.net`, `account.pixiv.net`, …) | self-generated CA + per-domain leaf | **sni / ech** tunnel, same as remote mode |
-
-### Prerequisites
-
-- **Administrator / root privileges** (binding port 443 requires it on all platforms).
-- **Go is not required** — the binary ships in the release assets.
-
-### Step 1 — Rename the binary
-
-Rename the downloaded binary so that its filename **ends with `.443.exe`**:
-
-```
-ech-proxy-windows-amd64.exe  →  ech-proxy.443.exe
+```text
+echproxy/
+├── netdial/      # [基础网络模块] 公共 DNS 解析、IPv4/IPv6 协议族优选、Cloudflare CIDR 识别、文件拉取与重试（0 内部依赖）
+├── config/       # [配置与路由模块] 解析 upstream.json，支持精确/泛域名匹配及任意非门户域名的自动透传（仅依赖 netdial）
+├── certstore/    # [证书管理模块] 公网证书加载 + 本地自签 CA 生成与按需动态签发完整信任链证书（仅依赖 config, netdial）
+├── cookie/       # [Cookie 管理模块] 受控 Cookie 加载、按域名的内存 CookieJar 与 Set-Cookie 域名改写（0 内部依赖）
+├── rewrite/      # [内容重写模块] 解压/重压缩、域名替换、HTTP->HTTPS 强制升级、SW 脚本生成与 Header/CORS 处理（仅依赖 config）
+├── ech/          # [传输隧道模块] Cloudflare ECH 隧道、SNI 伪装（H2/H1.1 双栈）与全自动无干预 RoundTrip 分发（仅依赖 netdial）
+├── portal.go     # [顶层门户路由] l.moonchan.xyz 导航页渲染与 Gin 路由注册
+├── proxy.go      # [顶层反代流水线] 串联路由解析、请求构造、自动隧道转发、自重定向熔断与响应重写
+└── server.go     # [顶层服务管理] 统一管理服务生命周期与双轨 TLS 证书挂载
 ```
 
-**The `.443.exe` convention — exact suffix, not substring.** The check is
-`strings.HasSuffix(filename, ".443.exe")`, so the filename must *end* with `.443.exe`:
+## 三、 本地透明反代使用步骤（以 Pixiv 为例）
 
-| Filename | 443 mode? |
-| :--- | :--- |
-| `ech-proxy.443.exe` | ✅ yes |
-| `foo.443.exe` | ✅ yes |
-| `ech-proxy.443.EXE` | ✅ yes (case-insensitive) |
-| `ech-proxy.exe` | ❌ no — keeps port 8443 |
-| `ech-proxy.443-windows-amd64.exe` | ❌ no — ends in `-amd64.exe` |
-| `ech-proxy.443.beta.exe` | ❌ no — ends in `.beta.exe` |
-| `ech-proxy.443` | ❌ no — no `.exe` |
-
-A substring match would be dangerous: a renamed intermediate build such as
-`ech-proxy.443.beta.exe` would silently bind a privileged port. Only a filename that genuinely
-*ends* in `.443.exe` triggers the 443 build.
-
-The release ships the Windows amd64 build already named **`ech-proxy.443.exe`**, so you can run
-it straight from the download. Alternatively, any filename works if you pass `-local` and
-`-addr 127.0.0.1:443` explicitly.
-
-### Step 2 — Edit the hosts file
-
-Add these entries to your system hosts file (`C:\Windows\System32\drivers\etc\hosts` on Windows):
-
-```
-127.0.0.1 pixiv.net
-127.0.0.1 www.pixiv.net
-127.0.0.1 account.pixiv.net
-127.0.0.1 api.sec.pixiv.net
-127.0.0.1 manga.pixiv.net
-```
-
-The leaf certificate is issued for the registrable domain `pixiv.net` with a `*.pixiv.net`
-wildcard SAN, so **all subdomains are covered** by the single `pixiv.net` entry in your hosts
-file. The explicit entries above are provided for clarity; you can safely drop the subdomain
-lines and keep only:
-
-```
-127.0.0.1 pixiv.net
-```
-
-**Note:** `pximg.net` (Pixiv's image CDN) is **not** covered by the `pixiv.net` subdomain
-entry — it needs its own hosts line and upstream config entry if you want it proxied.
-
-### Step 3 — Run
-
-Open an **elevated** terminal (Command Prompt / PowerShell as Administrator on Windows) and run:
-
-```
+### 步骤 1 — 启动 443 模式
+将下载的可执行文件重命名为以 `.443.exe` 结尾（如 `ech-proxy.443.exe`），并以**管理员 / `root` 权限**运行（也可以不重命名，直接运行 `ech-proxy -local -addr 127.0.0.1:443`）：
+```cmd
 ech-proxy.443.exe
 ```
 
-That's it. The `.443.exe` filename suffix enables local mode and port 443 automatically.
+### 步骤 2 — 编辑系统 `hosts` 文件 (#18)
+> **重要说明**：操作系统的 `hosts` 文件（Windows 位于 `C:\Windows\System32\drivers\etc\hosts`，Linux/macOS 位于 `/etc/hosts`）**不支持 `*.pixiv.net` 通配符语法**！必须将实际访问的子域名与图片 CDN 域名（`i.pximg.net` / `s.pximg.net`）逐行写入 `hosts`：
 
-Available flags:
+```hosts
+# Pixiv 主站与子域名
+127.0.0.1 pixiv.net
+127.0.0.1 www.pixiv.net
+127.0.0.1 accounts.pixiv.net
+127.0.0.1 account.pixiv.net
+127.0.0.1 api.sec.pixiv.net
+127.0.0.1 manga.pixiv.net
+127.0.0.1 novel.pixiv.net
+127.0.0.1 dic.pixiv.net
+127.0.0.1 fanbox.cc
+127.0.0.1 www.fanbox.cc
 
-| Flag | Default | Description |
-| :--- | :--- | :--- |
-| `-local` | *from filename* | Enable local reverse proxy mode (auto-enabled by a `.443.exe` filename suffix) |
-| `-http` | `false` | Run in HTTP mode (no TLS) — **mutually exclusive** with `-local` |
-| `-data-dir` | `$ECH_PROXY_DATA_DIR` or the executable's own directory | Directory for the local CA and issued certificates |
-| `-config` | *(default remote URL)* | Upstream config URL or local path |
-| `-addr` | `127.0.0.1:443` (when `.443.exe`) or `127.0.0.1:8443` | Listen address |
-| `-ip-mode` | `$IP_MODE` | Pin the upstream egress family to `v4` or `v6`; empty lets the OS decide |
-
-Example with explicit flags (no rename needed):
-
+# Pixiv 图片与静态资源 CDN（缺少这两项会导致图片裂开或样式丢失 #17 #18）
+127.0.0.1 pximg.net
+127.0.0.1 i.pximg.net
+127.0.0.1 s.pximg.net
 ```
-ech-proxy-windows-amd64.exe -local -addr 127.0.0.1:443
-```
+*(注：除 Pixiv 外，你也可以将任何其他需要代理的域名按 `127.0.0.1 <域名>` 格式加入 `hosts`，`ech-proxy` 会自动为其签发证书并自动选择 SNI/ECH 转发。)*
 
-### Step 4 — Install the CA certificate
+### 步骤 3 — 安装本地 CA 根证书与浏览器信任配置 (#21)
+首次运行后，`ech-proxy` 会在程序所在目录（若不可写则位于 `%AppData%\ech-proxy\` 或 `~/.config/ech-proxy/`）生成 `ca/ca.pem`：
 
-After the first run, `ech-proxy` generates a local self-signed CA and stores it under your
-data directory. You **must** install the CA certificate into your system's trust store for the
-browser to accept the leaf certificates.
+* **Windows（Chrome / Edge）**：右键点击 `ca\ca.pem` $ightarrow$ **安装证书** $ightarrow$ 选择 **本地计算机** $ightarrow$ 选择 **将所有的证书都放入下列存储** $ightarrow$ 浏览并选择 **受信任的根证书颁发机构** $ightarrow$ 完成并重启浏览器。
+* **macOS（Safari / Chrome）**：打开“钥匙串访问”，将 `ca/ca.pem` 拖入 **系统** 钥匙串，双击打开 `"ech-proxy local CA"`，展开“信任”并将“使用此证书时”设为 **始终信任**。
+* **Linux**：
+  ```bash
+  sudo cp ca/ca.pem /usr/local/share/ca-certificates/ech-proxy-ca.crt
+  sudo update-ca-certificates
+  ```
+* **Firefox 浏览器专属配置（必看 #21）**：
+  Firefox 默认使用内置的独立证书库，不会自动读取操作系统根证书库。请任选以下一种方式配置：
+  1. **方式 A（推荐，自动信任系统根证书）**：在 Firefox 地址栏输入 `about:config` 回车，搜索 `security.enterprise_roots.enabled`，双击将其值切换为 **`true`**。
+  2. **方式 B（手动导入 CA）**：打开 Firefox **设置** $ightarrow$ **隐私与安全** $ightarrow$ 滑到底部点击 **查看证书 (View Certificates)** $ightarrow$ 切换到 **证书颁发机构 (Authorities)** 标签页 $ightarrow$ 点击 **导入 (Import)**，选择 `ca/ca.pem`，勾选 **“信任由此证书颁发机构来标识网站”** 并确定。
 
-**CA certificate path:**
+## 四、 命令行参数与跨平台环境变量对照 (#27)
 
-**The default data dir is the folder that holds the executable** (it falls back to the
-platform user config dir only if that folder is not writable), so for a binary at
-`C:\Users\lumin\Downloads\ech-proxy.443.exe` the CA is at
-`C:\Users\lumin\Downloads\ca\ca.pem`:
+桌面端（`win/`）与 Android 端（`android/`）对齐了核心环境变量配置：
 
-| Executable location | Default CA path | Override |
-| :--- | :--- | :--- |
-| `%CD%\ech-proxy.443.exe` (Windows) | `%CD%\ca\ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
-| `/opt/ech-proxy/ech-proxy.443` (Linux) | `/opt/ech-proxy/ca/ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
-| `~/ech-proxy.443` (macOS) | `~/ca/ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
-| exe dir not writable (fallback) | `<user config dir>/ech-proxy/ca/ca.pem` | `-data-dir` or `$ECH_PROXY_DATA_DIR` |
+| 功能说明 | 桌面端 CLI 参数 | 跨平台环境变量（桌面端 + Android） | 默认值 |
+| :--- | :--- | :--- | :--- |
+| 本地透明反代模式 | `-local` | （通过 `.443.exe` 后缀或 `-local` 开启） | `false`（`.443.exe` 为 `true`） |
+| 监听地址与端口 | `-addr` | — | `127.0.0.1:8443` / `127.0.0.1:443` |
+| 上游配置文件路径/URL | `-config` | `ECH_PROXY_CONFIG` | 默认远程 GitHub URL |
+| 锁定上游出口协议族 | `-ip-mode` | `IP_MODE`（`v4` 或 `v6`） | 自动（`pixiv`/`pximg` 已内置 `v4`） |
+| DoH 引导 IP | `-local-ip` | `LOCALIP` | 空 |
+| 本地 CA 存储目录 | `-data-dir` | `ECH_PROXY_DATA_DIR` | 程序所在目录（或系统用户配置目录） |
+| 纯 HTTP 模式 | `-http` | — | `false` |
+| 详细请求日志 | `-v` | — | `false`（Android 默认开启） |
 
-The startup banner prints the resolved path on the `Data dir:` line — that is the folder whose
-`ca\ca.pem` (Windows) or `ca/ca.pem` (POSIX) to install.
-
-**Install the CA:**
-
-- **Windows**: Right-click `ca.pem` → "Install Certificate" → Local Machine → "Place all
-  certificates in the following store" → "Trusted Root Certification Authorities" → Finish.
-- **Linux**: Copy `ca.pem` to `/usr/local/share/ca-certificates/ech-proxy-ca.crt` and run
-  `sudo update-ca-certificates`.
-- **macOS**: Open Keychain Access → drag `ca.pem` into "System" → open the cert → expand
-  "Trust" → set "When using this certificate" to "Always Trust".
-
-Browsers may need to be **restarted** after installing the CA (Chrome reads the store at
-startup; Firefox may need `certs.p12` installation separately).
-
-### Security rationale
-
-**`ech-proxy` generates the CA and leaf certificates itself and never downloads any certificate
-from a third party.** This is a deliberate design decision, not an oversight.
-
-Downloading a certificate from a remote host would be a **MITM / supply-chain poisoning
-vector**: if the cert server were compromised, an attacker could serve a malicious CA, and
-every "encrypted" connection through the proxy would be terminated by that attacker's
-certificate — the browser would trust it, and the user would never see a warning. That is a
-worse failure mode than not having the feature at all.
-
-Self-generation eliminates this vector entirely:
-
-- The CA private key (`ca.key`) is **created on your machine** and **never transmitted**.
-- It is stored at `0600` inside a `0700` directory, so only your user account (or root) can
-  read it.
-- Every leaf certificate is signed by your local CA and persisted at `0600`.
-
-**You must still protect your data directory.** Anyone who steals `ca.key` can forge
-certificates for any hostname and MITM your traffic. On Windows, `%AppData%\ech-proxy\` is
-inside your user profile — anyone with access to your account can read it. On shared machines,
-restrict access to the data directory (e.g., `-data-dir /root/ech-proxy` with `chmod 700`).
-
-### Troubleshooting
-
-| Symptom | Cause | Fix |
-| :--- | :--- | :--- |
-| Browser shows "certificate not trusted" / "your connection is not private" | CA not installed in the system trust store | Install `ca.pem` (Step 4) and restart the browser |
-| Still getting 403 from Pixiv | `pximg.net` is not covered by the `pixiv.net` wildcard | Add `127.0.0.1 pximg.net` to hosts and add an upstream entry for `pximg.net` in the config |
-| Port 443 already in use | Another process is bound to port 443 (e.g., HTTPS proxy, IIS) | Stop the other process, or use `-addr 127.0.0.1:8443` and point hosts at that port instead |
-| IPv6 still leaking | the config entry for `pixiv.net` lacks `ip_mode` | The shipped config sets `"ip_mode": "v4"` on `pixiv.net`; verify with `-check-config`, or add `"mode": "ech", "ip_mode": "v4"` |
-| `ech-proxy` exits with "address already in use" | Not running as admin/root (cannot bind port 443) | Run from an elevated terminal (Windows) or `sudo` (Linux/macOS) |
-| Browser still shows cert error after installing CA | Browser cached the old chain | Clear the browser cache, or restart the browser process entirely |
-| Requests hang / time out and logs say `ECH initialization failed` | Local mode still needs the ECH tunnel for non-`l.moonchan.xyz` hosts, and `moonchan.xyz` was unreachable at startup | It retries in the background (10s, 30s, 2m, 10m); wait, or set `-local-ip` to a reachable bootstrap IP |
-| `ech-proxy` refuses to start, `cannot load CA from ... and will not overwrite it` | A previous data dir is corrupt | Inspect it by hand; do **not** delete it silently, since the browser already trusts that CA |
-
-## Build
-
-### Go Binaries (Windows / Linux)
+## 五、 编译构建
 
 ```bash
-go build -o ech-proxy ./win/
-```
+# 1. 运行全量测试（包含 upstream.json 校验）
+go test ./... -v
 
-For the local reverse proxy variant, name the output so it ends in `.443.exe` — that is what
-`win/main.go` matches, so it starts on `127.0.0.1:443` with local proxy mode and no flags:
+# 2. 编译桌面端常规版本
+go build -trimpath -ldflags="-s -w" -o ech-proxy ./win/
 
-```bash
+# 3. 编译 Windows 443 本地透明反代版本
 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ech-proxy.443.exe ./win/
 ```
-
-The release builds both (`ech-proxy-windows-amd64.exe` and `ech-proxy.443.exe`) via
-`.goreleaser.yaml`.
-
-### Android APK
-
-```bash
-# 1. Compile Go shared library (requires Android NDK r27)
-cd android
-GOOS=android GOARCH=arm64 CC=aarch64-linux-android21-clang \
-  go build -buildmode=c-shared -o app/src/main/jniLibs/arm64-v8a/libechproxy.so .
-
-# 2. Package APK
-./gradlew assembleRelease
-```
-
-## Configuration
-
-Upstream configurations reside in `certs/l.moonchan.xyz/upstream.json` and are dynamically fetched at runtime from the GitHub `main` branch (forwarded via `proxy.moonchan.xyz` to `raw.githubusercontent.com`).
-Changes pushed to the `main` branch immediately affect running proxies without pinning to specific commits/tags.
-
-### Runtime Options: CLI Flags (Desktop) and Environment Variables (Desktop / Android)
-
-Both set the same two fields of `echproxy.ServerOptions`. The flags live in `win/main.go`; the env vars are the flags' defaults, so a flag always wins when both are given. Android has no CLI, so `android/main.go` reads the env vars only.
-
-| Meaning | CLI flag (desktop) | Env var | Default |
-| :--- | :--- | :--- | :--- |
-| Upstream egress IP family | `-ip-mode v4` | `IP_MODE=v4` | *(unset)* = `auto` |
-| DoH bootstrap IP | `-local-ip 1.1.1.1` | `LOCALIP=1.1.1.1` | *(unset)* |
-
-**`-ip-mode` / `IP_MODE`.** `v4` or `v6` forces the IP family of the **upstream egress** dial; unset = `auto`, where the shell hostname (`cloudflare-ech.com`) is handed to the OS resolver and the OS picks the family.
-
-**Being unset is a live trap.** In `auto` the egress family is silently OS-decided. Observed 2026-09-18: an instance egressing over IPv6 received a static **403 "Access blocked"** from `www.pixiv.net`, while the same build over IPv4 received **200** — `www.pixiv.net` publishes no AAAA record, but the ECH shell domain `cloudflare-ech.com` does (`2606:4700::6812:a76` / `2606:4700::6812:b76`), so the TCP leg follows whatever family the OS resolves. Easy to miss because other upstreams on the same IPv6 egress (`archiveofourown.org`, `f95zone.to`, `i.pximg.net`) all returned 200. Fix: `-ip-mode v4`.
-
-To confirm which family an instance is actually using: with no `-ip-mode`, the first upstream dial logs `Upstream egress: IPv4 via <addr> (IP_MODE unset, family chosen by the OS)`; and `https://<entry>.l.moonchan.xyz:8443/cdn-cgi/trace` reports the egress address in `ip=` and the attributed country in `loc=`.
-
-### Core Mechanisms: `rewrites` vs `body_replace` vs `sw_inject`
-
-To prevent configuration ambiguity, response rewriting and Service Worker responsibilities are partitioned as follows:
-
-| Directive | Format | Scope | Core Mechanism & Use Cases |
-| :--- | :--- | :--- | :--- |
-| **`rewrites`** | `{"target.com": "local.proxy"}` | **Body + sw.js (Dual Effect)** | **Domain-Level Mapping**.<br>1. **Static Body Replacement**: Replaces `target.com` with the local proxy entry (with active port attached) across HTML, JS, JSON, XML, and response headers (`Location`/`Refresh`).<br>2. **Service Worker Dynamic Interception**: When `sw_inject` is enabled, all `rewrites` pairs are automatically injected into `__swMap` inside `sw.js`, intercepting runtime requests assembled dynamically by client scripts in the browser network layer (handling dynamic URLs that static replacements cannot reach, such as DLsite image CDNs). |
-| **`body_replace`** | `[["old", "new"]]`<br>`[{"replace": ["old", "new"]}]` | **Body Only (Single Direction)** | **General Text & Regex Replacement**.<br>Dedicated to precise text replacements or regex matches within response bodies (e.g., specific script URLs, version tags, or inline code adjustments).<br>**Note**: Rules in `body_replace` **never** enter `sw.js`, preventing regex or non-domain text from polluting Service Worker routing logic. |
-| **`sw_inject`** | `true` / `false` | **HTML Registration + sw.js** | **Service Worker Injection Toggle**.<br>For sites without a native Service Worker (such as DLsite). When enabled, the proxy injects `/sw.js` registration code into served HTML, and dynamically serves a script with `rewrites` mappings and `blocked_hosts` blocklists on `/sw.js`.<br>(**Warning**: Never enable for sites with built-in Service Workers like Iwara/Workbox, to avoid conflicts or overwrites). |
-
-### Example
-
-```json
-{
-    "upstreams": {
-        "dlsite.l.moonchan.xyz": {
-            "host": "www.dlsite.com",
-            "referer": "https://www.dlsite.com/",
-            "sw_inject": true,
-            "rewrites": {
-                "www.dlsite.com": "dlsite.l.moonchan.xyz",
-                "img.dlsite.jp": "dlsite-img.l.moonchan.xyz"
-            },
-            "body_replace": [
-                ["https://old-cdn.com/lib.js", "https://new-cdn.com/lib.js"],
-                {"replace": ["v[0-9]+\\.[0-9]+", "v2.0"]}
-            ]
-        }
-    }
-}
-```
-
-**Public SSL Certificates**: Both `certs/l.moonchan.xyz/fullchain.cer` and `privkey.pem` are tracked in the repository (and mirrored in the `wintools` repository, both public). Desktop editions fetch certs and private keys directly from public locations. Because Let's Encrypt certificates are natively trusted by browsers, anyone holding this private key can terminate browser-trusted TLS for `*.l.moonchan.xyz` — this is deliberate (see commit `d23da9b`), not a leak.
-
-The only secret is the Android APK signing keystore (`release.keystore`), managed via GitHub Secrets.
-
-## GitHub Actions
-
-- `go.yml`: Go unit tests
-- `ech-proxy.yml`: Go binary builds
-- `ech-proxy-android.yml`: Android APK builds
-- `release.yml`: Release publishing

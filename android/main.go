@@ -56,7 +56,9 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	proxyMu.Lock()
 	defer proxyMu.Unlock()
 
+	logMu.Lock()
 	logBuffer = nil
+	logMu.Unlock()
 	log.Println("=== Starting full ech-proxy ===")
 
 	if proxyServer != nil {
@@ -66,12 +68,18 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	echReady = false
 	echproxy.Debug = true
 
-	bootstrap := C.GoString(bootstrapIP)
+	// 对齐桌面端环境变量：支持 LOCALIP, IP_MODE, ECH_PROXY_CONFIG, ECH_PROXY_DATA_DIR (#27)
+	bootstrap := strings.TrimSpace(C.GoString(bootstrapIP))
+	if bootstrap == "" {
+		bootstrap = os.Getenv("LOCALIP")
+	}
 	srv, err := echproxy.NewServer(echproxy.ServerOptions{
 		Addr:            "127.0.0.1:8443",
 		AllowRandomPort: true,
+		ConfigURL:       os.Getenv("ECH_PROXY_CONFIG"),
 		BootstrapIP:     bootstrap,
 		IPMode:          os.Getenv("IP_MODE"),
+		DataDir:         os.Getenv("ECH_PROXY_DATA_DIR"),
 	})
 	if err != nil {
 		log.Printf("Server init failed: %v", err)
@@ -127,6 +135,8 @@ func GetProxyPort() uint16 {
 
 //export IsEchReady
 func IsEchReady() C.int {
+	proxyMu.Lock()
+	defer proxyMu.Unlock()
 	if echReady {
 		return 1
 	}

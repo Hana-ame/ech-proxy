@@ -1,14 +1,13 @@
-// Package certstore 提供双模式 TLS 证书管理：
-//  1. 8443 门户模式：加载远程或本地配置的公网证书（如 l.moonchan.xyz）。
-//  2. 443 本地透明反代模式：在本机生成并持久化自签名根证书（ca/ca.pem, ca/ca.key），
-//     并在 TLS 握手时通过 GetCertificate 回调为任意目标域名按需签发带通配符的叶子证书。
-//
-// 本模块仅依赖标准库与 netdial.FetchBytes。
+// Package certstore 提供双轨 TLS 证书管理（修复 #21 完整信任链与 SKID/AKID 扩展）：
+//  1. l.moonchan.xyz 及 *.l.moonchan.xyz 相关域名：使用公网受信证书。
+//  2. 其余所有通过修改 hosts=127.0.0.1 接入的域名（如 pixiv.net、i.pximg.net 等）：
+//     使用本机自生成的根证书（ca/ca.pem, ca/ca.key）按需动态签发带完整信任链的通配符叶子证书。
 package certstore
 
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -24,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Hana-ame/ech-proxy/echproxy/config"
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 )
 
@@ -38,7 +38,7 @@ const (
 	leafSerialMax     = 1 << 62
 )
 
-// LoadRemoteCert 从配置的 cert_path 和 key_path 加载公网 TLS 证书（用于 8443 模式及门户域名）。
+// LoadRemoteCert 从配置的 cert_path 和 key_path 加载公网 TLS 证书（用于 l.moonchan.xyz 及其子域名）。
 func LoadRemoteCert(certPath, keyPath string) (*tls.Certificate, error) {
 	if certPath == "" || keyPath == "" {
 		return nil, errors.New("missing cert_path or key_path in config")
@@ -66,7 +66,7 @@ type CA struct {
 	KeyPath  string
 }
 
-// Store 管理 443 本地模式下的自签名 CA 及按域名缓存的叶子证书。
+// Store 管理本地自签名 CA 及按可注册域名缓存的叶子证书。
 type Store struct {
 	mu      sync.Mutex
 	DataDir string
@@ -74,8 +74,7 @@ type Store struct {
 	leaf    map[string]*tls.Certificate
 }
 
-// DefaultDataDir 返回默认的本地证书存储目录：
-// 优先使用可执行文件所在同级目录（方便用户直接找到 ca/ca.pem 安装），若不可写则退回系统用户配置目录。
+// DefaultDataDir 返回默认的本地证书存储目录（优先可执行文件同级目录，不可写时回退至系统用户配置目录）。
 func DefaultDataDir() (string, error) {
 	exeDir := ""
 	if exe, err := os.Executable(); err == nil {
@@ -151,21 +150,29 @@ func (st *Store) CAValidUntil() time.Time {
 	return st.ca.Cert.NotAfter
 }
 
-// TLSConfig 构建 443 本地反向代理模式的 tls.Config：
-// 门户域名（如 l.moonchan.xyz）保持使用公网证书，其余所有域名由本地 CA 动态签发证书。
-func (st *Store) TLSConfig(portalHost string, portalCert *tls.Certificate) *tls.Config {
+// TLSConfig 构建双轨分流的 tls.Config：
+//   - 当客户端 SNI 为 l.moonchan.xyz 或 *.l.moonchan.xyz（且公网证书已加载）时，返回公网证书；
+//   - 其余所有通过 hosts=127.0.0.1 访问的域名（如 pixiv.net、i.pximg.net 等），均由本地自签名 CA 动态签发证书。
+func (st *Store) TLSConfig(portalCert *tls.Certificate) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			if hello.ServerName == portalHost && portalCert != nil {
+			sni := strings.ToLower(strings.TrimSpace(hello.ServerName))
+			if (sni == "" || config.IsPortalDomain(sni)) && portalCert != nil {
 				return portalCert, nil
 			}
-			return st.CertificateFor(hello.ServerName)
+			if st != nil {
+				return st.CertificateFor(sni)
+			}
+			if portalCert != nil {
+				return portalCert, nil
+			}
+			return nil, errors.New("no TLS certificate available")
 		},
 	}
 }
 
-// CertificateFor 为指定域名返回或按需签发包含主域名与 *.domain 通配符的 TLS 证书。
+// CertificateFor 为指定域名返回或按需签发包含主域名与 *.domain 通配符及完整 CA 链的 TLS 证书（#21）。
 func (st *Store) CertificateFor(host string) (*tls.Certificate, error) {
 	host = strings.ToLower(strings.TrimSpace(host))
 	if host == "" {
@@ -227,6 +234,9 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 	if strings.Contains(domain, ".") {
 		sans = append(sans, "*."+domain)
 	}
+	pubBytes := x509.MarshalPKCS1PublicKey(&key.PublicKey)
+	skid := sha1.Sum(pubBytes)
+
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: domain, Organization: []string{"ech-proxy local CA"}},
@@ -235,6 +245,8 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+		SubjectKeyId:          skid[:],
+		AuthorityKeyId:        st.ca.Cert.SubjectKeyId,
 		DNSNames:              sans,
 	}
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, st.ca.Cert, &key.PublicKey, st.ca.Key)
@@ -245,15 +257,19 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	// 将叶子证书与 CA 根证书一并写入 fullchain.pem，保证 TLS 握手提供完整信任链（#21）
+	var fullchainPEM strings.Builder
+	fullchainPEM.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
+	fullchainPEM.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: st.ca.Cert.Raw}))
+
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	if err := writeFileAtomic(filepath.Join(dir, leafCertFile), certPEM, 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(dir, leafCertFile), []byte(fullchainPEM.String()), 0o600); err != nil {
 		return nil, err
 	}
 	if err := writeFileAtomic(filepath.Join(dir, leafKeyFile), keyPEM, 0o600); err != nil {
 		return nil, err
 	}
-	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+	tlsCert, err := tls.X509KeyPair([]byte(fullchainPEM.String()), keyPEM)
 	if err != nil {
 		return nil, err
 	}
@@ -301,6 +317,9 @@ func generateCA() (*CA, error) {
 	if err != nil {
 		return nil, err
 	}
+	pubBytes := x509.MarshalPKCS1PublicKey(&key.PublicKey)
+	skid := sha1.Sum(pubBytes)
+
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: "ech-proxy local CA", Organization: []string{"ech-proxy"}, Country: []string{"US"}},
@@ -310,6 +329,8 @@ func generateCA() (*CA, error) {
 		BasicConstraintsValid: true,
 		IsCA:                  true,
 		MaxPathLen:            1,
+		SubjectKeyId:          skid[:],
+		AuthorityKeyId:        skid[:],
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {

@@ -175,7 +175,42 @@
                 "entry_suffix": ".pixiv.net",
                 "upstream_suffix": ".pixiv.net"
             },
-            "describe": "Pixiv (apex + all subdomains via wildcard) — local reverse proxy, ECH forward, force IPv4",
+            "describe": "Pixiv (apex + all subdomains via wildcard) — local reverse proxy, auto ECH/SNI forward, force IPv4",
+            "display": false
+        },
+        "pximg.net": {
+            "host": "pximg.net",
+            "ip_mode": "v4",
+            "referer": "https://www.pixiv.net/",
+            "headers": {
+                "Referer": "https://www.pixiv.net/"
+            },
+            "wildcard": {
+                "entry_suffix": ".pximg.net",
+                "upstream_suffix": ".pximg.net",
+                "referer": "https://www.pixiv.net/"
+            },
+            "describe": "Pixiv Image & Static CDN (pximg.net + i.pximg.net + s.pximg.net) — local reverse proxy with anti-hotlink Referer",
+            "display": false
+        },
+        "i.pximg.net": {
+            "host": "i.pximg.net",
+            "ip_mode": "v4",
+            "referer": "https://www.pixiv.net/",
+            "headers": {
+                "Referer": "https://www.pixiv.net/"
+            },
+            "describe": "Pixiv Original & Thumbnail Image CDN (i.pximg.net)",
+            "display": false
+        },
+        "s.pximg.net": {
+            "host": "s.pximg.net",
+            "ip_mode": "v4",
+            "referer": "https://www.pixiv.net/",
+            "headers": {
+                "Referer": "https://www.pixiv.net/"
+            },
+            "describe": "Pixiv Static Assets CDN (s.pximg.net)",
             "display": false
         }
     },

@@ -1,3 +1,9 @@
+// Package cloudflare_ech 封装上游传输隧道：
+//  1. Cloudflare ECH 域前置（Encrypted Client Hello + uTLS Chrome 指纹）
+//  2. SNI 伪装直连（DoH 解析真实 IP + 伪造 SNI + HTTP/2 传输）
+//  3. Direct 明文/标准 TLS 直连（支持 IPv4/IPv6 协议族锁定）
+//
+// 本模块仅依赖标准库、netdial、utls 与 x/net/http2。
 package cloudflare_ech
 
 import (
@@ -7,7 +13,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,259 +27,76 @@ import (
 	"golang.org/x/net/http2"
 )
 
-// Client is an HTTP client based on cloudflare-ech.com ECH domain fronting.
-// All requests are dispatched through cloudflare-ech.com IPs, while the true
-// target domain is transmitted encrypted to Cloudflare routing via ECH (Encrypted Client Hello).
+const (
+	shellDomain   = "cloudflare-ech.com"
+	defaultDohURL = "https://moonchan.xyz/doh"
+	dialTimeout   = netdial.OpTimeout
+	dohTimeout    = netdial.OpTimeout
+	minTTL        = 60
+	maxTTL        = 24 * 3600
+)
+
+// Client 是基于 cloudflare-ech.com ECH 域前置的 HTTP 客户端。
 type Client struct {
 	inner *http.Client
 }
-
-// ---- ECH Configuration Cache ----
 
 type echEntry struct {
 	config []byte
 	expiry time.Time
 }
 
+type runtimeConfig struct {
+	dohURL string
+	dialIP string
+	ipMode string
+}
+
 var (
-	cacheMu sync.Mutex
-	cache   = map[string]*echEntry{}
-)
+	cfgPtr        atomic.Pointer[runtimeConfig]
+	cacheMu       sync.Mutex
+	cache         = map[string]*echEntry{}
+	clientsMu     sync.Mutex
+	clients       = map[string]*Client{}
+	lastECHConfig []byte
+	refreshOnce   sync.Once
 
-const (
-	minTTL = 60
-	maxTTL = 24 * 3600
-)
-
-func getCachedECH(domain string) []byte {
-	cacheMu.Lock()
-	defer cacheMu.Unlock()
-	e, ok := cache[domain]
-	if !ok || time.Now().After(e.expiry) {
-		return nil
-	}
-	return e.config
-}
-
-func setCachedECH(domain string, config []byte, ttl int) {
-	if ttl < minTTL {
-		ttl = minTTL
-	}
-	if ttl > maxTTL {
-		ttl = maxTTL
-	}
-	cacheMu.Lock()
-	cache[domain] = &echEntry{config: config, expiry: time.Now().Add(time.Duration(ttl) * time.Second)}
-	cacheMu.Unlock()
-}
-
-// ---- DNS wire format parser ----
-
-type dohResponse struct {
-	Answer []struct {
-		Type int    `json:"type"`
-		TTL  int    `json:"TTL"`
-		Data string `json:"data"`
-	} `json:"Answer"`
-}
-
-func parseSVCBWire(wire []byte) ([]byte, error) {
-	if len(wire) < 2 {
-		return nil, fmt.Errorf("wire too short")
-	}
-	off := 2
-	for off < len(wire) {
-		labelLen := int(wire[off])
-		off++
-		if labelLen == 0 {
-			break
-		}
-		if off+labelLen > len(wire) {
-			return nil, fmt.Errorf("truncated target name")
-		}
-		off += labelLen
-	}
-	for off+4 <= len(wire) {
-		key := int(wire[off])<<8 | int(wire[off+1])
-		valLen := int(wire[off+2])<<8 | int(wire[off+3])
-		off += 4
-		if off+valLen > len(wire) {
-			return nil, fmt.Errorf("truncated SvcParam")
-		}
-		val := wire[off : off+valLen]
-		off += valLen
-		if key == 5 {
-			return val, nil
-		}
-	}
-	return nil, fmt.Errorf("ECH SvcParam not found")
-}
-
-func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/dns-json")
-
-	// Default to netdial.Transport (fixed public DNS + Termux CA): Termux lacks
-	// /etc/resolv.conf, so bare http.Transport using [::1]:53 causes connection refused.
-	tr := netdial.Transport()
-	cfg := currentConfig()
-	dialIP := cfg.dialIP
-	if dialIP != "" {
-		// Clone transport to avoid mutating the shared cached transport and avoid lock copy
-		tr = tr.Clone()
-		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			_, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			dialer := &net.Dialer{Timeout: dohTimeout}
-			return dialer.DialContext(ctx, network, net.JoinHostPort(dialIP, port))
-		}
-		uParsed, _ := url.Parse(urlStr)
-		if uParsed != nil {
-			tr.TLSClientConfig = &tls.Config{ServerName: uParsed.Host}
-		}
-	} else if cfg.ipMode != "" {
-		// Clone transport to avoid mutating the shared cached transport and avoid lock copy
-		tr = tr.Clone()
-		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			host, port, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			return dialTCP(ctx, host, port, cfg.ipMode, dohTimeout)
-		}
-	}
-	dohClient := &http.Client{Transport: tr, Timeout: dohTimeout}
-	return dohClient.Do(req)
-}
-
-// Regular expressions used by fetchECHConfig: compiled at package level to avoid
-// recompiling on each DoH request (refresh runs every 5 minutes).
-var (
 	echSvcParamRE = regexp.MustCompile(`ech="?([A-Za-z0-9+/=]+)"?`)
 	wsvcWireRE    = regexp.MustCompile(`\\#\s+(\d+)\s+([0-9a-fA-F\s]+)`)
 	nonHexRE      = regexp.MustCompile(`[^0-9a-fA-F]`)
 )
 
-// fetchECHConfig fetches ECH configuration for a domain via DoH (type=65 SVCB record) with TTL caching,
-// retrying on transient failures (netdial.Retry). Parses base64 ech= SvcParam first, falling back to wire format.
-func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
-	if cached := getCachedECH(domain); cached != nil {
-		return cached, nil
-	}
-	dohURL := currentConfig().dohURL
-	cfg, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() ([]byte, error) {
-		return fetchECHConfigOnce(ctx, domain, dohURL)
-	})
-	if err != nil {
-		return nil, fmt.Errorf("DoH %s (after %d attempts): %w", dohURL, netdial.RetryAttempts, err)
-	}
-	return cfg, nil
-}
-
-// QueryDoH executes a unified DoH DNS query (dispatches HTTP requests using current dohURL, bootstrap IP, and IP stack preferences).
-func QueryDoH(ctx context.Context, name string, qtype int) (*http.Response, error) {
-	dohURL := currentConfig().dohURL
-	u := fmt.Sprintf("%s?name=%s&type=%d", dohURL, url.QueryEscape(name), qtype)
-	return doDohRequest(ctx, u)
-}
-
-// fetchECHConfigOnce executes a single DoH fetch and parse (without retries; retried by caller fetchECHConfig).
-func fetchECHConfigOnce(ctx context.Context, domain, dohURL string) ([]byte, error) {
-	u := fmt.Sprintf("%s?name=%s&type=65", dohURL, url.QueryEscape(domain))
-	resp, err := doDohRequest(ctx, u)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("DoH %s failed: %d", dohURL, resp.StatusCode)
-	}
-
-	var d dohResponse
-	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-		return nil, fmt.Errorf("DoH %s decode: %w", dohURL, err)
-	}
-
-	echRe := echSvcParamRE
-	wireRe := wsvcWireRE
-
-	for _, ans := range d.Answer {
-		if ans.Type != 65 {
-			continue
-		}
-		ttl := ans.TTL
-		if ttl <= 0 {
-			ttl = 300
-		}
-
-		var cfg []byte
-		if m := echRe.FindStringSubmatch(ans.Data); len(m) > 1 {
-			cfg, err = base64.StdEncoding.DecodeString(m[1])
-		} else if m := wireRe.FindStringSubmatch(ans.Data); len(m) > 1 {
-			hexData := nonHexRE.ReplaceAllString(m[2], "")
-			var wire []byte
-			wire, err = hex.DecodeString(hexData)
-			if err == nil {
-				cfg, err = parseSVCBWire(wire)
-			}
-		}
-		if err != nil {
-			return nil, fmt.Errorf("ECH parse error: %w", err)
-		}
-		if len(cfg) > 0 {
-			setCachedECH(domain, cfg, ttl)
-			return cfg, nil
-		}
-	}
-	return nil, fmt.Errorf("no ECH config found for %s from %s", domain, dohURL)
-}
-
-// ---- public API ----
-
-const (
-	shellDomain = "cloudflare-ech.com"
-	// Operation timeouts unified to 5 minutes (dialing / TLS handshake / DoH). Original 5s/10s/15s
-	// caused frequent context deadline exceeded on slow DoH endpoints or network jitter, breaking ECH initialization.
-	dialTimeout = netdial.OpTimeout
-	dohTimeout  = netdial.OpTimeout
-)
-
-// config stores mutable global configuration such as DoH endpoints and IP preferences.
-// Uses atomic.Pointer for lock-free safe read/write, avoiding data races between SetXxx and request goroutines.
-type config struct {
-	dohURL string
-	// dialIP directly dials this IP for DoH when non-empty (bypassing local DNS).
-	dialIP string
-	// ipMode is "v4", "v6", or "" (automatic).
-	ipMode string
-}
-
-const defaultDohURL = "https://moonchan.xyz/doh"
-
-var cfgPtr atomic.Pointer[config]
-
-func currentConfig() *config {
+func currentConfig() *runtimeConfig {
 	if c := cfgPtr.Load(); c != nil {
 		return c
 	}
-	c := &config{dohURL: defaultDohURL}
+	c := &runtimeConfig{dohURL: defaultDohURL}
 	cfgPtr.Store(c)
 	return c
 }
 
-// SetIPMode sets the fallback IP protocol preference. mode is "v4", "v6", or "" (automatic).
+// SetDohURL 设置 DoH 服务端完整 URL。
+func SetDohURL(u string) {
+	nc := *currentConfig()
+	nc.dohURL = u
+	nc.dialIP = ""
+	cfgPtr.Store(&nc)
+}
+
+// SetDoHConfig 通过域名与引导 IP 配置 DoH（跳过对 DoH 域名的本地 DNS 解析）。
+func SetDoHConfig(host, bootstrapIP string) {
+	nc := *currentConfig()
+	nc.dohURL = fmt.Sprintf("https://%s/doh", host)
+	nc.dialIP = bootstrapIP
+	cfgPtr.Store(&nc)
+}
+
+// SetIPMode 设置全局默认上游出口 IP 协议族（"v4"、"v6" 或 ""）。
 func SetIPMode(mode string) {
 	nc := *currentConfig()
-	switch mode {
-	case "v4", "v6":
+	if mode == "v4" || mode == "v6" {
 		nc.ipMode = mode
-	default:
+	} else {
 		nc.ipMode = ""
 	}
 	cfgPtr.Store(&nc)
@@ -289,71 +111,7 @@ func SetIPMode(mode string) {
 	clients = map[string]*Client{}
 }
 
-func resolvePreferredIP(ctx context.Context, host, ipMode string) (string, error) {
-	mode := ipMode
-	if mode == "" || mode == "auto" {
-		mode = currentConfig().ipMode
-	}
-	if mode == "" || mode == "auto" {
-		return "", nil
-	}
-	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, host)
-	if err != nil {
-		return "", fmt.Errorf("resolve %s: %w", host, err)
-	}
-	for _, addr := range ips {
-		if mode == "v4" && addr.IP.To4() != nil {
-			return addr.IP.String(), nil
-		}
-		if mode == "v6" && addr.IP.To4() == nil && addr.IP.To16() != nil {
-			return addr.IP.String(), nil
-		}
-	}
-	return "", fmt.Errorf("no %s address for %s", mode, host)
-}
-
-// egressFamilyOnce logs the IP family the OS actually resolves for the upstream dial when IP_MODE
-// is unset, so the egress family is observable instead of silently OS-decided.
-var egressFamilyOnce sync.Once
-
-// dialTCP dials according to ipMode preference. When ipMode is empty or "auto", it uses netdial
-// fixed public DNS resolution; otherwise connects directly to the preferred IP. Environments without
-// resolv.conf like Termux must use netdial, as bare net.Dialer defaults to failing at [::1]:53.
-func dialTCP(ctx context.Context, host, port, ipMode string, timeout time.Duration) (net.Conn, error) {
-	dialer := &net.Dialer{Timeout: timeout}
-	mode := ipMode
-	if mode == "" || mode == "auto" {
-		mode = currentConfig().ipMode
-	}
-	if mode == "" || mode == "auto" {
-		conn, err := netdial.Dialer().DialContext(ctx, "tcp", net.JoinHostPort(host, port))
-		if err != nil {
-			return nil, err
-		}
-		if addr, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
-			family := "IPv6"
-			if addr.IP.To4() != nil {
-				family = "IPv4"
-			}
-			egressFamilyOnce.Do(func() {
-				log.Printf("Upstream egress: %s via %s (IP_MODE unset, family chosen by the OS). "+
-					"Some upstreams reject IPv6 sources (e.g. pixiv returns a static 403 'Access blocked'); "+
-					"set ip_mode: v4 in upstream.json or IP_MODE=v4 to pin the family.", family, addr)
-			})
-		}
-		return conn, nil
-	}
-	ip, err := resolvePreferredIP(ctx, host, mode)
-	if err != nil {
-		return nil, err
-	}
-	return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
-}
-
-// CheckDualStack reports whether the probe hostname publishes A / AAAA records. It does NOT probe
-// the local network stack, so its result is identical on every machine — it only says "what
-// families could we possibly dial". The family actually used for the upstream egress is logged by
-// dialTCP. Uses netdial resolver (public DNS): net.DefaultResolver is unusable on Termux.
+// CheckDualStack 检查 moonchan.xyz 是否发布 A / AAAA 记录。
 func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
 	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, "moonchan.xyz")
 	if err != nil {
@@ -369,54 +127,162 @@ func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
 	return
 }
 
-// SetDohURL overrides the DoH URL entirely.
-func SetDohURL(url string) {
-	nc := *currentConfig()
-	nc.dohURL = url
-	nc.dialIP = ""
-	cfgPtr.Store(&nc)
+// QueryDoH 向当前配置的 DoH 节点发起 DNS 查询（JSON 格式）。
+func QueryDoH(ctx context.Context, name string, qtype int) (*http.Response, error) {
+	u := fmt.Sprintf("%s?name=%s&type=%d", currentConfig().dohURL, url.QueryEscape(name), qtype)
+	return doDohRequest(ctx, u)
 }
 
-// SetDoHConfig sets DoH via host + bootstrap IP for direct-IP dialing.
-func SetDoHConfig(host, bootstrapIP string) {
-	nc := *currentConfig()
-	nc.dohURL = fmt.Sprintf("https://%s/doh", host)
-	nc.dialIP = bootstrapIP
-	cfgPtr.Store(&nc)
+func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/dns-json")
+
+	cfg := currentConfig()
+	tr := netdial.Transport()
+	if cfg.dialIP != "" {
+		tr = tr.Clone()
+		dialIP := cfg.dialIP
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			return (&net.Dialer{Timeout: dohTimeout}).DialContext(ctx, network, net.JoinHostPort(dialIP, port))
+		}
+		if uParsed, err := url.Parse(urlStr); err == nil && uParsed != nil {
+			tr.TLSClientConfig = &tls.Config{ServerName: uParsed.Host}
+		}
+	} else if cfg.ipMode != "" {
+		tr = netdial.TransportWithIPMode(cfg.ipMode)
+	}
+	return (&http.Client{Transport: tr, Timeout: dohTimeout}).Do(req)
 }
 
-// newTransport constructs an ECH domain fronting transport using utls with HelloChrome_120
-// to impersonate a real Chrome browser TLS fingerprint. Cloudflare checks JA3/JA4 fingerprints
-// to detect non-browser clients; using crypto/tls directly exposes the Go runtime fingerprint.
-// utls v1.8.2 supports EncryptedClientHelloConfigList, so ECH encryption is preserved.
+type dohResponse struct {
+	Answer []struct {
+		Type int    `json:"type"`
+		TTL  int    `json:"TTL"`
+		Data string `json:"data"`
+	} `json:"Answer"`
+}
+
+func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
+	cacheMu.Lock()
+	if e, ok := cache[domain]; ok && time.Now().Before(e.expiry) {
+		cacheMu.Unlock()
+		return e.config, nil
+	}
+	cacheMu.Unlock()
+
+	dohURL := currentConfig().dohURL
+	return netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() ([]byte, error) {
+		resp, err := QueryDoH(ctx, domain, 65)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("DoH %s status %d", dohURL, resp.StatusCode)
+		}
+		var d dohResponse
+		if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+			return nil, err
+		}
+		for _, ans := range d.Answer {
+			if ans.Type != 65 {
+				continue
+			}
+			var cfg []byte
+			if m := echSvcParamRE.FindStringSubmatch(ans.Data); len(m) > 1 {
+				cfg, err = base64.StdEncoding.DecodeString(m[1])
+			} else if m := wsvcWireRE.FindStringSubmatch(ans.Data); len(m) > 1 {
+				var wire []byte
+				wire, err = hex.DecodeString(nonHexRE.ReplaceAllString(m[2], ""))
+				if err == nil {
+					cfg, err = parseSVCBWire(wire)
+				}
+			}
+			if err != nil {
+				return nil, err
+			}
+			if len(cfg) > 0 {
+				ttl := ans.TTL
+				if ttl < minTTL {
+					ttl = minTTL
+				} else if ttl > maxTTL {
+					ttl = maxTTL
+				}
+				cacheMu.Lock()
+				cache[domain] = &echEntry{config: cfg, expiry: time.Now().Add(time.Duration(ttl) * time.Second)}
+				cacheMu.Unlock()
+				return cfg, nil
+			}
+		}
+		return nil, fmt.Errorf("no ECH config found for %s", domain)
+	})
+}
+
+func parseSVCBWire(wire []byte) ([]byte, error) {
+	if len(wire) < 2 {
+		return nil, fmt.Errorf("wire too short")
+	}
+	off := 2
+	for off < len(wire) {
+		l := int(wire[off])
+		off++
+		if l == 0 {
+			break
+		}
+		if off+l > len(wire) {
+			return nil, fmt.Errorf("truncated target name")
+		}
+		off += l
+	}
+	for off+4 <= len(wire) {
+		key := int(wire[off])<<8 | int(wire[off+1])
+		valLen := int(wire[off+2])<<8 | int(wire[off+3])
+		off += 4
+		if off+valLen > len(wire) {
+			return nil, fmt.Errorf("truncated SvcParam")
+		}
+		if key == 5 {
+			return wire[off : off+valLen], nil
+		}
+		off += valLen
+	}
+	return nil, fmt.Errorf("ECH SvcParam not found")
+}
+
 func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 	return &http2.Transport{
 		AllowHTTP: false,
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
+		DialTLSContext: func(ctx context.Context, _, addr string, _ *tls.Config) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
 			}
-
 			uCfg := &utls.Config{
 				ServerName:                     host,
 				EncryptedClientHelloConfigList: echConfig,
 				MinVersion:                     tls.VersionTLS13,
 				NextProtos:                     []string{"h2", "http/1.1"},
 			}
-
-			// Retry dialing shell domain + TLS handshake to handle transient RST/timeouts.
-			conn, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
-				rawConn, derr := dialTCP(ctx, shellDomain, "443", ipMode, dialTimeout)
-				if derr != nil {
-					return nil, derr
+			mode := ipMode
+			if mode == "" || mode == "auto" {
+				mode = currentConfig().ipMode
+			}
+			return netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
+				rawConn, err := netdial.DialContextIPMode(ctx, shellDomain, "443", mode, dialTimeout)
+				if err != nil {
+					return nil, err
 				}
-				// Use utls with HelloChrome_120 so Cloudflare sees a Chrome-grade TLS fingerprint
-				// (JA3/JA4) rather than the distinctive Go standard library fingerprint.
 				uConn := utls.UClient(rawConn, uCfg, utls.HelloChrome_120)
-				if herr := uConn.HandshakeContext(ctx); herr != nil {
+				if err := uConn.HandshakeContext(ctx); err != nil {
 					rawConn.Close()
-					return nil, herr
+					return nil, err
 				}
 				if uConn.ConnectionState().NegotiatedProtocol != "h2" {
 					rawConn.Close()
@@ -424,26 +290,15 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				}
 				return uConn, nil
 			})
-			if err != nil {
-				return nil, fmt.Errorf("dial shell: %w", err)
-			}
-			return conn, nil
 		},
 	}
 }
 
-// newClient constructs an ECH client (shared by New and refreshLoop).
-// No global Timeout is set: avoiding prematurely terminating >30s large file/video downloads
-// (which manifest in browsers as 206 CONTENT_LENGTH_MISMATCH truncated midway).
 func newClient(echConfig []byte, ipMode string) *Client {
 	return &Client{
 		inner: &http.Client{
 			Transport: newTransport(echConfig, ipMode),
 			Timeout:   0,
-			// Return redirects to the proxy layer so it can rewrite Location headers
-			// (e.g. accounts.pixiv.net → pixiv-accounts.l.moonchan.xyz) and re-inject
-			// cookies on each hop. The h2-only ECH transport also cannot follow
-			// scheme downgrades (https → http).
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -451,43 +306,23 @@ func newClient(echConfig []byte, ipMode string) *Client {
 	}
 }
 
-// New initializes an ECH domain-fronting HTTP client.
-// On first call, it retrieves cloudflare-ech.com's ECH keys via DoH and caches them.
+// New 创建并初始化一个新的 ECH 客户端实例。
 func New() (*Client, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
 	defer cancel()
-
 	echConfig, err := fetchECHConfig(ctx, shellDomain)
 	if err != nil {
-		return nil, fmt.Errorf("fetch ECH config: %w", err)
+		return nil, err
 	}
-
 	return newClient(echConfig, ""), nil
 }
 
-// Do executes an HTTP request dispatched via cloudflare-ech.com ECH domain fronting.
-// req.Host is set to the true target domain for Inner SNI.
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if req.Host == "" {
 		req.Host = req.URL.Host
 	}
 	return c.inner.Do(req)
 }
-
-// DoWithAddr is like Do, but allows specifying a target domain (for direct-IP scenarios).
-// host is used as the Inner SNI and HTTP Host header.
-func (c *Client) DoWithAddr(req *http.Request, host string) (*http.Response, error) {
-	req.Host = host
-	return c.inner.Do(req)
-}
-
-// ---- Convenience Functions ----
-
-var (
-	clientsMu     sync.Mutex
-	clients       = map[string]*Client{}
-	lastECHConfig []byte
-)
 
 func getECHClient(ipMode string) (*Client, error) {
 	mode := strings.ToLower(strings.TrimSpace(ipMode))
@@ -497,31 +332,26 @@ func getECHClient(ipMode string) (*Client, error) {
 	if mode != "v4" && mode != "v6" {
 		mode = "auto"
 	}
-
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
-
 	if c, ok := clients[mode]; ok {
 		return c, nil
 	}
-
 	if len(lastECHConfig) == 0 {
 		ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
 		defer cancel()
 		cfg, err := fetchECHConfig(ctx, shellDomain)
 		if err != nil {
-			return nil, fmt.Errorf("fetch ECH config: %w", err)
+			return nil, err
 		}
 		lastECHConfig = cfg
 	}
-
 	c := newClient(lastECHConfig, mode)
 	clients[mode] = c
 	return c, nil
 }
 
-// Do executes an ECH request using a client configured for the specified ipMode ("v4", "v6", or "auto").
-// If ipMode is omitted or empty, it falls back to the global configuration.
+// Do 通过 Cloudflare ECH 隧道发送请求（可选指定 "v4" 或 "v6" 出口协议族）。
 func Do(req *http.Request, ipMode ...string) (*http.Response, error) {
 	mode := ""
 	if len(ipMode) > 0 {
@@ -534,7 +364,7 @@ func Do(req *http.Request, ipMode ...string) (*http.Response, error) {
 	return c.Do(req)
 }
 
-// InitDefault explicitly initializes the global default client (can be called at startup).
+// InitDefault 初始化全局默认 ECH 客户端并启动后台定期刷新协程。
 func InitDefault() error {
 	ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
 	defer cancel()
@@ -545,44 +375,31 @@ func InitDefault() error {
 	clientsMu.Lock()
 	lastECHConfig = cfg
 	clientsMu.Unlock()
-
-	_, err = getECHClient("")
-	if err != nil {
+	if _, err := getECHClient(""); err != nil {
 		return err
 	}
-	go refreshLoop()
+	refreshOnce.Do(func() { go refreshLoop() })
 	return nil
 }
-
-var refreshCtx, refreshCancel = context.WithCancel(context.Background())
 
 func refreshLoop() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-
-	for {
-		select {
-		case <-refreshCtx.Done():
-			return
-		case <-ticker.C:
-		}
-
-		ctx, cancel := context.WithTimeout(refreshCtx, dohTimeout)
+	for range ticker.C {
+		ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
 		echConfig, err := fetchECHConfig(ctx, shellDomain)
 		cancel()
 		if err != nil {
 			continue
 		}
-
 		clientsMu.Lock()
 		lastECHConfig = echConfig
-		oldClients := make([]*Client, 0, len(clients))
+		var oldClients []*Client
 		for mode, old := range clients {
 			oldClients = append(oldClients, old)
 			clients[mode] = newClient(echConfig, mode)
 		}
 		clientsMu.Unlock()
-
 		for _, old := range oldClients {
 			if tr, ok := old.inner.Transport.(*http2.Transport); ok {
 				tr.CloseIdleConnections()

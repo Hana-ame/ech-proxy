@@ -11,14 +11,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Hana-ame/ech-proxy/echproxy/config"
+	"github.com/Hana-ame/ech-proxy/echproxy/cookie"
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
-	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
+	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
 	"github.com/gin-gonic/gin"
 )
 
+// Debug 控制是否输出逐请求的详细调试日志（通过 CLI -v 开启）。
 var Debug bool
 
-func debugLogf(format string, args ...interface{}) {
+func debugLogf(format string, args ...any) {
 	if Debug {
 		log.Printf(format, args...)
 	}
@@ -26,10 +29,10 @@ func debugLogf(format string, args ...interface{}) {
 
 const writeTimeout = 30 * time.Minute
 
-func setWriteDeadline(rc *http.ResponseController) {
-	rc.SetWriteDeadline(time.Now().Add(writeTimeout))
-}
+// roundTripFn 供单元测试注入自定义传输层使用，生产环境默认调用 cloudflare_ech.RoundTrip。
+var roundTripFn = cloudflare_ech.RoundTrip
 
+// ModeName 返回传输模式的可读名称。
 func ModeName(mode string) string {
 	switch mode {
 	case "sni":
@@ -41,181 +44,239 @@ func ModeName(mode string) string {
 	}
 }
 
-var roundTripFn = proxyRoundTrip
+// ProxyHandler 核心反向代理处理器，统一承载：
+//   - 功能一（8443 门户反代模式）：将 *.l.moonchan.xyz 映射至真实上游并执行域名重写、SW 注入与 Cookie 转换
+//   - 功能二（443 本地透明反代模式）：将原域名（如 pixiv.net / *.pixiv.net）直接通过 ECH/SNI 隧道转发
+func ProxyHandler(upstreams config.UpstreamMap, blockedHosts []string) gin.HandlerFunc {
+	blocked := append([]string(nil), blockedHosts...)
 
-func proxyRoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
-	switch mode {
-	case "direct":
-		// Respect ip_mode: with no family pinning the OS chooses the egress
-		// family, and some upstreams (observed: www.pixiv.net) reject IPv6
-		// sources with a static 403 "Access blocked". A pinned family resolves
-		// the hostname to the preferred family and dials that IP directly.
-		if ipMode == "v4" || ipMode == "v6" {
-			client := &http.Client{
-				Timeout:   netdial.OpTimeout,
-				Transport: netdial.TransportWithIPMode(ipMode),
-				CheckRedirect: func(req *http.Request, via []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
-			}
-			return client.Do(req)
+	return func(c *gin.Context) {
+		start := time.Now()
+		clientIP := c.ClientIP()
+		host := stripPort(c.Request.Host)
+
+		// 1. 匹配上游路由规则（精确匹配或泛子域名匹配）
+		uc, ok := config.Resolve(upstreams, host)
+		if !ok {
+			log.Printf("[%s] Upstream config not found: %s", clientIP, host)
+			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			c.String(http.StatusBadGateway, "no upstream for host: %s", host)
+			return
 		}
-		client := netdial.Client(netdial.OpTimeout)
-		return client.Do(req)
-	case "sni":
-		return sniFrontDo(req)
-	default:
-		return cloudflare_ech.Do(req, ipMode)
+
+		ucForRewrite := uc
+		if ucForRewrite.Wildcard == nil {
+			ucForRewrite.Wildcard = config.InheritWildcard(upstreams, host)
+		}
+		rewriter := rewrite.BuildEntryRewriter(ucForRewrite, blocked)
+
+		// 2. 构造发往真实上游的 HTTP 请求
+		outReq, err := buildUpstreamRequest(c, uc)
+		if err != nil {
+			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			c.String(http.StatusInternalServerError, "create request: %v", err)
+			return
+		}
+
+		// 3. 通过 ECH / SNI / Direct 隧道发送请求
+		resp, err := roundTripFn(outReq, uc.Mode, uc.IPMode)
+		if err != nil {
+			log.Printf("[%s] Upstream request failed (%s): %v", clientIP, uc.Host, err)
+			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			c.String(http.StatusBadGateway, "upstream: %v", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		cookie.DefaultJar.SaveResponseCookies(uc.Host, resp)
+		debugLogf("[%s] %s %s -> %s (%s, %v)", clientIP, c.Request.Method, c.Request.URL.Path, uc.Host, resp.Status, time.Since(start))
+
+		// 4. 处理响应头（剔除逐跳头、改写 Set-Cookie Domain、重写 Location 重定向、注入 CORS）
+		port := extractPort(c.Request.Host)
+		cookieDomain := uc.CookieDomain
+		if cookieDomain == "" {
+			cookieDomain = host
+		}
+		prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, rewriter, port)
+
+		// 防止上游 Canonical 重定向（如 iwara.tv -> www.iwara.tv）被 rewriter 改写回自身导致 301 死循环
+		if resp.StatusCode/100 == 3 {
+			if loc := c.Writer.Header().Get("Location"); loc != "" && isSelfRedirect(loc, c.Request) {
+				if nextResp, ok := followSelfRedirect(c, outReq, resp, uc); ok {
+					resp.Body.Close()
+					resp = nextResp
+					defer resp.Body.Close()
+					cookie.DefaultJar.SaveResponseCookies(resp.Request.Host, resp)
+					clearHeaders(c.Writer.Header())
+					prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, rewriter, port)
+				}
+			}
+		}
+
+		// 5. 若开启了 sw_inject 且请求 /sw.js（而上游未返回 JS），则自动返回生成的 Service Worker 脚本
+		if uc.SWInject && c.Request.URL.Path == "/sw.js" && !rewrite.IsJavascriptResponse(resp) {
+			c.Writer.Header().Del("Content-Length")
+			c.Writer.Header().Set("Content-Type", "application/javascript")
+			c.Writer.WriteHeader(http.StatusOK)
+			_, _ = c.Writer.Write([]byte(rewrite.GenerateServiceWorkerJS(upstreams, indexHost, port, blocked)))
+			return
+		}
+
+		// 6. 写回响应状态码并传输/重写响应体
+		c.Status(resp.StatusCode)
+		sendResponseBody(c, uc, resp, rewriter, port)
 	}
 }
 
-// buildUpstreamRequest constructs the outgoing upstream HTTP request from the client's gin context:
-// copies and filters headers, strips proxy-tracking headers, applies declarative header rules,
-// merges cookies (jar + client + fixed), and sets the upstream Host.
-func buildUpstreamRequest(c *gin.Context, uc UpstreamConfig, urlStr string, priority ...string) (*http.Request, error) {
-	p := getCookiePriority(priority...)
-	outReq, err := http.NewRequest(c.Request.Method, urlStr, c.Request.Body)
+func buildUpstreamRequest(c *gin.Context, uc config.UpstreamConfig) (*http.Request, error) {
+	reqURI := c.Request.RequestURI
+	if reqURI == "" {
+		reqURI = c.Request.URL.RequestURI()
+	} else if strings.HasPrefix(reqURI, "http://") || strings.HasPrefix(reqURI, "https://") {
+		if u, err := url.ParseRequestURI(reqURI); err == nil {
+			reqURI = u.RequestURI()
+		}
+	}
+	if !strings.HasPrefix(reqURI, "/") {
+		reqURI = "/" + reqURI
+	}
+
+	outReq, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, "https://"+uc.Host+reqURI, c.Request.Body)
 	if err != nil {
 		return nil, err
 	}
 
-	// 1. Capture JS-set cookies sent by the browser before overwriting the Cookie header.
-	saveClientCookies(uc.Host, c.Request, p)
+	cookie.DefaultJar.SaveClientCookies(uc.Host, c.Request)
+	rewrite.CopyHeaders(outReq.Header, c.Request.Header)
 
-	// 2. Copy client request headers, stripping RFC 2616 hop-by-hop headers.
-	copyHeaders(outReq.Header, c.Request.Header)
-
-	// 3. Strip proxy-identity headers unless explicitly configured via header rules.
 	if _, ok := uc.Headers["X-Forwarded-For"]; !ok {
 		outReq.Header.Del("X-Forwarded-For")
 	}
 	if _, ok := uc.Headers["X-Forwarded-Proto"]; !ok {
 		outReq.Header.Del("X-Forwarded-Proto")
 	}
-
-	// 4. Ensure explicit referer override is always enforced even if headers map was unpopulated
 	if uc.Referer != "" {
 		outReq.Header.Set("Referer", uc.Referer)
 	}
-
-	// 5. Apply declarative header rules (set/delete/regex-replace).
-	ApplyHeaderRules(outReq.Header, uc.Headers, true, c.Request)
+	rewrite.ApplyHeaderRules(outReq.Header, uc.Headers, true, c.Request)
 
 	outReq.Host = uc.Host
 	outReq.ContentLength = c.Request.ContentLength
 
-	// 5. Merge cookie jar + client cookies + fixed/file cookies into the outgoing Cookie header.
-	// If priority is browser, do not inject server's static fixedCookie.
-	fixedCookie := ""
-	if p != "browser" && !hasJarCookies(uc.Host) {
-		fixedCookie = getFixedCookie(uc)
-		if fixedCookie != "" {
-			seedCookieRaw(uc.Host, fixedCookie)
-		}
+	fixedCookie := cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile)
+	if fixedCookie != "" {
+		cookie.DefaultJar.Seed(uc.Host, fixedCookie)
 	}
-	applyCookies(uc.Host, outReq, fixedCookie, p)
-
+	cookie.DefaultJar.ApplyToRequest(uc.Host, outReq, fixedCookie)
 	return outReq, nil
 }
 
-// handleSWFallback serves the generated Service Worker JavaScript when the upstream does not
-// return a JavaScript response for /sw.js.
-func handleSWFallback(c *gin.Context, cfg UpstreamMap, blocked []string, clientIP, method, rawPath string) {
-	port := ""
-	if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
-		port = p
-	}
-	swProxyMap := buildSWProxyMap(cfg, port)
-	swRules := collectWildcardRules(cfg)
-	c.Writer.Header().Del("Content-Length")
-	c.Writer.Header().Set("Content-Type", "application/javascript")
-	ApplyCORSHeaders(c.Writer.Header(), c.Request)
-	c.Writer.WriteHeader(200)
-	c.Writer.Write([]byte(swOverrideJS(swProxyMap, swRules, blocked)))
-	debugLogf("[%s] %s %s -> SW fallback generated %d rules, %d wildcards, %d blocked",
-		clientIP, method, rawPath, len(swProxyMap), len(swRules), len(blocked))
+func prepareResponseHeaders(dst, src http.Header, uc config.UpstreamConfig, cookieDomain string, req *http.Request, rewriter func([]byte, string) []byte, port string) {
+	rewrite.CopyHeaders(dst, src)
+	cookie.RewriteSetCookieHeaders(dst, cookieDomain, req.TLS == nil)
+	rewrite.ApplyHeaderRules(dst, uc.ResponseHeaders, false, nil)
+	rewrite.RewriteRedirectHeaders(dst, rewriter, port)
+	rewrite.ApplyCORSHeaders(dst, req)
 }
 
-// rewriteAndSendBody handles the response body pipeline:
-// For text content within the size limit: decompresses, rewrites domains/URLs, optionally
-// injects the SW registration snippet, re-compresses (gzip if client accepts it), and
-// sets accurate Content-Length.
-// For binary or oversized content: streams raw bytes in 32 KB chunks with flushing.
-func rewriteAndSendBody(c *gin.Context, uc UpstreamConfig, resp *http.Response,
-	rewriter func([]byte, string) []byte, rc *http.ResponseController, clientIP, rawPath string) {
-
-	port := ""
-	if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
-		port = p
+func isSelfRedirect(rewrittenLoc string, clientReq *http.Request) bool {
+	u, err := url.Parse(rewrittenLoc)
+	if err != nil {
+		return false
 	}
+	reqPath := clientReq.URL.RequestURI()
+	if reqPath == "" {
+		reqPath = "/"
+	}
+	locPath := u.RequestURI()
+	if locPath == "" {
+		locPath = "/"
+	}
+	return (u.Host == "" || strings.EqualFold(u.Host, clientReq.Host)) && locPath == reqPath
+}
 
-	// Text body rewriting path (decompress → rewrite → optionally re-compress).
-	if rewriter != nil &&
-		isTextContent(resp.Header.Get("Content-Type")) &&
-		(resp.ContentLength <= 0 || resp.ContentLength <= maxRewriteSize) {
+func followSelfRedirect(c *gin.Context, outReq *http.Request, resp *http.Response, uc config.UpstreamConfig) (*http.Response, bool) {
+	rawTarget, err := outReq.URL.Parse(resp.Header.Get("Location"))
+	if err != nil || rawTarget.Host == "" {
+		return nil, false
+	}
+	if rawTarget.Scheme == "http" {
+		rawTarget.Scheme = "https"
+	}
+	nextReq, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, rawTarget.String(), nil)
+	if err != nil {
+		return nil, false
+	}
+	rewrite.CopyHeaders(nextReq.Header, outReq.Header)
+	nextReq.Host = rawTarget.Host
+	cookie.DefaultJar.ApplyToRequest(rawTarget.Host, nextReq, cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile))
+	nextResp, err := roundTripFn(nextReq, uc.Mode, uc.IPMode)
+	if err != nil {
+		return nil, false
+	}
+	nextResp.Request = nextReq
+	return nextResp, true
+}
 
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxRewriteSize+1))
-		if err != nil {
-			log.Printf("[%s] Body read error for %s: %v", clientIP, rawPath, err)
+func clearHeaders(h http.Header) {
+	for k := range h {
+		delete(h, k)
+	}
+}
+
+func sendResponseBody(c *gin.Context, uc config.UpstreamConfig, resp *http.Response, rewriter func([]byte, string) []byte, port string) {
+	rc := http.NewResponseController(c.Writer)
+
+	// 文本类且不超过 8MB：解压 -> 重写域名与内容 -> 注入 SW -> 重新压缩并发送
+	if rewriter != nil && rewrite.IsTextContent(resp.Header.Get("Content-Type")) &&
+		(resp.ContentLength <= 0 || resp.ContentLength <= rewrite.MaxRewriteSize) {
+
+		body, err := io.ReadAll(io.LimitReader(resp.Body, rewrite.MaxRewriteSize+1))
+		if err != nil || len(body) > rewrite.MaxRewriteSize {
 			if len(body) > 0 {
-				setWriteDeadline(rc)
-				c.Writer.Write(body)
+				_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+				_, _ = c.Writer.Write(body)
 			}
 			return
 		}
-		if len(body) > maxRewriteSize {
-			// Exceeds rewrite size limit; stream unmodified.
-			if len(body) > 0 {
-				setWriteDeadline(rc)
-				c.Writer.Write(body)
-			}
-			return
-		}
 
-		origEncoding := resp.Header.Get("Content-Encoding")
-		decompressed, derr := decompressBody(body, origEncoding)
+		origEnc := resp.Header.Get("Content-Encoding")
+		plain, derr := rewrite.DecompressBody(body, origEnc)
 		if derr != nil {
-			log.Printf("[%s] Decompression error for %s (%s): %v", clientIP, rawPath, origEncoding, derr)
-			if len(body) > 0 {
-				setWriteDeadline(rc)
-				c.Writer.Write(body)
-			}
+			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+			_, _ = c.Writer.Write(body)
 			return
 		}
 
-		decompressed = rewriter(decompressed, port)
+		plain = rewriter(plain, port)
 
-		// Inject Service Worker registration snippet into HTML pages that don't already have one.
-		if uc.SWInject &&
-			strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
-			!bytes.Contains(decompressed, []byte("serviceWorker")) {
+		if uc.SWInject && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
+			!bytes.Contains(plain, []byte("serviceWorker")) {
 			reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
-			if idx := bytes.Index(decompressed, []byte("</head>")); idx >= 0 {
-				decompressed = append(decompressed[:idx], append(reg, decompressed[idx:]...)...)
+			if idx := bytes.Index(plain, []byte("</head>")); idx >= 0 {
+				plain = append(plain[:idx], append(reg, plain[idx:]...)...)
 			} else {
-				decompressed = append(decompressed, reg...)
+				plain = append(plain, reg...)
 			}
-			debugLogf("[%s] %s -> HTML injected SW registration", clientIP, rawPath)
 		}
 
-		// Re-compress using gzip if the client accepts it and the original was gzip-encoded.
 		c.Writer.Header().Del("Content-Encoding")
-		if compressed, enc := compressBody(decompressed, origEncoding, c.Request.Header.Get("Accept-Encoding")); enc != "" {
-			decompressed = compressed
+		if compressed, enc := rewrite.CompressBody(plain, origEnc, c.Request.Header.Get("Accept-Encoding")); enc != "" {
+			plain = compressed
 			c.Writer.Header().Set("Content-Encoding", enc)
 		}
-		c.Writer.Header().Set("Content-Length", strconv.Itoa(len(decompressed)))
-		setWriteDeadline(rc)
-		c.Writer.Write(decompressed)
+		c.Writer.Header().Set("Content-Length", strconv.Itoa(len(plain)))
+		_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+		_, _ = c.Writer.Write(plain)
 		return
 	}
 
-	// Binary / large body streaming path: copy in 32 KB chunks with per-chunk flush.
+	// 二进制流或大文件（图片、视频等）：32KB 分块直接流式转发
 	buf := make([]byte, 32*1024)
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
-			setWriteDeadline(rc)
+			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
 				break
 			}
@@ -229,151 +290,9 @@ func rewriteAndSendBody(c *gin.Context, uc UpstreamConfig, resp *http.Response,
 	}
 }
 
-// ProxyHandler returns a gin.HandlerFunc that resolves the upstream for each request,
-// constructs and sends an outgoing request, then writes the (optionally rewritten) response
-// back to the client. The pipeline is split across three helpers:
-//   - buildUpstreamRequest: header/cookie construction
-//   - handleSWFallback:     service worker JS generation
-//   - rewriteAndSendBody:   body decompression, rewriting, re-compression, and streaming
-func ProxyHandler(cfg UpstreamMap, blockedHosts []string) gin.HandlerFunc {
-	blocked := append([]string(nil), blockedHosts...)
-	return func(c *gin.Context) {
-		start := time.Now()
-		clientIP := c.ClientIP()
-		method := c.Request.Method
-		rawPath := c.Request.URL.Path
-
-		// --- Step 1: Resolve upstream config ---
-		host := c.Request.Host
-		if h, _, err := net.SplitHostPort(host); err == nil {
-			host = h
-		}
-		uc, ok := cfg[host]
-		if !ok {
-			uc, ok = matchWildcard(cfg, host)
-		}
-		if !ok {
-			log.Printf("[%s] Upstream config not found: %s", clientIP, host)
-			ApplyCORSHeaders(c.Writer.Header(), c.Request)
-			c.String(http.StatusBadGateway, "no upstream for host: %s", host)
-			return
-		}
-
-		// URL parameter trigger for cookie mode switch (?_cookie_mode=seed or ?_cookie_mode=browser)
-		if mode := strings.ToLower(strings.TrimSpace(c.Query("_cookie_mode"))); mode == "seed" || mode == "browser" {
-			applyCookieModeSwitch(c, uc, host, mode)
-			u := *c.Request.URL
-			q := u.Query()
-			q.Del("_cookie_mode")
-			u.RawQuery = q.Encode()
-			target := u.RequestURI()
-			if target == "" {
-				target = "/"
-			}
-			c.Redirect(http.StatusFound, target)
-			return
-		}
-
-		cookiePriority := getEffectiveCookiePriority(c, uc, host)
-
-		ucForRewrite := uc
-		if ucForRewrite.Wildcard == nil {
-			ucForRewrite.Wildcard = inheritWildcard(cfg, host)
-		}
-		rewriter := buildEntryRewriter(ucForRewrite, blocked)
-		swWant := uc.SWInject && rawPath == "/sw.js"
-
-		// --- Step 2: Build outgoing upstream request ---
-		reqURI := c.Request.RequestURI
-		if reqURI == "" {
-			reqURI = c.Request.URL.EscapedPath()
-			if c.Request.URL.RawQuery != "" {
-				reqURI += "?" + c.Request.URL.RawQuery
-			}
-		} else if strings.HasPrefix(reqURI, "http://") || strings.HasPrefix(reqURI, "https://") {
-			if u, err := url.ParseRequestURI(reqURI); err == nil {
-				reqURI = u.RequestURI()
-			}
-		}
-		if !strings.HasPrefix(reqURI, "/") {
-			reqURI = "/" + reqURI
-		}
-		urlStr := "https://" + uc.Host + reqURI
-		debugLogf("[%s] %s %s -> %s", clientIP, method, reqURI, urlStr)
-
-		outReq, err := buildUpstreamRequest(c, uc, urlStr, cookiePriority)
-		if err != nil {
-			log.Printf("[%s] Failed to create request: %v", clientIP, err)
-			ApplyCORSHeaders(c.Writer.Header(), c.Request)
-			c.String(http.StatusInternalServerError, "create request: %v", err)
-			return
-		}
-
-		// --- Step 3: Round-trip to upstream (with auto-detection) ---
-		resp, err := autoRoundTrip(outReq, uc.Mode, uc.IPMode)
-		if err != nil {
-			log.Printf("[%s] Upstream request failed: %v (elapsed: %v)", clientIP, err, time.Since(start))
-			ApplyCORSHeaders(c.Writer.Header(), c.Request)
-			c.String(http.StatusBadGateway, "upstream: %v", err)
-			return
-		}
-		defer resp.Body.Close()
-
-		saveCookies(uc.Host, resp)
-		debugLogf("[%s] <- %s (elapsed: %v)", clientIP, resp.Status, time.Since(start))
-
-		// --- Step 4: Prepare response headers ---
-		copyHeaders(c.Writer.Header(), resp.Header)
-		cookieDomain := uc.CookieDomain
-		if cookieDomain == "" {
-			cookieDomain = host
-		}
-		rewriteSetCookieDomains(c.Writer.Header(), cookieDomain, c.Request.TLS == nil)
-		ApplyHeaderRules(c.Writer.Header(), uc.ResponseHeaders, false, nil)
-		syncJarCookiesToBrowser(c, uc.Host, cookieDomain, c.Request.TLS == nil, cookiePriority)
-
-		port := ""
-		if _, p, err := net.SplitHostPort(c.Request.Host); err == nil {
-			port = p
-		}
-		rewriteRedirectHeaders(c.Writer.Header(), rewriter, port)
-		ApplyCORSHeaders(c.Writer.Header(), c.Request)
-
-		// --- Step 5: SW fallback injection ---
-		if swWant && !isJavascriptResponse(resp) {
-			handleSWFallback(c, cfg, blocked, clientIP, method, rawPath)
-			return
-		}
-
-		c.Status(resp.StatusCode)
-		rc := http.NewResponseController(c.Writer)
-
-		// --- Step 6: Stream / rewrite response body ---
-		rewriteAndSendBody(c, uc, resp, rewriter, rc, clientIP, rawPath)
+func extractPort(hostport string) string {
+	if _, p, err := net.SplitHostPort(hostport); err == nil {
+		return p
 	}
-}
-
-// rewriteRedirectHeaders rewrites redirect headers (Location and Refresh):
-//  1. Applies domain and port rewriting through rewriter.
-//  2. Automatically upgrades any http:// scheme in redirects to https:// before sending to the client,
-//     ensuring clients stay on secure HTTPS and preventing protocol downgrade / mixed content loops.
-func rewriteRedirectHeaders(h http.Header, rewriter func([]byte, string) []byte, port string) {
-	if loc := h.Get("Location"); loc != "" {
-		if rewriter != nil {
-			loc = string(rewriter([]byte(loc), port))
-		}
-		if len(loc) >= 7 && strings.EqualFold(loc[:7], "http://") {
-			loc = "https://" + loc[7:]
-		}
-		h.Set("Location", loc)
-	}
-	if refresh := h.Get("Refresh"); refresh != "" {
-		if rewriter != nil {
-			refresh = string(rewriter([]byte(refresh), port))
-		}
-		if idx := strings.Index(strings.ToLower(refresh), "http://"); idx >= 0 {
-			refresh = refresh[:idx] + "https://" + refresh[idx+7:]
-		}
-		h.Set("Refresh", refresh)
-	}
+	return ""
 }

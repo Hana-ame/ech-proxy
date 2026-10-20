@@ -1,3 +1,11 @@
+## v2.2.0
+
+### Changes & Features
+
+- **32-bit x86 (386) desktop builds** — Every release now also ships `ech-proxy-windows-386.exe` and `ech-proxy-linux-386` for 32-bit computers (e.g. legacy 32-bit Windows PCs). Previously only amd64/arm64 binaries were published, and an amd64 PE executable cannot start on a 32-bit OS at all — the binary simply refused to open. On a 32-bit Windows machine, download **`ech-proxy-windows-386.exe`** (rename it to `ech-proxy.443.exe` if you want the port-443 local transparent proxy mode to auto-start, same rule as the Linux/macOS rename note).
+
+---
+
 ## v1.2.1
 
 ### Changes & Features

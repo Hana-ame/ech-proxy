@@ -33,11 +33,15 @@ builds:
     goarch:
       - amd64
       - arm64
+      - "386"
     goarm:
       - "7"
     ignore:
       - goos: darwin
         goarch: arm64
+      # darwin never supported 32-bit x86; Go builds darwin only amd64/arm64.
+      - goos: darwin
+        goarch: "386"
     # Explicit binary naming. The existing releases shipped raw binaries named
     # ech-proxy-<os>-<arch>[.exe]; keeping that shape means a GoReleaser
     # release is a drop-in replacement rather than a second, differently

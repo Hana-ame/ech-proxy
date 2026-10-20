@@ -19,7 +19,9 @@ jobs:
     strategy:
       matrix:
         os: [linux, windows]
-        arch: [amd64, aarch64]
+        # 386 = 32-bit x86: releases must stay runnable on 32-bit Windows PCs,
+        # where an amd64 PE binary cannot start at all ("not a valid Win32 app").
+        arch: [amd64, aarch64, 386]
         exclude:
           - os: windows
             arch: aarch64

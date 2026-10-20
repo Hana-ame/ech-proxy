@@ -28,8 +28,14 @@ jobs:
       - name: Build ech-proxy (Windows amd64)
         run: GOOS=windows GOARCH=amd64 go build -ldflags="-s -w" -o ech-proxy-windows-amd64.exe ./win/
 
+      - name: Build ech-proxy (Windows 386)
+        run: GOOS=windows GOARCH=386 go build -ldflags="-s -w" -o ech-proxy-windows-386.exe ./win/
+
       - name: Build ech-proxy (Linux amd64)
         run: GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o ech-proxy-linux-amd64 ./win/
+
+      - name: Build ech-proxy (Linux 386)
+        run: GOOS=linux GOARCH=386 go build -ldflags="-s -w" -o ech-proxy-linux-386 ./win/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -37,4 +43,6 @@ jobs:
           name: ech-proxy-desktop
           path: |
             ech-proxy-windows-amd64.exe
+            ech-proxy-windows-386.exe
             ech-proxy-linux-amd64
+            ech-proxy-linux-386

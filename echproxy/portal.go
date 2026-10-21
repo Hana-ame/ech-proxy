@@ -42,6 +42,18 @@ func NewEngine(cfg *config.Config) *gin.Engine {
 	return NewEngineWithOptions(EngineOptions{Config: cfg})
 }
 
+// New443Engine 构建 443 方案专属的极简反代引擎：
+//   - 仅处理 443 原域名 HTTPS 流量，不挂载 PAC、广告脚本或 8443 门户路由。
+func New443Engine(_ *certstore.Store, auth *AuthConfig) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery(), corsMiddleware())
+	emptyCfg := &config.Config{}
+	proxyHandler := ProxyHandlerWithConfig(emptyCfg, auth, nil)
+	r.NoRoute(proxyHandler)
+	return r
+}
+
 func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	cfg := opts.Config
 	if cfg == nil {
@@ -129,12 +141,13 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		if opts.Limiter != nil {
 			activeTunnels = opts.Limiter.ActiveCount()
 		}
-		adEnabled, skipAdScript, skipAdBlock := false, true, false
+		adEnabled, adOn, skipAdScript, skipAdBlock := false, true, true, false
 		allMode := opts.AllMode
 		adSource, adVersion := "disabled", ""
-		whitelistCount := 0
+		whitelistCount, blocklistCount := 0, 0
 		if opts.AdScript != nil {
 			adEnabled = opts.AdScript.Enabled()
+			adOn = opts.AdScript.On()
 			skipAdScript = opts.AdScript.SkipAdScript()
 			skipAdBlock = opts.AdScript.SkipAdBlock()
 			if opts.AdScript.AllMode() {
@@ -143,6 +156,8 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			adSource = opts.AdScript.Source()
 			adVersion = opts.AdScript.VersionHash()
 			whitelistCount = len(opts.AdScript.Whitelist())
+			bl := opts.AdScript.Blocklist()
+			blocklistCount = len(bl.Domains) + len(bl.Selectors)
 		}
 		logFile := ""
 		if opts.Logger != nil {
@@ -163,11 +178,13 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			"doh_primary":       cloudflare_ech.PrimaryDoHURL(),
 			"doh_secondary":     cloudflare_ech.SecondaryDoHURL(),
 			"ad_script_enabled": adEnabled,
+			"ad_on":             adOn,
 			"skip_ad_script":    skipAdScript,
 			"skip_ad_block":     skipAdBlock,
 			"ad_script_source":  adSource,
 			"ad_script_version": adVersion,
 			"whitelist_count":   whitelistCount,
+			"blocklist_count":   blocklistCount,
 			"log_file":          logFile,
 		})
 	})
@@ -189,7 +206,7 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	r.GET("/ca.pem", caDownloadHandler)
 	r.GET("/ca.crt", caDownloadHandler)
 
-	// PAC 自动代理脚本：在 PAC 方案下严格仅依据 pac.txt 白名单（与 upstream.json 完全解耦），且自适应任意监听端口
+	// PAC 自动代理脚本：严格仅依据 pac.txt 白名单（与 upstream.json 完全解耦），且自适应任意监听端口
 	r.GET("/proxy.pac", func(c *gin.Context) {
 		portStr := defaultPort
 		if opts.Port > 0 {
@@ -200,12 +217,11 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		}
 		proxyAddr := "127.0.0.1:" + portStr
 		global := opts.AllMode || (opts.AdScript != nil && opts.AdScript.AllMode()) || c.Query("mode") == "all" || c.Query("global") == "1"
-		var pac string
+		var wl []string
 		if opts.AdScript != nil {
-			pac = config.GeneratePAC(nil, proxyAddr, global, opts.AdScript.Whitelist())
-		} else {
-			pac = config.GeneratePAC(cfg, proxyAddr, global)
+			wl = opts.AdScript.Whitelist()
 		}
+		pac := config.GeneratePAC(nil, proxyAddr, global, wl)
 		c.Header("Content-Type", "application/x-ns-proxy-autoconfig; charset=utf-8")
 		c.String(http.StatusOK, pac)
 	})

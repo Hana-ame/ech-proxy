@@ -193,9 +193,10 @@ func stripManagedHostsBlock(content string) string {
 }
 
 // GeneratePAC 生成 PAC 脚本：
-//   - 在 PAC 方案中（传入 extraWhitelist 即 pac.txt 列表且 cfg == nil），严格仅使用 pac.txt 中的白名单域名，与 upstream.json 完全解耦；
+//   - 与 upstream.json (Config) 完全解耦（首个参数 _ *Config 被严格忽略，绝不读取 upstream.json 或内置域名）；
+//   - 严格仅使用 extraWhitelist（即 pac.txt 白名单）中的域名生成 PAC 路由规则；
 //   - 当 global=true（-all 模式）时，所有非本机环回/局域网域名均走 PROXY。
-func GeneratePAC(cfg *Config, proxyHostPort string, global bool, extraWhitelist ...[]string) string {
+func GeneratePAC(_ *Config, proxyHostPort string, global bool, extraWhitelist ...[]string) string {
 	if strings.TrimSpace(proxyHostPort) == "" {
 		proxyHostPort = "127.0.0.1:8443"
 	}
@@ -212,20 +213,6 @@ func GeneratePAC(cfg *Config, proxyHostPort string, global bool, extraWhitelist 
 			suffixSeen[s] = true
 			finalSuffixes = append(finalSuffixes, s)
 		}
-	}
-
-	if cfg != nil && len(extraWhitelist) == 0 {
-		origDomains, portalDomains, suffixes := CollectProxyDomains(cfg)
-		for _, d := range origDomains {
-			exactMap[d] = true
-		}
-		for _, d := range portalDomains {
-			exactMap[d] = true
-		}
-		for _, s := range suffixes {
-			addSuffix(s)
-		}
-		addSuffix("." + PortalDomain)
 	}
 
 	for _, list := range extraWhitelist {

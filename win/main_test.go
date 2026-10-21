@@ -17,7 +17,7 @@ import (
 )
 
 // TestFilenameIs443 pins the exact-suffix rule: only a filename ending in
-// ".443.exe" selects port 443. A substring hit in the middle of the name must
+// ".443.exe" (.*.443.exe) selects port 443. A substring hit in the middle of the name must
 // not trigger it — an intermediate build renamed ".443.beta.exe" would
 // otherwise bind a privileged port the operator never asked for.
 func TestFilenameIs443(t *testing.T) {
@@ -62,7 +62,7 @@ func TestFilenameIs443(t *testing.T) {
 func TestParseCLIArgsSubcommandsFlagsAndSysProxyDefaults(t *testing.T) {
 	noEnv := func(string) string { return "" }
 
-	// 1. 默认启动为 smart 模式（PAC HTTPS Proxy），默认 ipmode = ipv4 ("v4")，监听 127.0.0.1:8443，不开启 PortalMode 或 LocalProxy
+	// 1. 默认主流（mainstream）启动为 smart 模式（PAC HTTPS Proxy），默认 ipmode = ipv4 ("v4")，监听 127.0.0.1:8443，不开启 PortalMode 或 LocalProxy
 	c1, err := parseCLIArgs("ech-proxy", nil, noEnv)
 	if err != nil || c1.Action != "run" || c1.Mode != "smart" || c1.AllMode || c1.PortalMode || c1.IPMode != "v4" || c1.Addr != "127.0.0.1:8443" || c1.LocalProxy {
 		t.Errorf("default parseCLIArgs = %+v, %v", c1, err)
@@ -108,13 +108,16 @@ func TestParseCLIArgsSubcommandsFlagsAndSysProxyDefaults(t *testing.T) {
 		}
 	}
 
-	// 4. .443.exe 自动进入 443 方案并监听 127.0.0.1:443（默认不改系统代理 SysProxyOff）
+	// 4. .*.443.exe 只和 listen 443 有关：只开启 443 方案，不回退到 8443（FallbackAddr=""），不改系统代理，不运行托盘/更新器/CONNECT
 	c2, err := parseCLIArgs("ech-proxy.443.exe", nil, noEnv)
-	if err != nil || !c2.LocalProxy || c2.PortalMode || c2.Addr != "127.0.0.1:443" || c2.FallbackAddr != "127.0.0.1:8443" || c2.SysProxy != SysProxyOff {
-		t.Errorf(".443.exe parseCLIArgs = %+v, %v", c2, err)
+	if err != nil || !c2.LocalProxy || c2.PortalMode || c2.Addr != "127.0.0.1:443" || c2.FallbackAddr != "" || c2.SysProxy != SysProxyOff || c2.EnableTray || !c2.NoAutoUpdate || c2.AllowConnect {
+		t.Errorf(".443.exe parseCLIArgs = %+v, %v (expected strict listen-443-only isolation)", c2, err)
+	}
+	if _, err := parseCLIArgs("ech-proxy.443.exe", []string{"-addr", "127.0.0.1:8443"}, noEnv); err == nil {
+		t.Error("expected error when .443.exe is given a non-443 listen address")
 	}
 
-	// 4b. .8443.exe 自动进入 8443 门户方案（PortalMode=true, SysProxy=SysProxyOff）；非 .8443.exe 禁止显式开启 portal 模式
+	// 4b. .8443.exe 自动进入 8443 门户方案（PortalMode=true, SysProxy=SysProxyOff）；非 .8443.exe 禁止显式开启 portal 子命令
 	c8443, err := parseCLIArgs("ech-proxy.8443.exe", nil, noEnv)
 	if err != nil || !c8443.PortalMode || c8443.LocalProxy || c8443.Mode != "portal" || c8443.SysProxy != SysProxyOff {
 		t.Errorf(".8443.exe parseCLIArgs = %+v, %v", c8443, err)
@@ -139,12 +142,15 @@ func TestParseCLIArgsSubcommandsFlagsAndSysProxyDefaults(t *testing.T) {
 	}
 }
 
-func TestSysProxyManagerLifecycleAndExitCleanup(t *testing.T) {
+func TestSysProxyManagerAtomicReplaceAndOldValuePop(t *testing.T) {
 	drv := &noopSysProxyDriver{}
+	// 预设用户原本已有一个旧的 PAC 地址，验证原子替换与旧值 pop 恢复
+	_ = drv.ApplyPAC("http://corp.example.com/legacy.pac")
+
 	mgr := NewSysProxyManager("0.0.0.0:8443", drv)
 	mgr.nowUnix = func() int64 { return 1700000000 }
 
-	// 1. 切换为默认白名单 PAC 模式（带 ?t= 时间戳防缓存参数）
+	// 1. 切换为默认白名单 PAC 模式（带 ?t= 时间戳防缓存参数），旧值被压栈
 	if err := mgr.SetMode(SysProxyPAC); err != nil {
 		t.Fatalf("SetMode(PAC): %v", err)
 	}
@@ -154,7 +160,7 @@ func TestSysProxyManagerLifecycleAndExitCleanup(t *testing.T) {
 		t.Errorf("after SetMode(PAC): state=%+v, want AutoConfigURL=%q", st, wantPAC)
 	}
 
-	// 2. 开启 all 模式后切换为 PAC 模式（带 ?mode=all&t= 参数）
+	// 2. 开启 all 模式后切换为 PAC 模式（带 ?mode=all&t= 参数），再次压栈
 	mgr.SetAllMode(true)
 	if err := mgr.SetMode(SysProxyPAC); err != nil {
 		t.Fatalf("SetMode(PAC all): %v", err)
@@ -165,11 +171,21 @@ func TestSysProxyManagerLifecycleAndExitCleanup(t *testing.T) {
 		t.Errorf("after SetMode(PAC all): state=%+v, want AutoConfigURL=%q", st, wantAllPAC)
 	}
 
-	// 3. 退出时自动清理系统代理（防止浏览器断网）
+	// 3. 调用 Pop() 弹出上一次的 PAC 地址（wantPAC）
+	popped, ok, err := mgr.Pop()
+	if err != nil || !ok || popped.AutoConfigURL != wantPAC {
+		t.Fatalf("Pop() #1 got (%+v, %v, %v), want AutoConfigURL=%q", popped, ok, err, wantPAC)
+	}
+	st, _ = drv.Query()
+	if st.AutoConfigURL != wantPAC {
+		t.Errorf("after Pop() #1: driver state=%+v, want %q", st, wantPAC)
+	}
+
+	// 4. 退出时自动 pop 恢复进程启动前的初始旧值（http://corp.example.com/legacy.pac）
 	mgr.CleanupOnExit()
 	st, _ = drv.Query()
-	if st.Mode != SysProxyOff || st.AutoConfigURL != "" || st.ProxyServer != "" {
-		t.Errorf("after CleanupOnExit: state=%+v, want Mode=off", st)
+	if st.Mode != SysProxyPAC || st.AutoConfigURL != "http://corp.example.com/legacy.pac" {
+		t.Errorf("after CleanupOnExit: state=%+v, want restored legacy PAC", st)
 	}
 }
 
@@ -195,12 +211,6 @@ func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 	tc.UninstallCAFn = func(p string) error { mu.Lock(); uninstalledCA = p; mu.Unlock(); return nil }
 	tc.CheckUpdateFn = func() (bool, error) { mu.Lock(); updateChecked = true; mu.Unlock(); return true, nil }
 
-	// 1. 检查托盘菜单结构：
-	//    - 包含「反馈 (https://chatto.moonchan.xyz)」
-	//    - 包含「强制 v4 出口」、「强制 v6 出口」、「双端出口」
-	//    - 包含「一键安装本地 CA 根证书 (Install CA)」与「卸载本地 CA 根证书 (Uninstall CA)」
-	//    - 包含「检查更新 (Check Update)」
-	//    - 不包含「全局」模式，也不包含任何「广告 / Ad Script」设置
 	items := tc.MenuItems()
 	var titles []string
 	for _, it := range items {
@@ -232,7 +242,6 @@ func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 		}
 	}
 
-	// 2. 测试切换出口协议族：强制 v6 出口 / 双端出口 / 强制 v4 出口
 	tc.HandleCommand(TrayCmdIPModeV6)
 	if tc.CurrentIPMode() != "v6" || switchedIPMode != "v6" || !strings.Contains(tc.TooltipText(), "v6出口") {
 		t.Errorf("after TrayCmdIPModeV6: cur=%q switched=%q tooltip=%q", tc.CurrentIPMode(), switchedIPMode, tc.TooltipText())
@@ -246,7 +255,6 @@ func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 		t.Errorf("after TrayCmdIPModeV4: cur=%q switched=%q tooltip=%q", tc.CurrentIPMode(), switchedIPMode, tc.TooltipText())
 	}
 
-	// 3. 测试点击「卸载本地 CA 根证书」与「检查更新」与「反馈」
 	tc.HandleCommand(TrayCmdInstallCA)
 	tc.HandleCommand(TrayCmdUninstallCA)
 	tc.HandleCommand(TrayCmdCheckUpdate)
@@ -278,7 +286,6 @@ func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 		t.Errorf("TrayCmdOpenFeedback opened %q, want https://chatto.moonchan.xyz", gotOpenedURL)
 	}
 
-	// 4. 测试双击/菜单切换 Console 窗口显隐
 	tc.HandleCommand(TrayCmdToggleConsole)
 	if tc.IsConsoleVisible() {
 		t.Error("console should be hidden after first toggle")
@@ -288,11 +295,13 @@ func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 		t.Error("console should be visible after second toggle")
 	}
 
-	// 5. 测试托盘右键切换 PAC / Clear 模式与退出清理
 	tc.HandleCommand(TrayCmdSysProxyPAC)
 	tc.HandleCommand(TrayCmdCopyPACURL)
-	if copiedText != "http://127.0.0.1:8443/proxy.pac" {
-		t.Errorf("copied PAC URL = %q, want http://127.0.0.1:8443/proxy.pac", copiedText)
+	mu.Lock()
+	gotCopiedText := copiedText
+	mu.Unlock()
+	if gotCopiedText != "http://127.0.0.1:8443/proxy.pac" {
+		t.Errorf("copied PAC URL = %q, want http://127.0.0.1:8443/proxy.pac", gotCopiedText)
 	}
 
 	if shouldExit := tc.HandleCommand(TrayCmdExit); !shouldExit || !exited {
@@ -304,7 +313,6 @@ func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 }
 
 func TestUpdaterParseChecksumsAndAutoDownloadReplaceOnExit(t *testing.T) {
-	// 1. 验证 ParseChecksumsTxt 同时支持 GitHub Release 页面多行格式与标准 sha256sum 格式
 	releaseText := `
 checksums.txt
 sha256:29ec803c87048d5033fdf7d4c3dd91724090c3657e31a598e5b75fb1f36ca3dc
@@ -342,11 +350,10 @@ sha256:fcb8f707ccc5317a7813036ede4e89a5f5bff3bfc1ae74f9ae9046d39a3e95ca
 		}
 	}
 
-	// 2. 测试自动下载新版本 (<exe>.new) 并在退出后替换 (<exe>)
 	dir := t.TempDir()
 	exePath := filepath.Join(dir, "ech-proxy.exe")
-	oldBinary := bytes.Repeat([]byte("OLD_VERSION_BIN_"), 128) // 2048 bytes
-	newBinary := bytes.Repeat([]byte("NEW_VERSION_BIN_"), 128) // 2048 bytes
+	oldBinary := bytes.Repeat([]byte("OLD_VERSION_BIN_"), 128)
+	newBinary := bytes.Repeat([]byte("NEW_VERSION_BIN_"), 128)
 	newSum := sha256.Sum256(newBinary)
 	newHashHex := hex.EncodeToString(newSum[:])
 
@@ -384,7 +391,6 @@ sha256:fcb8f707ccc5317a7813036ede4e89a5f5bff3bfc1ae74f9ae9046d39a3e95ca
 		t.Fatalf("staged file %s missing: %v", upd.StagedPath(), err)
 	}
 
-	// 退出时自动替换可执行文件
 	replaced, err := upd.ApplyStagedUpdateOnExit()
 	if err != nil || !replaced {
 		t.Fatalf("ApplyStagedUpdateOnExit got replaced=%v, err=%v", replaced, err)
@@ -394,7 +400,6 @@ sha256:fcb8f707ccc5317a7813036ede4e89a5f5bff3bfc1ae74f9ae9046d39a3e95ca
 		t.Fatalf("executable was not replaced with new binary on exit")
 	}
 
-	// 再次检查更新应识别已是最新，不再重复下载
 	stagedAgain, err := upd.CheckAndDownloadOnce()
 	if err != nil || stagedAgain {
 		t.Errorf("second CheckAndDownloadOnce after update should report already up to date, got staged=%v err=%v", stagedAgain, err)
@@ -402,14 +407,12 @@ sha256:fcb8f707ccc5317a7813036ede4e89a5f5bff3bfc1ae74f9ae9046d39a3e95ca
 }
 
 func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
-	// 0. 测试 help 子命令打印 Flag 一览
 	var out bytes.Buffer
 	code := runToolAction(CLICommand{Action: "help"}, &out)
 	if code != 0 || !strings.Contains(out.String(), "--skip-ad-script") || !strings.Contains(out.String(), "--skip-ad-block") || !strings.Contains(out.String(), "-dual") {
 		t.Errorf("help action returned code=%d, out=%q", code, out.String())
 	}
 
-	// 1. 测试 check 子命令校验生产配置返回 0
 	out.Reset()
 	code = runToolAction(CLICommand{
 		Action:    "check",
@@ -419,7 +422,6 @@ func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
 		t.Errorf("check valid config returned code=%d, out=%q", code, out.String())
 	}
 
-	// 2. 测试 check 子命令对不存在文件返回 2
 	out.Reset()
 	code = runToolAction(CLICommand{
 		Action:    "check",
@@ -429,7 +431,6 @@ func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
 		t.Errorf("check nonexistent file returned code=%d, want 2", code)
 	}
 
-	// 3. 测试 ca export 子命令
 	out.Reset()
 	dir := t.TempDir()
 	exportFile := filepath.Join(dir, "exported-ca.crt")
@@ -445,7 +446,6 @@ func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
 		t.Errorf("exported CA file invalid: err=%v", err)
 	}
 
-	// 4. 测试 logs path / tail / crash / clean 子命令
 	logDir := t.TempDir()
 	mgr, err := echproxy.NewLogger(echproxy.LoggerOptions{
 		LogDir:     logDir,

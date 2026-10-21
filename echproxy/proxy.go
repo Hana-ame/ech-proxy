@@ -96,7 +96,14 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			}
 		}
 
-		upstreams, blocked := cfg.Snapshot()
+		// upstream.json 严格只与 8443 门户方案有关：
+		// 在 PAC 主线方案下（adScript != nil），非 *.l.moonchan.xyz 原域名完全不耦合 upstream.json。
+		var upstreams config.UpstreamMap
+		var blocked []string
+		if adScript == nil || config.IsPortalDomain(host) {
+			upstreams, blocked = cfg.Snapshot()
+		}
+
 		uc, ok := config.Resolve(upstreams, host)
 		if !ok {
 			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
@@ -105,10 +112,13 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 		}
 
 		ucForRewrite := uc
-		if ucForRewrite.Wildcard == nil {
+		if ucForRewrite.Wildcard == nil && len(upstreams) > 0 {
 			ucForRewrite.Wildcard = config.InheritWildcard(upstreams, host)
 		}
-		rewriter := rewrite.BuildEntryRewriterForHost(host, ucForRewrite, blocked)
+		var rewriter func([]byte, string) []byte
+		if len(upstreams) > 0 || len(blocked) > 0 {
+			rewriter = rewrite.BuildEntryRewriterForHost(host, ucForRewrite, blocked)
+		}
 
 		clientSentPlainHTTP := c.Request.TLS == nil &&
 			(strings.HasPrefix(strings.ToLower(c.Request.RequestURI), "http://") ||

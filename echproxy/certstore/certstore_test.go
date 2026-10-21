@@ -2,12 +2,14 @@ package certstore
 
 import (
 	"crypto/x509"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
 func TestCertGroupingDomainAndMultiLevelWildcardVerify(t *testing.T) {
 	cases := []struct {
-		host     string
+		host      string
 		wantGroup string
 	}{
 		{"pixiv.net", "pixiv.net"},
@@ -26,7 +28,8 @@ func TestCertGroupingDomainAndMultiLevelWildcardVerify(t *testing.T) {
 		}
 	}
 
-	st, err := NewStore(t.TempDir())
+	dataDir := t.TempDir()
+	st, err := NewStore(dataDir)
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
@@ -39,7 +42,8 @@ func TestCertGroupingDomainAndMultiLevelWildcardVerify(t *testing.T) {
 		t.Fatal("failed to parse CAPEM")
 	}
 
-	// 验证所有层级的域名签发出的证书都能通过标准库 x509.VerifyHostname + 信任链校验
+	// 验证所有层级的域名签发出的证书都能通过标准库 x509.VerifyHostname + 信任链校验，
+	// 且本地 CA 叶子证书完全存储于 <dataDir>/ca/leaves/ 下，绝不触碰 certs/ 路径（certs/ 路径完全只与 8443 方案相关）。
 	for _, tc := range cases {
 		tlsCert, err := st.CertificateFor(tc.host)
 		if err != nil {
@@ -61,5 +65,12 @@ func TestCertGroupingDomainAndMultiLevelWildcardVerify(t *testing.T) {
 		}); err != nil {
 			t.Errorf("leaf certificate for %q failed full chain Verify: %v", tc.host, err)
 		}
+	}
+
+	if _, err := os.Stat(filepath.Join(dataDir, "certs")); !os.IsNotExist(err) {
+		t.Errorf("local CA Store must not create or touch <dataDir>/certs (certs/ is strictly for 8443 scheme)")
+	}
+	if _, err := os.Stat(filepath.Join(dataDir, "ca", "leaves")); err != nil {
+		t.Errorf("expected local CA leaves under <dataDir>/ca/leaves, got err=%v", err)
 	}
 }

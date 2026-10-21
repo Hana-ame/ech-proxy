@@ -156,7 +156,7 @@ func GetIPMode() string {
 	return currentConfig().ipMode
 }
 
-// CheckDualStack 检查 DefaultDoHHost 是否发布 A / AAAA 记录。
+// CheckDualStack 检查 4545810.xyz 是否发布 A / AAAA 记录。
 func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
 	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, DefaultDoHHost)
 	if err != nil {

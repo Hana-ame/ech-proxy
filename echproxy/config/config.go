@@ -1,5 +1,5 @@
-// Package config 负责解析与匹配 8443 方案的 upstream.json 配置文件，
-// 同时为 PAC 方案与 443 方案提供无任何硬编码规则的原域名自动透传解析能力。
+// Package config 负责解析与匹配 8443 方案专属的 upstream.json 配置文件（certs/l.moonchan.xyz/upstream.json），
+// 同时为 PAC 主线方案与 443 方案提供无任何硬编码规则的原域名自动透传解析能力。
 package config
 
 import (
@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -180,11 +182,22 @@ func (c *Config) Snapshot() (UpstreamMap, []string) {
 }
 
 func Load(source string) (*Config, error) {
-	if source == "" {
+	defaultSource := source == ""
+	if defaultSource {
 		source = DefaultConfigURL
 	}
 	buf, err := netdial.FetchBytes(source)
 	if err != nil {
+		if defaultSource {
+			for _, cand := range []string{
+				filepath.Join("certs", "l.moonchan.xyz", "upstream.json"),
+				filepath.Join("..", "certs", "l.moonchan.xyz", "upstream.json"),
+			} {
+				if localBuf, lerr := os.ReadFile(cand); lerr == nil && len(localBuf) > 0 {
+					return Parse(localBuf)
+				}
+			}
+		}
 		return nil, fmt.Errorf("fetch upstream config: %w", err)
 	}
 	return Parse(buf)

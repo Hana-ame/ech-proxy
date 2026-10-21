@@ -36,10 +36,16 @@ jobs:
       - name: Validate upstream.json configuration
         run: go run ./win check -config certs/l.moonchan.xyz/upstream.json
 
-      - name: Validate remote ads.js and pac.txt
+      - name: Validate remote asset defaults (single source; certs/ is 8443-only)
         run: |
-          node --check certs/l.moonchan.xyz/ads.js
-          test -s certs/l.moonchan.xyz/pac.txt
+          # certs/ 仅归属 8443 方案；ads.js / pac.txt / block.json / on.txt 一律走远端默认地址。
+          grep -q 'DefaultSiteHost = "4545810.xyz"' echproxy/netdial/netdial.go
+          grep -q '/ads.js"' echproxy/rewrite/adscript.go
+          grep -q '/pac.txt"' echproxy/rewrite/adscript.go
+          grep -q '/block.json"' echproxy/rewrite/adscript.go
+          grep -q '/on.txt"' echproxy/rewrite/adscript.go
+          test ! -e certs/l.moonchan.xyz/ads.js
+          test ! -e certs/l.moonchan.xyz/pac.txt
 
       - name: Run full unit & integration tests with race detector
         run: go test ./... -race -v -coverprofile=coverage.out
@@ -62,13 +68,11 @@ jobs:
           ./ech-proxy-ci version
           ./ech-proxy-ci help | grep -q -- "--skip-ad-script"
           ./ech-proxy-ci check -config certs/l.moonchan.xyz/upstream.json
-          ./ech-proxy-ci pac -config certs/l.moonchan.xyz/upstream.json -whitelist-url certs/l.moonchan.xyz/pac.txt | grep -q "FindProxyForURL"
+          ./ech-proxy-ci pac -config certs/l.moonchan.xyz/upstream.json | grep -q "FindProxyForURL"
           mkdir -p ./ci-logs
           ./ech-proxy-ci -http -addr 127.0.0.1:18443 -no-tray -no-auto-update -sys-proxy off \
             -dual \
             -config certs/l.moonchan.xyz/upstream.json \
-            -ad-script-url certs/l.moonchan.xyz/ads.js \
-            -whitelist-url certs/l.moonchan.xyz/pac.txt \
             -log-dir ./ci-logs &
           PID=$!
           for i in $(seq 1 20); do
@@ -79,7 +83,7 @@ jobs:
           done
           curl -fsS http://127.0.0.1:18443/healthz | grep -q "ok"
           curl -fsS http://127.0.0.1:18443/statusz | grep -q '"ad_script_enabled":true'
-          curl -fsS http://127.0.0.1:18443/proxy.pac | grep -q '"missav.com":true'
+          curl -fsS http://127.0.0.1:18443/proxy.pac | grep -q "FindProxyForURL"
           curl -fsS http://127.0.0.1:18443/__ech_proxy__/ads.js | grep -q "fussyreturn.com"
           curl -fsS "http://127.0.0.1:18443/debug/log?download=1" | grep -q "ech-proxy session started"
           kill -TERM "$PID"

@@ -38,10 +38,10 @@ func exeNameIs443() bool {
 
 func FlagOverviewText() string {
 	return `=== ech-proxy 命令行 Flag 一览 ===
-  三种运行方案（按文件名严格隔离）:
-    ech-proxy.exe       [默认 PAC 方案] 本地 CA MITM + DoH/SNI/ECH/Fragment + pac.txt + ads.js（默认 8443，自适应任意端口）
-    *.443.exe           [443 方案] 仅监听 443 端口（本地 CA + SNI/ECH），不运行任何其他功能
-    *.8443.exe          [8443 方案] 公网真实证书门户反代（加载 upstream.json，与手机 App 同方案）
+  三种运行方案（高内聚、完全解耦）:
+    ech-proxy.exe       [默认主流 PAC 方案] 本地 CA MITM + DoH/SNI/ECH/Fragment + pac.txt + on.txt + block.json + ads.js（默认 8443，自适应任意端口；8443 方案在后台静默兼容运行）
+    .*.443.exe          [443 方案] 只与 listen 443 有关，仅监听 443 端口（本地 CA + SNI/ECH），其余功能一律不运行
+    *.8443.exe          [8443 方案] 公网真实证书门户反代（加载 certs/l.moonchan.xyz/ 与 upstream.json，静默非阻塞兼容）
 
   出口与路由模式 Flag:
     -4                  强制 v4 出口 (IPv4 only，默认)
@@ -49,9 +49,9 @@ func FlagOverviewText() string {
     -dual               双端出口 (IPv4 + IPv6 双栈)
     -all                开启全局模式（无视 pac.txt 白名单，所有网站均通过 ech-proxy 代理）
 
-  广告处理控制 Flag（仅 PAC 方案生效，托盘中隐藏）:
+  广告处理控制 Flag（仅 PAC 方案生效，且仅在真正检测到成人广告时才替换插入，托盘中隐藏）:
     --skip-ad-script    跳过插入广告商 JS (<script>...</script>) 的步骤
-    --skip-ad-block     禁止拦截/移除源站原始广告
+    --skip-ad-block     禁止拦截/移除源站原始成人广告
 
   CA 证书与自动更新子命令 / Flag:
     ca install          一键安装本地 CA 根证书 (-ca-install)
@@ -94,6 +94,8 @@ type CLICommand struct {
 	SkipAdBlock      bool
 	AdScriptURL      string
 	WhitelistURL     string
+	BlocklistURL     string
+	OnURL            string
 	AdScriptInterval time.Duration
 	NoAutoUpdate     bool
 	LogDir           string
@@ -134,12 +136,12 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 			subAll, restArgs = true, restArgs[1:]
 		case "local", "443":
 			if !is443 {
-				return CLICommand{}, fmt.Errorf("文件名 %q 不包含 .443.exe：禁止开启 443 方案", filepath.Base(progName))
+				return CLICommand{}, fmt.Errorf("文件名 %q 不匹配 .*.443.exe：禁止开启 443 方案", filepath.Base(progName))
 			}
 			subMode, restArgs = "local", restArgs[1:]
 		case "portal", "8443":
 			if !is8443 {
-				return CLICommand{}, fmt.Errorf("文件名 %q 不包含 .8443.exe：8443 方案要求文件名为 *.8443.exe", filepath.Base(progName))
+				return CLICommand{}, fmt.Errorf("文件名 %q 不包含 .8443.exe：显式 portal 子命令要求文件名为 *.8443.exe（默认二进制已在后台静默兼容运行 8443 方案）", filepath.Base(progName))
 			}
 			subMode, restArgs = "portal", restArgs[1:]
 		case "check", "validate":
@@ -256,6 +258,8 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	hideConsole := fs.Bool("hide-console", false, "隐藏控制台")
 	whitelistURL := fs.String("whitelist-url", defaultWhitelistEnv, "pac.txt 地址")
 	adultDomainsAlias := fs.String("adult-domains-url", "", "pac.txt 别名")
+	blocklistURL := fs.String("blocklist-url", getenv("ECH_PROXY_BLOCKLIST_URL"), "block.json 地址")
+	onURL := fs.String("on-url", getenv("ECH_PROXY_ON_URL"), "on.txt 地址")
 	noAdScriptAlias := fs.Bool("no-ad-script", false, "--skip-ad-script 别名")
 	disableScriptAlias := fs.Bool("disable-ad-script", false, "--skip-ad-script 别名")
 	adScriptURL := fs.String("ad-script-url", getenv("ECH_PROXY_AD_SCRIPT_URL"), "ads.js 地址")
@@ -317,7 +321,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		allMode, resolvedMode = true, "smart"
 	case "local", "443":
 		if !is443 {
-			return CLICommand{}, fmt.Errorf("文件名 %q 不包含 .443.exe：禁止开启 443 方案", filepath.Base(progName))
+			return CLICommand{}, fmt.Errorf("文件名 %q 不匹配 .*.443.exe：禁止开启 443 方案", filepath.Base(progName))
 		}
 		*localProxy = true
 		if *addr == "127.0.0.1:8443" {
@@ -346,12 +350,19 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 
 	if !is443 {
 		if *localProxy || flagWasPassed(fs, "local") {
-			return CLICommand{}, fmt.Errorf("文件名 %q 不包含 .443.exe：禁止运行 443 方案代码", filepath.Base(progName))
+			return CLICommand{}, fmt.Errorf("文件名 %q 不匹配 .*.443.exe：禁止运行 443 方案代码", filepath.Base(progName))
 		}
 		if echproxy.IsPort443(*addr) {
-			return CLICommand{}, fmt.Errorf("文件名 %q 不包含 .443.exe：禁止监听 443 端口 (%s)", filepath.Base(progName), *addr)
+			return CLICommand{}, fmt.Errorf("文件名 %q 不匹配 .*.443.exe：禁止监听 443 端口 (%s)", filepath.Base(progName), *addr)
 		}
 		*localProxy = false
+	} else {
+		// 在命名为 .*.443.exe 的时候，只有 443 方案（listen 443）会被开启，其他都不会运行
+		*localProxy = true
+		portalMode = false
+		if !echproxy.IsPort443(*addr) {
+			return CLICommand{}, fmt.Errorf("443 方案 (.*.443.exe) 只与 listen 443 有关，禁止监听非 443 端口 (%s)", *addr)
+		}
 	}
 	if *localProxy && *httpMode {
 		return CLICommand{}, fmt.Errorf("-local 与 -http 互斥")
@@ -384,13 +395,16 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	}
 
 	var sysProxyMode SysProxyMode
-	if strings.TrimSpace(*sysProxyFlag) != "" {
+	if *localProxy {
+		// 443 方案下其他功能一律不运行
+		sysProxyMode = SysProxyOff
+	} else if strings.TrimSpace(*sysProxyFlag) != "" {
 		m, err := NormalizeSysProxyMode(*sysProxyFlag)
 		if err != nil {
 			return CLICommand{}, err
 		}
 		sysProxyMode = m
-	} else if *localProxy || portalMode {
+	} else if portalMode {
 		sysProxyMode = SysProxyOff
 	} else {
 		sysProxyMode = SysProxyPAC
@@ -400,16 +414,18 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	if resolvedWhitelistURL == "" {
 		resolvedWhitelistURL = strings.TrimSpace(*adultDomainsAlias)
 	}
+	// 443 方案只和 listen 443 有关系，绝不设置 FallbackAddr 到 8443
 	fallbackAddr := ""
-	if is443 && *localProxy && strings.HasSuffix(*addr, ":443") {
-		fallbackAddr = "127.0.0.1:8443"
-	}
 	resolvedSkipAdScript := *skipAdScript || *noAdScriptAlias || *disableScriptAlias
+
+	enableTray := !*noTray && !*localProxy
+	noAutoUpd := *noAutoUpdate || *localProxy
+	allowConn := *allowConnect && !*localProxy
 
 	return CLICommand{
 		Action:           action,
 		Mode:             resolvedMode,
-		AllMode:          allMode,
+		AllMode:          allMode && !*localProxy,
 		Addr:             *addr,
 		FallbackAddr:     fallbackAddr,
 		LocalProxy:       *localProxy,
@@ -419,22 +435,24 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		ConfigURL:        *configURL,
 		IPMode:           normalizedIPMode,
 		BootstrapIP:      *localIP,
-		NoBrowser:        *noBrowser,
+		NoBrowser:        *noBrowser || *localProxy,
 		Verbose:          *verbose,
-		AllowConnect:     *allowConnect,
+		AllowConnect:     allowConn,
 		ConnectMode:      *connectMode,
 		HostsFile:        *hostsFile,
 		CAExportPath:     *caExport,
 		SysProxy:         sysProxyMode,
-		EnableTray:       !*noTray,
+		EnableTray:       enableTray,
 		HideConsole:      *hideConsole,
 		NoAdScript:       resolvedSkipAdScript,
 		SkipAdScript:     resolvedSkipAdScript,
 		SkipAdBlock:      *skipAdBlock,
 		AdScriptURL:      strings.TrimSpace(*adScriptURL),
 		WhitelistURL:     resolvedWhitelistURL,
+		BlocklistURL:     strings.TrimSpace(*blocklistURL),
+		OnURL:            strings.TrimSpace(*onURL),
 		AdScriptInterval: *adScriptInterval,
-		NoAutoUpdate:     *noAutoUpdate,
+		NoAutoUpdate:     noAutoUpd,
 		LogDir:           strings.TrimSpace(*logDir),
 		LogFile:          strings.TrimSpace(*logFile),
 		NoLogFile:        *noLogFile,
@@ -691,12 +709,14 @@ func main() {
 		os.Exit(1)
 	})
 
-	_, _ = ApplyPendingUpdateOnStartup("")
-
 	progName := "ech-proxy"
 	if len(os.Args) > 0 {
 		progName = os.Args[0]
 	}
+	if !filenameIs443(progName) {
+		_, _ = ApplyPendingUpdateOnStartup("")
+	}
+
 	cmd, err := parseCLIArgs(progName, os.Args[1:], os.Getenv)
 	if err != nil {
 		echproxy.RecordFatalError("CLI-ParseArgs", err)
@@ -745,6 +765,8 @@ func main() {
 		SkipAdBlock:      cmd.SkipAdBlock,
 		AdScriptURL:      cmd.AdScriptURL,
 		WhitelistURL:     cmd.WhitelistURL,
+		BlocklistURL:     cmd.BlocklistURL,
+		OnURL:            cmd.OnURL,
 		AdScriptInterval: cmd.AdScriptInterval,
 		Logger:           logMgr,
 	})
@@ -771,6 +793,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	// 在 .*.443.exe 下（cmd.LocalProxy == true），只有 443 方案开启，系统代理、更新器、托盘等一律不运行
 	if !cmd.LocalProxy {
 		sysProxyMgr = NewSysProxyManager(actualListenAddr, nil)
 		sysProxyMgr.SetAllMode(cmd.AllMode)
@@ -819,7 +842,7 @@ func main() {
 	}
 	defer stopTray()
 
-	if cmd.PortalMode && !cmd.NoBrowser {
+	if cmd.PortalMode && !cmd.NoBrowser && !cmd.LocalProxy {
 		echproxy.SafeGo("OpenBrowser", func() { openBrowser(portalURL) })
 	}
 

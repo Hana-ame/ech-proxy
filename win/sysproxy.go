@@ -69,12 +69,14 @@ func NormalizeLoopbackHostPort(listenAddr string) string {
 	return echproxy.NormalizeLoopbackHostPort(listenAddr, "127.0.0.1:8443")
 }
 
+// SysProxyManager 负责系统代理的原子替换与旧值栈（pop）恢复。
 type SysProxyManager struct {
 	mu         sync.Mutex
 	listenAddr string
 	allMode    atomic.Bool
 	mode       SysProxyMode
 	modified   bool
+	prevStates []SysProxyState
 	driver     SysProxyDriver
 	nowUnix    func() int64
 }
@@ -123,25 +125,102 @@ func (m *SysProxyManager) SetListenAddr(addr string) {
 	m.mu.Unlock()
 }
 
+func (m *SysProxyManager) HistoryDepth() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.prevStates)
+}
+
+// ReplacePAC 原子替换系统 PAC 地址，并将替换前的系统代理旧值压入栈中返回。
+func (m *SysProxyManager) ReplacePAC(pacURL string) (SysProxyState, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	prev, _ := m.driver.Query()
+	if err := m.driver.ApplyPAC(pacURL); err != nil {
+		return prev, fmt.Errorf("apply system PAC (%s): %w", pacURL, err)
+	}
+	m.prevStates = append(m.prevStates, prev)
+	m.mode = SysProxyPAC
+	m.modified = true
+	log.Printf("[SysProxy] Windows/OS system proxy atomically set to PAC mode: %s (pushed old mode=%s url=%q)", pacURL, prev.Mode, prev.AutoConfigURL)
+	return prev, nil
+}
+
+// Pop 弹出（pop）最近一次压栈的系统代理旧值并原子恢复。
+func (m *SysProxyManager) Pop() (SysProxyState, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if len(m.prevStates) == 0 {
+		return SysProxyState{Mode: SysProxyOff}, false, nil
+	}
+	idx := len(m.prevStates) - 1
+	old := m.prevStates[idx]
+	m.prevStates = m.prevStates[:idx]
+
+	err := m.restoreStateLocked(old)
+	m.mode = normalizeRestoredMode(old.Mode)
+	m.modified = len(m.prevStates) > 0
+	return old, true, err
+}
+
+// normalizeRestoredMode 把驱动返回的空 mode（未设置状态）归一为 off ——
+// 某些驱动（含测试用 noop 驱动）初始状态 Mode 为空，弹出恢复后应视为“无代理”。
+func normalizeRestoredMode(mode SysProxyMode) SysProxyMode {
+	if mode == "" {
+		return SysProxyOff
+	}
+	return mode
+}
+
+func (m *SysProxyManager) restoreStateLocked(st SysProxyState) error {
+	switch st.Mode {
+	case SysProxyPAC:
+		if strings.TrimSpace(st.AutoConfigURL) != "" {
+			return m.driver.ApplyPAC(st.AutoConfigURL)
+		}
+		return m.driver.Clear()
+	case SysProxyGlobal:
+		if strings.TrimSpace(st.ProxyServer) != "" {
+			bypass := st.ProxyBypass
+			if bypass == "" {
+				bypass = DefaultProxyBypass
+			}
+			return m.driver.ApplyGlobal(st.ProxyServer, bypass)
+		}
+		return m.driver.Clear()
+	default:
+		return m.driver.Clear()
+	}
+}
+
 func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	switch mode {
 	case SysProxyPAC:
+		prev, _ := m.driver.Query()
 		pacURL := BuildPACURL(m.listenAddr, m.allMode.Load(), m.nowUnix())
 		if err := m.driver.ApplyPAC(pacURL); err != nil {
 			return fmt.Errorf("apply system PAC (%s): %w", pacURL, err)
 		}
+		m.prevStates = append(m.prevStates, prev)
 		m.mode = SysProxyPAC
 		m.modified = true
 		log.Printf("[SysProxy] Windows/OS system proxy set to PAC mode: %s", pacURL)
 		return nil
 
 	case SysProxyGlobal:
+		prev, _ := m.driver.Query()
 		if err := m.driver.ApplyGlobal(m.listenAddr, DefaultProxyBypass); err != nil {
 			return fmt.Errorf("apply global system proxy (%s): %w", m.listenAddr, err)
 		}
+		m.prevStates = append(m.prevStates, prev)
 		m.mode = SysProxyGlobal
 		m.modified = true
 		log.Printf("[SysProxy] Windows/OS system proxy set to Global HTTP/HTTPS mode: %s", m.listenAddr)
@@ -151,6 +230,7 @@ func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
 		if err := m.driver.Clear(); err != nil {
 			return fmt.Errorf("clear system proxy: %w", err)
 		}
+		m.prevStates = nil
 		m.mode = SysProxyOff
 		m.modified = false
 		log.Printf("[SysProxy] Windows/OS system proxy cleared (Direct mode)")
@@ -167,12 +247,19 @@ func (m *SysProxyManager) CleanupOnExit() {
 	if !m.modified {
 		return
 	}
-	if err := m.driver.Clear(); err != nil {
-		log.Printf("[SysProxy] WARNING: failed to clear system proxy on exit: %v", err)
+	var target SysProxyState
+	if len(m.prevStates) > 0 {
+		target = m.prevStates[0]
+		m.prevStates = nil
 	} else {
-		log.Printf("[SysProxy] System proxy automatically cleared on exit")
+		target = SysProxyState{Mode: SysProxyOff}
 	}
-	m.mode = SysProxyOff
+	if err := m.restoreStateLocked(target); err != nil {
+		log.Printf("[SysProxy] WARNING: failed to restore system proxy on exit: %v", err)
+	} else {
+		log.Printf("[SysProxy] System proxy popped and restored on exit (mode=%s)", target.Mode)
+	}
+	m.mode = normalizeRestoredMode(target.Mode)
 	m.modified = false
 }
 

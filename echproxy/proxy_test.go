@@ -141,25 +141,36 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 		AllMode:  false,
 		CacheDir: t.TempDir(),
 	})
-	adMgr.SetWhitelist([]string{"e-hentai.org", "missav.com"})
+	adMgr.SetWhitelist([]string{"e-hentai.org", "missav.com", "pixiv.net"})
 
-	upstreamHTML := `<!DOCTYPE html><html><head><title>Gallery</title><script src="https://syndication.exoclick.com/ads.js"></script></head><body><div class="ad-banner">Ad</div></body></html>`
+	adultHTML := `<!DOCTYPE html><html><head><title>Gallery</title><script src="https://syndication.exoclick.com/ads.js"></script></head><body><div class="ad-banner">Ad</div></body></html>`
+	cleanHTML := `<!DOCTYPE html><html><head><title>Pixiv Art</title></head><body><div class="artwork">No adult ads here</div></body></html>`
 
 	orig := roundTripFn
 	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		body := adultHTML
+		if strings.Contains(req.Host, "pixiv.net") {
+			body = cleanHTML
+		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header: http.Header{
 				"Content-Type":            []string{"text/html; charset=utf-8"},
 				"Content-Security-Policy": []string{"script-src 'self'"},
 			},
-			Body: io.NopCloser(strings.NewReader(upstreamHTML)),
+			Body: io.NopCloser(strings.NewReader(body)),
 		}, nil
 	}
 	defer func() { roundTripFn = orig }()
 
+	// 即使 cfg 中含有 upstream.json 规则，PAC 模式下 /proxy.pac 与原域名请求也完全与 upstream.json 解耦
 	engine := NewEngineWithOptions(EngineOptions{
-		Config:   &config.Config{},
+		Config: &config.Config{
+			Upstreams: config.UpstreamMap{
+				"dlsite.l.moonchan.xyz": {Host: "www.dlsite.com"},
+			},
+			BlockedHosts: []string{"https://fonts.googleapis.com"},
+		},
 		AdScript: adMgr,
 		Logger:   logMgr,
 	})
@@ -172,6 +183,9 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	if !strings.Contains(pacStr, "var GLOBAL_MODE = false;") || !strings.Contains(pacStr, `"missav.com":true`) {
 		t.Errorf("default PAC should include remote whitelist domain missav.com and GLOBAL_MODE=false, got: %s", pacStr)
 	}
+	if strings.Contains(pacStr, "dlsite") {
+		t.Errorf("PAC must not leak domains from upstream.json: %s", pacStr)
+	}
 
 	adMgr.SetAllMode(true)
 	recPACAll := httptest.NewRecorder()
@@ -183,6 +197,16 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	}
 	adMgr.SetAllMode(false)
 
+	// 1. 虽在白名单中但未检测到成人广告的页面（pixiv.net） -> 绝不插入广告！
+	recClean := httptest.NewRecorder()
+	reqClean := httptest.NewRequest(http.MethodGet, "https://pixiv.net/", nil)
+	reqClean.Host = "pixiv.net"
+	engine.ServeHTTP(recClean, reqClean)
+	if strings.Contains(recClean.Body.String(), "slimgather.com") || strings.Contains(recClean.Body.String(), "ech-proxy-ad-script") {
+		t.Errorf("whitelisted site WITHOUT adult ads must NOT have ads injected: %s", recClean.Body.String())
+	}
+
+	// 2. 真正检测到成人广告的页面（e-hentai.org 含 exoclick） -> 替换并插入自己的成人广告
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "https://e-hentai.org/", nil)
 	req.Host = "e-hentai.org"

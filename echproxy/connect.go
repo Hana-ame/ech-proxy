@@ -24,6 +24,7 @@ import (
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
 	"github.com/Hana-ame/ech-proxy/echproxy/logger"
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
+	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
 	"golang.org/x/net/http2"
 )
 
@@ -259,6 +260,7 @@ type ConnectOptions struct {
 	CertStore           *certstore.Store
 	PortalCert          *tls.Certificate
 	Config              *config.Config
+	AdScript            *rewrite.AdScriptManager
 	HTTPHandler         http.Handler
 }
 
@@ -293,7 +295,13 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	upstreams, blocked := opts.Config.Snapshot()
+
+	// upstream.json 严格只与 8443 方案有关，在 PAC 方案下不耦合 upstream.json 的 blocked_hosts / upstreams
+	var upstreams config.UpstreamMap
+	var blocked []string
+	if opts.AdScript == nil || config.IsPortalDomain(host) {
+		upstreams, blocked = opts.Config.Snapshot()
+	}
 	if err := checkConnectTarget(host, blocked, opts.AllowPrivateTargets); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
@@ -330,8 +338,10 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 	}
 
 	ipMode := opts.IPMode
-	if uc, exists := config.Resolve(upstreams, host); exists && uc.IPMode != "" {
-		ipMode = uc.IPMode
+	if len(upstreams) > 0 {
+		if uc, exists := config.Resolve(upstreams, host); exists && uc.IPMode != "" {
+			ipMode = uc.IPMode
+		}
 	}
 
 	clientConn, clientBuf, err := hj.Hijack()
@@ -553,8 +563,8 @@ type singleConnListener struct {
 }
 
 // newSingleConnListener 创建一个只接受单条连接的监听器。
-// done 通道用于让第二次 Accept 阻塞，直到该连接被关闭——
-// 否则 http.Server.Serve 会在第一次 Accept 后立即返回，导致调用方过早关闭连接。
+// done 通道让第二次 Accept 阻塞到该连接关闭为止——否则 http.Server.Serve
+// 会在第一次 Accept 后立即返回，调用方过早关闭连接导致客户端 reset。
 func newSingleConnListener(c net.Conn) net.Listener {
 	return &singleConnListener{conn: c, done: make(chan struct{})}
 }
@@ -574,8 +584,7 @@ func (l *singleConnListener) Close() error {
 	return nil
 }
 
-// closeNotifyConn 在底层连接关闭时关闭 done 通道，使 singleConnListener 阻塞的
-// 第二次 Accept 得以返回。
+// closeNotifyConn 在底层连接关闭时关闭 done，使阻塞中的第二次 Accept 返回。
 type closeNotifyConn struct {
 	net.Conn
 	done chan struct{}

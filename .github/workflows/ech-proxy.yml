@@ -30,7 +30,7 @@ jobs:
       - name: Run go vet and unit tests before packaging
         run: |
           go vet ./...
-          node --check certs/l.moonchan.xyz/ad_script.js
+          grep -q 'DefaultSiteHost = "4545810.xyz"' echproxy/netdial/netdial.go
           go test ./... -race
 
       - name: Build ech-proxy (Windows amd64)

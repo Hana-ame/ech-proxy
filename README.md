@@ -1,59 +1,46 @@
 # ech-proxy
 
-支持 **Windows 7 ~ 11 (32位 `386` / 64位 `amd64` / `arm64`) PAC 方式运行的本地 HTTP/HTTPS 代理**，提供系统托盘控制、本地 CA 一键安装与卸载、自动检查并下载 GitHub Releases 更新（退出后再次打开自动替换）、双 DoH 冗余解析、三种上游 GFW 绕过隧道、服务端回传证书核对与强行访问放行。
+支持 **Windows 7 ~ 11 (32位 `386` / 64位 `amd64` / `arm64`) PAC 方式运行的本地 HTTP/HTTPS 代理（Mainstream）**，提供系统托盘控制、PAC 原子替换与旧值 `pop` 恢复、本地 CA 一键安装与卸载、自动检查并下载 GitHub Releases 更新（退出后再次打开自动替换）、双 DoH 冗余解析、三种上游 GFW 绕过隧道、服务端回传证书核对与强行访问放行。
 
-## 一、 核心架构与工作流
+## 一、 三种运行方案与严格解耦边界
 
-1. **PAC 白名单劫持 (`https://4545810.xyz/pac.txt`)**：
-   - 启动后默认将系统代理配置为本地 PAC 脚本（`http://127.0.0.1:8443/proxy.pac`），仅劫持远程白名单 `https://4545810.xyz/pac.txt`（一行一个 domain）中的站点并转发到本地代理，其余流量全部 `DIRECT` 直连。
-   - 启动后**不自动打开任何门户网页**，门户功能完全独立，绝不影响 PAC HTTPS Proxy 主线。
-   - 在可执行文件名不包含 `.443.exe` 时，**严禁监听 443 端口，且 443 相关代码绝对不运行**。
-2. **本地 HTTPS CONNECT MITM 与 CA 管理**：
-   - 本地代理接收 `CONNECT` 请求后，使用本地自动生成的根证书（`ca/ca.pem`）按需签发目标域名证书。
-   - 托盘右键菜单与命令行同时提供 **一键安装本地 CA 根证书** 与 **卸载本地 CA 根证书** 选项。
-3. **双 DoH 解析与三种上游请求方式**：
-   - **首选 DoH**：`https://4545810.xyz/doh`
-   - **次选 DoH（自动故障回退）**：`https://1.1.1.1/dns-query`
-   - **三种上游绕过方式**：
-     1. **方式 1（SNI 伪装）**：通过 DoH 解析真实 IP + 伪装 SNI 请求 + 核对服务端回传证书是否与伪装前真实域名（`truedomain.com`）一致且未过期。
-     2. **方式 2（Cloudflare ECH）**：通过 DoH 解析域名与 ECH 公钥 + 使用加密 ClientHello 请求 + 核对服务端回传证书。
-     3. **方式 3（TLS 分片绕过 GFW）**：通过 DoH 解析真实 IP + 将 TLS ClientHello 按字节分片发送绕过 DPI + 核对服务端回传证书。
-4. **上游证书严格核对与「强行访问」按钮**：
-   - 比较真实访问域名 `truedomain.com` 与上游服务器回传的证书是否一致、是否过期。
-   - 若不一致则提示**域名不一致**，若过期则提示**证书已过期**，并提供带一次性防伪令牌的 **「强行访问」** 按钮。
-5. **源站广告拦截与广告商 `<script>` 插入**：
-   - 默认拦截并删除源站广告（可通过 `--skip-ad-block` 禁用）。
-   - 自动从 `https://4545810.xyz/ads.js` 拉取最新广告商代码（若不可达则使用内置 `slimgather.com` 与 `fussyreturn.com` 兜底），将每段广告代码放入独立的 `<script>...</script>` 标签中插入返回（可通过 `--skip-ad-script` 跳过）。
-   - 广告相关设置在系统托盘中隐藏，仅通过命令行参数控制。
-6. **自动检查更新与退出替换**：
-   - 启动后后台自动检查 `https://github.com/Hana-ame/ech-proxy/releases` 最新版的 `checksums.txt`，对比当前平台二进制 SHA-256（支持 `ech-proxy-windows-386.exe`、`ech-proxy-windows-amd64.exe`、`ech-proxy-windows-arm64.exe`、`ech-proxy-linux-386`、`ech-proxy-linux-amd64`、`ech-proxy-linux-arm64`、`ech-proxy-darwin-amd64`）。
-   - 发现新版后自动下载并校验 SHA-256，暂存为 `<exe>.new`，在程序退出后再次打开时自动完成替换（托盘菜单也提供手动「检查更新」选项）。
+1. **PAC 方案（默认主流 Mainstream，`ech-proxy.exe`）**：
+   - 启动后默认将系统代理原子替换为本地 PAC 脚本（`http://127.0.0.1:8443/proxy.pac?t=<ts>`），并将旧系统代理状态压栈（退出或 `Pop` 时自动 `pop` 恢复旧值）。
+   - 严格仅依据远程白名单 `https://4545810.xyz/pac.txt`（一行一个 domain，支持原子替换 `SwapWhitelist` 与旧值 `PopWhitelist`）生成 PAC 规则，**与 `upstream.json` 及 `certs/` 路径完全解耦**。
+   - 本地自签 CA 与动态签发的域名叶子证书统一存放在 `<dataDir>/ca/`（`ca/ca.pem`、`ca/leaves/`），绝不触碰 `certs/` 目录。
+2. **443 方案（仅当文件名匹配 `.*.443.exe` 时开启）**：
+   - **只与 `listen 443` 有关**：仅在可执行文件名匹配 `.*.443.exe` 时开启，严格仅监听 `443` 端口（不回退到 `8443`），其余所有功能（PAC、广告处理、8443 门户、系统代理、托盘、自动更新、CONNECT 隧道）一律不运行。
+   - 当文件名不匹配 `.*.443.exe` 时，严禁监听 443 端口且 443 方案绝不运行。
+3. **8443 方案（真实公网证书下发的代理，`upstream.json` + `certs/l.moonchan.xyz/`）**：
+   - `upstream.json` 与 `certs/` 路径（`certs/l.moonchan.xyz/fullchain.cer`、`privkey.pem`、`upstream.json`、`pixiv_cookie.txt`）**完全只与 8443 方案相关**。
+   - 在当前主流版本中，8443 方案单纯在后台协程中**静默非阻塞运行**（仅为了兼容性保留），即使拉取或解析报错也完全静默忽略，绝不影响其他功能，且绝不阻塞主线代码。
 
-## 二、 命令行 Flag 一览
+## 二、 成人广告检测、拦截与替换规则（仅 PAC 方案）
+
+- **远程开关 `DefaultOnURL = "https://4545810.xyz/on.txt"`**：
+  - 拉取 `on.txt` 失败时自动重试 **2 次**（共尝试 3 次）；若重试 2 次之后仍然失败，**直接置 `on`（开启显示广告，instead of 不显示）**。
+- **远程屏蔽表 `DefaultBlocklistURL = "https://4545810.xyz/block.json"`**：
+  - 兼容 **JSON 数组/对象**、**EasyList `||domain^`**、**`##selector`** 与 **HOSTS (`0.0.0.0` / `127.0.0.1`)** 格式。
+  - 与 `certs/` 路径完全解耦（不依赖 `certs/l.moonchan.xyz/block.json`），拉取失败时使用内存内置规则兜底。
+- **严格仅在真正检测到成人广告时才替换插入**：
+  - **只有真正抓到/检测到网页中包含成人广告内容时**，才在该页面执行替换（剥离原成人广告并插入来自 `https://4545810.xyz/ads.js` 或内置兜底的成人广告 `<script>` 标签）。
+  - **如果未检测到成人广告内容**（即使站点在 `pac.txt` 白名单中或开启了 `-all` 全局模式），**绝不修改页面、绝不插入广告**。
+
+## 三、 命令行 Flag 一览
 
 | Flag / 子命令 | 说明 |
 | :--- | :--- |
 | `-4` | 强制 v4 出口（IPv4 only，默认开启） |
 | `-6` | 强制 v6 出口（IPv6 only） |
 | `-dual` | 双端出口（IPv4 + IPv6 双栈自动优选） |
-| `-all` | 开启全局模式（无视 `pac.txt` 白名单，所有网站均通过 `ech-proxy` 代理；**仅命令行 `-all` 可开启**，不在托盘中显示） |
+| `-all` | 开启全局模式（无视 `pac.txt` 白名单，所有网站均通过 `ech-proxy` 代理；仅命令行 `-all` 可开启，不在托盘中显示） |
 | `--skip-ad-script` | 跳过插入广告商 JS（`<script>...</script>`）的步骤 |
-| `--skip-ad-block` | 禁止拦截/移除源站原始广告 |
+| `--skip-ad-block` | 禁止拦截/移除源站原始成人广告 |
+| `-whitelist-url` | 自定义 `pac.txt` 地址（默认 `https://4545810.xyz/pac.txt`） |
+| `-blocklist-url` | 自定义 `block.json` 地址（默认 `https://4545810.xyz/block.json`） |
+| `-on-url` | 自定义 `on.txt` 地址（默认 `https://4545810.xyz/on.txt`） |
+| `-ad-script-url` | 自定义 `ads.js` 地址（默认 `https://4545810.xyz/ads.js`） |
 | `ca install` / `-ca-install` | 一键安装本地 CA 根证书到受信任根证书库 |
 | `ca uninstall` / `-ca-uninstall` | 一键从受信任根证书库卸载本地 CA 根证书 |
 | `update` / `-update` | 立即检查并下载 GitHub Releases 最新版本 |
 | `help` / `-h` | 打印完整命令行 Flag 一览 |
-
-## 三、 系统托盘右键菜单
-
-- **显示 / 隐藏控制台 (双击托盘图标)**
-- **系统代理：自动配置 PAC 模式 (推荐)**
-- **系统代理：清除 / 禁用系统代理 (直连)**
-- **强制 v4 出口** / **强制 v6 出口** / **双端出口**
-- **一键安装本地 CA 根证书 (Install CA)**
-- **卸载本地 CA 根证书 (Uninstall CA)**
-- **检查更新 (Check Update)**
-- **反馈 (`https://chatto.moonchan.xyz`)**
-- **复制 PAC 地址 (Copy PAC URL)**
-- **打开本地日志目录 (问题排查/上传日志)**
-- **退出程序并清理系统代理 (Exit)**

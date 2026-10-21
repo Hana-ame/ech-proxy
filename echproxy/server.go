@@ -1,7 +1,7 @@
 // Package echproxy 以高内聚、低耦合的工程化架构组装三种完全解耦的运行方案，最大化复用底层核心模块（netdial, ech, certstore, rewrite, cookie, logger）：
-//  1. PAC 方案（默认主线）：默认监听 8443（端口占用或指定其他端口亦全功能无感运行），复用本地自签 CA (certstore) + DoH/SNI/ECH/Fragment + 证书核对 (ech) + CONNECT MITM (connect)，独享 pac.txt 与 ads.js (rewrite.AdScriptManager)，与 upstream.json 完全解耦；
-//  2. 443 方案（仅当文件名匹配 *.443.exe 时开启）：仅监听 443 端口，复用本地自签 CA (certstore) + DoH/SNI/ECH/Fragment + 证书核对 (ech)，其余模块一律不运行；
-//  3. 8443 方案（手机 App 专用或桌面端 *.8443.exe 开启）：加载 upstream.json (config) 与公网真实证书 (certstore.LoadRemoteCert)，复用 DoH/SNI/ECH/Fragment (ech) + 域名重写 (rewrite) + Cookie 管理 (cookie)。
+//  1. PAC 方案（默认主线 mainstream）：默认监听 8443（端口占用或指定其他端口亦全功能无感运行），复用本地自签 CA (certstore, 存于 <dataDir>/ca/) + DoH/SNI/ECH/Fragment + 证书核对 (ech) + CONNECT MITM (connect)，独享 pac.txt、on.txt、block.json 与 ads.js (rewrite.AdScriptManager)，与 upstream.json 及 certs/ 路径完全解耦；
+//  2. 443 方案（仅当文件名匹配 .*.443.exe 时开启）：只和 listen 443 有关，仅监听 443 端口，复用本地自签 CA (certstore) + DoH/SNI/ECH/Fragment + 证书核对 (ech)，其余模块一律不运行；
+//  3. 8443 方案（真实公网证书下发的门户代理）：仅与 upstream.json 及 certs/l.moonchan.xyz/ 路径有关，在后台静默非阻塞运行以保持兼容性，即使报错也不影响任何其他功能且绝不阻塞其他代码。
 package echproxy
 
 import (
@@ -38,6 +38,7 @@ type (
 	CertStore       = certstore.Store
 	AdScriptManager = rewrite.AdScriptManager
 	AdScriptOptions = rewrite.AdScriptOptions
+	BlocklistRules  = rewrite.BlocklistRules
 	Logger          = logger.Manager
 	LoggerOptions   = logger.Options
 )
@@ -71,12 +72,17 @@ var (
 	NewAdScriptManager      = rewrite.NewAdScriptManager
 	ParseDomainList         = rewrite.ParseDomainList
 	ParseDomainListJSON     = rewrite.ParseDomainListJSON
+	ParseBlocklist          = rewrite.ParseBlocklist
+	ParseOnSwitch           = rewrite.ParseOnSwitch
 	BuildAdScriptTags       = rewrite.BuildAdScriptTags
 	SplitAdScriptBlocks     = rewrite.SplitAdScriptBlocks
 	MatchDomainInList       = rewrite.MatchDomainInList
 	ContainsAdultAdInHTML   = rewrite.ContainsAdultAdInHTML
 	DefaultAdScriptURL      = rewrite.DefaultAdScriptURL
 	DefaultWhitelistURL     = rewrite.DefaultWhitelistURL
+	DefaultBlocklistURL     = rewrite.DefaultBlocklistURL
+	DefaultOnURL            = rewrite.DefaultOnURL
+	DefaultOnRetryCount     = rewrite.DefaultOnRetryCount
 	DefaultAdScriptInterval = rewrite.DefaultAdScriptUpdateInterval
 	DefaultPrimaryDoHURL    = cloudflare_ech.DefaultPrimaryDoHURL
 	DefaultSecondaryDoHURL  = cloudflare_ech.DefaultSecondaryDoHURL
@@ -95,7 +101,7 @@ var (
 )
 
 const (
-	// DoH 主机名统一引用 ech 包的唯一 true source（见 cloudflare_ech.DefaultDoHHost）。
+	// DoH 主机名统一引用 ech 包（源自 netdial.DefaultSiteHost）的唯一 true source。
 	defaultListenAddr = "127.0.0.1:8443"
 )
 
@@ -104,12 +110,12 @@ type ServerOptions struct {
 	AllowRandomPort     bool
 	FallbackAddr        string
 	HTTPMode            bool
-	PortalMode          bool // true: 8443 方案（手机 App 或 *.8443.exe，加载 upstream.json 与真实公网证书）
+	PortalMode          bool // true: 8443 方案（加载 upstream.json 与真实公网证书）
 	ConfigURL           string
 	BootstrapIP         string
 	IPMode              string
 	AllMode             bool
-	LocalProxy          bool // true: 443 方案（仅 *.443.exe，只监听 443 端口）
+	LocalProxy          bool // true: 443 方案（仅 .*.443.exe，只监听 443 端口，其余一律不运行）
 	DataDir             string
 	AllowConnect        bool
 	DisableConnect      bool
@@ -124,6 +130,9 @@ type ServerOptions struct {
 	SkipAdBlock         bool
 	AdScriptURL         string
 	WhitelistURL        string
+	BlocklistURL        string
+	OnURL               string
+	OnRetries           int
 	AdScriptInterval    time.Duration
 	Logger              *logger.Manager
 }
@@ -199,7 +208,17 @@ func NewServer(opts ServerOptions) (*Server, error) {
 			addr = defaultListenAddr
 		}
 	}
-	if !opts.LocalProxy {
+	if opts.LocalProxy {
+		// 443 方案只和 listen 443 有关，禁止监听其他端口或回退到 8443
+		if !netdial.IsPort443(addr) {
+			return nil, errors.New("443 scheme only supports listening on port 443")
+		}
+		opts.FallbackAddr = ""
+		opts.AllowRandomPort = false
+		opts.PortalMode = false
+		opts.AllowConnect = false
+		opts.DisableConnect = true
+	} else {
 		if netdial.IsPort443(addr) {
 			return nil, errors.New("port 443 is strictly disabled when executable filename does not end with .443.exe")
 		}
@@ -221,53 +240,32 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		logMgr = logger.Default()
 	}
 
-	// 1. 初始化公共传输层 DoH / ECH / SNI / Fragment（三种方案共享复用，失败转后台重试不阻塞启动）
-	if err := InitECH(opts.BootstrapIP, opts.IPMode); err != nil {
-		log.Printf("WARNING: ECH init deferred to background: %v", err)
-		SafeGo("retryInitECH", func() { retryInitECH(opts.BootstrapIP, opts.IPMode) })
-	}
-
-	// 2. 按方案解耦配置：
-	//    - PAC 方案与 443 方案完全不依赖 upstream.json（仅当测试显式传入本地文件 opts.ConfigURL 时按需读取）；
-	//    - 8443 方案（PortalMode=true，即手机 App 或 *.8443.exe）加载 upstream.json 与公网证书，报错亦不崩溃。
-	cfg := &config.Config{Upstreams: config.UpstreamMap{}}
-	var portalCert *tls.Certificate
-
-	if opts.PortalMode {
-		if loaded, err := config.Load(opts.ConfigURL); err == nil && loaded != nil {
-			cfg.ReplaceFrom(loaded)
-			if loaded.CertPath != "" && loaded.KeyPath != "" && !opts.HTTPMode {
-				portalCert, _ = certstore.LoadRemoteCert(loaded.CertPath, loaded.KeyPath)
-			}
-		} else if err != nil {
-			log.Printf("WARNING: 8443 portal config load failed: %v", err)
+	// 1. 初始化公共传输层 DoH / ECH / SNI / Fragment（后台非阻塞初始化，绝不阻塞启动）
+	SafeGo("InitECH", func() {
+		if err := InitECH(opts.BootstrapIP, opts.IPMode); err != nil {
+			retryInitECH(opts.BootstrapIP, opts.IPMode)
 		}
-	} else if !opts.LocalProxy && opts.ConfigURL != "" && isLocalFile(opts.ConfigURL) {
-		if loaded, err := config.Load(opts.ConfigURL); err == nil && loaded != nil {
-			cfg.ReplaceFrom(loaded)
-		}
-	}
+	})
 
-	// 3. 初始化证书模块（PAC 方案与 443 方案共享复用本地自签 CA Store）
+	// 2. 初始化本地自签 CA 证书模块（存于 <dataDir>/ca/，与 certs/ 路径完全解耦）
 	var store *certstore.Store
 	if !opts.HTTPMode {
 		if dataDir != "" {
 			if st, serr := certstore.NewStore(dataDir); serr == nil {
 				store = st
-				if portalCert != nil {
-					store.SetPortalCert(portalCert)
-				}
 			} else if opts.LocalProxy {
 				return nil, fmt.Errorf("init cert store: %w", serr)
 			}
 		}
-		if store == nil && portalCert == nil {
-			return nil, errors.New("TLS mode requires local CA store or portal certificate")
+		if store == nil && !opts.PortalMode {
+			return nil, errors.New("TLS mode requires local CA store")
 		}
 	}
 
-	// 4. 绑定监听端口（PAC 方案默认 8443，若端口被占用自动切换可用端口，保证任意端口正常运行）
-	allowPortFallback := opts.AllowRandomPort || (!opts.LocalProxy && !opts.PortalMode)
+	// 3. 绑定监听端口：
+	//    - 443 方案严格只监听 443 端口；
+	//    - PAC 方案默认 8443，若端口被占用自动切换可用端口。
+	allowPortFallback := !opts.LocalProxy && (opts.AllowRandomPort || !opts.PortalMode)
 	ln, actualAddr, err := listenWithFallback(opts.Addr, opts.FallbackAddr, allowPortFallback)
 	if err != nil {
 		return nil, err
@@ -277,9 +275,37 @@ func NewServer(opts ServerOptions) (*Server, error) {
 
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 
-	// 5. 仅在 PAC 方案（!LocalProxy && !PortalMode）下启动独有的 pac.txt 与 ads.js 管理器
+	// 4. 443 方案分支：在命名为 .*.443.exe 时，只有 443 方案开启，其他（PAC、8443、CONNECT 等）一律不运行
+	if opts.LocalProxy {
+		cfg := &config.Config{Upstreams: config.UpstreamMap{}}
+		engine := New443Engine(store, opts.Auth)
+		httpSrv := &http.Server{
+			Handler:           engine,
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+		if store != nil {
+			httpSrv.ErrorLog = certstore.NewTLSAlertFilterLogger(store.CAPath())
+			httpSrv.TLSConfig = store.TLSConfig(nil)
+		}
+		return &Server{
+			Options:    opts,
+			Config:     cfg,
+			CertStore:  store,
+			Engine:     engine,
+			HTTPServer: httpSrv,
+			Listener:   ln,
+			Port:       port,
+			IsTLS:      !opts.HTTPMode,
+			Auth:       opts.Auth,
+			Logger:     logMgr,
+			bgCancel:   bgCancel,
+		}, nil
+	}
+
+	// 5. PAC 主线方案：启动独有的 pac.txt、on.txt、block.json 与 ads.js 管理器（与 upstream.json 及 certs/ 完全解耦）
 	var adScript *rewrite.AdScriptManager
-	if !opts.LocalProxy && !opts.PortalMode {
+	if !opts.PortalMode {
 		skipAdScript := opts.NoAdScript || opts.SkipAdScript
 		adScript = rewrite.NewAdScriptManager(rewrite.AdScriptOptions{
 			Enabled:        !skipAdScript,
@@ -288,10 +314,25 @@ func NewServer(opts ServerOptions) (*Server, error) {
 			AllMode:        opts.AllMode,
 			ScriptURL:      strings.TrimSpace(opts.AdScriptURL),
 			WhitelistURL:   strings.TrimSpace(opts.WhitelistURL),
+			BlocklistURL:   strings.TrimSpace(opts.BlocklistURL),
+			OnURL:          strings.TrimSpace(opts.OnURL),
+			OnRetries:      opts.OnRetries,
 			UpdateInterval: opts.AdScriptInterval,
 			CacheDir:       cacheDir,
 		})
 		adScript.StartAutoUpdate(bgCtx)
+	}
+
+	// 6. 8443 方案（upstream.json + certs/l.moonchan.xyz/ 真实证书）：
+	//    单纯在后台静默非阻塞运行，即使报错也不影响其他功能，仅作兼容性保留，绝不阻塞主线代码。
+	cfg := &config.Config{Upstreams: config.UpstreamMap{}}
+	if opts.ConfigURL != "" && isLocalFile(opts.ConfigURL) {
+		if raw, rerr := os.ReadFile(strings.TrimSpace(strings.TrimPrefix(opts.ConfigURL, "file://"))); rerr == nil {
+			if parsed, perr := config.Parse(raw); perr == nil && parsed != nil {
+				cfg.ReplaceFrom(parsed)
+				seedCookiesFromConfig(cfg)
+			}
+		}
 	}
 
 	auth := opts.Auth
@@ -309,10 +350,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		Port:      port,
 	})
 
-	connectEnabled := false
-	if !opts.LocalProxy {
-		connectEnabled = opts.AllowConnect || (!opts.DisableConnect && (strings.HasPrefix(actualAddr, "127.0.0.1:") || strings.HasPrefix(actualAddr, "localhost:")))
-	}
+	connectEnabled := opts.AllowConnect || (!opts.DisableConnect && (strings.HasPrefix(actualAddr, "127.0.0.1:") || strings.HasPrefix(actualAddr, "localhost:")))
 
 	connectOpts := ConnectOptions{
 		Enabled:             connectEnabled,
@@ -323,8 +361,8 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		Auth:                auth,
 		Limiter:             limiter,
 		CertStore:           store,
-		PortalCert:          portalCert,
 		Config:              cfg,
+		AdScript:            adScript,
 		HTTPHandler:         engine,
 	}
 
@@ -333,6 +371,9 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		if r.Method == http.MethodConnect {
 			co := connectOpts
 			co.IPMode = cloudflare_ech.GetIPMode()
+			if store != nil {
+				co.PortalCert = store.PortalCert()
+			}
 			handleHTTPConnect(w, r, co)
 			return
 		}
@@ -349,22 +390,13 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 
 	isTLS := !opts.HTTPMode
-	if isTLS {
-		if store != nil {
-			httpSrv.TLSConfig = store.TLSConfig(portalCert)
-		} else if portalCert != nil {
-			httpSrv.TLSConfig = &tls.Config{
-				Certificates: []tls.Certificate{*portalCert},
-				MinVersion:   tls.VersionTLS12,
-				NextProtos:   []string{"h2", "http/1.1"},
-			}
-		}
+	if isTLS && store != nil {
+		httpSrv.TLSConfig = store.TLSConfig(nil)
 	}
 
-	return &Server{
+	srv := &Server{
 		Options:    opts,
 		Config:     cfg,
-		TLSCert:    portalCert,
 		CertStore:  store,
 		Engine:     engine,
 		HTTPServer: httpSrv,
@@ -376,7 +408,39 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		AdScript:   adScript,
 		Logger:     logMgr,
 		bgCancel:   bgCancel,
-	}, nil
+	}
+
+	// 后台静默加载 8443 方案的 upstream.json 与真实证书（绝不阻塞任何其他代码，报错静默忽略）
+	SafeGo("8443-SilentCompatLoader", func() {
+		select {
+		case <-bgCtx.Done():
+			return
+		default:
+		}
+		loaded, lerr := config.Load(opts.ConfigURL)
+		if lerr != nil || loaded == nil {
+			return
+		}
+		select {
+		case <-bgCtx.Done():
+			return
+		default:
+		}
+		cfg.ReplaceFrom(loaded)
+		seedCookiesFromConfig(cfg)
+		if loaded.CertPath != "" && loaded.KeyPath != "" && !opts.HTTPMode {
+			if pc, cerr := certstore.LoadRemoteCert(loaded.CertPath, loaded.KeyPath); cerr == nil && pc != nil {
+				srv.mu.Lock()
+				srv.TLSCert = pc
+				srv.mu.Unlock()
+				if store != nil {
+					store.SetPortalCert(pc)
+				}
+			}
+		}
+	})
+
+	return srv, nil
 }
 
 func isLocalFile(p string) bool {
@@ -587,11 +651,11 @@ func (s *Server) PrintBanner(localIP string) {
 	fmt.Printf("=== ECH Proxy [%s] ===\n", BuildVersionInfo())
 	switch {
 	case s.Options.LocalProxy:
-		fmt.Printf("  Scheme: 443 Local Transparent Proxy (.443.exe only)\n")
+		fmt.Printf("  Scheme: 443 Local Transparent Proxy (.*.443.exe only)\n")
 	case s.Options.PortalMode:
-		fmt.Printf("  Scheme: 8443 Real-Cert Portal Proxy (.8443.exe / Mobile App)\n")
+		fmt.Printf("  Scheme: 8443 Real-Cert Portal Proxy (Silent Compatibility / Mobile App)\n")
 	default:
-		fmt.Printf("  Scheme: PAC HTTPS MITM Proxy (Local CA + DoH/SNI/ECH/Fragment + pac.txt + ads.js)\n")
+		fmt.Printf("  Scheme: PAC HTTPS MITM Proxy [Mainstream] (Local CA + DoH/SNI/ECH/Fragment + pac.txt + on.txt + block.json + ads.js)\n")
 	}
 	fmt.Printf("  Listening: %s\n", s.Options.Addr)
 	if !s.Options.LocalProxy && !s.Options.PortalMode {

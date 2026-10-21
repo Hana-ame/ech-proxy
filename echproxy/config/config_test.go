@@ -109,7 +109,7 @@ func TestTopLevelIPModeInheritanceAndNormalization(t *testing.T) {
 	}
 }
 
-func TestGenerateAndManageHostsAndPAC(t *testing.T) {
+func TestGenerateAndManageHostsAndPACDecoupledFromUpstreamJSON(t *testing.T) {
 	raw := []byte(`{
 		"upstreams": {
 			"dlsite.l.moonchan.xyz": {
@@ -151,10 +151,18 @@ func TestGenerateAndManageHostsAndPAC(t *testing.T) {
 		t.Errorf("RemoveHostsBlock did not cleanly restore hosts:\n%s", string(afterRemove))
 	}
 
-	pac := GeneratePAC(cfg, "127.0.0.1:8443", false)
+	// 验证 GeneratePAC 与 upstream.json (cfg) 完全解耦：
+	// 即使传入非空 cfg，只要未传入 pac.txt 白名单，绝不从 upstream.json 生成任何域名规则！
+	pacEmpty := GeneratePAC(cfg, "127.0.0.1:8443", false)
+	if strings.Contains(pacEmpty, "dlsite.com") || strings.Contains(pacEmpty, "pximg.net") || strings.Contains(pacEmpty, "moonchan.xyz") {
+		t.Errorf("GeneratePAC must be completely decoupled from upstream.json (cfg), got:\n%s", pacEmpty)
+	}
+
+	// 传入 pac.txt 白名单时，严格仅生成 pac.txt 中的域名规则
+	pacWithWL := GeneratePAC(nil, "127.0.0.1:8443", false, []string{"i.pximg.net", "dlsite.com"})
 	for _, want := range []string{`PROXY 127.0.0.1:8443; DIRECT`, `"i.pximg.net":true`, `".dlsite.com"`} {
-		if !strings.Contains(pac, want) {
-			t.Errorf("GeneratePAC missing %q:\n%s", want, pac)
+		if !strings.Contains(pacWithWL, want) {
+			t.Errorf("GeneratePAC missing %q:\n%s", want, pacWithWL)
 		}
 	}
 }

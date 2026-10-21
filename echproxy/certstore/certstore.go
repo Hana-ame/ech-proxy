@@ -1,6 +1,6 @@
 // Package certstore 提供高内聚的 TLS 证书管理组件（供 PAC 方案、443 方案与 8443 方案按需复用）：
-//   - 本地自签 CA + 动态通配符叶子证书签发（Store，供 PAC 方案与 443 方案共享复用）；
-//   - 公网真实证书加载（LoadRemoteCert，供 8443 门户方案使用）。
+//   - 本地自签 CA + 动态通配符叶子证书签发（Store，供 PAC 方案与 443 方案共享复用，存储于 <dataDir>/ca/ 下，与 certs/ 完全解耦）；
+//   - 公网真实证书加载（LoadRemoteCert，仅供 8443 门户方案使用，certs/ 路径完全与 8443 方案相关）。
 package certstore
 
 import (
@@ -29,7 +29,7 @@ import (
 const (
 	caCertName        = "ca.pem"
 	caKeyName         = "ca.key"
-	certsDir          = "certs"
+	leavesSubDir      = "leaves"
 	leafCertFile      = "fullchain.pem"
 	leafKeyFile       = "privkey.pem"
 	caValidDuration   = 10 * 365 * 24 * time.Hour
@@ -48,23 +48,42 @@ var multiPartPublicSuffixes = map[string]bool{
 	"com.sg": true, "com.my": true, "co.nz": true, "com.br": true,
 }
 
+// LoadRemoteCert 加载 8443 方案专属的公网真实证书（远端拉取失败时可静默回退至本地 certs/l.moonchan.xyz/）。
 func LoadRemoteCert(certPath, keyPath string) (*tls.Certificate, error) {
 	if certPath == "" || keyPath == "" {
 		return nil, errors.New("missing cert_path or key_path in config")
 	}
 	certPEM, err := netdial.FetchBytes(certPath)
 	if err != nil {
-		return nil, fmt.Errorf("fetch certificate: %w", err)
+		certPEM = readFallback8443File("fullchain.cer")
+		if len(certPEM) == 0 {
+			return nil, fmt.Errorf("fetch certificate: %w", err)
+		}
 	}
 	keyPEM, err := netdial.FetchBytes(keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("fetch key: %w", err)
+		keyPEM = readFallback8443File("privkey.pem")
+		if len(keyPEM) == 0 {
+			return nil, fmt.Errorf("fetch key: %w", err)
+		}
 	}
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
 		return nil, fmt.Errorf("parse certificate key pair: %w", err)
 	}
 	return &cert, nil
+}
+
+func readFallback8443File(name string) []byte {
+	for _, cand := range []string{
+		filepath.Join("certs", "l.moonchan.xyz", name),
+		filepath.Join("..", "certs", "l.moonchan.xyz", name),
+	} {
+		if b, err := os.ReadFile(cand); err == nil && len(b) > 0 {
+			return b
+		}
+	}
+	return nil
 }
 
 type CA struct {
@@ -89,6 +108,15 @@ func (st *Store) SetPortalCert(cert *tls.Certificate) {
 	st.mu.Lock()
 	st.portalCert = cert
 	st.mu.Unlock()
+}
+
+func (st *Store) PortalCert() *tls.Certificate {
+	if st == nil {
+		return nil
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.portalCert
 }
 
 func DefaultDataDir() (string, error) {
@@ -243,8 +271,12 @@ func certGroupingDomain(host string) string {
 	return strings.Join(labels[1:], ".")
 }
 
+func (st *Store) leafDir(domain string) string {
+	return filepath.Join(st.DataDir, "ca", leavesSubDir, sanitizeDomain(domain))
+}
+
 func (st *Store) loadLeaf(domain string) (*tls.Certificate, error) {
-	dir := filepath.Join(st.DataDir, certsDir, sanitizeDomain(domain))
+	dir := st.leafDir(domain)
 	certPEM, err := os.ReadFile(filepath.Join(dir, leafCertFile))
 	if err != nil {
 		return nil, err
@@ -291,7 +323,7 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(st.DataDir, certsDir, sanitizeDomain(domain))
+	dir := st.leafDir(domain)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}

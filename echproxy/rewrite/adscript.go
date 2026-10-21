@@ -20,13 +20,24 @@ import (
 
 const (
 	// DefaultAdScriptURL 是 PAC 方案专属的远程广告商脚本（ads.js）默认地址（失败自动使用内置 fallback）。
-	// 域名来自 netdial.DefaultSiteHost（唯一 true source）。
 	DefaultAdScriptURL = "https://" + netdial.DefaultSiteHost + "/ads.js"
 
 	// DefaultWhitelistURL 是 PAC 方案专属的远程白名单（pac.txt，一行一个 domain）默认地址（失败 fallback = []）。
 	DefaultWhitelistURL = "https://" + netdial.DefaultSiteHost + "/pac.txt"
 
-	// DefaultAdScriptUpdateInterval 是远程 ads.js 与 pac.txt 后台自动检查更新周期（30 分钟）。
+	// DefaultBlocklistURL 是 PAC 方案专属的远程广告屏蔽规则（block.json）默认地址：
+	//   - 兼容 JSON 数组/对象、EasyList ||domain^、##selector、HOSTS 格式；
+	//   - 与 certs/ 路径完全解耦（certs/ 完全只与 8443 方案相关），拉取失败使用内存内置规则兜底。
+	DefaultBlocklistURL = "https://" + netdial.DefaultSiteHost + "/block.json"
+
+	// DefaultOnURL 是 PAC 方案专属的远程广告开关（on.txt）默认地址：
+	//   - 对 on.txt 重试 2 次之后若仍失败，直接置 on（即开启显示广告，instead of 不显示）。
+	DefaultOnURL = "https://" + netdial.DefaultSiteHost + "/on.txt"
+
+	// DefaultOnRetryCount 是拉取 on.txt 失败后的重试次数（重试 2 次，即最多尝试 3 次；仍失败直接置 on）。
+	DefaultOnRetryCount = 2
+
+	// DefaultAdScriptUpdateInterval 是远程配置后台自动检查更新周期（30 分钟）。
 	DefaultAdScriptUpdateInterval = 30 * time.Minute
 
 	maxAdScriptBytes   = 2 << 20
@@ -60,6 +71,17 @@ var DefaultAdultAdSignatures = []string{
 	`class="adult-ad"`, `id="adult-ad"`,
 }
 
+var DefaultAdBlockSelectors = []string{
+	".exo-native-widget", "[data-exo-zone]", "[id^='exo_']", "[class*='exo-ad']",
+	"[data-juicyads]", "ins.adsbyjuicy", "[data-trafficjunky]", "[class*='trafficjunky']",
+	"[data-ero-ad]", "[id^='ero_ad']", "[data-adult-ad]", ".adult-ad", "#adult-ad",
+	"iframe[src*='exoclick']", "iframe[src*='exosrv']", "iframe[src*='magsrv']",
+	"iframe[src*='realsrv']", "iframe[src*='juicyads']", "iframe[src*='jads.co']",
+	"iframe[src*='trafficjunky']", "iframe[src*='ero-advertising']",
+	"iframe[src*='tsyndicate']", "iframe[src*='trafficstars']", "iframe[src*='plugrush']",
+	"ins.adsbygoogle", "[id^='div-gpt-ad']", "[id^='google_ads_iframe']",
+}
+
 const BuiltInAdScript = `// ad1
 (function(augj){
 var d = document,
@@ -86,6 +108,231 @@ l.parentNode.insertBefore(s, l);
 `
 
 const defaultOriginalAdBlockStyle = `<style id="ech-proxy-adblock-style">.exo-native-widget,[data-exo-zone],[id^='exo_'],[class*='exo-ad'],[data-juicyads],ins.adsbyjuicy,[data-trafficjunky],[class*='trafficjunky'],[data-ero-ad],[id^='ero_ad'],[data-adult-ad],.adult-ad,#adult-ad,iframe[src*='exoclick'],iframe[src*='exosrv'],iframe[src*='magsrv'],iframe[src*='realsrv'],iframe[src*='juicyads'],iframe[src*='jads.co'],iframe[src*='trafficjunky'],iframe[src*='ero-advertising'],iframe[src*='tsyndicate'],iframe[src*='trafficstars'],iframe[src*='plugrush'],ins.adsbygoogle,[id^='div-gpt-ad'],[id^='google_ads_iframe']{display:none!important;visibility:hidden!important;height:0!important;max-height:0!important;overflow:hidden!important;pointer-events:none!important;}</style>`
+
+// BlocklistRules 表示从 block.json 解析出的广告拦截规则集合（与 certs/ 完全解耦）。
+type BlocklistRules struct {
+	Domains     []string `json:"domains,omitempty"`
+	BlockedURLs []string `json:"blocked_urls,omitempty"`
+	Selectors   []string `json:"selectors,omitempty"`
+}
+
+func isHTMLOrXMLErrorPage(trimmed []byte) bool {
+	headLen := len(trimmed)
+	if headLen > 64 {
+		headLen = 64
+	}
+	head := strings.ToLower(string(trimmed[:headLen]))
+	for _, p := range []string{"<!doctype", "<html", "<?xml", "<head", "<body"} {
+		if strings.HasPrefix(head, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseOnSwitch 解析远程 on.txt 内容：
+//   - "1", "true", "on", "yes", "enable", "enabled" -> true
+//   - "0", "false", "off", "no", "disable", "disabled" -> false
+//   - 空内容、HTML 错误页或未知值返回 error（供上层重试 2 次后直接置 on）。
+func ParseOnSwitch(raw []byte) (bool, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || len(trimmed) > 4096 {
+		return false, fmt.Errorf("empty or oversized on.txt (len=%d)", len(trimmed))
+	}
+	if isHTMLOrXMLErrorPage(trimmed) {
+		return false, fmt.Errorf("invalid on.txt: received HTML/XML error page")
+	}
+	for _, line := range strings.Split(strings.ReplaceAll(string(trimmed), "\r\n", "\n"), "\n") {
+		s := strings.TrimSpace(line)
+		if s == "" || strings.HasPrefix(s, "//") || strings.HasPrefix(s, "#") {
+			continue
+		}
+		if idx := strings.Index(s, "//"); idx >= 0 {
+			s = strings.TrimSpace(s[:idx])
+		}
+		if idx := strings.IndexByte(s, '#'); idx >= 0 {
+			s = strings.TrimSpace(s[:idx])
+		}
+		switch strings.ToLower(s) {
+		case "1", "true", "on", "yes", "enable", "enabled":
+			return true, nil
+		case "0", "false", "off", "no", "disable", "disabled":
+			return false, nil
+		default:
+			return false, fmt.Errorf("unrecognized on.txt value: %q", s)
+		}
+	}
+	return false, fmt.Errorf("no valid switch token in on.txt")
+}
+
+// ParseBlocklist 解析远程 block.json 规则（兼容 JSON 数组/对象、EasyList ||domain^、##selector、HOSTS 格式）。
+func ParseBlocklist(raw []byte) (BlocklistRules, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || len(trimmed) > maxDomainJSONBytes {
+		return BlocklistRules{}, fmt.Errorf("empty or oversized blocklist (len=%d)", len(trimmed))
+	}
+	if isHTMLOrXMLErrorPage(trimmed) {
+		return BlocklistRules{}, fmt.Errorf("invalid blocklist: received HTML/XML error page")
+	}
+
+	var entries []string
+	var explicitSelectors []string
+
+	if trimmed[0] == '[' {
+		if err := json.Unmarshal(trimmed, &entries); err != nil {
+			return BlocklistRules{}, fmt.Errorf("invalid block.json array: %w", err)
+		}
+	} else if trimmed[0] == '{' {
+		var obj struct {
+			Domains      []string `json:"domains"`
+			Hosts        []string `json:"hosts"`
+			BlockedHosts []string `json:"blocked_hosts"`
+			BlockedURLs  []string `json:"blocked_urls"`
+			URLs         []string `json:"urls"`
+			Rules        []string `json:"rules"`
+			Blocklist    []string `json:"blocklist"`
+			Ads          []string `json:"ads"`
+			Selectors    []string `json:"selectors"`
+			CSS          []string `json:"css"`
+			Elements     []string `json:"elements"`
+		}
+		if err := json.Unmarshal(trimmed, &obj); err != nil {
+			return BlocklistRules{}, fmt.Errorf("invalid block.json object: %w", err)
+		}
+		entries = append(entries, obj.Domains...)
+		entries = append(entries, obj.Hosts...)
+		entries = append(entries, obj.BlockedHosts...)
+		entries = append(entries, obj.BlockedURLs...)
+		entries = append(entries, obj.URLs...)
+		entries = append(entries, obj.Rules...)
+		entries = append(entries, obj.Blocklist...)
+		entries = append(entries, obj.Ads...)
+		explicitSelectors = append(explicitSelectors, obj.Selectors...)
+		explicitSelectors = append(explicitSelectors, obj.CSS...)
+		explicitSelectors = append(explicitSelectors, obj.Elements...)
+	} else {
+		entries = strings.Split(strings.ReplaceAll(string(trimmed), "\r\n", "\n"), "\n")
+	}
+
+	domainSeen := make(map[string]bool)
+	urlSeen := make(map[string]bool)
+	selSeen := make(map[string]bool)
+	var out BlocklistRules
+
+	addDomain := func(d string) {
+		norm := netdial.NormalizeDomainEntry(d)
+		if norm == "" || norm == "localhost" || norm == "localhost.localdomain" || norm == "local" || norm == "broadcasthost" {
+			return
+		}
+		if !domainSeen[norm] {
+			domainSeen[norm] = true
+			out.Domains = append(out.Domains, norm)
+		}
+		u := "https://" + norm
+		if !urlSeen[u] {
+			urlSeen[u] = true
+			out.BlockedURLs = append(out.BlockedURLs, u)
+		}
+	}
+
+	addURL := func(u string) {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			return
+		}
+		if !urlSeen[u] {
+			urlSeen[u] = true
+			out.BlockedURLs = append(out.BlockedURLs, u)
+		}
+		if d := netdial.NormalizeDomainEntry(u); d != "" && !domainSeen[d] {
+			domainSeen[d] = true
+			out.Domains = append(out.Domains, d)
+		}
+	}
+
+	addSelector := func(sel string) {
+		sel = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(sel), "##"))
+		if sel == "" || strings.ContainsAny(sel, "{}") {
+			return
+		}
+		if !selSeen[sel] {
+			selSeen[sel] = true
+			out.Selectors = append(out.Selectors, sel)
+		}
+	}
+
+	for _, sel := range explicitSelectors {
+		addSelector(sel)
+	}
+
+	for _, rawLine := range entries {
+		s := strings.TrimSpace(rawLine)
+		if s == "" || strings.HasPrefix(s, "!") || strings.HasPrefix(s, "//") || strings.HasPrefix(s, "[") || strings.HasPrefix(s, "@@") || strings.Contains(s, "#@#") {
+			continue
+		}
+		// EasyList element hiding rule: ##selector or domain.com##selector
+		if idx := strings.Index(s, "##"); idx >= 0 {
+			addSelector(s[idx+2:])
+			continue
+		}
+		// Pure comment starting with single #
+		if strings.HasPrefix(s, "#") {
+			continue
+		}
+		// EasyList ||domain^ or |https://...
+		if strings.HasPrefix(s, "||") {
+			rule := strings.TrimPrefix(s, "||")
+			if optIdx := strings.IndexByte(rule, '$'); optIdx >= 0 {
+				rule = rule[:optIdx]
+			}
+			rule = strings.TrimRight(rule, "^/")
+			addDomain(rule)
+			continue
+		}
+		if strings.HasPrefix(s, "|") {
+			rule := strings.TrimPrefix(s, "|")
+			if optIdx := strings.IndexByte(rule, '$'); optIdx >= 0 {
+				rule = rule[:optIdx]
+			}
+			rule = strings.TrimRight(rule, "^")
+			if strings.HasPrefix(strings.ToLower(rule), "http://") || strings.HasPrefix(strings.ToLower(rule), "https://") {
+				addURL(rule)
+			} else {
+				addDomain(rule)
+			}
+			continue
+		}
+		// Strip inline # comment for HOSTS / plain domain lines
+		if idx := strings.IndexByte(s, '#'); idx >= 0 {
+			s = strings.TrimSpace(s[:idx])
+		}
+		if s == "" {
+			continue
+		}
+		// HOSTS format: 0.0.0.0 domain.com / 127.0.0.1 domain.com / ::1 domain.com
+		fields := strings.Fields(s)
+		if len(fields) >= 2 && (fields[0] == "0.0.0.0" || fields[0] == "127.0.0.1" || fields[0] == "::1" || fields[0] == "::" || fields[0] == "::0") {
+			for _, f := range fields[1:] {
+				addDomain(f)
+			}
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(s), "http://") || strings.HasPrefix(strings.ToLower(s), "https://") {
+			addURL(strings.TrimRight(s, "^/"))
+			continue
+		}
+		if optIdx := strings.IndexByte(s, '$'); optIdx >= 0 {
+			s = s[:optIdx]
+		}
+		s = strings.TrimRight(s, "^/")
+		addDomain(s)
+	}
+
+	if len(out.Domains) == 0 && len(out.BlockedURLs) == 0 && len(out.Selectors) == 0 {
+		return BlocklistRules{}, fmt.Errorf("no valid blocklist rules parsed")
+	}
+	return out, nil
+}
 
 func SplitAdScriptBlocks(raw []byte) []string {
 	trimmed := strings.TrimSpace(string(raw))
@@ -141,15 +388,8 @@ func ParseDomainList(raw []byte) ([]string, error) {
 	if len(trimmed) == 0 || len(trimmed) > maxDomainJSONBytes {
 		return nil, fmt.Errorf("empty or oversized pac whitelist (len=%d)", len(trimmed))
 	}
-	headLen := len(trimmed)
-	if headLen > 64 {
-		headLen = 64
-	}
-	head := strings.ToLower(string(trimmed[:headLen]))
-	for _, p := range []string{"<!doctype", "<html", "<?xml", "<head", "<body"} {
-		if strings.HasPrefix(head, p) {
-			return nil, fmt.Errorf("invalid pac whitelist: received HTML/XML error page")
-		}
+	if isHTMLOrXMLErrorPage(trimmed) {
+		return nil, fmt.Errorf("invalid pac whitelist: received HTML/XML error page")
 	}
 	if trimmed[0] == '[' || trimmed[0] == '{' {
 		var list []string
@@ -247,6 +487,9 @@ type AdScriptOptions struct {
 	AllMode        bool
 	ScriptURL      string
 	WhitelistURL   string
+	BlocklistURL   string
+	OnURL          string
+	OnRetries      int
 	UpdateInterval time.Duration
 	CacheDir       string
 	FetchFn        func(string) ([]byte, error)
@@ -255,18 +498,25 @@ type AdScriptOptions struct {
 type AdScriptManager struct {
 	mu             sync.RWMutex
 	enabled        atomic.Bool
+	remoteOn       atomic.Bool
 	skipAdBlock    atomic.Bool
 	allMode        atomic.Bool
 	scriptURL      string
 	whitelistURL   string
+	blocklistURL   string
+	onURL          string
+	onRetries      int
 	updateInterval time.Duration
 	cacheDir       string
 	fetchFn        func(string) ([]byte, error)
 
+	whitelistPtr     atomic.Pointer[[]string]
+	whitelistHistory [][]string
+
 	scriptBytes []byte
 	versionHash string
 	source      string
-	whitelist   []string
+	blocklist   BlocklistRules
 	lastUpdated time.Time
 	lastError   string
 	stopOnce    sync.Once
@@ -282,6 +532,18 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	if whiteURL == "" {
 		whiteURL = DefaultWhitelistURL
 	}
+	blockURL := strings.TrimSpace(opts.BlocklistURL)
+	if blockURL == "" {
+		blockURL = DefaultBlocklistURL
+	}
+	onURL := strings.TrimSpace(opts.OnURL)
+	if onURL == "" {
+		onURL = DefaultOnURL
+	}
+	onRetries := opts.OnRetries
+	if onRetries <= 0 {
+		onRetries = DefaultOnRetryCount
+	}
 	interval := opts.UpdateInterval
 	if interval <= 0 {
 		interval = DefaultAdScriptUpdateInterval
@@ -294,13 +556,18 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	m := &AdScriptManager{
 		scriptURL:      scriptURL,
 		whitelistURL:   whiteURL,
+		blocklistURL:   blockURL,
+		onURL:          onURL,
+		onRetries:      onRetries,
 		updateInterval: interval,
 		cacheDir:       strings.TrimSpace(opts.CacheDir),
 		fetchFn:        fetchFn,
-		whitelist:      []string{},
 		stopCh:         make(chan struct{}),
 	}
+	emptyWL := []string{}
+	m.whitelistPtr.Store(&emptyWL)
 	m.enabled.Store(opts.Enabled && !opts.SkipAdScript)
+	m.remoteOn.Store(true)
 	m.skipAdBlock.Store(opts.SkipAdBlock)
 	m.allMode.Store(opts.AllMode)
 	m.setScriptLocked([]byte(BuiltInAdScript), "builtin")
@@ -326,16 +593,11 @@ func isValidAdScript(raw []byte) bool {
 	if len(trimmed) < 16 || len(trimmed) > maxAdScriptBytes {
 		return false
 	}
-	n := len(trimmed)
-	if n > 64 {
-		n = 64
-	}
-	head := strings.ToLower(string(trimmed[:n]))
-	return !strings.HasPrefix(head, "<!doctype html") && !strings.HasPrefix(head, "<html") && !strings.HasPrefix(head, "<?xml")
+	return !isHTMLOrXMLErrorPage(trimmed)
 }
 
 func (m *AdScriptManager) Enabled() bool {
-	return m != nil && m.enabled.Load()
+	return m != nil && m.enabled.Load() && m.remoteOn.Load()
 }
 
 func (m *AdScriptManager) SetEnabled(v bool) {
@@ -344,8 +606,62 @@ func (m *AdScriptManager) SetEnabled(v bool) {
 	}
 }
 
+func (m *AdScriptManager) On() bool {
+	return m != nil && m.remoteOn.Load()
+}
+
+func (m *AdScriptManager) SetOn(v bool) {
+	if m != nil {
+		m.remoteOn.Store(v)
+	}
+}
+
+func (m *AdScriptManager) OnURL() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.onURL
+}
+
+func (m *AdScriptManager) BlocklistURL() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.blocklistURL
+}
+
+func (m *AdScriptManager) Blocklist() BlocklistRules {
+	if m == nil {
+		return BlocklistRules{}
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return BlocklistRules{
+		Domains:     append([]string(nil), m.blocklist.Domains...),
+		BlockedURLs: append([]string(nil), m.blocklist.BlockedURLs...),
+		Selectors:   append([]string(nil), m.blocklist.Selectors...),
+	}
+}
+
+func (m *AdScriptManager) SetBlocklist(rules BlocklistRules) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.blocklist = BlocklistRules{
+		Domains:     normalizeDomainSlice(rules.Domains),
+		BlockedURLs: append([]string(nil), rules.BlockedURLs...),
+		Selectors:   append([]string(nil), rules.Selectors...),
+	}
+	m.mu.Unlock()
+}
+
 func (m *AdScriptManager) SkipAdScript() bool {
-	return m == nil || !m.enabled.Load()
+	return m == nil || !m.Enabled()
 }
 
 func (m *AdScriptManager) SetSkipAdScript(skip bool) {
@@ -396,22 +712,50 @@ func (m *AdScriptManager) Whitelist() []string {
 	if m == nil {
 		return []string{}
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if len(m.whitelist) == 0 {
+	ptr := m.whitelistPtr.Load()
+	if ptr == nil || len(*ptr) == 0 {
 		return []string{}
 	}
-	return append([]string(nil), m.whitelist...)
+	return append([]string(nil), (*ptr)...)
 }
 
-func (m *AdScriptManager) SetWhitelist(domains []string) {
+// SwapWhitelist 原子替换 PAC 白名单，并将旧值压入历史栈后返回旧值。
+func (m *AdScriptManager) SwapWhitelist(domains []string) []string {
 	if m == nil {
-		return
+		return []string{}
 	}
 	norm := normalizeDomainSlice(domains)
 	m.mu.Lock()
-	m.whitelist = norm
+	oldPtr := m.whitelistPtr.Swap(&norm)
+	var old []string
+	if oldPtr != nil {
+		old = append([]string(nil), (*oldPtr)...)
+	}
+	m.whitelistHistory = append(m.whitelistHistory, old)
 	m.mu.Unlock()
+	return old
+}
+
+func (m *AdScriptManager) SetWhitelist(domains []string) {
+	_ = m.SwapWhitelist(domains)
+}
+
+// PopWhitelist 弹出（pop）上一次的 PAC 白名单旧值并原子恢复。
+func (m *AdScriptManager) PopWhitelist() ([]string, bool) {
+	if m == nil {
+		return []string{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.whitelistHistory) == 0 {
+		return []string{}, false
+	}
+	idx := len(m.whitelistHistory) - 1
+	old := m.whitelistHistory[idx]
+	m.whitelistHistory = m.whitelistHistory[:idx]
+	restored := append([]string(nil), old...)
+	m.whitelistPtr.Store(&restored)
+	return append([]string(nil), restored...), true
 }
 
 func (m *AdScriptManager) IsWhitelisted(hosts ...string) bool {
@@ -427,11 +771,41 @@ func (m *AdScriptManager) IsWhitelisted(hosts ...string) bool {
 	return false
 }
 
-func (m *AdScriptManager) IsAdultWebsite(htmlBody []byte, hosts ...string) (bool, string) {
-	if m != nil && m.IsWhitelisted(hosts...) {
-		return true, "whitelist"
-	}
+// ContainsAdultAd 检测 HTML 中是否真正出现了成人广告内容（内置成人广告特征或 block.json 规则）。
+func (m *AdScriptManager) ContainsAdultAd(htmlBody []byte) bool {
 	if ContainsAdultAdInHTML(htmlBody) {
+		return true
+	}
+	if m == nil || len(htmlBody) == 0 {
+		return false
+	}
+	bl := m.Blocklist()
+	if len(bl.Domains) == 0 && len(bl.Selectors) == 0 {
+		return false
+	}
+	lower := bytes.ToLower(htmlBody)
+	for _, d := range bl.Domains {
+		if d != "" && bytes.Contains(lower, []byte(strings.ToLower(d))) {
+			return true
+		}
+	}
+	for _, sel := range bl.Selectors {
+		s := strings.ToLower(strings.TrimSpace(sel))
+		if strings.HasPrefix(s, ".") || strings.HasPrefix(s, "#") {
+			token := s[1:]
+			if token != "" && bytes.Contains(lower, []byte(token)) {
+				return true
+			}
+		} else if s != "" && bytes.Contains(lower, []byte(s)) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsAdultWebsite 严格仅在页面中真正检测到成人广告内容时才判定为需要替换广告的站点。
+func (m *AdScriptManager) IsAdultWebsite(htmlBody []byte, _ ...string) (bool, string) {
+	if m.ContainsAdultAd(htmlBody) {
 		return true, "html-adult-ad"
 	}
 	return false, ""
@@ -473,6 +847,45 @@ func (m *AdScriptManager) ScriptBytes() []byte {
 	return append([]byte(nil), m.scriptBytes...)
 }
 
+// RefreshOnOnce 拉取 on.txt 并在失败时最多重试 2 次（共 3 次尝试）；
+// 若重试 2 次之后仍然失败，直接置 on（true，即开启显示广告，instead of 不显示）。
+func (m *AdScriptManager) RefreshOnOnce() (bool, error) {
+	if m == nil {
+		return true, nil
+	}
+	m.mu.RLock()
+	url, fetch, retries := m.onURL, m.fetchFn, m.onRetries
+	m.mu.RUnlock()
+
+	if retries <= 0 {
+		retries = DefaultOnRetryCount
+	}
+	if url == "" || fetch == nil {
+		m.remoteOn.Store(true)
+		return true, nil
+	}
+
+	var lastErr error
+	for attempt := 0; attempt <= retries; attempt++ {
+		raw, err := fetch(url)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		val, perr := ParseOnSwitch(raw)
+		if perr != nil {
+			lastErr = perr
+			continue
+		}
+		m.remoteOn.Store(val)
+		return val, nil
+	}
+
+	// 重试 2 次之后仍失败 -> 直接置 on（true，开启显示广告，instead of 不显示）
+	m.remoteOn.Store(true)
+	return true, fmt.Errorf("fetch on.txt from %s failed after %d retries (forced on=true): %w", url, retries, lastErr)
+}
+
 func (m *AdScriptManager) RefreshWhitelistOnce() ([]string, error) {
 	if m == nil {
 		return []string{}, nil
@@ -482,30 +895,57 @@ func (m *AdScriptManager) RefreshWhitelistOnce() ([]string, error) {
 	m.mu.RUnlock()
 
 	if url == "" || fetch == nil {
-		m.SetWhitelist(nil)
+		m.SwapWhitelist(nil)
 		return []string{}, nil
 	}
 	raw, err := fetch(url)
 	if err != nil {
-		m.SetWhitelist(nil)
+		m.SwapWhitelist(nil)
 		return []string{}, fmt.Errorf("fetch pac whitelist from %s: %w", url, err)
 	}
 	domains, perr := ParseDomainList(raw)
 	if perr != nil {
-		m.SetWhitelist(nil)
+		m.SwapWhitelist(nil)
 		return []string{}, fmt.Errorf("parse pac whitelist from %s: %w", url, perr)
 	}
-	m.mu.Lock()
-	m.whitelist = domains
-	m.mu.Unlock()
+	m.SwapWhitelist(domains)
 	return append([]string(nil), domains...), nil
+}
+
+// RefreshBlocklistOnce 拉取远程 block.json（完全与 certs/ 解耦，失败回退至内存内置规则）。
+func (m *AdScriptManager) RefreshBlocklistOnce() (BlocklistRules, error) {
+	if m == nil {
+		return BlocklistRules{}, nil
+	}
+	m.mu.RLock()
+	url, fetch := m.blocklistURL, m.fetchFn
+	m.mu.RUnlock()
+
+	if url == "" || fetch == nil {
+		m.SetBlocklist(BlocklistRules{})
+		return BlocklistRules{}, nil
+	}
+	raw, err := fetch(url)
+	if err != nil {
+		m.SetBlocklist(BlocklistRules{})
+		return BlocklistRules{}, fmt.Errorf("fetch blocklist from %s: %w", url, err)
+	}
+	rules, perr := ParseBlocklist(raw)
+	if perr != nil {
+		m.SetBlocklist(BlocklistRules{})
+		return BlocklistRules{}, fmt.Errorf("parse blocklist from %s: %w", url, perr)
+	}
+	m.SetBlocklist(rules)
+	return rules, nil
 }
 
 func (m *AdScriptManager) RefreshOnce() (bool, error) {
 	if m == nil {
 		return false, nil
 	}
+	_, _ = m.RefreshOnOnce()
 	_, whiteErr := m.RefreshWhitelistOnce()
+	_, _ = m.RefreshBlocklistOnce()
 	if !m.Enabled() {
 		return false, whiteErr
 	}
@@ -574,10 +1014,53 @@ func (m *AdScriptManager) Stop() {
 	}
 }
 
+func (m *AdScriptManager) EffectiveBlockedURLs() []string {
+	out := append([]string(nil), DefaultAdNetworkBlockedURLs...)
+	if m == nil {
+		return out
+	}
+	bl := m.Blocklist()
+	seen := make(map[string]bool, len(out))
+	for _, u := range out {
+		seen[u] = true
+	}
+	for _, u := range bl.BlockedURLs {
+		if u != "" && !seen[u] {
+			seen[u] = true
+			out = append(out, u)
+		}
+	}
+	return out
+}
+
+func (m *AdScriptManager) EffectiveAdBlockStyle() string {
+	if m == nil {
+		return defaultOriginalAdBlockStyle
+	}
+	bl := m.Blocklist()
+	if len(bl.Selectors) == 0 {
+		return defaultOriginalAdBlockStyle
+	}
+	allSels := append([]string(nil), DefaultAdBlockSelectors...)
+	seen := make(map[string]bool, len(allSels))
+	for _, s := range allSels {
+		seen[s] = true
+	}
+	for _, s := range bl.Selectors {
+		if s != "" && !seen[s] {
+			seen[s] = true
+			allSels = append(allSels, s)
+		}
+	}
+	return `<style id="ech-proxy-adblock-style">` + strings.Join(allSels, ",") + `{display:none!important;visibility:hidden!important;height:0!important;max-height:0!important;overflow:hidden!important;pointer-events:none!important;}</style>`
+}
+
 func (m *AdScriptManager) InjectIntoHTML(htmlBody []byte) []byte {
 	return m.InjectIntoHTMLForHost(htmlBody)
 }
 
+// InjectIntoHTMLForHost 严格仅在真正检测到成人广告内容（hasAdultAd == true）时才执行替换并插入自己的成人广告；
+// 若未检测到成人广告内容，则绝不修改页面、绝不插入广告。
 func (m *AdScriptManager) InjectIntoHTMLForHost(htmlBody []byte, hosts ...string) []byte {
 	if m == nil || len(htmlBody) == 0 {
 		return htmlBody
@@ -586,21 +1069,22 @@ func (m *AdScriptManager) InjectIntoHTMLForHost(htmlBody []byte, hosts ...string
 	if (skipScript && skipBlock) || !looksLikeHTMLDocument(htmlBody) || bytes.Contains(htmlBody, []byte(`id="ech-proxy-ad-script"`)) {
 		return htmlBody
 	}
-	hasAdultAd := ContainsAdultAdInHTML(htmlBody)
-	whitelisted := m.IsWhitelisted(hosts...)
-	isAdult, adultReason := m.IsAdultWebsite(htmlBody, hosts...)
-	if !isAdult && !m.AllMode() {
+	hasAdultAd := m.ContainsAdultAd(htmlBody)
+	if !hasAdultAd {
 		return htmlBody
 	}
+	whitelisted := m.IsWhitelisted(hosts...)
+	isAdult := true
+	adultReason := "html-adult-ad"
 
 	cleaned := htmlBody
-	if !skipBlock && (isAdult || m.AllMode()) {
-		cleaned = stripBlockedURLs(cleaned, DefaultAdNetworkBlockedURLs)
+	if !skipBlock {
+		cleaned = stripBlockedURLs(cleaned, m.EffectiveBlockedURLs())
 	}
 
 	var payload bytes.Buffer
 	if !skipBlock && !bytes.Contains(cleaned, []byte(`id="ech-proxy-adblock-style"`)) {
-		payload.WriteString(defaultOriginalAdBlockStyle + "\n")
+		payload.WriteString(m.EffectiveAdBlockStyle() + "\n")
 	}
 	if !skipScript {
 		if scriptTags := BuildAdScriptTags(m.ScriptBytes()); len(scriptTags) > 0 {

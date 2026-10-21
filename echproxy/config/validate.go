@@ -34,8 +34,9 @@ func (v ValidationIssue) String() string {
 }
 
 var (
+	// knownTopLevelKeys 仅包含 8443 方案专属的 upstream.json 顶层字段，与 PAC 方案完全解耦。
 	knownTopLevelKeys = []string{
-		"cert_path", "key_path", "ip_mode", "whitelist_url", "ad_script_url", "ad_script_disabled", "upstreams", "blocked_hosts",
+		"cert_path", "key_path", "ip_mode", "upstreams", "blocked_hosts",
 	}
 	knownEntryKeys = []string{
 		"host", "describe", "display", "mode", "ip_mode", "sni_server_name",
@@ -55,7 +56,7 @@ var (
 	validCookiePriority = map[string]bool{"": true, "browser": true, "seed": true}
 )
 
-// Validate 对 upstream.json 原始字节执行严格静态校验，主动捕获 S1–S6 静默失败面。
+// Validate 对 8443 方案的 upstream.json 原始字节执行严格静态校验，主动捕获 S1–S6 静默失败面。
 // 该函数只读，绝不修改任何运行时状态。
 func Validate(buf []byte) ([]ValidationIssue, error) {
 	var rawRoot map[string]json.RawMessage

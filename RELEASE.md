@@ -1,3 +1,15 @@
+## v3.1.1
+
+### Changes & Features
+
+- **Fix: goreleaser.yml / release.yml release-asset collision on plain tags** — On `v3.1.0` the `goreleaser` workflow failed (`422 already_exists`) because both `release.yml` and `goreleaser.yml` triggered on the same `v*` tag push and both uploaded same-named desktop binaries (`ech-proxy-{linux,windows}-{amd64,386}`) + `checksums.txt` to the same GitHub release. `release.yml`'s upload was non-fatal (warn-and-keep), `goreleaser`'s was fatal → flaky by timing (v3.0.0 happened to not interleave, v3.1.0 did).
+  - Fix: removed the desktop `build` matrix job from `release.yml` (it built `ech-proxy-{linux,windows}-{amd64,aarch64,386}`, all of which `goreleaser.yml` already builds as a superset — goreleaser also adds `darwin` + `ech-proxy.443.exe`). `release.yml` now owns **only the Android APKs + the release notes body**, restoring the documented design (see the `goreleaser.yml` header comment: "release.yml builds the Android APKs, GoReleaser builds the desktop binaries plus checksums. Their asset names do not collide."). No published artifact is lost; the arm64 naming becomes consistent (`arm64` across all platforms, previously `release.yml` used `aarch64` only for linux).
+  - Net effect: plain `v*` tags now publish cleanly through both workflows with no asset-name overlap.
+
+### Notes
+
+- No Go source changes this release; behavior identical to v3.1.0. `go test ./... -race` remains 11/11 green (verified locally; Go CI run `39571344307` on `merge/ech-proxy-20261021` was green).
+
 ## v3.1.0
 
 ### Changes & Features

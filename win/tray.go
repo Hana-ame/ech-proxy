@@ -8,15 +8,19 @@ import (
 
 // 托盘右键菜单命令 ID 常量（参考 V2rayN 托盘菜单布局）。
 const (
-	TrayCmdToggleConsole uintptr = 1001
-	TrayCmdSysProxyPAC   uintptr = 1002
+	TrayCmdToggleConsole  uintptr = 1001
+	TrayCmdSysProxyPAC    uintptr = 1002
 	TrayCmdSysProxyGlobal uintptr = 1003
-	TrayCmdSysProxyClear uintptr = 1004
-	TrayCmdOpenPortal    uintptr = 1005
-	TrayCmdCopyPACURL    uintptr = 1006
-	TrayCmdInstallCA     uintptr = 1007
-	TrayCmdExit          uintptr = 1008
+	TrayCmdSysProxyClear  uintptr = 1004
+	TrayCmdOpenPortal     uintptr = 1005
+	TrayCmdCopyPACURL     uintptr = 1006
+	TrayCmdInstallCA      uintptr = 1007
+	TrayCmdExit           uintptr = 1008
+	TrayCmdFeedbackChat   uintptr = 1009
 )
+
+// feedbackChatURL 是「反馈 / 聊天」托盘菜单项打开的项目聊天/反馈页面地址。
+const feedbackChatURL = "https://chatto.moonchan.xyz"
 
 // ConsoleWindowDriver 抽象控制台窗口显隐控制接口（Windows 下由 GetConsoleWindow + ShowWindow 实现）。
 type ConsoleWindowDriver interface {
@@ -38,6 +42,7 @@ type TrayController struct {
 	mu              sync.Mutex
 	ListenAddr      string
 	PortalURL       string
+	FeedbackURL     string
 	CAPath          string
 	SysProxy        *SysProxyManager
 	Console         ConsoleWindowDriver
@@ -56,6 +61,7 @@ func NewTrayController(listenAddr, portalURL, caPath string, sysProxy *SysProxyM
 	return &TrayController{
 		ListenAddr:      NormalizeLoopbackHostPort(listenAddr),
 		PortalURL:       portalURL,
+		FeedbackURL:     feedbackChatURL,
 		CAPath:          caPath,
 		SysProxy:        sysProxy,
 		Console:         console,
@@ -139,6 +145,7 @@ func (tc *TrayController) MenuItems() []TrayMenuItem {
 		{ID: TrayCmdOpenPortal, Title: "打开 Web 门户导航页 (" + tc.PortalURL + ")"},
 		{ID: TrayCmdCopyPACURL, Title: "复制 PAC 地址 (Copy PAC URL)"},
 		{ID: TrayCmdInstallCA, Title: "一键安装本地 CA 根证书 (Install CA)"},
+		{ID: TrayCmdFeedbackChat, Title: "反馈 / 聊天 (Feedback / Chat)"},
 		{Separator: true},
 		{ID: TrayCmdExit, Title: "退出程序并清理系统代理 (Exit)"},
 	}
@@ -184,6 +191,11 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 	case TrayCmdOpenPortal:
 		if tc.OpenURLFn != nil && tc.PortalURL != "" {
 			go tc.OpenURLFn(tc.PortalURL)
+		}
+
+	case TrayCmdFeedbackChat:
+		if tc.OpenURLFn != nil && tc.FeedbackURL != "" {
+			go tc.OpenURLFn(tc.FeedbackURL)
 		}
 
 	case TrayCmdCopyPACURL:

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestFilenameIs443 pins the exact-suffix rule: only a filename ending in
@@ -140,13 +141,14 @@ func TestTrayControllerConsoleToggleAndMenuCommands(t *testing.T) {
 	sysMgr := NewSysProxyManager("127.0.0.1:8443", drv)
 	console := &memoryConsoleDriver{visible: true}
 
-	var openedURL, copiedText, installedCA string
+	var copiedText, installedCA string
 	exited := false
+	openedURLs := make(chan string, 8)
 
 	tc := NewTrayController("127.0.0.1:8443", "https://l.moonchan.xyz:8443", "/tmp/ca.pem", sysMgr, console, func() {
 		exited = true
 	})
-	tc.OpenURLFn = func(u string) { openedURL = u }
+	tc.OpenURLFn = func(u string) { openedURLs <- u }
 	tc.CopyClipboardFn = func(s string) error { copiedText = s; return nil }
 	tc.InstallCAFn = func(p string) error { installedCA = p; return nil }
 
@@ -180,6 +182,31 @@ func TestTrayControllerConsoleToggleAndMenuCommands(t *testing.T) {
 		t.Errorf("copied PAC URL = %q, want http://127.0.0.1:8443/proxy.pac", copiedText)
 	}
 
+	// 3b. 测试「反馈 / 聊天」菜单项打开项目反馈页（外部链接）
+	tc.HandleCommand(TrayCmdFeedbackChat)
+	select {
+	case u := <-openedURLs:
+		if u != "https://chatto.moonchan.xyz" {
+			t.Errorf("feedback/chat URL = %q, want https://chatto.moonchan.xyz", u)
+		}
+	case <-time.After(time.Second):
+		t.Error("TrayCmdFeedbackChat did not open a URL")
+	}
+
+	// 3c. 确认右键菜单结构包含「反馈 / 聊天」项
+	var foundFeedback bool
+	for _, mi := range tc.MenuItems() {
+		if mi.ID == TrayCmdFeedbackChat {
+			foundFeedback = true
+			if !strings.Contains(mi.Title, "反馈") || !strings.Contains(mi.Title, "Chat") {
+				t.Errorf("feedback menu title = %q, want bilingual 反馈/Chat", mi.Title)
+			}
+		}
+	}
+	if !foundFeedback {
+		t.Error("MenuItems() missing TrayCmdFeedbackChat entry")
+	}
+
 	// 4. 测试退出命令自动清理系统代理并触发回调
 	if shouldExit := tc.HandleCommand(TrayCmdExit); !shouldExit || !exited {
 		t.Errorf("TrayCmdExit should return true and invoke OnExit")
@@ -187,7 +214,6 @@ func TestTrayControllerConsoleToggleAndMenuCommands(t *testing.T) {
 	if sysMgr.Mode() != SysProxyOff {
 		t.Errorf("TrayCmdExit must clean up system proxy, got mode=%q", sysMgr.Mode())
 	}
-	_ = openedURL
 	_ = installedCA
 }
 

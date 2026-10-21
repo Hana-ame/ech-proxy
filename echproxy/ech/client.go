@@ -273,6 +273,10 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				EncryptedClientHelloConfigList: echConfig,
 				MinVersion:                     tls.VersionTLS13,
 				NextProtos:                     []string{"h2", "http/1.1"},
+				// 不由 utls 做证书校验（InsecureSkipVerify），改由下方 validateUpstreamCert 手动校验返回证书
+				// （时间 + 主机名 + 信任链），使证书失败统一走 CertError 警告页、且 WithAllowBadCert 可跳过。
+				// ECH 伪装（外层 SNI=shell、内层加密真实域名）保持不变。
+				InsecureSkipVerify: true,
 			}
 			mode := netdial.NormalizeIPMode(ipMode)
 			if mode == "" {
@@ -288,6 +292,11 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				if err := uConn.HandshakeContext(ctx); err != nil {
 					rawConn.Close()
 					return nil, err
+				}
+				// MITM 覆盖证书后客户端看不到上游真实证书，代理代为校验返回证书（不比对假 SNI）。
+				if cerr := validateUpstreamCert(ctx, host, uConn.ConnectionState().PeerCertificates); cerr != nil {
+					rawConn.Close()
+					return nil, cerr
 				}
 				if uConn.ConnectionState().NegotiatedProtocol != "h2" {
 					rawConn.Close()

@@ -209,11 +209,19 @@ func buildUpstreamRequest(c *gin.Context, uc config.UpstreamConfig) (*http.Reque
 		reqURI = "/" + reqURI
 	}
 
-	// 「强行访问」覆盖：用户在证书警告页点击继续后，请求带 ?__ech_proxy_force_cert__=1。
-	// 注入跳过上游证书校验的标记，并从发往上游的 URI 中剥离该参数（不外泄给上游）。
-	forceAllowCert := c.Query(forceCertQueryParam) == "1"
+	// 「强行访问」覆盖（会话级记忆 + 一次性 token）：用户在证书警告页点击按钮后，请求带
+	// ?__ech_proxy_force_cert__=<token>。仅当 token 有效（由 ech-proxy 警告页签发、一次性、
+	// 常数时间比较通过）或该主机本会话已被批准时，才注入跳过上游证书校验的标记，并从发往上游
+	// 的 URI 中剥离该参数（不外泄给上游）。内嵌无 token 的 ?__ech_proxy_force_cert__=1 链接不会放行。
+	forceToken := c.Query(forceCertQueryParam)
+	forceApproved := forceCerts.isForceApproved(uc.Host)
+	if forceToken != "" && !forceApproved {
+		if forceCerts.consumeForceToken(uc.Host, forceToken) {
+			forceApproved = true
+		}
+	}
 	reqCtx := cloudflare_ech.WithSNIServerName(c.Request.Context(), uc.SNIServerName)
-	if forceAllowCert {
+	if forceApproved {
 		reqCtx = cloudflare_ech.WithAllowBadCert(reqCtx)
 		if u, perr := url.Parse(reqURI); perr == nil {
 			q := u.Query()
@@ -407,7 +415,12 @@ func extractPort(hostport string) string {
 // 警告页含「强行访问」按钮：点击后以 ?__ech_proxy_force_cert__=1 重新请求并跳过校验。
 func serveCertWarningPage(c *gin.Context, kind, certHost, detail, requestHost, upstreamHost string) {
 	rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
-	forceURL := forceAccessURL(c.Request.URL, c.Request.Host)
+	// 为该上游主机签发一次性「强行访问」token（嵌入按钮 URL；限速，超限返回空 -> 不渲染按钮）
+	token := forceCerts.issueForceToken(upstreamHost)
+	forceURL := ""
+	if token != "" {
+		forceURL = forceAccessURL(c.Request.URL, c.Request.Host, token)
+	}
 	htmlBody := buildCertWarningHTML(kind, certHost, detail, requestHost, upstreamHost, forceURL)
 	c.Header("Content-Type", "text/html; charset=utf-8")
 	c.Header("Cache-Control", "no-store")
@@ -415,15 +428,15 @@ func serveCertWarningPage(c *gin.Context, kind, certHost, detail, requestHost, u
 	_, _ = c.Writer.Write([]byte(htmlBody))
 }
 
-// forceAccessURL 构造「强行访问」目标：原请求 URL 追加 ?__ech_proxy_force_cert__=1。
+// forceAccessURL 构造「强行访问」目标：原请求 URL 追加 ?__ech_proxy_force_cert__=<token>。
 // 不修改传入的 *url.URL。
-func forceAccessURL(u *url.URL, requestHost string) string {
+func forceAccessURL(u *url.URL, requestHost, token string) string {
 	var clone url.URL
 	if u != nil {
 		clone = *u // 拷贝结构体值，避免改动原始 c.Request.URL
 	}
 	q := clone.Query()
-	q.Set(forceCertQueryParam, "1")
+	q.Set(forceCertQueryParam, token)
 	clone.RawQuery = q.Encode()
 	scheme := clone.Scheme
 	if scheme == "" {
@@ -471,16 +484,13 @@ a.back{background:#3a3f4a;color:#e6e6e6}
 <p style="margin:0 0 8px"><strong>为什么会看到这个页面？</strong></p>
 <p style="margin:0;color:#9aa0a6;line-height:1.6">ech-proxy 在 MITM 模式下用本地 CA 覆盖了客户端证书，你的浏览器无法自行判断上游真实证书。代理代为校验了上游 <code>{{UPSTREAM}}</code> 返回的证书并发现了上述问题。</p>
 </div>
-<div class="btns">
-<a class="btn force" href="{{FORCE_URL}}">强行访问（不安全）</a>
-<a class="btn back" href="/">返回门户</a>
-</div>
-<p class="muted">强行访问将跳过证书校验继续连接上游，存在中间人风险，请仅在你确信安全时使用。</p>
+{{BUTTONS}}
 </div>
 </body>
 </html>`
 
-// buildCertWarningHTML 渲染区分「过期」与「不一致」的证书警告页。
+// buildCertWarningHTML 渲染区分「过期 / 不一致 / 不可信」的证书警告页。
+// forceURL 为空（限速或异常）时不渲染「强行访问」按钮，改为「稍后重试」提示。
 func buildCertWarningHTML(kind, certHost, detail, requestHost, upstreamHost, forceURL string) string {
 	var title, headline, class, explain string
 	switch kind {
@@ -494,11 +504,29 @@ func buildCertWarningHTML(kind, certHost, detail, requestHost, upstreamHost, for
 		headline = "⚠ 上游证书与请求域名不一致"
 		class = "danger"
 		explain = fmt.Sprintf("代理连接上游 <code>%s</code> 时，其返回的证书未覆盖真实请求域名 <code>%s</code>。这可能意味着遭遇了中间人攻击，或连接到了错误的服务器。", html.EscapeString(upstreamHost), html.EscapeString(certHost))
+	case "chain":
+		title = "上游证书不可信 - ech-proxy"
+		headline = "⚠ 上游证书链未被系统根信任"
+		class = "danger"
+		explain = fmt.Sprintf("代理连接上游 <code>%s</code> 时，其返回的证书链未通过系统根证书校验（自签 / 未知 CA / 中间证书缺失）。", html.EscapeString(upstreamHost))
 	default:
 		title = "上游证书校验失败 - ech-proxy"
 		headline = "⚠ 上游证书校验失败"
 		class = "warn"
 		explain = fmt.Sprintf("代理连接上游 <code>%s</code> 时证书校验未通过。", html.EscapeString(upstreamHost))
+	}
+	buttons := ""
+	if forceURL != "" {
+		buttons = `<div class="btns">
+<a class="btn force" href="` + html.EscapeString(forceURL) + `">强行访问（不安全）</a>
+<a class="btn back" href="/">返回门户</a>
+</div>
+<p class="muted">强行访问将跳过证书校验继续连接上游，存在中间人风险，请仅在你确信安全时使用。</p>`
+	} else {
+		buttons = `<div class="btns">
+<a class="btn back" href="/">返回门户</a>
+</div>
+<p class="muted">强行访问请求过于频繁，请稍后刷新本页重试。</p>`
 	}
 	out := certWarningHTMLTemplate
 	repl := func(k, v string) { out = strings.ReplaceAll(out, k, v) }
@@ -508,6 +536,6 @@ func buildCertWarningHTML(kind, certHost, detail, requestHost, upstreamHost, for
 	repl("{{EXPLAIN}}", explain) // explain 已用 html.EscapeString 转义其内部片段，整体为受信片段
 	repl("{{DETAIL}}", html.EscapeString(detail))
 	repl("{{UPSTREAM}}", html.EscapeString(upstreamHost))
-	repl("{{FORCE_URL}}", html.EscapeString(forceURL))
+	repl("{{BUTTONS}}", buttons)
 	return out
 }

@@ -3,6 +3,7 @@ package cloudflare_ech
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -118,7 +119,7 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	normIPMode = netdial.EffectiveIPMode(normIPMode)
 
 	if strings.EqualFold(mode, "direct") {
-		return netdial.ClientWithIPMode(normIPMode, netdial.OpTimeout).Do(req)
+		return directDo(req, normIPMode)
 	}
 
 	host := req.Host
@@ -172,11 +173,30 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		return nil, err2
 	}
 
-	// 兜底尝试标准直连
-	if resp3, err3 := netdial.ClientWithIPMode(normIPMode, netdial.OpTimeout).Do(req); err3 == nil {
+	// 兜底尝试标准直连（同样带证书校验，失败上抛 CertError 走警告页）
+	resp3, err3 := directDo(req, normIPMode)
+	if err3 == nil {
 		return resp3, nil
 	}
+	if IsCertError(err3) {
+		return nil, err3
+	}
 	return nil, err
+}
+
+// directDo 经标准 TLS 直连上游（Direct 模式），并在握手后手动校验上游证书
+// （时间 + 主机名 + 信任链），使证书失败统一走 CertError 警告页，且 WithAllowBadCert（强行访问）可跳过。
+// 不复用 netdial 全局 Transport（避免影响 DoH/拉取等内部流量），按 ipMode 新建带校验的 Transport。
+func directDo(req *http.Request, ipMode string) (*http.Response, error) {
+	tr := netdial.TransportWithIPModeAndCertCheck(ipMode, func(host string, peerCerts []*x509.Certificate) error {
+		return validateUpstreamCert(req.Context(), host, peerCerts)
+	})
+	c := &http.Client{
+		Transport: tr,
+		Timeout:   netdial.OpTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	return c.Do(req)
 }
 
 func doSingleMode(req *http.Request, mode, ipMode string) (*http.Response, error) {
@@ -184,7 +204,7 @@ func doSingleMode(req *http.Request, mode, ipMode string) (*http.Response, error
 	case "sni":
 		return SNIFrontDo(req, ipMode)
 	case "direct":
-		return netdial.ClientWithIPMode(ipMode, netdial.OpTimeout).Do(req)
+		return directDo(req, ipMode)
 	default:
 		return Do(req, ipMode)
 	}

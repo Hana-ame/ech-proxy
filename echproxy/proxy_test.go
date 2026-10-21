@@ -374,58 +374,69 @@ func TestCertWarningPage(t *testing.T) {
 	orig := roundTripFn
 	defer func() { roundTripFn = orig }()
 
+	forceCerts.reset() // 隔离会话级状态（approved / tokens / 限速计数）
+
 	cfg := &config.Config{
 		Upstreams: config.UpstreamMap{
-			"t.l.moonchan.xyz": {Host: "truedomain.com"},
+			"t.l.moonchan.xyz":  {Host: "truedomain.com"},
+			"t2.l.moonchan.xyz": {Host: "truedomain2.com"},
 		},
 	}
 	engine := NewEngine(cfg)
 
-	// 1. 过期 -> 502 + text/html 警告页，含「已过期」与「强行访问」按钮
-	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
-		return nil, fmt.Errorf("dial upstream: %w", cloudflare_ech.ErrCertExpired)
-	}
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path", nil)
-	req.Host = "t.l.moonchan.xyz:8443"
-	engine.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("expired: status=%d, want 502", rec.Code)
-	}
-	if ct := rec.Result().Header.Get("Content-Type"); !strings.Contains(ct, "text/html") {
-		t.Fatalf("expired: content-type=%q, want text/html", ct)
-	}
-	body := rec.Body.String()
-	if !strings.Contains(body, "已过期") {
-		t.Errorf("expired page missing 「已过期」 text: %s", body)
-	}
-	if !strings.Contains(body, "强行访问") || !strings.Contains(body, forceCertQueryParam) {
-		t.Errorf("expired page missing force-access button (%s): %s", forceCertQueryParam, body)
-	}
-	if strings.Contains(body, "不一致") {
-		t.Errorf("expired page must NOT contain 「不一致」 text: %s", body)
+	extractForceToken := func(htmlBody string) string {
+		idx := strings.Index(htmlBody, forceCertQueryParam+"=")
+		if idx < 0 {
+			return ""
+		}
+		start := idx + len(forceCertQueryParam) + 1
+		end := strings.IndexByte(htmlBody[start:], '"')
+		if end < 0 {
+			return ""
+		}
+		return htmlBody[start : start+end]
 	}
 
-	// 2. 不一致 -> 502 + text/html 警告页，含「不一致」与「强行访问」按钮
-	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
-		return nil, fmt.Errorf("dial upstream: %w", cloudflare_ech.ErrCertMismatch)
-	}
-	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path", nil)
-	req2.Host = "t.l.moonchan.xyz:8443"
-	engine.ServeHTTP(rec2, req2)
-	body2 := rec2.Body.String()
-	if !strings.Contains(body2, "不一致") {
-		t.Errorf("mismatch page missing 「不一致」 text: %s", body2)
-	}
-	if !strings.Contains(body2, "强行访问") || !strings.Contains(body2, forceCertQueryParam) {
-		t.Errorf("mismatch page missing force-access button: %s", body2)
-	}
-	if strings.Contains(body2, "已过期") {
-		t.Errorf("mismatch page must NOT contain 「已过期」 text: %s", body2)
+	assertWarning := func(name string, sentinel error, wantText string, forbidden ...string) {
+		t.Helper()
+		roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+			return nil, fmt.Errorf("dial upstream: %w", sentinel)
+		}
+		rec := httptest.NewRecorder()
+		r := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path", nil)
+		r.Host = "t.l.moonchan.xyz:8443"
+		engine.ServeHTTP(rec, r)
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("%s: status=%d, want 502", name, rec.Code)
+		}
+		if ct := rec.Result().Header.Get("Content-Type"); !strings.Contains(ct, "text/html") {
+			t.Fatalf("%s: content-type=%q, want text/html", name, ct)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, wantText) {
+			t.Errorf("%s: missing 「%s」: %s", name, wantText, body)
+		}
+		if !strings.Contains(body, "强行访问") {
+			t.Errorf("%s: missing 强行访问 button: %s", name, body)
+		}
+		if extractForceToken(body) == "" {
+			t.Errorf("%s: force token missing/empty in href: %s", name, body)
+		}
+		for _, f := range forbidden {
+			if strings.Contains(body, f) {
+				t.Errorf("%s: must NOT contain 「%s」: %s", name, f, body)
+			}
+		}
 	}
 
-	// 3. 强行访问覆盖：无参时上游返回证书错误 -> 警告页；带 ?__ech_proxy_force_cert__=1 -> 跳过校验直接放行上游
+	// 1. 过期
+	assertWarning("expired", cloudflare_ech.ErrCertExpired, "已过期", "不一致", "不可信")
+	// 2. 不一致
+	assertWarning("mismatch", cloudflare_ech.ErrCertMismatch, "不一致", "已过期", "不可信")
+	// 3. 不可信链
+	assertWarning("chain", cloudflare_ech.ErrCertUntrusted, "不可信", "已过期", "不一致")
+
+	// 4. 强行访问：一次性 token + 会话级记忆
 	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		if !cloudflare_ech.AllowBadCert(req.Context()) {
 			return nil, fmt.Errorf("dial upstream: %w", cloudflare_ech.ErrCertMismatch)
@@ -436,20 +447,42 @@ func TestCertWarningPage(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader("forced-ok")),
 		}, nil
 	}
-	// 3a. 无参 -> 警告页（不一致）
-	rec3a := httptest.NewRecorder()
-	req3a := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path", nil)
-	req3a.Host = "t.l.moonchan.xyz:8443"
-	engine.ServeHTTP(rec3a, req3a)
-	if rec3a.Code != http.StatusBadGateway || !strings.Contains(rec3a.Body.String(), "不一致") {
-		t.Fatalf("no force param: want 502+不一致 page, got status=%d body=%q", rec3a.Code, rec3a.Body.String())
+	// 4a. 无参 -> 警告页（不一致），提取 token
+	rec4a := httptest.NewRecorder()
+	r4a := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path", nil)
+	r4a.Host = "t.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec4a, r4a)
+	if rec4a.Code != http.StatusBadGateway || !strings.Contains(rec4a.Body.String(), "不一致") {
+		t.Fatalf("4a no-param: want 502+不一致, got status=%d body=%q", rec4a.Code, rec4a.Body.String())
 	}
-	// 3b. 带参 -> 跳过校验，直接放行上游
-	rec3b := httptest.NewRecorder()
-	req3b := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path?"+forceCertQueryParam+"=1", nil)
-	req3b.Host = "t.l.moonchan.xyz:8443"
-	engine.ServeHTTP(rec3b, req3b)
-	if rec3b.Code != http.StatusOK || rec3b.Body.String() != "forced-ok" {
-		t.Fatalf("force-access should bypass cert check and serve upstream, got status=%d body=%q", rec3b.Code, rec3b.Body.String())
+	tok := extractForceToken(rec4a.Body.String())
+	if tok == "" {
+		t.Fatalf("4a: extracted force token empty: %s", rec4a.Body.String())
+	}
+	// 4b. 携带有效 token -> 消费并批准，跳过校验放行上游
+	rec4b := httptest.NewRecorder()
+	r4b := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path?"+forceCertQueryParam+"="+tok, nil)
+	r4b.Host = "t.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec4b, r4b)
+	if rec4b.Code != http.StatusOK || rec4b.Body.String() != "forced-ok" {
+		t.Fatalf("4b valid-token: want 200 forced-ok, got status=%d body=%q", rec4b.Code, rec4b.Body.String())
+	}
+	// 4c. 再次无参请求同主机 -> 会话级已批准，子资源直接放行（不再警告）
+	rec4c := httptest.NewRecorder()
+	r4c := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/style.css", nil)
+	r4c.Host = "t.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec4c, r4c)
+	if rec4c.Code != http.StatusOK || rec4c.Body.String() != "forced-ok" {
+		t.Fatalf("4c session-approved: want 200 (no re-warning), got status=%d body=%q", rec4c.Code, rec4c.Body.String())
+	}
+
+	// 5. 防内嵌链接静默放行：另一主机 t2（未签发 token、未批准）携带 ?__ech_proxy_force_cert__=1
+	//    -> token 不匹配 -> 不放行 -> 照常校验 -> 警告页（不静默放行）
+	rec5 := httptest.NewRecorder()
+	r5 := httptest.NewRequest(http.MethodGet, "https://t2.l.moonchan.xyz:8443/path?"+forceCertQueryParam+"=1", nil)
+	r5.Host = "t2.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec5, r5)
+	if rec5.Code != http.StatusBadGateway || !strings.Contains(rec5.Body.String(), "不一致") {
+		t.Fatalf("5 embedded-link: want 502+不一致 (not bypassed), got status=%d body=%q", rec5.Code, rec5.Body.String())
 	}
 }

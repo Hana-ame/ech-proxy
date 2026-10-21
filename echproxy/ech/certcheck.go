@@ -20,9 +20,12 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"crypto/x509"
+
+	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 )
 
 var (
@@ -30,6 +33,8 @@ var (
 	ErrCertExpired = errors.New("upstream certificate expired or not yet valid")
 	// ErrCertMismatch 上游证书未覆盖真实请求域名（主机名不一致，可能遭遇中间人/走错服务器）。
 	ErrCertMismatch = errors.New("upstream certificate does not match the requested domain")
+	// ErrCertUntrusted 上游证书链未通过系统根证书信任校验（自签 / 未知 CA / 中间证书缺失）。
+	ErrCertUntrusted = errors.New("upstream certificate chain is not trusted by system roots")
 )
 
 // CertError 携带证书校验失败的具体上下文，Unwrap 到 ErrCertExpired 或 ErrCertMismatch。
@@ -46,13 +51,13 @@ func (e *CertError) Error() string {
 
 func (e *CertError) Unwrap() error { return e.err }
 
-// IsCertError 判断 err 是否为上游证书校验失败（过期或不匹配）。
+// IsCertError 判断 err 是否为上游证书校验失败（过期 / 不一致 / 不可信）。
 func IsCertError(err error) bool {
-	return errors.Is(err, ErrCertExpired) || errors.Is(err, ErrCertMismatch)
+	return errors.Is(err, ErrCertExpired) || errors.Is(err, ErrCertMismatch) || errors.Is(err, ErrCertUntrusted)
 }
 
 // ClassifyCertError 从（可能被 http2/url 包装的）错误中判定证书校验失败类型。
-// 返回 kind ∈ {"expired","mismatch"}、host、detail 与是否命中。
+// 返回 kind ∈ {"expired","mismatch","chain"}、host、detail 与是否命中。
 // 优先 errors.As（走 CertError）；其次 errors.Is（%w 包装链）；最后字符串兜底
 // （http2/url 可能未保留 Unwrap 链）。
 func ClassifyCertError(err error) (kind, host, detail string, ok bool) {
@@ -69,12 +74,18 @@ func ClassifyCertError(err error) (kind, host, detail string, ok bool) {
 	if errors.Is(err, ErrCertMismatch) {
 		return "mismatch", "", err.Error(), true
 	}
+	if errors.Is(err, ErrCertUntrusted) {
+		return "chain", "", err.Error(), true
+	}
 	s := err.Error()
 	if strings.Contains(s, ErrCertExpired.Error()) {
 		return "expired", "", s, true
 	}
 	if strings.Contains(s, ErrCertMismatch.Error()) {
 		return "mismatch", "", s, true
+	}
+	if strings.Contains(s, ErrCertUntrusted.Error()) {
+		return "chain", "", s, true
 	}
 	return "", "", "", false
 }
@@ -103,9 +114,23 @@ func allowBadCert(ctx context.Context) bool {
 // 供测试与诊断使用。
 func AllowBadCert(ctx context.Context) bool { return allowBadCert(ctx) }
 
+// rootPoolOverride 仅用于测试：注入自定义根证书池以验证证书链通过/失败；nil 时用系统根证书池。
+var rootPoolOverride atomic.Pointer[x509.CertPool]
+
+// SetRootPoolOverride 设置（仅测试用）自定义根证书池；传 nil 恢复使用系统根证书池。
+func SetRootPoolOverride(pool *x509.CertPool) { rootPoolOverride.Store(pool) }
+
+func effectiveRootPool() *x509.CertPool {
+	if p := rootPoolOverride.Load(); p != nil {
+		return p
+	}
+	return netdial.RootPool()
+}
+
 // validateUpstreamCert 校验 SNI 伪装路径返回的上游叶证书：
 //   - 时间有效性（NotBefore/NotAfter）不过 -> ErrCertExpired（过期）
 //   - 主机名是否覆盖真实请求域名 realDomain（leaf.VerifyHostname）不过 -> ErrCertMismatch（不一致）
+//   - 证书链 / 信任根（leaf.Verify，系统根证书池 + 上游返回的中间证书）不过 -> ErrCertUntrusted（不可信）
 //
 // 不比对假 SNI（伪装域名与证书域名必然不同）。ctx 携带 WithAllowBadCert 时直接放行（强行访问覆盖）。
 // 无证书可校验时放行（不阻塞伪装路径）。
@@ -140,6 +165,23 @@ func validateUpstreamCert(ctx context.Context, realDomain string, peerCerts []*x
 			Kind:   "mismatch",
 			Detail: fmt.Sprintf("certificate not valid for %s: %v (subject=%s, DNSNames=%v)", realDomain, err, leaf.Subject, leaf.DNSNames),
 			err:    ErrCertMismatch,
+		}
+	}
+	// 证书链 / 信任根校验：用系统根证书池 + 上游返回的中间证书构建验证链。
+	intermediates := x509.NewCertPool()
+	for _, c := range peerCerts[1:] {
+		intermediates.AddCert(c)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{
+		Roots:         effectiveRootPool(),
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}); err != nil {
+		return &CertError{
+			Host:   realDomain,
+			Kind:   "chain",
+			Detail: fmt.Sprintf("certificate chain not trusted by system roots: %v (issuer=%s)", err, leaf.Issuer),
+			err:    ErrCertUntrusted,
 		}
 	}
 	return nil

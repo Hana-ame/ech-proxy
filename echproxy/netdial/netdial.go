@@ -225,6 +225,9 @@ func getRootPool() *x509.CertPool {
 	return rootPool
 }
 
+// RootPool 返回系统根证书池（含 Termux 路径补充），供手动 x509.Verify 校验上游证书链使用。
+func RootPool() *x509.CertPool { return getRootPool() }
+
 // Dialer 返回绑定了公共 DNS 的拨号器（兼容 Android/Termux 等无 /etc/resolv.conf 的环境）。
 func Dialer() *net.Dialer {
 	return &net.Dialer{
@@ -359,6 +362,52 @@ func TransportWithIPMode(mode string) *http.Transport {
 			return DialContextIPMode(ctx, host, port, norm, DialTimeout)
 		},
 		TLSClientConfig:   &tls.Config{RootCAs: getRootPool()},
+		MaxIdleConns:      100,
+		IdleConnTimeout:   90 * time.Second,
+		ForceAttemptHTTP2: true,
+	}
+}
+
+// TransportWithIPModeAndCertCheck 返回锁定出口 IP 协议族、且在上游 TLS 握手成功后
+// 调用 certCheck(host, peerCerts) 手动校验上游证书的 HTTP Transport。
+//
+// 用于 Direct 模式：以 InsecureSkipVerify + 手动校验替代标准库自动校验，使上游证书失败
+// （过期/不一致/不可信）统一以 certCheck 返回的 CertError 上抛、走警告页；且上游请求 Context
+// 携带 WithAllowBadCert（强行访问）时由 certCheck 自行跳过。certCheck 为 nil 时不做额外校验。
+// 不复用全局 Transport，避免影响 DoH / 拉取等内部流量的证书行为。
+func TransportWithIPModeAndCertCheck(mode string, certCheck func(host string, peerCerts []*x509.Certificate) error) *http.Transport {
+	norm := EffectiveIPMode(mode)
+	if norm != "v4" && norm != "v6" {
+		norm = DefaultIPMode
+	}
+	return &http.Transport{
+		DialTLSContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			rawConn, err := DialContextIPMode(ctx, host, port, norm, DialTimeout)
+			if err != nil {
+				return nil, err
+			}
+			tlsConn := tls.Client(rawConn, &tls.Config{
+				ServerName:         host,
+				InsecureSkipVerify: true, // 由 certCheck 手动校验（Direct 模式：不做 SNI 伪装，host 即真实域名）
+				MinVersion:         tls.VersionTLS12,
+				NextProtos:         []string{"h2", "http/1.1"},
+			})
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				_ = tlsConn.Close()
+				return nil, err
+			}
+			if certCheck != nil {
+				if cerr := certCheck(host, tlsConn.ConnectionState().PeerCertificates); cerr != nil {
+					_ = tlsConn.Close()
+					return nil, cerr
+				}
+			}
+			return tlsConn, nil
+		},
 		MaxIdleConns:      100,
 		IdleConnTimeout:   90 * time.Second,
 		ForceAttemptHTTP2: true,

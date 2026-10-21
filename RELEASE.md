@@ -1,3 +1,29 @@
+## v3.1.0
+
+### Changes & Features
+
+- **ECH & Direct paths now share the same upstream-cert validation + warning pages as the SNI path** — Previously only the SNI-camouflage path validated the upstream cert; ECH (`ech/client.go:newTransport`) and Direct (`netdial` via new `directDo`) cert failures surfaced as a bare `502 upstream: ...`. Now all three paths run `validateUpstreamCert` after the TLS handshake, so any cert failure renders the distinct HTML warning page:
+  - ECH path: switched to `InsecureSkipVerify` + manual check (ECH disguise — outer SNI = shell, inner encrypted real SNI — is untouched); the Cloudflare-served cert for the real host passes hostname + chain.
+  - Direct path: new `directDo` (`ech/sni.go`) uses `netdial.TransportWithIPModeAndCertCheck`, a dedicated transport that does `InsecureSkipVerify` + manual check (the shared `netdial.Transport` used by DoH/fetches is untouched).
+  - `RoundTrip`'s fallback chain propagates cert errors from the direct fallback too.
+- **Certificate chain / trust-root verification (third category)** — `validateUpstreamCert` now also runs `leaf.Verify({Roots: netdial.RootPool(), Intermediates: <peer chain>})` (after time + `VerifyHostname`). A self-signed / unknown-CA / missing-intermediate cert yields `ErrCertUntrusted` → a third, distinct warning page: 「上游证书链未被系统根信任」. Order: time → hostname → chain.
+- **「强行访问」session-level memory + one-time token + rate-limiting (anti silent-bypass)** — Replaces the trivial `?__ech_proxy_force_cert__=1` bypass, which any page could embed to silently skip cert checks:
+  - Each warning page issues a one-time random token (16 bytes, hex) bound to the upstream host, embedded only in ech-proxy's own warning-page HTML (cross-origin scripts can't read it). Force-access now requires `?__ech_proxy_force_cert__=<token>` matching (constant-time compare); the bare `=1` no longer bypasses.
+  - Consuming a valid token marks that host **approved for the session** (in-memory `approved` set), so subsequent subresource requests to it load without re-warning (usable UX) — and without needing the token.
+  - Rate-limit: max 6 tokens/min per host (sliding window); over-limit returns no button (shows a 「稍后刷新重试」 note). Approved-set capped at 256 hosts (session-level eviction).
+  - Net effect: an attacker-embedded `?__ech_proxy_force_cert__=1` link on a non-approved host is ignored → the request still runs the cert check → renders a warning, never silently bypassing.
+
+### Tests
+
+- `ech/certcheck_test.go` rewritten with a test CA: covers expired / not-yet-valid / mismatch / untrusted-chain / trusted-chain-pass / wildcard / force-bypass / no-cert / time-first / classify-non-cert-error (chain pass/fail are hermetic via `SetRootPoolOverride`).
+- `proxy_test.go:TestCertWarningPage`: distinct expired/mismatch/**chain** pages; one-time-token force flow (extract token → consume → approved → session memory loads subresources); anti-embed (a second host carrying `=1` is NOT bypassed → warning).
+- Verified: `go vet ./...` OK, `go build ./...` OK, `go test ./... -race` (CI's exact command) 11/11 PASS.
+
+### Notes
+
+- The MITM client-facing cert override (`certstore`) is unchanged. Disguise (fake SNI + `InsecureSkipVerify`) preserved on all paths — verification is always against the real domain, never the disguised SNI.
+- Force-access approval is session-level (process memory, not persisted); a host approved once stays approved until process restart. If you want stricter per-request re-approval, that's a follow-up.
+
 ## v3.0.0
 
 ### Changes & Features

@@ -452,7 +452,7 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       90 * time.Second,
 	}
-	_ = srv.Serve(&singleConnListener{conn: tlsConn})
+	_ = srv.Serve(newSingleConnListener(tlsConn))
 }
 
 func writeConnectError(conn net.Conn, code int, body string) {
@@ -566,23 +566,32 @@ func (d *deadlineConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// singleConnListener 向 http.Server.Serve 提供恰好一条连接。
+// 第二次 Accept 会阻塞到该连接被关闭为止，避免 Serve 在请求仍在处理时
+// 提前返回（并触发调用方关闭底层连接）导致 MITM 请求被截断为连接重置。
 type singleConnListener struct {
-	conn net.Conn
-	once sync.Once
+	conn   net.Conn
+	done   chan struct{}
+	once   sync.Once
+	closed sync.Once
+}
+
+func newSingleConnListener(c net.Conn) *singleConnListener {
+	return &singleConnListener{conn: c, done: make(chan struct{})}
 }
 
 func (l *singleConnListener) Accept() (net.Conn, error) {
 	var c net.Conn
-	l.once.Do(func() {
-		c = l.conn
-	})
+	l.once.Do(func() { c = l.conn })
 	if c != nil {
-		return c, nil
+		return &closeNotifyConn{Conn: c, done: l.done}, nil
 	}
-	return nil, net.ErrClosed
+	<-l.done
+	return nil, errors.New("singleConnListener: closed")
 }
 
 func (l *singleConnListener) Close() error {
+	l.closed.Do(func() { close(l.done) })
 	return nil
 }
 
@@ -591,4 +600,17 @@ func (l *singleConnListener) Addr() net.Addr {
 		return l.conn.LocalAddr()
 	}
 	return &net.TCPAddr{}
+}
+
+// closeNotifyConn 在底层连接关闭时关闭 done 通道，使 singleConnListener 阻塞的
+// 第二次 Accept 得以返回。
+type closeNotifyConn struct {
+	net.Conn
+	done chan struct{}
+	once sync.Once
+}
+
+func (c *closeNotifyConn) Close() error {
+	c.once.Do(func() { close(c.done) })
+	return c.Conn.Close()
 }

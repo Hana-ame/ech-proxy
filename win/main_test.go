@@ -108,10 +108,19 @@ func TestParseCLIArgsSubcommandsFlagsAndSysProxyDefaults(t *testing.T) {
 		}
 	}
 
-	// 4. .443.exe 自动进入 local 模式并监听 127.0.0.1:443（默认不改系统代理 SysProxyOff，保留托盘）
+	// 4. .443.exe 自动进入 443 方案并监听 127.0.0.1:443（默认不改系统代理 SysProxyOff）
 	c2, err := parseCLIArgs("ech-proxy.443.exe", nil, noEnv)
-	if err != nil || !c2.LocalProxy || c2.Addr != "127.0.0.1:443" || c2.FallbackAddr != "127.0.0.1:8443" || c2.SysProxy != SysProxyOff {
+	if err != nil || !c2.LocalProxy || c2.PortalMode || c2.Addr != "127.0.0.1:443" || c2.FallbackAddr != "127.0.0.1:8443" || c2.SysProxy != SysProxyOff {
 		t.Errorf(".443.exe parseCLIArgs = %+v, %v", c2, err)
+	}
+
+	// 4b. .8443.exe 自动进入 8443 门户方案（PortalMode=true, SysProxy=SysProxyOff）；非 .8443.exe 禁止显式开启 portal 模式
+	c8443, err := parseCLIArgs("ech-proxy.8443.exe", nil, noEnv)
+	if err != nil || !c8443.PortalMode || c8443.LocalProxy || c8443.Mode != "portal" || c8443.SysProxy != SysProxyOff {
+		t.Errorf(".8443.exe parseCLIArgs = %+v, %v", c8443, err)
+	}
+	if _, err := parseCLIArgs("ech-proxy.exe", []string{"portal"}, noEnv); err == nil {
+		t.Error("expected error when non-.8443.exe requests portal subcommand")
 	}
 
 	// 5. 子命令 ca install / ca uninstall / update / logs

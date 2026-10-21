@@ -24,7 +24,6 @@ const (
 
 type sniServerNameKey struct{}
 
-// WithSNIServerName 在请求 Context 中注入自定义 SNI 伪装域名（若传 "none" 则发送空 SNI，留空则默认使用 cloudflare-ech.com）。
 func WithSNIServerName(ctx context.Context, serverName string) context.Context {
 	if strings.TrimSpace(serverName) == "" {
 		return ctx
@@ -32,7 +31,6 @@ func WithSNIServerName(ctx context.Context, serverName string) context.Context {
 	return context.WithValue(ctx, sniServerNameKey{}, strings.TrimSpace(serverName))
 }
 
-// SNIServerNameFromContext 读取请求 Context 中配置的 SNI 伪装域名。
 func SNIServerNameFromContext(ctx context.Context) string {
 	if v, ok := ctx.Value(sniServerNameKey{}).(string); ok && v != "" {
 		if strings.EqualFold(v, "none") {
@@ -75,22 +73,13 @@ func clearCachedRoute(host string) {
 	routeMu.Unlock()
 }
 
-// DetectTransportMode 全自动无干预判断目标主机应优先使用 "ech" 还是 "sni"：
-//  1. 优先读取已验证成功的路由缓存；
-//  2. 通过 DoH（或公共 DNS 回退）解析目标主机 IP，检查是否属于 Cloudflare 网段（netdial.IsCloudflareIP）：
-//     - 属于 Cloudflare 网段 -> 返回 "ech"（走方式 2：Cloudflare ECH 加密 ClientHello）
-//     - 不属于 Cloudflare 网段 -> 返回 "sni"（走方式 1：DoH 解析 + 伪造 SNI 直连）
 func DetectTransportMode(ctx context.Context, host string) string {
 	mode, _ := DetectTransportModeWithStatus(ctx, host, "")
 	return mode
 }
 
-// DetectTransportModeWithStatus 返回探测到的模式以及该结论是否来自成功的 DNS 解析（修复 Issue #6 瞬时故障负缓存）。
 func DetectTransportModeWithStatus(ctx context.Context, host, ipMode string) (mode string, confident bool) {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
+	host = netdial.CleanHost(host)
 	if cached, ok := getCachedRoute(host); ok {
 		return cached, true
 	}
@@ -103,24 +92,34 @@ func DetectTransportModeWithStatus(ctx context.Context, host, ipMode string) (mo
 		}
 		return "sni", true
 	}
-	// DNS 解析瞬时失败时回退尝试 ech，但标记 confident=false 避免将未验证猜测负缓存
 	return "ech", false
 }
 
-// RoundTrip 统一调度三种上游请求方案，并在所有 HTTPS 路径上严格校验服务端回传证书（与 truedomain.com 比对域名一致性与过期时间）：
-//   - 当 req.URL.Scheme == "http" 时：通过 DoH 解析真实 IP 并执行明文 HTTP 请求（PlainHTTPDo），支持纯 HTTP 站点与自定义 HTTP 端口；
-//   - 方式 1 ("sni")：通过 DoH 解析域名 -> SNI 伪装绕过请求 -> 核对回传证书与伪装前真实域名一致且未过期；
-//   - 方式 2 ("ech")：通过 DoH 解析域名 -> 使用 ECH 请求 -> 核对回传证书与真实域名一致且未过期；
-//   - 方式 3 ("fragment" / 其他)：通过 DoH 解析域名 -> 使用 TLS ClientHello 分片方案绕过 GFW DPI -> 核对回传证书；
-//   - "direct"：仅用于门户自身或显式指定直连的站点（同样核对回传证书）。
-func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
-	normIPMode := netdial.NormalizeIPMode(ipMode)
-	if normIPMode == "" {
-		normIPMode = currentConfig().ipMode
+func resolveEffectiveIPMode(ipMode string) string {
+	norm := netdial.NormalizeIPMode(ipMode)
+	if norm == "" {
+		norm = currentConfig().ipMode
 	}
-	normIPMode = netdial.EffectiveIPMode(normIPMode)
+	return netdial.EffectiveIPMode(norm)
+}
 
-	// 若请求显式为明文 http:// 协议，使用基于 DoH 解析的明文 HTTP 传输
+func extractRequestHost(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	if req.Host != "" {
+		return netdial.CleanHost(req.Host)
+	}
+	if req.URL != nil {
+		return netdial.CleanHost(req.URL.Host)
+	}
+	return ""
+}
+
+// RoundTrip 统一调度上游请求通道（供 PAC 方案、443 方案、8443 方案共同复用），并在所有 HTTPS 路径核对上游证书。
+func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
+	normIPMode := resolveEffectiveIPMode(ipMode)
+
 	if req != nil && req.URL != nil && strings.EqualFold(req.URL.Scheme, "http") {
 		return PlainHTTPDo(req, normIPMode)
 	}
@@ -133,15 +132,7 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		return FragmentDo(req, normIPMode)
 	}
 
-	host := req.Host
-	if host == "" {
-		host = req.URL.Host
-	}
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	host = strings.ToLower(host)
-
+	host := extractRequestHost(req)
 	primary := trimmedMode
 	confident := true
 	if primary == "" || primary == "auto" {
@@ -150,7 +141,6 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		primary = cached
 	}
 
-	// 第 1 步：执行首选方式（方式 1 SNI 伪装 或 方式 2 ECH）
 	resp, err := doSingleMode(req, primary, normIPMode)
 	if err == nil && !isCloudflareRouteRejection(resp, primary) {
 		if confident || resp.StatusCode < 500 {
@@ -161,13 +151,11 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	if resp != nil {
 		resp.Body.Close()
 	}
-	// 上游证书校验失败（过期/不一致/不可信）：立即上抛走警告页，绝不切换备选模式掩盖
 	if IsCertError(err) {
 		return nil, err
 	}
 	clearCachedRoute(host)
 
-	// 第 2 步：首选模式连接失败时，自动切换另一核心模式（SNI <-> ECH）
 	secondary := "sni"
 	if primary == "sni" {
 		secondary = "ech"
@@ -184,8 +172,6 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		return nil, err2
 	}
 
-	// 第 3 步（方式 3）：当 ECH 与假 SNI 均无法连通（例如源站非 Cloudflare 且拒绝假 SNI）时，
-	// 使用 DoH 解析真实 IP + TLS ClientHello 记录分片（FragmentDo）绕过 GFW DPI！
 	respFrag, errFrag := FragmentDo(req, normIPMode)
 	if errFrag == nil {
 		setCachedRoute(host, "fragment")
@@ -198,7 +184,6 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		return nil, errFrag
 	}
 
-	// 第 4 步：最后兜底尝试标准直连（同样带证书校验，失败上抛 CertError 走警告页）
 	resp3, err3 := directDo(req, normIPMode)
 	if err3 == nil {
 		return resp3, nil
@@ -209,31 +194,22 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	return nil, err
 }
 
-// PlainHTTPDo 通过 DoH 解析目标域名真实 IP（防 DNS 污染），并发起明文 HTTP 请求（支持仅提供 HTTP 80 或自定义端口的目标站点）。
 func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 	mode := ""
 	if len(ipMode) > 0 {
 		mode = ipMode[0]
 	}
-	normMode := netdial.NormalizeIPMode(mode)
-	if normMode == "" {
-		normMode = currentConfig().ipMode
-	}
-	normMode = netdial.EffectiveIPMode(normMode)
+	normMode := resolveEffectiveIPMode(mode)
 
 	hostPort := req.URL.Host
 	if hostPort == "" {
 		hostPort = req.Host
 	}
-	host := hostPort
-	port := "80"
-	if h, p, err := net.SplitHostPort(hostPort); err == nil {
-		host = h
-		if p != "" {
-			port = p
-		}
+	host := netdial.CleanHost(hostPort)
+	port := netdial.ExtractPort(hostPort)
+	if port == "" {
+		port = "80"
 	}
-	host = strings.ToLower(strings.TrimSpace(host))
 
 	dialTarget := host
 	if ips, err := ResolveHostIPsByMode(req.Context(), host, normMode); err == nil && len(ips) > 0 {
@@ -245,24 +221,20 @@ func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 		return netdial.DialContextIPMode(ctx, dialTarget, port, normMode, dialTimeout)
 	}
 	c := &http.Client{
-		Transport: tr,
-		Timeout:   netdial.OpTimeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+		Transport:     tr,
+		Timeout:       netdial.OpTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	return c.Do(req)
 }
 
-// directDo 经标准 TLS 直连上游（Direct 模式），并在握手后手动校验上游证书
-// （时间 + 主机名 + 信任链），使证书失败统一走 CertError 警告页，且 WithAllowBadCert（强行访问）可跳过。
 func directDo(req *http.Request, ipMode string) (*http.Response, error) {
 	tr := netdial.TransportWithIPModeAndCertCheck(ipMode, func(host string, peerCerts []*x509.Certificate) error {
 		return validateUpstreamCert(req.Context(), host, peerCerts)
 	})
 	c := &http.Client{
-		Transport: tr,
-		Timeout:   netdial.OpTimeout,
+		Transport:     tr,
+		Timeout:       netdial.OpTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	return c.Do(req)
@@ -281,7 +253,6 @@ func doSingleMode(req *http.Request, mode, ipMode string) (*http.Response, error
 	}
 }
 
-// isCloudflareRouteRejection 判断 ECH 响应是否为 Cloudflare 边缘因域名未托管在 CF 而返回的网关拒绝状态码。
 func isCloudflareRouteRejection(resp *http.Response, mode string) bool {
 	if mode != "ech" && mode != "" {
 		return false
@@ -299,29 +270,20 @@ type ipCacheEntry struct {
 }
 
 var (
-	ipCacheMu    sync.Mutex
-	ipCache      = map[string]ipCacheEntry{}
-	sniTransMu   sync.Mutex
-	sniH2Trans   = map[string]*http2.Transport{}
-	sniH1Clients = map[string]*http.Client{}
+	ipCacheMu     sync.Mutex
+	ipCache       = map[string]ipCacheEntry{}
+	utlsTransMu   sync.Mutex
+	utlsH2Trans   = map[string]*http2.Transport{}
+	utlsH1Clients = map[string]*http.Client{}
 )
 
-// ResolveHostIPs 通过 DoH（及公共 DNS 兜底）查询目标域名的 IP 记录并按 TTL 缓存。
 func ResolveHostIPs(ctx context.Context, host string) ([]string, error) {
 	return ResolveHostIPsByMode(ctx, host, "")
 }
 
-// ResolveHostIPsByMode 按指定的 ipMode（默认 "v4"、"v6" 或 "dual"）通过 DoH 查询 A/AAAA 记录并缓存（修复 S3 与 Issue #9）。
 func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, error) {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	normMode := netdial.NormalizeIPMode(ipMode)
-	if normMode == "" {
-		normMode = currentConfig().ipMode
-	}
-	normMode = netdial.EffectiveIPMode(normMode)
+	host = netdial.CleanHost(host)
+	normMode := resolveEffectiveIPMode(ipMode)
 
 	if parsed := net.ParseIP(host); parsed != nil {
 		filtered := netdial.FilterIPsByMode([]net.IP{parsed}, normMode)
@@ -339,14 +301,12 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 	}
 	ipCacheMu.Unlock()
 
-	var qtypes []int
+	qtypes := []int{1}
 	switch normMode {
-	case "v4":
-		qtypes = []int{1} // A (IPv4 only, default)
 	case "v6":
-		qtypes = []int{28} // AAAA (IPv6 only)
-	default:
-		qtypes = []int{1, 28} // dual: A 优先，AAAA 补充
+		qtypes = []int{28}
+	case "dual":
+		qtypes = []int{1, 28}
 	}
 
 	var ips []string
@@ -368,8 +328,7 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 					for _, ans := range d.Answer {
 						if ans.Type == qt {
 							if parsed := net.ParseIP(ans.Data); parsed != nil {
-								matched := netdial.FilterIPsByMode([]net.IP{parsed}, normMode)
-								for _, m := range matched {
+								for _, m := range netdial.FilterIPsByMode([]net.IP{parsed}, normMode) {
 									if !seen[m] {
 										seen[m] = true
 										ips = append(ips, m)
@@ -385,13 +344,11 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 			}
 			resp.Body.Close()
 		}
-		// 若 dual 模式下已拿到 IPv4 A 记录，无需再额外阻塞等待 AAAA
 		if normMode == "dual" && len(ips) > 0 {
 			break
 		}
 	}
 
-	// 若 DoH 未返回结果，回退使用 netdial 公共 DNS 解析器（同样遵守 normMode）
 	if len(ips) == 0 {
 		if fallbackIPs, rerr := netdial.ResolveIPs(ctx, host, normMode); rerr == nil && len(fallbackIPs) > 0 {
 			ips = fallbackIPs
@@ -414,7 +371,8 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 	return ips, nil
 }
 
-func dialUTLS(ctx context.Context, ip, sniName, host string, nextProtos []string) (*utls.UConn, error) {
+// dialUTLSWithWrapper 统一的 uTLS Chrome 指纹拨号与上游证书校验封装（供 SNI 伪装与 Fragment 分片模式共同复用）。
+func dialUTLSWithWrapper(ctx context.Context, ip, sniName, verifyHost string, nextProtos []string, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
 	rawConn, err := (&net.Dialer{
 		Timeout:   dialTimeout,
 		KeepAlive: 30 * time.Second,
@@ -422,35 +380,36 @@ func dialUTLS(ctx context.Context, ip, sniName, host string, nextProtos []string
 	if err != nil {
 		return nil, err
 	}
-	uConn := utls.UClient(rawConn, &utls.Config{
-		ServerName:         sniName, // 伪装 SNI（假域名），保持不变
-		InsecureSkipVerify: true,    // 不由 utls 做假 SNI 主机名校验，改由下方手动核对真实域名 host
+	var baseConn net.Conn = rawConn
+	if wrapConn != nil {
+		baseConn = wrapConn(rawConn)
+	}
+	uConn := utls.UClient(baseConn, &utls.Config{
+		ServerName:         sniName,
+		InsecureSkipVerify: true,
 		NextProtos:         nextProtos,
 	}, utls.HelloChrome_120)
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		rawConn.Close()
 		return nil, err
 	}
-	// 方式 1 核心校验：SNI 伪装请求握手后，立即核对服务端回传的证书是否正确，
-	// 证书包含的 domain 必须与伪装之前访问的真实域名 host (truedomain.com) 符合条件，且未过期！
-	if cerr := validateUpstreamCert(ctx, host, uConn.ConnectionState().PeerCertificates); cerr != nil {
+	if cerr := validateUpstreamCert(ctx, verifyHost, uConn.ConnectionState().PeerCertificates); cerr != nil {
 		rawConn.Close()
 		return nil, cerr
 	}
 	return uConn, nil
 }
 
-func getSNIH2Transport(ip, sniName, host string) *http2.Transport {
-	key := ip + "|" + sniName + "|" + host
-	sniTransMu.Lock()
-	defer sniTransMu.Unlock()
-	if t, ok := sniH2Trans[key]; ok {
+func getUTLSH2Transport(cacheKey string, dialFn func(ctx context.Context, nextProtos []string) (*utls.UConn, error)) *http2.Transport {
+	utlsTransMu.Lock()
+	defer utlsTransMu.Unlock()
+	if t, ok := utlsH2Trans[cacheKey]; ok {
 		return t
 	}
 	t := &http2.Transport{
 		AllowHTTP: false,
 		DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
-			uConn, err := dialUTLS(ctx, ip, sniName, host, []string{"h2", "http/1.1"})
+			uConn, err := dialFn(ctx, []string{"h2", "http/1.1"})
 			if err != nil {
 				return nil, err
 			}
@@ -461,92 +420,76 @@ func getSNIH2Transport(ip, sniName, host string) *http2.Transport {
 			return uConn, nil
 		},
 	}
-	if len(sniH2Trans) >= maxSNICacheEntries {
-		for k, old := range sniH2Trans {
+	if len(utlsH2Trans) >= maxSNICacheEntries {
+		for k, old := range utlsH2Trans {
 			old.CloseIdleConnections()
-			delete(sniH2Trans, k)
+			delete(utlsH2Trans, k)
 			break
 		}
 	}
-	sniH2Trans[key] = t
+	utlsH2Trans[cacheKey] = t
 	return t
 }
 
-func getSNIH1Client(ip, sniName, host string) *http.Client {
-	key := ip + "|" + sniName + "|" + host
-	sniTransMu.Lock()
-	defer sniTransMu.Unlock()
-	if c, ok := sniH1Clients[key]; ok {
+func getUTLSH1Client(cacheKey string, dialFn func(ctx context.Context, nextProtos []string) (*utls.UConn, error)) *http.Client {
+	utlsTransMu.Lock()
+	defer utlsTransMu.Unlock()
+	if c, ok := utlsH1Clients[cacheKey]; ok {
 		return c
 	}
 	tr := &http.Transport{
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialUTLS(ctx, ip, sniName, host, []string{"http/1.1"})
+			return dialFn(ctx, []string{"http/1.1"})
 		},
 		MaxIdleConns:    32,
 		IdleConnTimeout: 90 * time.Second,
 	}
 	c := &http.Client{
-		Transport: tr,
-		Timeout:   netdial.OpTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
+		Transport:     tr,
+		Timeout:       netdial.OpTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	if len(sniH1Clients) >= maxSNICacheEntries {
-		for k, old := range sniH1Clients {
+	if len(utlsH1Clients) >= maxSNICacheEntries {
+		for k, old := range utlsH1Clients {
 			if oldTr, ok := old.Transport.(*http.Transport); ok {
 				oldTr.CloseIdleConnections()
 			}
-			delete(sniH1Clients, k)
+			delete(utlsH1Clients, k)
 			break
 		}
 	}
-	sniH1Clients[key] = c
+	utlsH1Clients[cacheKey] = c
 	return c
 }
 
-// SNIFrontDo（方式 1）通过 DoH 解析真实 IP + SNI 伪装直连目标主机，
-// 并在握手后核对服务端回传证书是否覆盖伪装前的真实域名 host（truedomain.com）且未过期。
-func SNIFrontDo(req *http.Request, ipMode ...string) (*http.Response, error) {
-	mode := ""
-	if len(ipMode) > 0 {
-		mode = ipMode[0]
-	}
-	normMode := netdial.NormalizeIPMode(mode)
-	if normMode == "" {
-		normMode = currentConfig().ipMode
-	}
-	normMode = netdial.EffectiveIPMode(normMode)
-
-	host := req.Host
-	if host == "" {
-		host = req.URL.Host
-	}
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
-	host = strings.ToLower(host)
-
+// roundTripUTLS 复用 DoH 解析、H2/H1.1 自适应降级、证书错误透传与连接池淘汰逻辑（供 SNIFrontDo 与 FragmentDo 共用）。
+func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func(net.Conn) net.Conn) (*http.Response, error) {
+	normMode := resolveEffectiveIPMode(ipMode)
+	host := extractRequestHost(req)
 	ips, err := ResolveHostIPsByMode(req.Context(), host, normMode)
 	if err != nil {
 		return nil, err
 	}
-	sniName := SNIServerNameFromContext(req.Context())
+	effectiveSNI := sniName
+	if effectiveSNI == "" && tag == "frag" {
+		effectiveSNI = host
+	}
 
 	var lastErr error
 	for _, ip := range ips {
-		resp, err := getSNIH2Transport(ip, sniName, host).RoundTrip(req)
+		cacheKey := tag + "|" + ip + "|" + effectiveSNI + "|" + host
+		dialFn := func(ctx context.Context, nextProtos []string) (*utls.UConn, error) {
+			return dialUTLSWithWrapper(ctx, ip, effectiveSNI, host, nextProtos, wrapConn)
+		}
+		resp, err := getUTLSH2Transport(cacheKey, dialFn).RoundTrip(req)
 		if err == nil {
 			return resp, nil
 		}
-		// 若命中证书校验错误（过期 / 域名不一致 / 不可信），立即上抛以渲染警告页
 		if IsCertError(err) {
 			return nil, err
 		}
-		// 若源站仅支持 HTTP/1.1，自动回退至 uTLS HTTP/1.1 传输
 		if strings.Contains(err.Error(), "not h2") {
-			if resp1, err1 := getSNIH1Client(ip, sniName, host).Do(req); err1 == nil {
+			if resp1, err1 := getUTLSH1Client(cacheKey, dialFn).Do(req); err1 == nil {
 				return resp1, nil
 			} else {
 				if IsCertError(err1) {
@@ -556,16 +499,23 @@ func SNIFrontDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 			}
 		}
 		lastErr = err
-		key := ip + "|" + sniName + "|" + host
-		sniTransMu.Lock()
-		if old, ok := sniH2Trans[key]; ok {
+		utlsTransMu.Lock()
+		if old, ok := utlsH2Trans[cacheKey]; ok {
 			old.CloseIdleConnections()
-			delete(sniH2Trans, key)
+			delete(utlsH2Trans, cacheKey)
 		}
-		sniTransMu.Unlock()
+		utlsTransMu.Unlock()
 	}
 	ipCacheMu.Lock()
 	delete(ipCache, host+"|"+normMode)
 	ipCacheMu.Unlock()
 	return nil, fmt.Errorf("all IPs failed for %s: %w", host, lastErr)
+}
+
+func SNIFrontDo(req *http.Request, ipMode ...string) (*http.Response, error) {
+	mode := ""
+	if len(ipMode) > 0 {
+		mode = ipMode[0]
+	}
+	return roundTripUTLS(req, mode, "sni", SNIServerNameFromContext(req.Context()), nil)
 }

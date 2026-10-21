@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -37,6 +38,21 @@ func serveCertWarningPage(c *gin.Context, err error, kind, certHost, detail, req
 	c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
 	c.Writer.WriteHeader(http.StatusBadGateway)
 	_, _ = c.Writer.Write([]byte(htmlBody))
+}
+
+// renderCertWarningIfMatch 若 err 是上游证书校验失败（过期 / 域名不一致 / 链不可信），
+// 渲染对应警告页并返回 true；否则返回 false，由调用方按普通上游错误处理。
+func renderCertWarningIfMatch(c *gin.Context, upstreamHost string, err error) bool {
+	kind, certHost, detail, ok := cloudflare_ech.ClassifyCertError(err)
+	if !ok {
+		return false
+	}
+	requestHost := c.Request.Host
+	if h, _, herr := net.SplitHostPort(requestHost); herr == nil {
+		requestHost = h
+	}
+	serveCertWarningPage(c, err, kind, certHost, detail, requestHost, upstreamHost)
+	return true
 }
 
 // forceAccessURL 构造「强行访问」目标：原请求 URL 追加 ?__ech_proxy_force_cert__=<token>。

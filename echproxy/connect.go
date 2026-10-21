@@ -33,18 +33,12 @@ const (
 	DefaultTunnelIdleTimeout = 10 * time.Minute
 	authFailureWindow        = 5 * time.Minute
 	maxAuthFailures          = 10
-)
 
-// ConnectMode 定义 HTTP CONNECT 请求的处理策略：
-//   - "auto" / "mitm": 对 HTTPS/HTTP 端口且拥有本地 CA 时自动嗅探首字节（TLS 0x16 执行 MITM 终结并经由 DoH+SNI/ECH/Fragment 转发，明文 HTTP 亦直接进入反代流水线）；
-//   - "tunnel": 始终作为纯 TCP 字节流隧道透传（不终结 TLS，优先通过 DoH 解析目标 IP）。
-const (
 	ConnectModeAuto   = "auto"
 	ConnectModeMITM   = "mitm"
 	ConnectModeTunnel = "tunnel"
 )
 
-// AuthConfig 定义代理访问认证配置（同时保护 CONNECT 隧道与反代请求，豁免 /healthz、/ca.pem、/proxy.pac 与门户首页）。
 type AuthConfig struct {
 	Token    string
 	Username string
@@ -59,7 +53,6 @@ type authFailWindow struct {
 	windowEnd time.Time
 }
 
-// AuthConfigFromEnv 从环境变量加载认证配置（返回指针以避免复制内部的 sync.Mutex，对齐桌面端与 Android 端 #12）。
 func AuthConfigFromEnv() *AuthConfig {
 	return &AuthConfig{
 		Token:    strings.TrimSpace(os.Getenv("ECH_PROXY_TOKEN")),
@@ -68,14 +61,12 @@ func AuthConfigFromEnv() *AuthConfig {
 	}
 }
 
-// Enabled 判断是否启用了访问认证。
 func (a *AuthConfig) Enabled() bool {
 	return a != nil && (a.Token != "" || a.Username != "" || a.Password != "")
 }
 
 var ErrAuthRateLimited = errors.New("too many failed authentication attempts")
 
-// Check 校验请求的 Proxy-Authorization 或 Authorization 头，并执行防爆破限流。
 func (a *AuthConfig) Check(req *http.Request, clientIP string) (bool, error) {
 	if !a.Enabled() {
 		return true, nil
@@ -127,10 +118,8 @@ func (a *AuthConfig) verifyCredentials(headerVal string) bool {
 	}
 	if a.Username != "" || a.Password != "" {
 		if strings.HasPrefix(strings.ToLower(headerVal), "basic ") {
-			raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(headerVal[6:]))
-			if err == nil {
-				parts := strings.SplitN(string(raw), ":", 2)
-				if len(parts) == 2 {
+			if raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(headerVal[6:])); err == nil {
+				if parts := strings.SplitN(string(raw), ":", 2); len(parts) == 2 {
 					uOK := subtle.ConstantTimeCompare([]byte(parts[0]), []byte(a.Username)) == 1
 					pOK := subtle.ConstantTimeCompare([]byte(parts[1]), []byte(a.Password)) == 1
 					if uOK && pOK {
@@ -143,15 +132,13 @@ func (a *AuthConfig) verifyCredentials(headerVal string) bool {
 	return false
 }
 
-// TunnelLimiter 实现 DESIGN-tunnel-limits-and-android.md 中的双层并发隧道限流器（per-peer + global）。
 type TunnelLimiter struct {
 	PerPeerMax int
 	GlobalMax  int
 	globalCur  atomic.Int32
-	peers      sync.Map // map[string]*atomic.Int32
+	peers      sync.Map
 }
 
-// NewTunnelLimiter 创建并发隧道限流器。
 func NewTunnelLimiter(perPeerMax, globalMax int) *TunnelLimiter {
 	if perPeerMax <= 0 {
 		perPeerMax = DefaultPerPeerMaxTunnels
@@ -159,13 +146,9 @@ func NewTunnelLimiter(perPeerMax, globalMax int) *TunnelLimiter {
 	if globalMax <= 0 {
 		globalMax = DefaultGlobalMaxTunnels
 	}
-	return &TunnelLimiter{
-		PerPeerMax: perPeerMax,
-		GlobalMax:  globalMax,
-	}
+	return &TunnelLimiter{PerPeerMax: perPeerMax, GlobalMax: globalMax}
 }
 
-// Acquire 尝试为指定 peerIP 分配一条隧道配额；成功时返回 release 函数与 true，超限时返回 nil 与 false。
 func (l *TunnelLimiter) Acquire(peerIP string) (func(), bool) {
 	if l == nil {
 		return func() {}, true
@@ -192,7 +175,6 @@ func (l *TunnelLimiter) Acquire(peerIP string) (func(), bool) {
 	}, true
 }
 
-// ActiveCount 返回当前全局活跃隧道总数。
 func (l *TunnelLimiter) ActiveCount() int {
 	if l == nil {
 		return 0
@@ -200,18 +182,19 @@ func (l *TunnelLimiter) ActiveCount() int {
 	return int(l.globalCur.Load())
 }
 
-// dialConnectFn 供单元测试注入自定义拨号函数；生产环境优先通过 DoH 解析真实 IP 后再拨号，防止 DNS 污染。
 var dialConnectFn = func(ctx context.Context, host, port, ipMode string) (net.Conn, error) {
-	target := host
 	if net.ParseIP(host) == nil {
 		if ips, err := cloudflare_ech.ResolveHostIPsByMode(ctx, host, ipMode); err == nil && len(ips) > 0 {
-			target = ips[0]
+			for _, ip := range ips {
+				if c, derr := netdial.DialContextIPMode(ctx, ip, port, ipMode, netdial.DialTimeout); derr == nil {
+					return c, nil
+				}
+			}
 		}
 	}
-	return netdial.DialContextIPMode(ctx, target, port, ipMode, netdial.DialTimeout)
+	return netdial.DialContextIPMode(ctx, host, port, ipMode, netdial.DialTimeout)
 }
 
-// isMITMCapablePort 判断 CONNECT 目标端口是否支持 HTTP/HTTPS 协议终结（含 443、80 及常见 Cloudflare HTTPS 端口）。
 func isMITMCapablePort(port string) bool {
 	switch port {
 	case "443", "80", "8443", "2053", "2083", "2087", "2096":
@@ -221,8 +204,6 @@ func isMITMCapablePort(port string) bool {
 	}
 }
 
-// parseConnectTarget 解析并严格校验 CONNECT 请求的 host:port（CONNECT-boundaries.md B5）。
-// RequestURI 中的 authority 优先于 Host 头。
 func parseConnectTarget(req *http.Request) (string, string, error) {
 	raw := strings.TrimSpace(req.RequestURI)
 	if raw == "" || strings.HasPrefix(raw, "/") {
@@ -246,7 +227,6 @@ func parseConnectTarget(req *http.Request) (string, string, error) {
 	return host, strconv.Itoa(portNum), nil
 }
 
-// checkConnectTarget 校验 CONNECT 目标是否触发 SSRF 防护（拦截环回、内网与 169.254.169.254 云元数据地址）。
 func checkConnectTarget(host string, blockedHosts []string, allowPrivate bool) error {
 	if !allowPrivate {
 		if host == "localhost" || strings.HasSuffix(host, ".localhost") || strings.HasSuffix(host, ".local") {
@@ -268,10 +248,9 @@ func checkConnectTarget(host string, blockedHosts []string, allowPrivate bool) e
 	return nil
 }
 
-// ConnectOptions 配置 HTTP CONNECT 处理器。
 type ConnectOptions struct {
 	Enabled             bool
-	Mode                string // "auto" / "mitm" / "tunnel"
+	Mode                string
 	IPMode              string
 	AllowPrivateTargets bool
 	IdleTimeout         time.Duration
@@ -283,7 +262,6 @@ type ConnectOptions struct {
 	HTTPHandler         http.Handler
 }
 
-// handleHTTPConnect 按照「认证 → 目标校验 → 限流 → MITM / Dial」顺序处理 HTTP CONNECT 请求。
 func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptions) {
 	if !opts.Enabled {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -297,7 +275,6 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 		clientIP = r.RemoteAddr
 	}
 
-	// 1. 认证检查（带防爆破速率限制）
 	if opts.Auth != nil && opts.Auth.Enabled() {
 		ok, err := opts.Auth.Check(r, clientIP)
 		if errors.Is(err, ErrAuthRateLimited) {
@@ -311,22 +288,17 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 		}
 	}
 
-	// 2. 目标语法与 SSRF 黑名单校验（在限流配额前执行，防止扫描 169.254.169.254 耗尽配额）
 	host, port, err := parseConnectTarget(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	var blocked []string
-	if opts.Config != nil {
-		blocked = opts.Config.BlockedHosts
-	}
+	upstreams, blocked := opts.Config.Snapshot()
 	if err := checkConnectTarget(host, blocked, opts.AllowPrivateTargets); err != nil {
 		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
 
-	// 3. 并发隧道限流检查（per-peer 128 / global 1024）
 	release, ok := opts.Limiter.Acquire(clientIP)
 	if !ok {
 		http.Error(w, "tunnel concurrency limit exceeded", http.StatusTooManyRequests)
@@ -340,13 +312,9 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 		return
 	}
 
-	// 判断是否走 Smart MITM ECH/SNI/Fragment 终结模式
-	useMITM := false
 	mode := strings.ToLower(strings.TrimSpace(opts.Mode))
-	if (mode == "" || mode == ConnectModeAuto || mode == ConnectModeMITM) &&
-		isMITMCapablePort(port) && opts.CertStore != nil && opts.HTTPHandler != nil && net.ParseIP(host) == nil {
-		useMITM = true
-	}
+	useMITM := (mode == "" || mode == ConnectModeAuto || mode == ConnectModeMITM) &&
+		isMITMCapablePort(port) && opts.CertStore != nil && opts.HTTPHandler != nil && net.ParseIP(host) == nil
 
 	if useMITM {
 		clientConn, clientBuf, err := hj.Hijack()
@@ -354,20 +322,16 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 			release()
 			return
 		}
-		go func() {
-			defer logger.RecoverAndLog("CONNECT-MITM", nil)
+		logger.SafeGo("serveMITMConnect", func() {
 			defer release()
-			serveMITMConnect(clientConn, clientBuf, host, opts)
-		}()
+			serveMITMConnect(clientConn, clientBuf, host, port, opts)
+		})
 		return
 	}
 
-	// 4. Raw TCP 隧道模式：先拨号上游，再 hijack 发送 200（或 hijack 后手写 502）
 	ipMode := opts.IPMode
-	if opts.Config != nil {
-		if uc, exists := config.Resolve(opts.Config.Upstreams, host); exists && uc.IPMode != "" {
-			ipMode = uc.IPMode
-		}
+	if uc, exists := config.Resolve(upstreams, host); exists && uc.IPMode != "" {
+		ipMode = uc.IPMode
 	}
 
 	clientConn, clientBuf, err := hj.Hijack()
@@ -391,11 +355,9 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 		return
 	}
 
-	// B2: 转发客户端与 CONNECT 同包发出的 pipelined ClientHello 字节
 	if clientBuf != nil && clientBuf.Reader.Buffered() > 0 {
 		pipelined := make([]byte, clientBuf.Reader.Buffered())
-		n, _ := io.ReadFull(clientBuf.Reader, pipelined)
-		if n > 0 {
+		if n, _ := io.ReadFull(clientBuf.Reader, pipelined); n > 0 {
 			if _, werr := upConn.Write(pipelined[:n]); werr != nil {
 				release()
 				_ = upConn.Close()
@@ -409,20 +371,13 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 	if idleTimeout <= 0 {
 		idleTimeout = DefaultTunnelIdleTimeout
 	}
-	go func() {
-		defer logger.RecoverAndLog("CONNECT-Relay", nil)
+	logger.SafeGo("CONNECT-Relay", func() {
 		defer release()
-		relay(
-			newDeadlineConn(clientConn, idleTimeout),
-			newDeadlineConn(upConn, idleTimeout),
-		)
-	}()
+		relay(newDeadlineConn(clientConn, idleTimeout), newDeadlineConn(upConn, idleTimeout))
+	})
 }
 
-// serveMITMConnect 在 CONNECT 隧道内嗅探首字节：
-//   - 若首字节为 0x16（TLS ClientHello），用本地自签 CA 终结 TLS，并将解密后的 HTTP/1.1 或 HTTP/2 请求交由 ECH/SNI/Fragment 反代引擎处理；
-//   - 若首字节为明文 HTTP（如部分客户端在 CONNECT 隧道内发送明文 HTTP），则直接交由反代引擎处理，兼顾 HTTP 与 HTTPS。
-func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHost string, opts ConnectOptions) {
+func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHost, targetPort string, opts ConnectOptions) {
 	defer clientConn.Close()
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		return
@@ -438,11 +393,14 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 	}
 	peekedConn := &bufferedConn{Conn: wrapped, r: br}
 
-	// 若客户端在 CONNECT 隧道内发送的是明文 HTTP 请求（首字节非 0x16 TLS Handshake）
 	if first[0] != 0x16 {
 		plainHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			if req.Host == "" {
-				req.Host = targetHost
+				if targetPort != "" && targetPort != "80" {
+					req.Host = net.JoinHostPort(targetHost, targetPort)
+				} else {
+					req.Host = targetHost
+				}
 			}
 			req.URL.Scheme = "http"
 			if req.URL.Host == "" {
@@ -450,18 +408,13 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 			}
 			opts.HTTPHandler.ServeHTTP(w, req)
 		})
-		plainSrv := &http.Server{
-			Handler:           plainHandler,
-			ReadHeaderTimeout: 15 * time.Second,
-			IdleTimeout:       90 * time.Second,
-		}
-		_ = plainSrv.Serve(newSingleConnListener(peekedConn))
+		srv := &http.Server{Handler: plainHandler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second}
+		_ = srv.Serve(newSingleConnListener(peekedConn))
 		return
 	}
 
 	baseTLS := opts.CertStore.TLSConfig(opts.PortalCert)
 	tlsCfg := baseTLS.Clone()
-	// 若客户端未发送 SNI，使用 CONNECT 请求行中的 targetHost 签发证书
 	tlsCfg.GetCertificate = func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 		if hello.ServerName == "" {
 			hello.ServerName = targetHost
@@ -475,7 +428,7 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 	cancel()
 	if err != nil {
 		if !isExpectedConnError(err) && opts.CertStore != nil {
-			log.Printf("[CONNECT MITM] TLS handshake for %s failed: %v (ensure %s is trusted)", targetHost, err, opts.CertStore.CAPath())
+			log.Printf("[CONNECT MITM] TLS handshake for %s failed: %v", targetHost, err)
 		}
 		return
 	}
@@ -492,18 +445,10 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 	})
 
 	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
-		h2Srv := &http2.Server{}
-		h2Srv.ServeConn(tlsConn, &http2.ServeConnOpts{
-			Handler: handler,
-		})
+		(&http2.Server{}).ServeConn(tlsConn, &http2.ServeConnOpts{Handler: handler})
 		return
 	}
-
-	srv := &http.Server{
-		Handler:           handler,
-		ReadHeaderTimeout: 15 * time.Second,
-		IdleTimeout:       90 * time.Second,
-	}
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second}
 	_ = srv.Serve(newSingleConnListener(tlsConn))
 }
 
@@ -517,7 +462,6 @@ func writeConnectError(conn net.Conn, code int, body string) {
 	_, _ = conn.Write([]byte(resp))
 }
 
-// relay 双向拷贝字节，任一方向结束或出错时立即关闭双端连接并退出（修复 B1 哑客户端连接泄漏）。
 func relay(a, b net.Conn) {
 	done := make(chan error, 2)
 	cp := func(dst, src net.Conn) {
@@ -526,18 +470,15 @@ func relay(a, b net.Conn) {
 	}
 	go cp(a, b)
 	go cp(b, a)
-
 	err := <-done
 	_ = a.Close()
 	_ = b.Close()
 	<-done
-
 	if err != nil && !isExpectedConnError(err) {
 		debugLogf("CONNECT relay error: %v", err)
 	}
 }
 
-// isExpectedConnError 过滤隧道关闭时的常态网络断开错误，但绝不吞掉 TLS 证书等真实错误（B4）。
 func isExpectedConnError(err error) bool {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
 		return true
@@ -550,13 +491,7 @@ func isExpectedConnError(err error) bool {
 	if strings.Contains(s, "certificate") || strings.Contains(s, "x509") || strings.Contains(s, "tls:") {
 		return false
 	}
-	for _, pat := range []string{
-		"connection reset by peer",
-		"broken pipe",
-		"use of closed network connection",
-		"unexpected eof",
-		"forcibly closed by the remote host",
-	} {
+	for _, pat := range []string{"connection reset by peer", "broken pipe", "use of closed network connection", "unexpected eof", "forcibly closed by the remote host"} {
 		if strings.Contains(s, pat) {
 			return true
 		}
@@ -564,7 +499,6 @@ func isExpectedConnError(err error) bool {
 	return false
 }
 
-// prefixConn 将 Hijack 时已在 bufio.ReadWriter 中缓冲的字节无缝拼接到 net.Conn 前端。
 type prefixConn struct {
 	net.Conn
 	r io.Reader
@@ -573,22 +507,15 @@ type prefixConn struct {
 func newPrefixConn(c net.Conn, rw *bufio.ReadWriter) net.Conn {
 	if rw != nil && rw.Reader.Buffered() > 0 {
 		buf := make([]byte, rw.Reader.Buffered())
-		n, _ := io.ReadFull(rw.Reader, buf)
-		if n > 0 {
-			return &prefixConn{
-				Conn: c,
-				r:    io.MultiReader(strings.NewReader(string(buf[:n])), c),
-			}
+		if n, _ := io.ReadFull(rw.Reader, buf); n > 0 {
+			return &prefixConn{Conn: c, r: io.MultiReader(strings.NewReader(string(buf[:n])), c)}
 		}
 	}
 	return c
 }
 
-func (p *prefixConn) Read(b []byte) (int, error) {
-	return p.r.Read(b)
-}
+func (p *prefixConn) Read(b []byte) (int, error) { return p.r.Read(b) }
 
-// deadlineConn 在每次成功 Read/Write 后自动顺延空闲超时时间（DESIGN-tunnel-limits-and-android.md 第三层）。
 type deadlineConn struct {
 	net.Conn
 	idle time.Duration
@@ -618,15 +545,17 @@ func (d *deadlineConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// singleConnListener 向 http.Server.Serve 提供恰好一条连接。
 type singleConnListener struct {
 	conn   net.Conn
-	done   chan struct{}
 	once   sync.Once
 	closed sync.Once
+	done   chan struct{}
 }
 
-func newSingleConnListener(c net.Conn) *singleConnListener {
+// newSingleConnListener 创建一个只接受单条连接的监听器。
+// done 通道用于让第二次 Accept 阻塞，直到该连接被关闭——
+// 否则 http.Server.Serve 会在第一次 Accept 后立即返回，导致调用方过早关闭连接。
+func newSingleConnListener(c net.Conn) net.Listener {
 	return &singleConnListener{conn: c, done: make(chan struct{})}
 }
 
@@ -637,7 +566,7 @@ func (l *singleConnListener) Accept() (net.Conn, error) {
 		return &closeNotifyConn{Conn: c, done: l.done}, nil
 	}
 	<-l.done
-	return nil, errors.New("singleConnListener: closed")
+	return nil, net.ErrClosed
 }
 
 func (l *singleConnListener) Close() error {
@@ -645,13 +574,8 @@ func (l *singleConnListener) Close() error {
 	return nil
 }
 
-func (l *singleConnListener) Addr() net.Addr {
-	if l.conn != nil {
-		return l.conn.LocalAddr()
-	}
-	return &net.TCPAddr{}
-}
-
+// closeNotifyConn 在底层连接关闭时关闭 done 通道，使 singleConnListener 阻塞的
+// 第二次 Accept 得以返回。
 type closeNotifyConn struct {
 	net.Conn
 	done chan struct{}
@@ -661,4 +585,10 @@ type closeNotifyConn struct {
 func (c *closeNotifyConn) Close() error {
 	c.once.Do(func() { close(c.done) })
 	return c.Conn.Close()
+}
+func (l *singleConnListener) Addr() net.Addr {
+	if l.conn != nil {
+		return l.conn.LocalAddr()
+	}
+	return &net.TCPAddr{}
 }

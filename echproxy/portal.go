@@ -2,11 +2,10 @@ package echproxy
 
 import (
 	_ "embed"
-	"encoding/json"
 	"html"
-	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/Hana-ame/ech-proxy/echproxy/certstore"
@@ -27,7 +26,6 @@ const (
 	defaultPort = "8443"
 )
 
-// EngineOptions 定义创建路由引擎时的可选扩展组件（本地 CA、CONNECT 限流器、认证策略、远程广告脚本/白名单与本地日志器等）。
 type EngineOptions struct {
 	Config    *config.Config
 	CertStore *certstore.Store
@@ -40,12 +38,10 @@ type EngineOptions struct {
 	Port      uint16
 }
 
-// NewEngine 构建并配置 Gin 路由引擎，同时服务 8443 门户模式、443 本地透明反代模式及 PAC/CA 自助下载端点。
 func NewEngine(cfg *config.Config) *gin.Engine {
 	return NewEngineWithOptions(EngineOptions{Config: cfg})
 }
 
-// NewEngineWithOptions 使用完整配置项构建 Gin 路由引擎。
 func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	cfg := opts.Config
 	if cfg == nil {
@@ -56,12 +52,10 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	r.Use(gin.Recovery(), corsMiddleware())
 
 	seedCookiesFromConfig(cfg)
-	proxyHandler := ProxyHandlerWithOptions(cfg.Upstreams, cfg.BlockedHosts, opts.Auth, opts.AdScript)
+	proxyHandler := ProxyHandlerWithConfig(cfg, opts.Auth, opts.AdScript)
 
-	// 对所有非门户/非本机回环管理域名的代理流量（涵盖明文 HTTP 正向代理与 HTTPS CONNECT MITM 下的所有方法/路径），
-	// 除 /__ech_proxy__/ 内置脚本端点外，一律直接交由 proxyHandler 转发至真实上游，避免与本地管理路由（如 POST /、/healthz 等）冲突。
 	r.Use(func(c *gin.Context) {
-		host := stripPort(c.Request.Host)
+		host := netdial.CleanHost(c.Request.Host)
 		if !isPortalOrLocalAdminHost(host) &&
 			c.Request.URL.Path != "/__ech_proxy__/ads.js" &&
 			c.Request.URL.Path != "/__ech_proxy__/ad_script.js" {
@@ -76,7 +70,6 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		c.String(http.StatusOK, "ok")
 	})
 
-	// 远程广告商脚本端点（供查看、外部引用或手动触发 refresh=1 立即拉取更新）
 	serveAdScriptEndpoint := func(c *gin.Context) {
 		c.Header("Content-Type", "application/javascript; charset=utf-8")
 		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
@@ -84,7 +77,7 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			c.String(http.StatusOK, "/* ech-proxy ads.js is skipped (--skip-ad-script) */\n")
 			return
 		}
-		if c.Query("refresh") == "1" && isPortalOrLocalAdminHost(stripPort(c.Request.Host)) {
+		if c.Query("refresh") == "1" && isPortalOrLocalAdminHost(netdial.CleanHost(c.Request.Host)) {
 			_, _ = opts.AdScript.RefreshOnce()
 		}
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", opts.AdScript.ScriptBytes())
@@ -92,13 +85,7 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	r.GET("/__ech_proxy__/ads.js", serveAdScriptEndpoint)
 	r.GET("/__ech_proxy__/ad_script.js", serveAdScriptEndpoint)
 
-	// 本地持久化日志与崩溃快照导出端点（仅限本机回环或门户域名访问，方便崩溃时用户一键下载上传排障）
 	r.GET("/debug/log", func(c *gin.Context) {
-		host := stripPort(c.Request.Host)
-		if !isPortalOrLocalAdminHost(host) {
-			proxyHandler(c)
-			return
-		}
 		logMgr := opts.Logger
 		if logMgr == nil {
 			logMgr = logger.Default()
@@ -130,15 +117,8 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		c.String(http.StatusOK, "local logger is not initialized")
 	})
 
-	// 运行时状态诊断端点
 	r.GET("/statusz", func(c *gin.Context) {
-		host := stripPort(c.Request.Host)
-		if !isPortalOrLocalAdminHost(host) {
-			proxyHandler(c)
-			return
-		}
-		caPath := ""
-		caValid := ""
+		caPath, caValid := "", ""
 		if opts.CertStore != nil {
 			caPath = opts.CertStore.CAPath()
 			if !opts.CertStore.CAValidUntil().IsZero() {
@@ -149,12 +129,9 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		if opts.Limiter != nil {
 			activeTunnels = opts.Limiter.ActiveCount()
 		}
-		adEnabled := false
-		skipAdScript := true
-		skipAdBlock := false
+		adEnabled, skipAdScript, skipAdBlock := false, true, false
 		allMode := opts.AllMode
-		adSource := "disabled"
-		adVersion := ""
+		adSource, adVersion := "disabled", ""
 		whitelistCount := 0
 		if opts.AdScript != nil {
 			adEnabled = opts.AdScript.Enabled()
@@ -173,9 +150,10 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		} else if logger.Default() != nil {
 			logFile = logger.Default().LogFilePath()
 		}
+		upstreams, _ := cfg.Snapshot()
 		c.JSON(http.StatusOK, gin.H{
 			"status":            "ok",
-			"upstreams":         len(cfg.Upstreams),
+			"upstreams":         len(upstreams),
 			"ca_path":           caPath,
 			"ca_valid_until":    caValid,
 			"active_tunnels":    activeTunnels,
@@ -194,13 +172,7 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		})
 	})
 
-	// 一键下载本地 CA 根证书（方便浏览器、移动端直接点击安装信任）
 	caDownloadHandler := func(c *gin.Context) {
-		host := stripPort(c.Request.Host)
-		if !isPortalOrLocalAdminHost(host) {
-			proxyHandler(c)
-			return
-		}
 		if opts.CertStore == nil {
 			c.String(http.StatusNotFound, "local CA store is not initialized")
 			return
@@ -217,58 +189,34 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	r.GET("/ca.pem", caDownloadHandler)
 	r.GET("/ca.crt", caDownloadHandler)
 
-	// 自动代理配置脚本（PAC）：
-	// - 默认白名单模式：https://4545810.xyz/pac.txt 中的白名单域名与配置中的目标域名走 ech-proxy（PROXY），其他网站全部直连（DIRECT）；
-	// - all 模式（命令行 -all 开启）：无视名单，所有网站均走 ech-proxy。
+	// PAC 自动代理脚本：在 PAC 方案下严格仅依据 pac.txt 白名单（与 upstream.json 完全解耦），且自适应任意监听端口
 	r.GET("/proxy.pac", func(c *gin.Context) {
-		host := stripPort(c.Request.Host)
-		if !isPortalOrLocalAdminHost(host) {
-			proxyHandler(c)
-			return
+		portStr := defaultPort
+		if opts.Port > 0 {
+			portStr = strconv.Itoa(int(opts.Port))
 		}
-		proxyAddr := c.Request.Host
-		if !strings.Contains(proxyAddr, ":") {
-			p := defaultPort
-			if opts.Port > 0 {
-				p = jsonNumber(int(opts.Port))
-			}
-			proxyAddr = "127.0.0.1:" + p
-		} else {
-			_, p, _ := net.SplitHostPort(proxyAddr)
-			proxyAddr = "127.0.0.1:" + p
+		if p := netdial.ExtractPort(c.Request.Host); p != "" {
+			portStr = p
 		}
+		proxyAddr := "127.0.0.1:" + portStr
 		global := opts.AllMode || (opts.AdScript != nil && opts.AdScript.AllMode()) || c.Query("mode") == "all" || c.Query("global") == "1"
-		var whitelist []string
+		var pac string
 		if opts.AdScript != nil {
-			whitelist = opts.AdScript.Whitelist()
+			pac = config.GeneratePAC(nil, proxyAddr, global, opts.AdScript.Whitelist())
+		} else {
+			pac = config.GeneratePAC(cfg, proxyAddr, global)
 		}
-		pac := config.GeneratePAC(cfg, proxyAddr, global, whitelist)
 		c.Header("Content-Type", "application/x-ns-proxy-autoconfig; charset=utf-8")
 		c.String(http.StatusOK, pac)
 	})
 
-	// 自动生成完整的 hosts 配置片段（供偏爱 443 透明反代模式的用户直接复制）
 	r.GET("/hosts.txt", func(c *gin.Context) {
-		host := stripPort(c.Request.Host)
-		if !isPortalOrLocalAdminHost(host) {
-			proxyHandler(c)
-			return
-		}
 		ip := c.DefaultQuery("ip", "127.0.0.1")
 		c.Header("Content-Type", "text/plain; charset=utf-8")
 		c.String(http.StatusOK, config.GenerateHostsBlock(cfg, ip))
 	})
 
 	r.GET("/", func(c *gin.Context) {
-		host := stripPort(c.Request.Host)
-		if isPortalOrLocalAdminHost(host) {
-			servePortal(c, cfg)
-			return
-		}
-		if _, ok := config.Resolve(cfg.Upstreams, host); ok {
-			proxyHandler(c)
-			return
-		}
 		servePortal(c, cfg)
 	})
 
@@ -277,13 +225,8 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 }
 
 func isPortalOrLocalAdminHost(host string) bool {
-	h := strings.ToLower(strings.TrimSpace(host))
+	h := netdial.CleanHost(host)
 	return h == indexHost || h == "localhost" || h == "127.0.0.1" || h == "::1"
-}
-
-func jsonNumber(n int) string {
-	b, _ := json.Marshal(n)
-	return string(b)
 }
 
 func corsMiddleware() gin.HandlerFunc {
@@ -299,7 +242,8 @@ func corsMiddleware() gin.HandlerFunc {
 }
 
 func seedCookiesFromConfig(cfg *config.Config) {
-	for _, uc := range cfg.Upstreams {
+	upstreams, _ := cfg.Snapshot()
+	for _, uc := range upstreams {
 		if raw := cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile); raw != "" {
 			cookie.DefaultJar.Seed(uc.Host, raw)
 		}
@@ -321,23 +265,24 @@ func servePortal(c *gin.Context, cfg *config.Config) {
 func renderUpstreamList(cfg *config.Config, requestHost string) string {
 	var sb strings.Builder
 	port := ":" + defaultPort
-	if _, p, err := net.SplitHostPort(requestHost); err == nil {
+	if p := netdial.ExtractPort(requestHost); p != "" {
 		if p == "443" || p == "80" {
 			port = ""
 		} else {
 			port = ":" + p
 		}
 	}
+	upstreams, _ := cfg.Snapshot()
 	entries := cfg.UpstreamOrder
 	if len(entries) == 0 {
-		for k := range cfg.Upstreams {
+		for k := range upstreams {
 			entries = append(entries, k)
 		}
 	}
 	colors := []string{"#5ce1e6", "#f0a35e", "#7c9cff", "#5ecb8e", "#e68ab8", "#9b8cff", "#5ec9e6", "#e6c45e"}
 	ci := 0
 	for _, entry := range entries {
-		uc, ok := cfg.Upstreams[entry]
+		uc, ok := upstreams[entry]
 		if !ok || !uc.Display {
 			continue
 		}
@@ -364,11 +309,4 @@ func renderUpstreamList(cfg *config.Config, requestHost string) string {
 		sb.WriteString(`</a></div>`)
 	}
 	return sb.String()
-}
-
-func stripPort(hostport string) string {
-	if h, _, err := net.SplitHostPort(hostport); err == nil {
-		return h
-	}
-	return hostport
 }

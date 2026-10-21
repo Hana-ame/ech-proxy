@@ -24,9 +24,8 @@ import (
 )
 
 // TestIssue17And26_UpstreamJSONAndPximgRouting 验证：
-// 1. certs/l.moonchan.xyz/upstream.json 语法与结构完整合法 (#26)，且通过严格静态校验 ValidateConfig (#8)；
-// 2. 包含 pixiv.net、pximg.net、i.pximg.net、s.pximg.net 路由且携带防盗链 Referer (#17)；
-// 3. 任何未写入 upstream.json 的非 l.moonchan.xyz 域名（修改 hosts=127.0.0.1 或通过 CONNECT 后）均可自动透传转发。
+// 1. 8443 方案的 certs/l.moonchan.xyz/upstream.json 语法与结构完整合法 (#26)，且通过严格静态校验 ValidateConfig (#8)；
+// 2. 在不加载 upstream.json 的 PAC 方案与 443 方案下（空 UpstreamMap），config.Resolve 对任意非 l.moonchan.xyz 域名执行纯粹的原域名自动透传，不内置任何特定域名硬编码。
 func TestIssue17And26_UpstreamJSONAndPximgRouting(t *testing.T) {
 	buf, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
 	if err != nil {
@@ -44,7 +43,6 @@ func TestIssue17And26_UpstreamJSONAndPximgRouting(t *testing.T) {
 		t.Fatalf("ParseConfig failed: %v", err)
 	}
 
-	// 验证 Pixiv 主站与子域
 	for _, host := range []string{"pixiv.net", "www.pixiv.net", "account.pixiv.net", "accounts.pixiv.net", "api.sec.pixiv.net"} {
 		uc, ok := config.Resolve(cfg.Upstreams, host)
 		if !ok || uc.Host != host || uc.IPMode != "v4" {
@@ -52,25 +50,15 @@ func TestIssue17And26_UpstreamJSONAndPximgRouting(t *testing.T) {
 		}
 	}
 
-	// 验证 #17: pximg.net / i.pximg.net / s.pximg.net 路由与防盗链 Referer
-	for _, imgHost := range []string{"pximg.net", "i.pximg.net", "s.pximg.net", "imp.pximg.net"} {
-		uc, ok := config.Resolve(cfg.Upstreams, imgHost)
-		if !ok || uc.Host != imgHost {
-			t.Errorf("pximg host %s resolve failed: got %q (ok=%v)", imgHost, uc.Host, ok)
+	// 验证完全解耦（空 UpstreamMap）下，任意非门户域名（含 i.pximg.net 与 unlisted.example.org）纯透传且不内置任何硬编码 Referer
+	for _, h := range []string{"i.pximg.net", "unlisted.example.org"} {
+		autoUC, ok := config.Resolve(nil, h)
+		if !ok || autoUC.Host != h || autoUC.Mode != "auto" || autoUC.Referer != "" {
+			t.Errorf("decoupled Resolve(nil, %q) = %+v (ok=%v), want pure passthrough with empty Referer", h, autoUC, ok)
 		}
-		if uc.Referer != "https://www.pixiv.net/" {
-			t.Errorf("pximg host %s missing Referer: got %q", imgHost, uc.Referer)
-		}
-	}
-
-	// 验证任意未在 upstream.json 中声明的 hosts=127.0.0.1 域名自动透传（Mode="auto"）
-	autoUC, ok := config.Resolve(cfg.Upstreams, "unlisted.example.org")
-	if !ok || autoUC.Host != "unlisted.example.org" || autoUC.Mode != "auto" {
-		t.Errorf("unlisted non-portal domain should auto-passthrough, got: %+v (ok=%v)", autoUC, ok)
 	}
 }
 
-// TestIssue23_ForceHTTPSRedirectUpgrade 验证上游返回 http:// Location 或 Refresh 时强制升级为 https:// (#23)。
 func TestIssue23_ForceHTTPSRedirectUpgrade(t *testing.T) {
 	h := http.Header{}
 	h.Set("Location", "http://www.pixiv.net/?return_to=%2F")
@@ -89,9 +77,6 @@ func TestIssue23_ForceHTTPSRedirectUpgrade(t *testing.T) {
 	}
 }
 
-// TestIssue28_BlockArbitraryFileReadAndControlPlane 验证：
-// 1. cookie_file 拒绝读取系统任意路径或 ".." 路径穿越 (#28)；
-// 2. 控制面端点 /control/cookie 不再暴露。
 func TestIssue28_BlockArbitraryFileReadAndControlPlane(t *testing.T) {
 	for _, unsafePath := range []string{"/etc/passwd", "../../../etc/hosts", `C:\Windows\win.ini`} {
 		if got := cookie.ReadFixedCookie("", unsafePath); got != "" {
@@ -103,17 +88,16 @@ func TestIssue28_BlockArbitraryFileReadAndControlPlane(t *testing.T) {
 	}
 }
 
-// TestLargeChunkedTextResponseNotTruncated 验证超过 8MB (MaxRewriteSize) 的 Chunked 文本响应不会被截断。
 func TestLargeChunkedTextResponseNotTruncated(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	largeSize := rewrite.MaxRewriteSize + 512*1024 // 8.5 MB
+	largeSize := rewrite.MaxRewriteSize + 512*1024
 	payload := bytes.Repeat([]byte("A"), largeSize)
 
 	orig := roundTripFn
 	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		return &http.Response{
 			StatusCode:    http.StatusOK,
-			ContentLength: -1, // 模拟未知长度的 Chunked 响应
+			ContentLength: -1,
 			Header:        http.Header{"Content-Type": []string{"application/javascript"}},
 			Body:          io.NopCloser(bytes.NewReader(payload)),
 		}, nil
@@ -139,10 +123,6 @@ func TestLargeChunkedTextResponseNotTruncated(t *testing.T) {
 	}
 }
 
-// TestUnifiedWhitelistPACAndAdultAdInjection 验证：
-// 1. 远程 PAC 白名单（pac.txt = 去原有广告 + 插入广告商 <script> 标签 + PAC 走 proxy，其他直接 direct）；
-// 2. all 模式（-all）：PAC 对所有网站返回 PROXY；
-// 3. --skip-ad-script 与 --skip-ad-block 行为正确，且 /__ech_proxy__/ads.js、/debug/log、/proxy.pac 与 /statusz 端点正常工作。
 func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	logDir := t.TempDir()
@@ -178,18 +158,12 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	}
 	defer func() { roundTripFn = orig }()
 
-	cfg := &config.Config{
-		Upstreams: config.UpstreamMap{
-			"ex.l.moonchan.xyz": {Host: "e-hentai.org"},
-		},
-	}
 	engine := NewEngineWithOptions(EngineOptions{
-		Config:   cfg,
+		Config:   &config.Config{},
 		AdScript: adMgr,
 		Logger:   logMgr,
 	})
 
-	// 1. 验证默认白名单模式下 /proxy.pac 包含远程白名单域名 (missav.com / e-hentai.org) 且 GLOBAL_MODE = false
 	recPAC := httptest.NewRecorder()
 	reqPAC := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/proxy.pac", nil)
 	reqPAC.Host = "127.0.0.1:8443"
@@ -199,7 +173,6 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 		t.Errorf("default PAC should include remote whitelist domain missav.com and GLOBAL_MODE=false, got: %s", pacStr)
 	}
 
-	// 2. 验证 all 模式下 /proxy.pac 设置 GLOBAL_MODE = true（所有网站走 ech-proxy）
 	adMgr.SetAllMode(true)
 	recPACAll := httptest.NewRecorder()
 	reqPACAll := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/proxy.pac", nil)
@@ -210,10 +183,9 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	}
 	adMgr.SetAllMode(false)
 
-	// 3. 访问白名单中的站点 (ex.l.moonchan.xyz -> e-hentai.org)：剥离原有广告并注入广告商 <script> 标签
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "https://ex.l.moonchan.xyz:8443/", nil)
-	req.Host = "ex.l.moonchan.xyz:8443"
+	req := httptest.NewRequest(http.MethodGet, "https://e-hentai.org/", nil)
+	req.Host = "e-hentai.org"
 	engine.ServeHTTP(rec, req)
 	bodyStr := rec.Body.String()
 	if !strings.Contains(bodyStr, "slimgather.com") || !strings.Contains(bodyStr, "fussyreturn.com") || !strings.Contains(bodyStr, "<script>\n(function(augj){") {
@@ -223,11 +195,10 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 		t.Errorf("expected exoclick ad URL to be stripped from HTML")
 	}
 
-	// 4. 开启 --skip-ad-script 时，不再插入广告商 <script> 标签，但仍移除源站广告
 	adMgr.SetSkipAdScript(true)
 	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodGet, "https://ex.l.moonchan.xyz:8443/", nil)
-	req2.Host = "ex.l.moonchan.xyz:8443"
+	req2 := httptest.NewRequest(http.MethodGet, "https://e-hentai.org/", nil)
+	req2.Host = "e-hentai.org"
 	engine.ServeHTTP(rec2, req2)
 	if strings.Contains(rec2.Body.String(), "slimgather.com") {
 		t.Errorf("expected no advertiser script when --skip-ad-script is enabled")
@@ -237,11 +208,10 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	}
 	adMgr.SetSkipAdScript(false)
 
-	// 5. 开启 --skip-ad-block 时，保留源站原始广告，同时正常插入广告商 <script> 标签
 	adMgr.SetSkipAdBlock(true)
 	rec3 := httptest.NewRecorder()
-	req3 := httptest.NewRequest(http.MethodGet, "https://ex.l.moonchan.xyz:8443/", nil)
-	req3.Host = "ex.l.moonchan.xyz:8443"
+	req3 := httptest.NewRequest(http.MethodGet, "https://e-hentai.org/", nil)
+	req3.Host = "e-hentai.org"
 	engine.ServeHTTP(rec3, req3)
 	if !strings.Contains(rec3.Body.String(), "syndication.exoclick.com") {
 		t.Errorf("expected original exoclick ad to be preserved when --skip-ad-block is enabled")
@@ -251,7 +221,6 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	}
 	adMgr.SetSkipAdBlock(false)
 
-	// 6. 验证 /__ech_proxy__/ads.js 与 /debug/log 端点
 	recScript := httptest.NewRecorder()
 	reqScript := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/__ech_proxy__/ads.js", nil)
 	reqScript.Host = "127.0.0.1:8443"
@@ -269,10 +238,10 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	}
 }
 
-// TestIssue21AndAutoTransparentReverseProxy 验证：
-// 1. 除 l.moonchan.xyz 体系外，所有域名（含多级子域 api.sec.pixiv.net 与双后缀域名 www.dlsite.co.jp）均由本地自签名 CA 动态签发证书，且下发完整证书链与 SKID/AKID (#21)；
+// TestIssue21AndAutoTransparentReverseProxy 验证不依赖 upstream.json 时：
+// 1. 除 l.moonchan.xyz 体系外，所有域名均由本地自签名 CA 动态签发证书，且下发完整证书链 (#21)；
 // 2. 同一监听端口同时支持 HTTPS 访问与明文 HTTP (/proxy.pac, /ca.pem, /statusz) 自动分流；
-// 3. 请求通过自动 SNI/ECH 隧道转发至真实上游。
+// 3. 请求通过自动 SNI/ECH 隧道原域名透传转发。
 func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dir := t.TempDir()
@@ -282,22 +251,14 @@ func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 		t.Fatalf("NewCertStore: %v", err)
 	}
 
-	buf, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
-	if err != nil {
-		t.Fatalf("read upstream.json: %v", err)
-	}
-	cfg, err := ParseConfig(buf)
-	if err != nil {
-		t.Fatalf("ParseConfig: %v", err)
-	}
+	emptyCfg := &config.Config{}
 
 	orig := roundTripFn
 	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header: http.Header{
-				"X-Saw-Host":    []string{req.Host},
-				"X-Saw-Referer": []string{req.Header.Get("Referer")},
+				"X-Saw-Host": []string{req.Host},
 			},
 			Body: io.NopCloser(strings.NewReader("ok:" + req.Host)),
 		}, nil
@@ -312,13 +273,13 @@ func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 	port := uint16(ln.Addr().(*net.TCPAddr).Port)
 
 	engine := NewEngineWithOptions(EngineOptions{
-		Config:    cfg,
+		Config:    emptyCfg,
 		CertStore: store,
 		Port:      port,
 	})
 	tlsCfg := store.TLSConfig(nil)
 	srv := &Server{
-		Config:    cfg,
+		Config:    emptyCfg,
 		CertStore: store,
 		Engine:    engine,
 		HTTPServer: &http.Server{
@@ -341,7 +302,6 @@ func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 		t.Fatal("append CA cert failed")
 	}
 
-	// 1. 验证同一端口的明文 HTTP 自助端点 (/proxy.pac, /ca.pem, /statusz)
 	plainResp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/proxy.pac", port))
 	if err != nil {
 		t.Fatalf("GET plain /proxy.pac on dual-mode port failed: %v", err)
@@ -352,7 +312,6 @@ func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 		t.Errorf("unexpected /proxy.pac body: %q", string(pacBody))
 	}
 
-	// 2. 测试 www.pixiv.net、api.sec.pixiv.net、i.pximg.net、s.pximg.net、www.dlsite.co.jp 以及未列入 upstream.json 的任意域名
 	for _, sni := range []string{"www.pixiv.net", "api.sec.pixiv.net", "i.pximg.net", "s.pximg.net", "www.dlsite.co.jp", "custom.site.example"} {
 		client := &http.Client{
 			Transport: &http.Transport{
@@ -374,24 +333,18 @@ func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 		if string(b) != "ok:"+sni {
 			t.Errorf("%s body = %q, want %q", sni, string(b), "ok:"+sni)
 		}
-		if strings.HasSuffix(sni, "pximg.net") && resp.Header.Get("X-Saw-Referer") != "https://www.pixiv.net/" {
-			t.Errorf("%s expected Referer https://www.pixiv.net/, got %q", sni, resp.Header.Get("X-Saw-Referer"))
-		}
-		// 验证下发了完整证书链（leaf + CA）(#21)
 		if resp.TLS == nil || len(resp.TLS.PeerCertificates) < 2 {
 			t.Errorf("%s expected full certificate chain (>=2 certs), got %d", sni, len(resp.TLS.PeerCertificates))
 		}
 	}
 }
 
-// TestCertWarningPage 验证上游证书校验失败时渲染区分「过期 / 不一致」的 HTML 警告页，
-// 且页面含「强行访问」按钮（?__ech_proxy_force_cert__=<token>），同时验证浏览器并发请求 /favicon.ico 不会覆盖主页面 token。
 func TestCertWarningPage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	orig := roundTripFn
 	defer func() { roundTripFn = orig }()
 
-	forceCerts.reset() // 隔离会话级状态（approved / tokens / 限速计数）
+	forceCerts.reset()
 
 	cfg := &config.Config{
 		Upstreams: config.UpstreamMap{
@@ -446,14 +399,10 @@ func TestCertWarningPage(t *testing.T) {
 		}
 	}
 
-	// 1. 过期
 	assertWarning("expired", cloudflare_ech.ErrCertExpired, "已过期", "不一致", "不可信")
-	// 2. 不一致
 	assertWarning("mismatch", cloudflare_ech.ErrCertMismatch, "不一致", "已过期", "不可信")
-	// 3. 不可信链
 	assertWarning("chain", cloudflare_ech.ErrCertUntrusted, "不可信", "已过期", "不一致")
 
-	// 4. 强行访问：一次性 token + 并发 /favicon.ico 容错 + 会话级记忆
 	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		if !cloudflare_ech.AllowBadCert(req.Context()) {
 			return nil, fmt.Errorf("dial upstream: %w", cloudflare_ech.ErrCertMismatch)
@@ -464,7 +413,7 @@ func TestCertWarningPage(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader("forced-ok")),
 		}, nil
 	}
-	// 4a. 无参请求主页面 -> 警告页（不一致），提取主页面 token
+
 	rec4a := httptest.NewRecorder()
 	r4a := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path", nil)
 	r4a.Host = "t.l.moonchan.xyz:8443"
@@ -477,13 +426,11 @@ func TestCertWarningPage(t *testing.T) {
 		t.Fatalf("4a: extracted force token empty: %s", rec4a.Body.String())
 	}
 
-	// 4a-favicon: 模拟浏览器在渲染警告页后立即自动请求 /favicon.ico，确保不会使主页面的 tok 失效
 	recFav := httptest.NewRecorder()
 	rFav := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/favicon.ico", nil)
 	rFav.Host = "t.l.moonchan.xyz:8443"
 	engine.ServeHTTP(recFav, rFav)
 
-	// 4b. 用户点击主页面上的「强行访问」按钮（携带主页面 tok）-> 必须成功消费并放行上游
 	rec4b := httptest.NewRecorder()
 	r4b := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path?"+forceCertQueryParam+"="+tok, nil)
 	r4b.Host = "t.l.moonchan.xyz:8443"
@@ -491,7 +438,7 @@ func TestCertWarningPage(t *testing.T) {
 	if rec4b.Code != http.StatusOK || rec4b.Body.String() != "forced-ok" {
 		t.Fatalf("4b valid-token: want 200 forced-ok, got status=%d body=%q", rec4b.Code, rec4b.Body.String())
 	}
-	// 4c. 再次无参请求同主机 -> 会话级已批准，子资源直接放行（不再警告）
+
 	rec4c := httptest.NewRecorder()
 	r4c := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/style.css", nil)
 	r4c.Host = "t.l.moonchan.xyz:8443"
@@ -500,8 +447,6 @@ func TestCertWarningPage(t *testing.T) {
 		t.Fatalf("4c session-approved: want 200 (no re-warning), got status=%d body=%q", rec4c.Code, rec4c.Body.String())
 	}
 
-	// 5. 防内嵌链接静默放行：另一主机 t2（未签发 token、未批准）携带 ?__ech_proxy_force_cert__=1
-	//    -> token 不匹配 -> 不放行 -> 照常校验 -> 警告页（不静默放行）
 	rec5 := httptest.NewRecorder()
 	r5 := httptest.NewRequest(http.MethodGet, "https://t2.l.moonchan.xyz:8443/path?"+forceCertQueryParam+"=1", nil)
 	r5.Host = "t2.l.moonchan.xyz:8443"
@@ -511,11 +456,6 @@ func TestCertWarningPage(t *testing.T) {
 	}
 }
 
-// TestPlainHTTPAndHTTPSProxyRoutingAndFallback 验证：
-// 1. 浏览器通过 PAC 发来的明文 HTTP 正向代理请求（GET/POST http://host/path）自动剥离 Proxy-Connection 等逐跳头；
-// 2. 标准 80 端口的 http:// 请求优先尝试 https:// GFW 绕过通道，若源站不支持 HTTPS（非证书校验错误）则无缝自动回退至 DoH 明文 HTTP（且完整保留 POST 请求体）；
-// 3. 显式非标端口（如 http://host:8080/path）直接按明文 HTTP 转发；
-// 4. 被代理域名的 POST / 或 GET /healthz 等请求直接进入 proxyHandler，绝不与本地管理路由冲突。
 func TestPlainHTTPAndHTTPSProxyRoutingAndFallback(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	orig := roundTripFn
@@ -532,7 +472,6 @@ func TestPlainHTTPAndHTTPSProxyRoutingAndFallback(t *testing.T) {
 			b, _ := io.ReadAll(req.Body)
 			seenPostBody = string(b)
 		}
-		// 模拟 http-only.example.com 不支持 HTTPS（连接被拒绝），仅支持明文 HTTP
 		if strings.HasPrefix(req.Host, "http-only.example.com") && req.URL.Scheme == "https" {
 			return nil, fmt.Errorf("dial tcp: connection refused")
 		}
@@ -550,7 +489,6 @@ func TestPlainHTTPAndHTTPSProxyRoutingAndFallback(t *testing.T) {
 	}
 	engine := NewEngine(cfg)
 
-	// A. 明文 HTTP 访问仅支持 HTTP 的源站（POST /submit，带请求体与 Proxy-Connection 头）
 	seenSchemes = nil
 	rec1 := httptest.NewRecorder()
 	req1 := httptest.NewRequest(http.MethodPost, "http://http-only.example.com/submit?k=1", strings.NewReader("payload=123"))
@@ -572,7 +510,6 @@ func TestPlainHTTPAndHTTPSProxyRoutingAndFallback(t *testing.T) {
 		t.Errorf("POST body lost during https->http fallback: got %q, want payload=123", seenPostBody)
 	}
 
-	// B. 显式非标端口 http://legacy.example.com:8080/api 直接走明文 HTTP
 	seenSchemes = nil
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodGet, "http://legacy.example.com:8080/api", nil)
@@ -583,7 +520,6 @@ func TestPlainHTTPAndHTTPSProxyRoutingAndFallback(t *testing.T) {
 		t.Errorf("custom port HTTP request mismatch: code=%d schemes=%v body=%q", rec2.Code, seenSchemes, rec2.Body.String())
 	}
 
-	// C. 被代理域名的 POST / 与 GET /healthz 必须走代理转发而非命中本地 Gin 路由
 	rec3 := httptest.NewRecorder()
 	req3 := httptest.NewRequest(http.MethodPost, "https://pixiv.net/", strings.NewReader("login=1"))
 	req3.Host = "pixiv.net"

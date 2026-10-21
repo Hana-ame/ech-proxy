@@ -161,6 +161,12 @@ func (s *forceCertState) isForceApproved(host string) bool {
 	return false
 }
 
+// isApproved 是 isForceApproved 的别名（proxy.go 的强行访问判定使用）。
+func (s *forceCertState) isApproved(host string) bool { return s.isForceApproved(host) }
+
+// consume 是 consumeForceToken 的别名（一次性消费 token 并在会话内批准该站点）。
+func (s *forceCertState) consume(host, token string) bool { return s.consumeForceToken(host, token) }
+
 func lowerForceHost(h string) string {
 	h = strings.ToLower(strings.TrimSpace(h))
 	if host, _, err := net.SplitHostPort(h); err == nil {

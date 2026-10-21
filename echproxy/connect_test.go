@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -38,7 +37,6 @@ func TestParseConnectTargetRejectsMalformedAndPrefersRequestURI(t *testing.T) {
 		}
 	}
 
-	// RequestURI authority 优先于 Host
 	req := &http.Request{
 		Method:     http.MethodConnect,
 		RequestURI: "preferred.example.com:8443",
@@ -83,7 +81,6 @@ func TestConnectAuthSSRFAndConcurrencyLimits(t *testing.T) {
 		Config:  &config.Config{BlockedHosts: []string{"https://blocked.example.com"}},
 	}
 
-	// 1. 缺少凭证 -> 407 Proxy Authentication Required
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodConnect, "http://example.com:443", nil)
 	req.RequestURI = "example.com:443"
@@ -93,7 +90,6 @@ func TestConnectAuthSSRFAndConcurrencyLimits(t *testing.T) {
 		t.Fatalf("missing auth status = %d, want 407", rec.Code)
 	}
 
-	// 2. SSRF 拦截（169.254.169.254 与 127.0.0.1 及 blocked_hosts）-> 403 Forbidden，且不消耗限流配额、不拨号
 	for _, forbidden := range []string{"169.254.169.254:80", "127.0.0.1:8080", "localhost:443", "blocked.example.com:443"} {
 		rec = httptest.NewRecorder()
 		req = httptest.NewRequest(http.MethodConnect, "http://"+forbidden, nil)
@@ -112,22 +108,19 @@ func TestConnectAuthSSRFAndConcurrencyLimits(t *testing.T) {
 		t.Errorf("403 SSRF targets leaked limiter quota: active=%d", limiter.ActiveCount())
 	}
 
-	// 3. 验证 per-peer 与 global 限流器
 	rel1, ok1 := limiter.Acquire("198.51.100.1")
 	rel2, ok2 := limiter.Acquire("198.51.100.1")
-	_, ok3 := limiter.Acquire("198.51.100.1") // 超过 per-peer 上限 2
+	_, ok3 := limiter.Acquire("198.51.100.1")
 	if !ok1 || !ok2 || ok3 {
 		t.Fatalf("per-peer acquire got (%v, %v, %v), want (true, true, false)", ok1, ok2, ok3)
 	}
 
-	// Peer A 满额不影响 Peer B（直到触及 global 上限 3）
 	relB1, okB1 := limiter.Acquire("198.51.100.2")
-	_, okB2 := limiter.Acquire("198.51.100.2") // 触及 global 上限 3
+	_, okB2 := limiter.Acquire("198.51.100.2")
 	if !okB1 || okB2 {
 		t.Fatalf("peer B acquire got (%v, %v), want (true, false)", okB1, okB2)
 	}
 
-	// 归还配额后可再次申请
 	rel1()
 	rel2()
 	relB1()
@@ -137,7 +130,6 @@ func TestConnectAuthSSRFAndConcurrencyLimits(t *testing.T) {
 }
 
 func TestConnectUnreachableUpstreamReturns502AndPipelinedBytesRelay(t *testing.T) {
-	// 启动本地回显 TCP 服务端模拟上游
 	upLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -179,7 +171,6 @@ func TestConnectUnreachableUpstreamReturns502AndPipelinedBytesRelay(t *testing.T
 	}))
 	defer srv.Close()
 
-	// 1. 不可达上游返回 502 Bad Gateway
 	conn1, err := net.Dial("tcp", srv.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -195,7 +186,6 @@ func TestConnectUnreachableUpstreamReturns502AndPipelinedBytesRelay(t *testing.T
 		t.Errorf("unreachable upstream status = %d, want 502", resp1.StatusCode)
 	}
 
-	// 2. Pipelined 字节（与 CONNECT 请求放在同一 TCP 报文发出）完整转发至上游并回显
 	conn2, err := net.Dial("tcp", srv.Listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -228,7 +218,6 @@ func TestRelayClosesBothSidesWhenOneEndDiesAndErrorClassification(t *testing.T) 
 		close(done)
 	}()
 
-	// 模拟上游返回数据后主动关闭，而客户端保持静默（B1）
 	_, _ = u2.Write([]byte("hello"))
 	buf := make([]byte, 5)
 	_, _ = io.ReadFull(c1, buf)
@@ -240,7 +229,6 @@ func TestRelayClosesBothSidesWhenOneEndDiesAndErrorClassification(t *testing.T) 
 		t.Fatal("relay hung when upstream closed while client stayed idle")
 	}
 
-	// B4: 验证错误分类器不吞掉 TLS/证书错误
 	if !isExpectedConnError(net.ErrClosed) || !isExpectedConnError(errors.New("read: connection reset by peer")) {
 		t.Error("expected network close errors to be classified as expected")
 	}
@@ -249,6 +237,8 @@ func TestRelayClosesBothSidesWhenOneEndDiesAndErrorClassification(t *testing.T) 
 	}
 }
 
+// TestConnectSmartMITMRoutesThroughECHProxyPipeline 验证 PAC MITM 方案在完全不加载 upstream.json 的情况下，
+// 复用本地 CA (CertStore) 与 ECH/SNI 管道直接代理任意域名，且不内置任何硬编码 Referer。
 func TestConnectSmartMITMRoutesThroughECHProxyPipeline(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewCertStore(dir)
@@ -256,14 +246,7 @@ func TestConnectSmartMITMRoutesThroughECHProxyPipeline(t *testing.T) {
 		t.Fatalf("NewCertStore: %v", err)
 	}
 
-	buf, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
-	if err != nil {
-		t.Fatalf("read upstream.json: %v", err)
-	}
-	cfg, err := ParseConfig(buf)
-	if err != nil {
-		t.Fatalf("ParseConfig: %v", err)
-	}
+	emptyCfg := &config.Config{}
 
 	origRT := roundTripFn
 	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
@@ -278,12 +261,12 @@ func TestConnectSmartMITMRoutesThroughECHProxyPipeline(t *testing.T) {
 	}
 	defer func() { roundTripFn = origRT }()
 
-	engine := NewEngineWithOptions(EngineOptions{Config: cfg, CertStore: store})
+	engine := NewEngineWithOptions(EngineOptions{Config: emptyCfg, CertStore: store})
 	opts := ConnectOptions{
 		Enabled:     true,
 		Mode:        ConnectModeMITM,
 		CertStore:   store,
-		Config:      cfg,
+		Config:      emptyCfg,
 		HTTPHandler: engine,
 		Limiter:     NewTunnelLimiter(10, 20),
 	}
@@ -309,7 +292,6 @@ func TestConnectSmartMITMRoutesThroughECHProxyPipeline(t *testing.T) {
 		},
 	}
 
-	// 通过标准 HTTP CONNECT 正向代理直接访问 i.pximg.net 与多级子域 api.sec.pixiv.net（无需改 hosts、无需 443 端口！）
 	for _, target := range []string{"https://i.pximg.net/img-original/test.jpg", "https://api.sec.pixiv.net/v1/check"} {
 		resp, err := client.Get(target)
 		if err != nil {
@@ -320,8 +302,8 @@ func TestConnectSmartMITMRoutesThroughECHProxyPipeline(t *testing.T) {
 		if resp.Header.Get("X-Via-MITM") != "true" {
 			t.Errorf("%s missing X-Via-MITM header", target)
 		}
-		if strings.Contains(target, "i.pximg.net") && resp.Header.Get("X-Referer") != "https://www.pixiv.net/" {
-			t.Errorf("i.pximg.net via CONNECT MITM missing anti-hotlink Referer, got %q", resp.Header.Get("X-Referer"))
+		if resp.Header.Get("X-Referer") != "" {
+			t.Errorf("%s must not have built-in Referer when client did not send one, got %q", target, resp.Header.Get("X-Referer"))
 		}
 		if !strings.HasPrefix(string(body), "mitm-ok:") {
 			t.Errorf("%s unexpected body %q", target, string(body))

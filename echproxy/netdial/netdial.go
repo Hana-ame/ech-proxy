@@ -1,6 +1,6 @@
-// Package netdial 提供基础网络拨号、公共 DNS 解析、IPv4/IPv6 协议族绑定、
+// Package netdial 提供基础网络拨号、公共 DNS 解析、IPv4/IPv6 协议族绑定、主机端口与域名归一化、
 // Cloudflare IP 识别、内网/保留地址识别（SSRF 防护）、远程/本地文件拉取与通用重试工具。
-// 本模块处于架构最底层，不依赖项目内任何其他包。
+// 本模块处于架构最底层，不依赖项目内任何其他包，供上层所有模块高内聚复用。
 package netdial
 
 import (
@@ -18,17 +18,11 @@ import (
 )
 
 const (
-	// DialTimeout 是单次 TCP 连接建立超时时间（避免单个不可达 IP 阻塞数分钟）。
-	DialTimeout = 10 * time.Second
-	// DoHTimeout 是单次 DoH / DNS 查询超时时间。
-	DoHTimeout = 10 * time.Second
-	// OpTimeout 是流式传输或大文件拉取的整体操作超时上限。
-	OpTimeout = 5 * time.Minute
-
+	DialTimeout   = 10 * time.Second
+	DoHTimeout    = 10 * time.Second
+	OpTimeout     = 5 * time.Minute
 	RetryAttempts = 3
 	RetryBackoff  = 1500 * time.Millisecond
-
-	// DefaultIPMode 是全局默认的出口 IP 协议族（默认 ipv4 = "v4"）。
 	DefaultIPMode = "v4"
 )
 
@@ -39,7 +33,6 @@ var dnsServers = []string{
 	"114.114.114.114:53",
 }
 
-// 统一维护的 Cloudflare IPv4 / IPv6 网段列表，用于全自动判断目标站点应走 ECH 还是 SNI 伪装。
 var cloudflareCIDRs = []string{
 	"104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "141.101.64.0/18",
 	"173.245.48.0/20", "188.114.96.0/20", "190.93.240.0/20", "197.234.240.0/22",
@@ -49,46 +42,92 @@ var cloudflareCIDRs = []string{
 	"2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
 }
 
-var cloudflareNets = func() []*net.IPNet {
-	var nets []*net.IPNet
-	for _, c := range cloudflareCIDRs {
-		if _, n, err := net.ParseCIDR(c); err == nil {
-			nets = append(nets, n)
-		}
-	}
-	return nets
-}()
+var cloudflareNets = parseCIDRList(cloudflareCIDRs)
 
-// 保留与特殊用途网段（CGNAT、基准测试、链路本地、云元数据等），用于 CONNECT 隧道 SSRF 拦截。
 var reservedCIDRs = []string{
-	"0.0.0.0/8",
-	"100.64.0.0/10",
-	"127.0.0.0/8",
-	"169.254.0.0/16",
-	"192.0.0.0/24",
-	"192.0.2.0/24",
-	"198.18.0.0/15",
-	"198.51.100.0/24",
-	"203.0.113.0/24",
-	"224.0.0.0/4",
-	"240.0.0.0/4",
-	"::1/128",
-	"fc00::/7",
-	"fe80::/10",
-	"ff00::/8",
+	"0.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+	"192.0.0.0/24", "192.0.2.0/24", "198.18.0.0/15", "198.51.100.0/24",
+	"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+	"::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
 }
 
-var reservedNets = func() []*net.IPNet {
-	var nets []*net.IPNet
-	for _, c := range reservedCIDRs {
+var reservedNets = parseCIDRList(reservedCIDRs)
+
+func parseCIDRList(cidrs []string) []*net.IPNet {
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, c := range cidrs {
 		if _, n, err := net.ParseCIDR(c); err == nil {
 			nets = append(nets, n)
 		}
 	}
 	return nets
-}()
+}
 
-// IsCloudflareIP 判断给定 IP 是否属于 Cloudflare 边缘节点网段。
+// CleanHost 归一化主机名（转小写、去空白、剥离端口号与末尾点号），供全项目复用。
+func CleanHost(hostport string) string {
+	h := strings.ToLower(strings.TrimSpace(hostport))
+	if name, _, err := net.SplitHostPort(h); err == nil {
+		h = name
+	}
+	return strings.TrimSuffix(h, ".")
+}
+
+// ExtractPort 提取 host:port 中的端口号（无端口时返回空字符串）。
+func ExtractPort(hostport string) string {
+	if _, p, err := net.SplitHostPort(strings.TrimSpace(hostport)); err == nil {
+		return p
+	}
+	return ""
+}
+
+// IsPort443 判断地址是否指向 443 端口。
+func IsPort443(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if p := ExtractPort(addr); p != "" {
+		return p == "443"
+	}
+	return strings.HasSuffix(addr, ":443")
+}
+
+// NormalizeLoopbackHostPort 将监听地址（如 ":8443" 或 "0.0.0.0:8443"）转换为客户端可访问的 "127.0.0.1:<port>"。
+func NormalizeLoopbackHostPort(listenAddr, defaultAddr string) string {
+	if defaultAddr == "" {
+		defaultAddr = "127.0.0.1:8443"
+	}
+	listenAddr = strings.TrimSpace(listenAddr)
+	if listenAddr == "" {
+		return defaultAddr
+	}
+	host, port, err := net.SplitHostPort(listenAddr)
+	if err != nil {
+		return defaultAddr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" || host == "[::]" {
+		host = "127.0.0.1"
+	}
+	return net.JoinHostPort(host, port)
+}
+
+// NormalizeDomainEntry 将域名条目（支持剥离协议头、路径、端口与 *. 通配前缀）归一化为纯域名。
+func NormalizeDomainEntry(raw string) string {
+	s := strings.ToLower(strings.TrimSpace(raw))
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "https://"), "http://")
+	if idx := strings.IndexByte(s, '/'); idx >= 0 {
+		s = s[:idx]
+	}
+	if h, _, err := net.SplitHostPort(s); err == nil {
+		s = h
+	}
+	for strings.HasPrefix(s, "*.") {
+		s = strings.TrimPrefix(s, "*.")
+	}
+	s = strings.Trim(s, ".")
+	if s == "" || strings.ContainsAny(s, " \t\r\n/\\:*?<>\"'") || !strings.Contains(s, ".") {
+		return ""
+	}
+	return s
+}
+
 func IsCloudflareIP(ip net.IP) bool {
 	if ip == nil {
 		return false
@@ -101,7 +140,6 @@ func IsCloudflareIP(ip net.IP) bool {
 	return false
 }
 
-// IsPrivateOrReservedIP 判断 IP 是否属于环回、内网、链路本地（如 169.254.169.254）或保留地址。
 func IsPrivateOrReservedIP(ip net.IP) bool {
 	if ip == nil {
 		return true
@@ -118,11 +156,6 @@ func IsPrivateOrReservedIP(ip net.IP) bool {
 	return false
 }
 
-// NormalizeIPMode 将显式出口协议族字符串归一化：
-//   - "4" / "v4" / "ipv4" -> "v4" (ipv4 only)
-//   - "6" / "v6" / "ipv6" -> "v6" (ipv6 only)
-//   - "dual" / "auto"     -> "dual" (dual-stack)
-//   - ""                  -> "" (未显式指定，交由上层继承或取默认值 DefaultIPMode="v4")
 func NormalizeIPMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "4", "v4", "ipv4":
@@ -136,19 +169,13 @@ func NormalizeIPMode(mode string) string {
 	}
 }
 
-// EffectiveIPMode 返回最终生效的出口 IP 协议族（未指定时默认返回 DefaultIPMode = "v4"，即默认 ipv4）。
 func EffectiveIPMode(mode string) string {
-	norm := NormalizeIPMode(mode)
-	if norm == "" {
-		return DefaultIPMode
+	if norm := NormalizeIPMode(mode); norm != "" {
+		return norm
 	}
-	return norm
+	return DefaultIPMode
 }
 
-// ValidateIPMode 校验并归一化命令行或配置传入的 ipmode 值：
-//   - "" / "4" / "v4" / "ipv4" -> "v4" (默认 ipv4 only)
-//   - "dual" / "auto"          -> "dual" (双栈)
-//   - "6" / "v6" / "ipv6"      -> "v6" (ipv6 only)
 func ValidateIPMode(raw string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "", "4", "v4", "ipv4":
@@ -162,7 +189,6 @@ func ValidateIPMode(raw string) (string, error) {
 	}
 }
 
-// FormatIPMode 返回出口协议族的可读描述（默认 "ipv4 (4 = ipv4 only)" / "dual" / "ipv6 (6 = ipv6 only)"）。
 func FormatIPMode(mode string) string {
 	switch EffectiveIPMode(mode) {
 	case "v4":
@@ -225,10 +251,8 @@ func getRootPool() *x509.CertPool {
 	return rootPool
 }
 
-// RootPool 返回系统根证书池（含 Termux 路径补充），供手动 x509.Verify 校验上游证书链使用。
 func RootPool() *x509.CertPool { return getRootPool() }
 
-// Dialer 返回绑定了公共 DNS 的拨号器（兼容 Android/Termux 等无 /etc/resolv.conf 的环境）。
 func Dialer() *net.Dialer {
 	return &net.Dialer{
 		Timeout:   DialTimeout,
@@ -237,7 +261,6 @@ func Dialer() *net.Dialer {
 	}
 }
 
-// FilterIPsByMode 按指定的协议族（默认 "v4"、"v6" 或 "dual"）过滤 IP 列表。
 func FilterIPsByMode(ips []net.IP, mode string) []string {
 	norm := EffectiveIPMode(mode)
 	var out []string
@@ -247,10 +270,7 @@ func FilterIPsByMode(ips []net.IP, mode string) []string {
 			continue
 		}
 		isV4 := ip.To4() != nil
-		if norm == "v4" && !isV4 {
-			continue
-		}
-		if norm == "v6" && (isV4 || ip.To16() == nil) {
+		if (norm == "v4" && !isV4) || (norm == "v6" && (isV4 || ip.To16() == nil)) {
 			continue
 		}
 		s := ip.String()
@@ -262,7 +282,6 @@ func FilterIPsByMode(ips []net.IP, mode string) []string {
 	return out
 }
 
-// ResolveIPs 按指定的协议族（默认 "v4"、"v6" 或 "dual"）解析域名并返回所有匹配的 IP。
 func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
 	norm := EffectiveIPMode(mode)
 	if ip := net.ParseIP(host); ip != nil {
@@ -290,7 +309,6 @@ func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
 	return filtered, nil
 }
 
-// ResolvePreferredIP 按指定的协议族（默认 "v4"、"v6" 或 "dual"）解析域名并返回首个匹配的 IP。
 func ResolvePreferredIP(ctx context.Context, host, mode string) (string, error) {
 	ips, err := ResolveIPs(ctx, host, mode)
 	if err != nil {
@@ -299,7 +317,6 @@ func ResolvePreferredIP(ctx context.Context, host, mode string) (string, error) 
 	return ips[0], nil
 }
 
-// DialContextIPMode 根据 ipMode（默认 "v4"、"v6" 或 "dual"）向目标 host:port 发起 TCP 连接。
 func DialContextIPMode(ctx context.Context, host, port, mode string, timeout time.Duration) (net.Conn, error) {
 	if timeout <= 0 {
 		timeout = DialTimeout
@@ -310,10 +327,8 @@ func DialContextIPMode(ctx context.Context, host, port, mode string, timeout tim
 		if err != nil {
 			return nil, err
 		}
-		network := "tcp"
-		if norm == "v4" {
-			network = "tcp4"
-		} else {
+		network := "tcp4"
+		if norm == "v6" {
 			network = "tcp6"
 		}
 		var lastErr error
@@ -333,7 +348,6 @@ func DialContextIPMode(ctx context.Context, host, port, mode string, timeout tim
 	}).DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 }
 
-// Transport 返回全局复用的 HTTP Transport。
 func Transport() *http.Transport {
 	transportOnce.Do(func() {
 		cachedTransport = &http.Transport{
@@ -347,7 +361,6 @@ func Transport() *http.Transport {
 	return cachedTransport
 }
 
-// TransportWithIPMode 返回锁定出口 IP 协议族（默认 "v4"、"v6" 或 "dual"）的 HTTP Transport。
 func TransportWithIPMode(mode string) *http.Transport {
 	norm := EffectiveIPMode(mode)
 	if norm != "v4" && norm != "v6" {
@@ -368,13 +381,6 @@ func TransportWithIPMode(mode string) *http.Transport {
 	}
 }
 
-// TransportWithIPModeAndCertCheck 返回锁定出口 IP 协议族、且在上游 TLS 握手成功后
-// 调用 certCheck(host, peerCerts) 手动校验上游证书的 HTTP Transport。
-//
-// 用于 Direct 模式：以 InsecureSkipVerify + 手动校验替代标准库自动校验，使上游证书失败
-// （过期/不一致/不可信）统一以 certCheck 返回的 CertError 上抛、走警告页；且上游请求 Context
-// 携带 WithAllowBadCert（强行访问）时由 certCheck 自行跳过。certCheck 为 nil 时不做额外校验。
-// 不复用全局 Transport，避免影响 DoH / 拉取等内部流量的证书行为。
 func TransportWithIPModeAndCertCheck(mode string, certCheck func(host string, peerCerts []*x509.Certificate) error) *http.Transport {
 	norm := EffectiveIPMode(mode)
 	if norm != "v4" && norm != "v6" {
@@ -392,7 +398,7 @@ func TransportWithIPModeAndCertCheck(mode string, certCheck func(host string, pe
 			}
 			tlsConn := tls.Client(rawConn, &tls.Config{
 				ServerName:         host,
-				InsecureSkipVerify: true, // 由 certCheck 手动校验（Direct 模式：不做 SNI 伪装，host 即真实域名）
+				InsecureSkipVerify: true,
 				MinVersion:         tls.VersionTLS12,
 				NextProtos:         []string{"h2", "http/1.1"},
 			})
@@ -414,12 +420,10 @@ func TransportWithIPModeAndCertCheck(mode string, certCheck func(host string, pe
 	}
 }
 
-// Client 返回不自动跟随重定向的默认 HTTP 客户端（默认走 IPv4）。
 func Client(timeout time.Duration) *http.Client {
 	return ClientWithIPMode(DefaultIPMode, timeout)
 }
 
-// ClientWithIPMode 返回按指定 IP 协议族拨号、不自动跟随重定向的 HTTP 客户端。
 func ClientWithIPMode(mode string, timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout:   timeout,
@@ -430,7 +434,6 @@ func ClientWithIPMode(mode string, timeout time.Duration) *http.Client {
 	}
 }
 
-// FetchBytes 支持从 file://、本地文件路径或远程 HTTP(S) URL 读取字节数据（含自动重试）。
 func FetchBytes(rawURL string) ([]byte, error) {
 	if strings.HasPrefix(rawURL, "file://") {
 		return os.ReadFile(strings.TrimPrefix(rawURL, "file://"))
@@ -443,13 +446,10 @@ func FetchBytes(rawURL string) ([]byte, error) {
 	client := Client(OpTimeout)
 	resp, err := Retry(context.Background(), RetryAttempts, RetryBackoff, func() (*http.Response, error) {
 		r, e := client.Get(rawURL)
-		if e != nil {
-			if r != nil {
-				r.Body.Close()
-			}
-			return nil, e
+		if e != nil && r != nil {
+			r.Body.Close()
 		}
-		return r, nil
+		return r, e
 	})
 	if err != nil {
 		return nil, err
@@ -461,7 +461,6 @@ func FetchBytes(rawURL string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 }
 
-// Retry 在遇到临时错误时按指定次数和退避间隔重试 fn。
 func Retry[T any](ctx context.Context, attempts int, backoff time.Duration, fn func() (T, error)) (T, error) {
 	var zero T
 	var last error

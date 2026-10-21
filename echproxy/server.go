@@ -1,10 +1,7 @@
-// Package echproxy 组装各语义子模块（config, certstore, ech, rewrite, cookie, netdial, logger）：
-//   - 主线模式：PAC HTTPS 正向代理（Smart MITM ECH/SNI/Fragment 终结，使用本地生成的自签名 CA，独立于门户模式）；
-//   - 支持远程 PAC 白名单（https://4545810.xyz/pac.txt，一行一个 domain）：白名单 = 去掉原有广告 + 插入广告商代码 (https://4545810.xyz/ads.js) + 通过 PAC 代理，其他直接 DIRECT；
-//   - 支持全局模式（仅通过命令行 -all 开启）：无视名单，所有网站均通过 ech-proxy 代理；
-//   - 支持出口协议族选择（-4 强制 v4 出口、-6 强制 v6 出口、-dual 双端出口，以及托盘菜单实时切换）；
-//   - 支持首选 DoH (https://4545810.xyz/doh) 与次选 DoH (https://1.1.1.1/dns-query) 自动故障切换；
-//   - 443 本地透明反代代码严格隔离：仅当可执行文件名包含 .443.exe (LocalProxy=true) 时才监听 443 端口并运行 443 逻辑。
+// Package echproxy 以高内聚、低耦合的工程化架构组装三种完全解耦的运行方案，最大化复用底层核心模块（netdial, ech, certstore, rewrite, cookie, logger）：
+//  1. PAC 方案（默认主线）：默认监听 8443（端口占用或指定其他端口亦全功能无感运行），复用本地自签 CA (certstore) + DoH/SNI/ECH/Fragment + 证书核对 (ech) + CONNECT MITM (connect)，独享 pac.txt 与 ads.js (rewrite.AdScriptManager)，与 upstream.json 完全解耦；
+//  2. 443 方案（仅当文件名匹配 *.443.exe 时开启）：仅监听 443 端口，复用本地自签 CA (certstore) + DoH/SNI/ECH/Fragment + 证书核对 (ech)，其余模块一律不运行；
+//  3. 8443 方案（手机 App 专用或桌面端 *.8443.exe 开启）：加载 upstream.json (config) 与公网真实证书 (certstore.LoadRemoteCert)，复用 DoH/SNI/ECH/Fragment (ech) + 域名重写 (rewrite) + Cookie 管理 (cookie)。
 package echproxy
 
 import (
@@ -32,7 +29,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// 导出常用类型与函数别名，保持与桌面端/Android 端调用方的完全兼容。
 type (
 	Config          = config.Config
 	UpstreamConfig  = config.UpstreamConfig
@@ -47,26 +43,30 @@ type (
 )
 
 var (
-	ParseConfig              = config.Parse
-	LoadConfig               = config.Load
-	ValidateConfig           = config.Validate
-	FormatConfigIssues       = config.FormatIssues
-	ConfigHasErrors          = config.HasErrors
-	GenerateHostsBlock       = config.GenerateHostsBlock
-	ApplyHostsBlock          = config.ApplyHostsBlock
-	RemoveHostsBlock         = config.RemoveHostsBlock
-	DefaultSystemHostsPath   = config.DefaultSystemHostsPath
-	GeneratePAC              = config.GeneratePAC
-	FetchBytes               = netdial.FetchBytes
-	ValidateIPMode           = netdial.ValidateIPMode
-	NormalizeIPMode          = netdial.NormalizeIPMode
-	EffectiveIPMode          = netdial.EffectiveIPMode
-	FormatIPMode             = netdial.FormatIPMode
-	DefaultIPMode            = netdial.DefaultIPMode
-	NewCertStore             = certstore.NewStore
-	DefaultDataDir           = certstore.DefaultDataDir
-	MatchWildcardForTest     = config.MatchWildcard
-	DefaultUpstreamConfigURL = config.DefaultConfigURL
+	ParseConfig               = config.Parse
+	LoadConfig                = config.Load
+	ValidateConfig            = config.Validate
+	FormatConfigIssues        = config.FormatIssues
+	ConfigHasErrors           = config.HasErrors
+	GenerateHostsBlock        = config.GenerateHostsBlock
+	ApplyHostsBlock           = config.ApplyHostsBlock
+	RemoveHostsBlock          = config.RemoveHostsBlock
+	DefaultSystemHostsPath    = config.DefaultSystemHostsPath
+	GeneratePAC               = config.GeneratePAC
+	FetchBytes                = netdial.FetchBytes
+	CleanHost                 = netdial.CleanHost
+	ExtractPort               = netdial.ExtractPort
+	IsPort443                 = netdial.IsPort443
+	NormalizeLoopbackHostPort = netdial.NormalizeLoopbackHostPort
+	ValidateIPMode            = netdial.ValidateIPMode
+	NormalizeIPMode           = netdial.NormalizeIPMode
+	EffectiveIPMode           = netdial.EffectiveIPMode
+	FormatIPMode              = netdial.FormatIPMode
+	DefaultIPMode             = netdial.DefaultIPMode
+	NewCertStore              = certstore.NewStore
+	DefaultDataDir            = certstore.DefaultDataDir
+	MatchWildcardForTest      = config.MatchWildcard
+	DefaultUpstreamConfigURL  = config.DefaultConfigURL
 
 	NewAdScriptManager      = rewrite.NewAdScriptManager
 	ParseDomainList         = rewrite.ParseDomainList
@@ -94,41 +94,39 @@ var (
 )
 
 const (
-	dohHost           = "4545810.xyz"
+	dohHost           = "moonchan.xyz"
 	defaultListenAddr = "127.0.0.1:8443"
 )
 
-// ServerOptions 定义启动代理服务所需的配置项。
 type ServerOptions struct {
-	Addr                string          // 监听地址，默认 127.0.0.1:8443（仅 .443.exe 时允许 127.0.0.1:443）
-	AllowRandomPort     bool            // 端口占用时是否允许回退至随机端口（Android 端使用）
-	FallbackAddr        string          // .443.exe 模式下 443 端口无权限时的回退监听地址
-	HTTPMode            bool            // 纯 HTTP 明文模式（仅用于本地调试，与 LocalProxy 互斥）
-	PortalMode          bool            // 是否显式启用独立的 l.moonchan.xyz 门户导航模式（默认 false，不影响 PAC HTTPS Proxy 主线）
-	ConfigURL           string          // upstream.json 路径或 URL，留空使用默认远程地址
-	BootstrapIP         string          // DoH 引导 IP（可选）
-	IPMode              string          // 全局出口协议族：默认 "v4"（-4 强制 v4 出口）、"v6"（-6 强制 v6 出口）、"dual"（-dual 双端出口）
-	AllMode             bool            // 全局模式（仅命令行 -all 开启）：无视名单所有网站都走 ech-proxy
-	LocalProxy          bool            // 是否启用 443 本地透明反向代理模式（仅当可执行文件名含 .443.exe 时为 true）
-	DataDir             string          // 本地自签 CA 与叶子证书存储目录
-	AllowConnect        bool            // 是否允许 HTTP CONNECT 代理请求
-	DisableConnect      bool            // 显式禁用 HTTP CONNECT（优先于默认开启策略）
-	ConnectMode         string          // CONNECT 模式："auto" / "mitm"（默认，支持 ECH/SNI）或 "tunnel"（纯 TCP）
-	AllowPrivateConnect bool            // 是否允许 CONNECT 连接本机/内网地址（仅测试用）
-	PerPeerMaxTunnels   int             // 单客户端最大并发 CONNECT 隧道数（默认 128）
-	GlobalMaxTunnels    int             // 全局最大并发 CONNECT 隧道数（默认 1024）
+	Addr                string
+	AllowRandomPort     bool
+	FallbackAddr        string
+	HTTPMode            bool
+	PortalMode          bool // true: 8443 方案（手机 App 或 *.8443.exe，加载 upstream.json 与真实公网证书）
+	ConfigURL           string
+	BootstrapIP         string
+	IPMode              string
+	AllMode             bool
+	LocalProxy          bool // true: 443 方案（仅 *.443.exe，只监听 443 端口）
+	DataDir             string
+	AllowConnect        bool
+	DisableConnect      bool
+	ConnectMode         string
+	AllowPrivateConnect bool
+	PerPeerMaxTunnels   int
+	GlobalMaxTunnels    int
 	TunnelIdleTimeout   time.Duration
-	Auth                *AuthConfig     // 访问认证配置指针（避免复制内部 sync.Mutex）
-	NoAdScript          bool            // 是否跳过插入广告 JS（兼容旧参数 -no-ad-script）
-	SkipAdScript        bool            // 是否跳过插入广告 JS（对应 --skip-ad-script）
-	SkipAdBlock         bool            // 是否禁止拦截源站原始广告（对应 --skip-ad-block）
-	AdScriptURL         string          // 远程 ads.js URL 或本地路径（留空使用 https://4545810.xyz/ads.js）
-	WhitelistURL        string          // 远程 pac.txt 白名单 URL（留空使用 https://4545810.xyz/pac.txt，失败 fallback = []）
-	AdScriptInterval    time.Duration   // 远程脚本与白名单自动更新检查周期（默认 30m）
-	Logger              *logger.Manager // 本地日志管理器（可选）
+	Auth                *AuthConfig
+	NoAdScript          bool
+	SkipAdScript        bool
+	SkipAdBlock         bool
+	AdScriptURL         string
+	WhitelistURL        string
+	AdScriptInterval    time.Duration
+	Logger              *logger.Manager
 }
 
-// Server 表示运行中的 ECH 代理服务器实例。
 type Server struct {
 	mu         sync.RWMutex
 	Options    ServerOptions
@@ -147,13 +145,10 @@ type Server struct {
 	bgCancel   context.CancelFunc
 }
 
-// InitECH 初始化底层 Cloudflare ECH 与 DoH 客户端（首选 https://4545810.xyz/doh，次选 https://1.1.1.1/dns-query）。
 func InitECH(bootstrapIP, ipMode string) error {
 	if bootstrapIP != "" {
-		log.Printf("ECH: Primary DoH=https://%s/doh (bootstrapIP=%s), Secondary DoH=%s", dohHost, bootstrapIP, DefaultSecondaryDoHURL)
 		cloudflare_ech.SetDoHConfig(dohHost, bootstrapIP)
 	} else {
-		log.Printf("ECH: Primary DoH=%s, Secondary DoH=%s", DefaultPrimaryDoHURL, DefaultSecondaryDoHURL)
 		cloudflare_ech.SetDohURL(DefaultPrimaryDoHURL)
 	}
 	cloudflare_ech.SetFallbackDohURL(DefaultSecondaryDoHURL)
@@ -161,21 +156,18 @@ func InitECH(bootstrapIP, ipMode string) error {
 	if err := cloudflare_ech.InitDefault(); err != nil {
 		return fmt.Errorf("ECH client initialization failed: %w", err)
 	}
-	log.Printf("ECH client ready (ipmode=%s)", netdial.EffectiveIPMode(ipMode))
 	return nil
 }
 
 func retryInitECH(bootstrapIP, ipMode string) {
 	for _, wait := range []time.Duration{10 * time.Second, 30 * time.Second, 2 * time.Minute, 10 * time.Minute} {
 		time.Sleep(wait)
-		if err := InitECH(bootstrapIP, ipMode); err == nil {
-			log.Printf("ECH client recovered")
+		if InitECH(bootstrapIP, ipMode) == nil {
 			return
 		}
 	}
 }
 
-// SetIPMode 在运行期动态切换全局出口 IP 协议族（供托盘菜单「强制 v4 出口 / 强制 v6 出口 / 双端出口」调用）。
 func (s *Server) SetIPMode(mode string) {
 	norm := netdial.EffectiveIPMode(mode)
 	cloudflare_ech.SetIPMode(norm)
@@ -184,21 +176,10 @@ func (s *Server) SetIPMode(mode string) {
 	}
 	s.mu.Lock()
 	s.Options.IPMode = norm
-	if s.Config != nil {
-		s.Config.IPMode = norm
-		for host, uc := range s.Config.Upstreams {
-			uc.IPMode = norm
-			if uc.Wildcard != nil {
-				uc.Wildcard.IPMode = norm
-			}
-			s.Config.Upstreams[host] = uc
-		}
-	}
 	s.mu.Unlock()
 	log.Printf("[IPMode] Switched global egress IP mode to: %s", netdial.FormatIPMode(norm))
 }
 
-// GetIPMode 返回当前生效的全局出口 IP 协议族（"v4", "v6", "dual"）。
 func (s *Server) GetIPMode() string {
 	if s == nil {
 		return cloudflare_ech.GetIPMode()
@@ -208,32 +189,23 @@ func (s *Server) GetIPMode() string {
 	return netdial.EffectiveIPMode(s.Options.IPMode)
 }
 
-// isPort443Addr 检查监听地址是否指向 443 端口。
-func isPort443Addr(addr string) bool {
-	_, port, err := net.SplitHostPort(strings.TrimSpace(addr))
-	if err != nil {
-		return strings.HasSuffix(strings.TrimSpace(addr), ":443")
-	}
-	return port == "443"
-}
-
-// NewServer 根据 ServerOptions 完成 ECH 初始化、配置加载与校验、远程白名单/脚本自动更新、证书准备与端口监听。
 func NewServer(opts ServerOptions) (*Server, error) {
 	addr := strings.TrimSpace(opts.Addr)
 	if addr == "" {
-		addr = defaultListenAddr
+		if opts.LocalProxy {
+			addr = "127.0.0.1:443"
+		} else {
+			addr = defaultListenAddr
+		}
 	}
-	// 严格守护：在未开启 LocalProxy（即文件名不包含 .443.exe）时，绝不监听 443 端口，且 443 相关代码绝不运行！
 	if !opts.LocalProxy {
-		if isPort443Addr(addr) {
+		if netdial.IsPort443(addr) {
 			return nil, errors.New("port 443 is strictly disabled when executable filename does not end with .443.exe")
 		}
 		opts.FallbackAddr = ""
 	}
 	opts.Addr = addr
-
-	explicitIPMode := netdial.NormalizeIPMode(opts.IPMode)
-	opts.IPMode = netdial.EffectiveIPMode(opts.IPMode) // 默认 ipv4 ("v4")
+	opts.IPMode = netdial.EffectiveIPMode(opts.IPMode)
 
 	dataDir := opts.DataDir
 	if dataDir == "" {
@@ -243,102 +215,83 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	if dataDir != "" {
 		cacheDir = filepath.Join(dataDir, "cache")
 	}
-
 	logMgr := opts.Logger
 	if logMgr == nil {
 		logMgr = logger.Default()
 	}
 
-	// 1. 初始化 ECH/DoH 客户端（启动瞬间若不可达则一律转入后台重试，绝不因瞬时网络波动导致程序启动闪退）
+	// 1. 初始化公共传输层 DoH / ECH / SNI / Fragment（三种方案共享复用，失败转后台重试不阻塞启动）
 	if err := InitECH(opts.BootstrapIP, opts.IPMode); err != nil {
-		log.Printf("WARNING: ECH initialization failed on startup, retrying in background: %v", err)
-		SafeGo("retryInitECH", func() {
-			retryInitECH(opts.BootstrapIP, opts.IPMode)
-		})
+		log.Printf("WARNING: ECH init deferred to background: %v", err)
+		SafeGo("retryInitECH", func() { retryInitECH(opts.BootstrapIP, opts.IPMode) })
 	}
 
-	// 2. 加载并校验 upstream.json 路由配置（带本地磁盘缓存与内置兜底配置，防止远程配置不可达时闪退）
-	cfg, err := loadConfigWithCacheFallback(opts.ConfigURL, cacheDir)
-	if err != nil {
-		return nil, err
-	}
-	if explicitIPMode != "" {
-		cfg.IPMode = explicitIPMode
-		for host, uc := range cfg.Upstreams {
-			uc.IPMode = explicitIPMode
-			if uc.Wildcard != nil {
-				uc.Wildcard.IPMode = explicitIPMode
+	// 2. 按方案解耦配置：
+	//    - PAC 方案与 443 方案完全不依赖 upstream.json（仅当测试显式传入本地文件 opts.ConfigURL 时按需读取）；
+	//    - 8443 方案（PortalMode=true，即手机 App 或 *.8443.exe）加载 upstream.json 与公网证书，报错亦不崩溃。
+	cfg := &config.Config{Upstreams: config.UpstreamMap{}}
+	var portalCert *tls.Certificate
+
+	if opts.PortalMode {
+		if loaded, err := config.Load(opts.ConfigURL); err == nil && loaded != nil {
+			cfg.ReplaceFrom(loaded)
+			if loaded.CertPath != "" && loaded.KeyPath != "" && !opts.HTTPMode {
+				portalCert, _ = certstore.LoadRemoteCert(loaded.CertPath, loaded.KeyPath)
 			}
-			cfg.Upstreams[host] = uc
+		} else if err != nil {
+			log.Printf("WARNING: 8443 portal config load failed: %v", err)
 		}
-		cloudflare_ech.SetIPMode(explicitIPMode)
-	} else if cfg.IPMode != "" {
-		opts.IPMode = netdial.EffectiveIPMode(cfg.IPMode)
-		cloudflare_ech.SetIPMode(opts.IPMode)
+	} else if !opts.LocalProxy && opts.ConfigURL != "" && isLocalFile(opts.ConfigURL) {
+		if loaded, err := config.Load(opts.ConfigURL); err == nil && loaded != nil {
+			cfg.ReplaceFrom(loaded)
+		}
 	}
 
-	// 3. 准备 TLS 证书：
-	//    - PAC HTTPS Proxy 主线仅使用本地自生成的根证书（store）按需签发目标网站证书；
-	//    - 仅当显式开启独立门户模式（PortalMode=true）或本地测试未提供 store 时，才加载 l.moonchan.xyz 门户公网证书，
-	//      确保门户功能完全独立，绝不阻塞或影响 PAC HTTPS Proxy 主线。
-	var (
-		portalCert *tls.Certificate
-		store      *certstore.Store
-	)
+	// 3. 初始化证书模块（PAC 方案与 443 方案共享复用本地自签 CA Store）
+	var store *certstore.Store
 	if !opts.HTTPMode {
 		if dataDir != "" {
 			if st, serr := certstore.NewStore(dataDir); serr == nil {
 				store = st
+				if portalCert != nil {
+					store.SetPortalCert(portalCert)
+				}
 			} else if opts.LocalProxy {
 				return nil, fmt.Errorf("init cert store: %w", serr)
 			}
 		}
-		if (opts.PortalMode || store == nil) && cfg.CertPath != "" && cfg.KeyPath != "" {
-			cert, ferr := certstore.LoadRemoteCert(cfg.CertPath, cfg.KeyPath)
-			if ferr != nil {
-				if store == nil && !opts.LocalProxy && !opts.AllowRandomPort {
-					return nil, ferr
-				}
-				log.Printf("WARNING: Failed to load portal certificate (%v); continuing with local CA store", ferr)
-			} else {
-				portalCert = cert
-			}
-		}
 		if store == nil && portalCert == nil {
-			return nil, errors.New("TLS mode requires local CA store (or portal certificate in portal mode)")
+			return nil, errors.New("TLS mode requires local CA store or portal certificate")
 		}
 	}
 
-	// 4. 绑定监听端口
-	ln, actualAddr, err := listenWithFallback(opts.Addr, opts.FallbackAddr, opts.AllowRandomPort)
+	// 4. 绑定监听端口（PAC 方案默认 8443，若端口被占用自动切换可用端口，保证任意端口正常运行）
+	allowPortFallback := opts.AllowRandomPort || (!opts.LocalProxy && !opts.PortalMode)
+	ln, actualAddr, err := listenWithFallback(opts.Addr, opts.FallbackAddr, allowPortFallback)
 	if err != nil {
 		return nil, err
 	}
 	opts.Addr = actualAddr
 	port := uint16(ln.Addr().(*net.TCPAddr).Port)
 
-	// 5. 初始化远程广告商脚本（https://4545810.xyz/ads.js）与 PAC 白名单（https://4545810.xyz/pac.txt）管理器
-	skipAdScript := opts.NoAdScript || opts.SkipAdScript || cfg.AdScriptDisabled
-	adScriptURL := strings.TrimSpace(opts.AdScriptURL)
-	if adScriptURL == "" && cfg.AdScriptURL != "" {
-		adScriptURL = cfg.AdScriptURL
-	}
-	whitelistURL := strings.TrimSpace(opts.WhitelistURL)
-	if whitelistURL == "" && cfg.WhitelistURL != "" {
-		whitelistURL = cfg.WhitelistURL
-	}
-	adScript := rewrite.NewAdScriptManager(rewrite.AdScriptOptions{
-		Enabled:        !skipAdScript,
-		SkipAdScript:   skipAdScript,
-		SkipAdBlock:    opts.SkipAdBlock,
-		AllMode:        opts.AllMode,
-		ScriptURL:      adScriptURL,
-		WhitelistURL:   whitelistURL,
-		UpdateInterval: opts.AdScriptInterval,
-		CacheDir:       cacheDir,
-	})
 	bgCtx, bgCancel := context.WithCancel(context.Background())
-	adScript.StartAutoUpdate(bgCtx)
+
+	// 5. 仅在 PAC 方案（!LocalProxy && !PortalMode）下启动独有的 pac.txt 与 ads.js 管理器
+	var adScript *rewrite.AdScriptManager
+	if !opts.LocalProxy && !opts.PortalMode {
+		skipAdScript := opts.NoAdScript || opts.SkipAdScript
+		adScript = rewrite.NewAdScriptManager(rewrite.AdScriptOptions{
+			Enabled:        !skipAdScript,
+			SkipAdScript:   skipAdScript,
+			SkipAdBlock:    opts.SkipAdBlock,
+			AllMode:        opts.AllMode,
+			ScriptURL:      strings.TrimSpace(opts.AdScriptURL),
+			WhitelistURL:   strings.TrimSpace(opts.WhitelistURL),
+			UpdateInterval: opts.AdScriptInterval,
+			CacheDir:       cacheDir,
+		})
+		adScript.StartAutoUpdate(bgCtx)
+	}
 
 	auth := opts.Auth
 	limiter := NewTunnelLimiter(opts.PerPeerMaxTunnels, opts.GlobalMaxTunnels)
@@ -355,11 +308,9 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		Port:      port,
 	})
 
-	connectEnabled := opts.AllowConnect
-	if !opts.DisableConnect && !opts.AllowConnect {
-		if strings.HasPrefix(actualAddr, "127.0.0.1:") || strings.HasPrefix(actualAddr, "localhost:") {
-			connectEnabled = true
-		}
+	connectEnabled := false
+	if !opts.LocalProxy {
+		connectEnabled = opts.AllowConnect || (!opts.DisableConnect && (strings.HasPrefix(actualAddr, "127.0.0.1:") || strings.HasPrefix(actualAddr, "localhost:")))
 	}
 
 	connectOpts := ConnectOptions{
@@ -396,12 +347,11 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		httpSrv.ErrorLog = certstore.NewTLSAlertFilterLogger(store.CAPath())
 	}
 
-	isTLS := false
-	if !opts.HTTPMode {
-		isTLS = true
+	isTLS := !opts.HTTPMode
+	if isTLS {
 		if store != nil {
 			httpSrv.TLSConfig = store.TLSConfig(portalCert)
-		} else {
+		} else if portalCert != nil {
 			httpSrv.TLSConfig = &tls.Config{
 				Certificates: []tls.Certificate{*portalCert},
 				MinVersion:   tls.VersionTLS12,
@@ -428,87 +378,50 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}, nil
 }
 
-func loadConfigWithCacheFallback(customConfigURL, cacheDir string) (*config.Config, error) {
-	isDefaultURL := strings.TrimSpace(customConfigURL) == ""
-	cfgSource := customConfigURL
-	if isDefaultURL {
-		cfgSource = config.DefaultConfigURL
+func isLocalFile(p string) bool {
+	p = strings.TrimSpace(strings.TrimPrefix(p, "file://"))
+	if p == "" || strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
+		return false
 	}
-
-	rawCfgBytes, err := netdial.FetchBytes(cfgSource)
-	if err == nil {
-		if issues, verr := config.Validate(rawCfgBytes); verr == nil && len(issues) > 0 {
-			for _, iss := range issues {
-				log.Printf("Config validation %s", iss.String())
-			}
-		}
-		cfg, perr := config.Parse(rawCfgBytes)
-		if perr != nil {
-			return nil, fmt.Errorf("load upstream config: %w", perr)
-		}
-		if cacheDir != "" {
-			if mkErr := os.MkdirAll(cacheDir, 0o755); mkErr == nil {
-				_ = os.WriteFile(filepath.Join(cacheDir, "upstream.json"), rawCfgBytes, 0o644)
-			}
-		}
-		return cfg, nil
-	}
-
-	if !isDefaultURL {
-		return nil, fmt.Errorf("fetch upstream config: %w", err)
-	}
-
-	if cacheDir != "" {
-		cachedPath := filepath.Join(cacheDir, "upstream.json")
-		if cachedBytes, cerr := os.ReadFile(cachedPath); cerr == nil {
-			if cfg, perr := config.Parse(cachedBytes); perr == nil {
-				log.Printf("WARNING: Failed to fetch remote upstream.json (%v); loaded cached config from %s", err, cachedPath)
-				return cfg, nil
-			}
-		}
-	}
-	if cfg, perr := config.Parse([]byte(config.FallbackConfigJSON)); perr == nil {
-		log.Printf("WARNING: Failed to fetch remote upstream.json (%v); loaded built-in fallback config", err)
-		return cfg, nil
-	}
-	return nil, fmt.Errorf("fetch upstream config: %w", err)
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
 }
 
-func listenWithFallback(primaryAddr, fallbackAddr string, allowRandom bool) (net.Listener, string, error) {
+func listenWithFallback(primaryAddr, fallbackAddr string, allowOtherPort bool) (net.Listener, string, error) {
 	network := "tcp"
 	if strings.HasPrefix(primaryAddr, "127.0.0.1") {
 		network = "tcp4"
 	}
-	ln, err := net.Listen(network, primaryAddr)
-	if err == nil {
+	if ln, err := net.Listen(network, primaryAddr); err == nil {
 		return ln, ln.Addr().String(), nil
-	}
-	candidates := []string{}
-	if fallbackAddr != "" && fallbackAddr != primaryAddr {
-		candidates = append(candidates, fallbackAddr)
-	}
-	if strings.HasSuffix(primaryAddr, ":8443") {
-		candidates = append(candidates, "127.0.0.1:8444", "127.0.0.1:18443")
-	}
-	for _, cand := range candidates {
-		fbNet := "tcp"
-		if strings.HasPrefix(cand, "127.0.0.1") {
-			fbNet = "tcp4"
+	} else {
+		var candidates []string
+		if fallbackAddr != "" && fallbackAddr != primaryAddr {
+			candidates = append(candidates, fallbackAddr)
 		}
-		if ln2, err2 := net.Listen(fbNet, cand); err2 == nil {
-			log.Printf("WARNING: Cannot bind %s (%v); automatically fell back to %s", primaryAddr, err, ln2.Addr().String())
-			return ln2, ln2.Addr().String(), nil
+		if allowOtherPort && strings.HasSuffix(primaryAddr, ":8443") {
+			candidates = append(candidates, "127.0.0.1:8444", "127.0.0.1:18443")
 		}
-	}
-	if allowRandom {
-		if ln3, err3 := net.Listen("tcp4", "127.0.0.1:0"); err3 == nil {
-			return ln3, ln3.Addr().String(), nil
+		for _, cand := range candidates {
+			fbNet := "tcp"
+			if strings.HasPrefix(cand, "127.0.0.1") {
+				fbNet = "tcp4"
+			}
+			if ln2, err2 := net.Listen(fbNet, cand); err2 == nil {
+				log.Printf("WARNING: Port %s busy (%v); switched to %s", primaryAddr, err, ln2.Addr().String())
+				return ln2, ln2.Addr().String(), nil
+			}
 		}
+		if allowOtherPort {
+			if ln3, err3 := net.Listen("tcp4", "127.0.0.1:0"); err3 == nil {
+				log.Printf("WARNING: Port %s busy (%v); switched to %s", primaryAddr, err, ln3.Addr().String())
+				return ln3, ln3.Addr().String(), nil
+			}
+		}
+		return nil, primaryAddr, fmt.Errorf("listen on %s: %w", primaryAddr, err)
 	}
-	return nil, primaryAddr, fmt.Errorf("listen on %s: %w", primaryAddr, err)
 }
 
-// Serve 启动服务主循环。
 func (s *Server) Serve() error {
 	if s.IsTLS {
 		return s.serveDualModeTLS()
@@ -516,22 +429,12 @@ func (s *Server) Serve() error {
 	return s.HTTPServer.Serve(s.Listener)
 }
 
-// serveDualModeTLS 通过嗅探连接首字节（0x16 为 TLS Handshake，其余为明文 HTTP / CONNECT）在同一端口上无感兼容 HTTPS 与明文 HTTP 代理请求。
 func (s *Server) serveDualModeTLS() error {
-	tlsChan := &chanListener{
-		addr: s.Listener.Addr(),
-		ch:   make(chan net.Conn, 128),
-		done: make(chan struct{}),
-	}
-	plainChan := &chanListener{
-		addr: s.Listener.Addr(),
-		ch:   make(chan net.Conn, 128),
-		done: make(chan struct{}),
-	}
+	tlsChan := &chanListener{addr: s.Listener.Addr(), ch: make(chan net.Conn, 128), done: make(chan struct{})}
+	plainChan := &chanListener{addr: s.Listener.Addr(), ch: make(chan net.Conn, 128), done: make(chan struct{})}
 
-	errCh := make(chan error, 2)
 	SafeGo("serveDualModeTLS-TLS", func() {
-		errCh <- s.HTTPServer.Serve(tls.NewListener(tlsChan, s.HTTPServer.TLSConfig))
+		_ = s.HTTPServer.Serve(tls.NewListener(tlsChan, s.HTTPServer.TLSConfig))
 	})
 	SafeGo("serveDualModeTLS-Plain", func() {
 		plainSrv := &http.Server{
@@ -540,7 +443,7 @@ func (s *Server) serveDualModeTLS() error {
 			IdleTimeout:       s.HTTPServer.IdleTimeout,
 			ErrorLog:          s.HTTPServer.ErrorLog,
 		}
-		errCh <- plainSrv.Serve(plainChan)
+		_ = plainSrv.Serve(plainChan)
 	})
 
 	for {
@@ -554,29 +457,23 @@ func (s *Server) serveDualModeTLS() error {
 			return err
 		}
 		SafeGo("serveDualModeTLS-AcceptConn", func() {
-			c := rawConn
-			_ = c.SetReadDeadline(time.Now().Add(10 * time.Second))
-			br := bufio.NewReaderSize(c, 4096)
+			_ = rawConn.SetReadDeadline(time.Now().Add(10 * time.Second))
+			br := bufio.NewReaderSize(rawConn, 4096)
 			first, perr := br.Peek(1)
-			_ = c.SetReadDeadline(time.Time{})
+			_ = rawConn.SetReadDeadline(time.Time{})
 			if perr != nil {
-				_ = c.Close()
+				_ = rawConn.Close()
 				return
 			}
-			wrapped := &bufferedConn{Conn: c, r: br}
-			// 0x16 是 TLS Record Layer Handshake 类型
+			wrapped := &bufferedConn{Conn: rawConn, r: br}
+			target := plainChan
 			if first[0] == 0x16 {
-				select {
-				case tlsChan.ch <- wrapped:
-				case <-tlsChan.done:
-					_ = c.Close()
-				}
-			} else {
-				select {
-				case plainChan.ch <- wrapped:
-				case <-plainChan.done:
-					_ = c.Close()
-				}
+				target = tlsChan
+			}
+			select {
+			case target.ch <- wrapped:
+			case <-target.done:
+				_ = rawConn.Close()
 			}
 		})
 	}
@@ -587,9 +484,7 @@ type bufferedConn struct {
 	r *bufio.Reader
 }
 
-func (b *bufferedConn) Read(p []byte) (int, error) {
-	return b.r.Read(p)
-}
+func (b *bufferedConn) Read(p []byte) (int, error) { return b.r.Read(p) }
 
 type chanListener struct {
 	addr net.Addr
@@ -611,15 +506,11 @@ func (l *chanListener) Accept() (net.Conn, error) {
 }
 
 func (l *chanListener) Close() error {
-	l.once.Do(func() {
-		close(l.done)
-	})
+	l.once.Do(func() { close(l.done) })
 	return nil
 }
 
-func (l *chanListener) Addr() net.Addr {
-	return l.addr
-}
+func (l *chanListener) Addr() net.Addr { return l.addr }
 
 func (s *Server) ServeAsync() error {
 	SafeGo("ServeAsync", func() {
@@ -662,7 +553,6 @@ func (s *Server) Close() error {
 	return nil
 }
 
-// BuildVersionInfo 返回嵌入在二进制中的 Git 版本与构建时间信息。
 func BuildVersionInfo() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
@@ -691,44 +581,34 @@ func BuildVersionInfo() string {
 	return fmt.Sprintf("%s%s (%s, %s)", rev, dirty, t, info.GoVersion)
 }
 
-// PrintBanner 打印启动状态、DoH 首选/次选节点、PAC/路由模式、出口 IP 模式与 Flag 一览。
 func (s *Server) PrintBanner(localIP string) {
 	listenPort := fmt.Sprintf("%d", s.Port)
 	fmt.Printf("=== ECH Proxy [%s] ===\n", BuildVersionInfo())
 	switch {
 	case s.Options.LocalProxy:
-		fmt.Printf("  Mode: Local 443 Reverse Proxy (.443.exe mode)\n")
+		fmt.Printf("  Scheme: 443 Local Transparent Proxy (.443.exe only)\n")
 	case s.Options.PortalMode:
-		fmt.Printf("  Mode: Standalone Web Portal Mode\n")
-	case s.Options.HTTPMode:
-		fmt.Printf("  Mode: HTTP Plaintext Proxy\n")
+		fmt.Printf("  Scheme: 8443 Real-Cert Portal Proxy (.8443.exe / Mobile App)\n")
 	default:
-		fmt.Printf("  Mode: PAC HTTPS Proxy (CONNECT Local HTTPS MITM + DoH + SNI / ECH / GFW Bypass)\n")
+		fmt.Printf("  Scheme: PAC HTTPS MITM Proxy (Local CA + DoH/SNI/ECH/Fragment + pac.txt + ads.js)\n")
 	}
 	fmt.Printf("  Listening: %s\n", s.Options.Addr)
-	if s.Options.AllMode {
-		fmt.Printf("  Routing Scope: ALL Mode (-all, all websites route via ech-proxy)\n")
-	} else {
-		fmt.Printf("  Routing Scope: PAC Whitelist Mode (%s -> ech-proxy, others -> direct)\n", DefaultWhitelistURL)
+	if !s.Options.LocalProxy && !s.Options.PortalMode {
+		if s.Options.AllMode {
+			fmt.Printf("  Routing Scope: ALL Mode (-all)\n")
+		} else {
+			fmt.Printf("  Routing Scope: PAC Whitelist (%s)\n", DefaultWhitelistURL)
+		}
+		pacSuffix := ""
+		if s.Options.AllMode {
+			pacSuffix = "?mode=all"
+		}
+		fmt.Printf("  PAC URL: http://127.0.0.1:%s/proxy.pac%s\n", listenPort, pacSuffix)
 	}
 	fmt.Printf("  Egress IP Mode: %s (flags: -4 / -6 / -dual)\n", netdial.FormatIPMode(s.GetIPMode()))
 	fmt.Printf("  DoH Endpoints: Primary=%s | Secondary=%s\n", DefaultPrimaryDoHURL, DefaultSecondaryDoHURL)
 	if s.CertStore != nil {
-		fmt.Printf("  CA Cert: %s (valid until %s)\n", s.CertStore.CAPath(), s.CertStore.CAValidUntil().Format("2006-01-02"))
-		fmt.Printf("  CA Download URL: http://127.0.0.1:%s/ca.pem\n", listenPort)
+		fmt.Printf("  CA Cert: %s (http://127.0.0.1:%s/ca.pem)\n", s.CertStore.CAPath(), listenPort)
 	}
-	pacSuffix := ""
-	if s.Options.AllMode {
-		pacSuffix = "?mode=all"
-	}
-	fmt.Printf("  PAC Auto-Config URL: http://127.0.0.1:%s/proxy.pac%s\n", listenPort, pacSuffix)
-	fmt.Printf("  HTTP/HTTPS Proxy: 127.0.0.1:%s\n", listenPort)
-	if s.Logger != nil && s.Logger.LogFilePath() != "" {
-		fmt.Printf("  Local Log File: %s (crash log: %s)\n", s.Logger.LogFilePath(), s.Logger.CrashLogPath())
-	}
-	if localIP != "" {
-		fmt.Printf("  DoH Bootstrap IP: %s\n", localIP)
-	}
-	fmt.Printf("  CLI Flags Overview: -4 (强制v4出口) | -6 (强制v6出口) | -dual (双端出口) | -all (全局模式) | --skip-ad-script | --skip-ad-block\n")
 	fmt.Printf("=================\n")
 }

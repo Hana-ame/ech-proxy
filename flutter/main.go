@@ -59,11 +59,12 @@ var indexHTML string
 const cdnHost = "video-cf.twimg.com"
 const apiHost = "x.moonchan.xyz"
 
-// DoH 服务器地址：服务的固有配置，硬编码。
+// DoH 服务器地址来源于 ech 包的唯一 true source（cloudflare_ech.DefaultDoHHost /
+// DefaultPrimaryDoHURL），不再在本文件硬编码字面量。
 // bootstrapIP（连接 DoH 用的目标 IP）不在此处硬编码，由调用方通过
-// StartProxy(bootstrapIP) 传入，来源是运行时 DNS 解析 4545810.xyz。
-const defaultDohHost = "4545810.xyz"
-const defaultDohURL = "https://4545810.xyz/doh"
+// StartProxy(bootstrapIP) 传入，来源是运行时 DNS 解析 cloudflare_ech.DefaultDoHHost。
+const defaultDohHost = cloudflare_ech.DefaultDoHHost
+const defaultDohURL = cloudflare_ech.DefaultPrimaryDoHURL
 
 // ─── 状态 ────────────────────────────────────────────────────────────────────
 

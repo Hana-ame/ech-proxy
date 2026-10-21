@@ -31,8 +31,10 @@ import (
 const (
 	shellDomain = "cloudflare-ech.com"
 
-	// DefaultPrimaryDoHURL 是首选 DoH 端点（https://4545810.xyz/doh）。
-	DefaultPrimaryDoHURL = "https://4545810.xyz/doh"
+	// DefaultDoHHost 是首选 DoH 端点的主机名 —— 引用 netdial.DefaultSiteHost（全项目唯一 true source）。
+	DefaultDoHHost = netdial.DefaultSiteHost
+	// DefaultPrimaryDoHURL 是首选 DoH 端点，由 DefaultDoHHost 派生。
+	DefaultPrimaryDoHURL = "https://" + DefaultDoHHost + "/doh"
 	// DefaultSecondaryDoHURL 是次选兜底 DoH 端点（Cloudflare 1.1.1.1 官方 DoH JSON/Wire 路径：https://1.1.1.1/dns-query）。
 	DefaultSecondaryDoHURL = "https://1.1.1.1/dns-query"
 
@@ -123,7 +125,7 @@ func SetFallbackDohURL(u string) {
 func SetDoHConfig(host, bootstrapIP string) {
 	nc := *currentConfig()
 	if host == "" {
-		host = "4545810.xyz"
+		host = DefaultDoHHost
 	}
 	nc.dohURL = fmt.Sprintf("https://%s/doh", host)
 	if nc.fallbackURL == "" {
@@ -154,9 +156,9 @@ func GetIPMode() string {
 	return currentConfig().ipMode
 }
 
-// CheckDualStack 检查 4545810.xyz 是否发布 A / AAAA 记录。
+// CheckDualStack 检查 DefaultDoHHost 是否发布 A / AAAA 记录。
 func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
-	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, "4545810.xyz")
+	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, DefaultDoHHost)
 	if err != nil {
 		return false, false
 	}

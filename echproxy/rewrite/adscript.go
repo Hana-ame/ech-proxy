@@ -20,10 +20,11 @@ import (
 
 const (
 	// DefaultAdScriptURL 是 PAC 方案专属的远程广告商脚本（ads.js）默认地址（失败自动使用内置 fallback）。
-	DefaultAdScriptURL = "https://4545810.xyz/ads.js"
+	// 域名来自 netdial.DefaultSiteHost（唯一 true source）。
+	DefaultAdScriptURL = "https://" + netdial.DefaultSiteHost + "/ads.js"
 
 	// DefaultWhitelistURL 是 PAC 方案专属的远程白名单（pac.txt，一行一个 domain）默认地址（失败 fallback = []）。
-	DefaultWhitelistURL = "https://4545810.xyz/pac.txt"
+	DefaultWhitelistURL = "https://" + netdial.DefaultSiteHost + "/pac.txt"
 
 	// DefaultAdScriptUpdateInterval 是远程 ads.js 与 pac.txt 后台自动检查更新周期（30 分钟）。
 	DefaultAdScriptUpdateInterval = 30 * time.Minute

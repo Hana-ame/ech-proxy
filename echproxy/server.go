@@ -80,6 +80,7 @@ var (
 	DefaultAdScriptInterval = rewrite.DefaultAdScriptUpdateInterval
 	DefaultPrimaryDoHURL    = cloudflare_ech.DefaultPrimaryDoHURL
 	DefaultSecondaryDoHURL  = cloudflare_ech.DefaultSecondaryDoHURL
+	DefaultDoHHost          = cloudflare_ech.DefaultDoHHost
 	SetGlobalIPMode         = cloudflare_ech.SetIPMode
 	GetGlobalIPMode         = cloudflare_ech.GetIPMode
 	InitLogger              = logger.Init
@@ -94,7 +95,7 @@ var (
 )
 
 const (
-	dohHost           = "moonchan.xyz"
+	// DoH 主机名统一引用 ech 包的唯一 true source（见 cloudflare_ech.DefaultDoHHost）。
 	defaultListenAddr = "127.0.0.1:8443"
 )
 
@@ -147,7 +148,7 @@ type Server struct {
 
 func InitECH(bootstrapIP, ipMode string) error {
 	if bootstrapIP != "" {
-		cloudflare_ech.SetDoHConfig(dohHost, bootstrapIP)
+		cloudflare_ech.SetDoHConfig(DefaultDoHHost, bootstrapIP)
 	} else {
 		cloudflare_ech.SetDohURL(DefaultPrimaryDoHURL)
 	}

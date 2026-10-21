@@ -15,7 +15,7 @@ import (
 const (
 	internetSettingsRegPath = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 
-	// WinINet InternetSetOptionW 常量（对齐 V2rayN 系统代理设置实现）
+	// WinINet InternetSetOptionW 常量（对齐 V2rayN 系统代理设置实现，兼容 Windows 7~11 32/64 位）
 	internetOptionRefresh             = 37
 	internetOptionSettingsChanged     = 39
 	internetOptionPerConnectionOption = 75
@@ -28,6 +28,9 @@ const (
 	proxyTypeDirect       = 0x00000001
 	proxyTypeProxy        = 0x00000002
 	proxyTypeAutoProxyURL = 0x00000004
+
+	// ptrSize 在 32 位 Windows (GOARCH=386) 下为 4，在 64 位 Windows (GOARCH=amd64) 下为 8。
+	ptrSize = unsafe.Sizeof(uintptr(0))
 )
 
 var (
@@ -35,11 +38,25 @@ var (
 	procInternetSetOption = modwininet.NewProc("InternetSetOptionW")
 )
 
-// internetPerConnOption 对应 Win32 INTERNET_PER_CONN_OPTIONW 结构体。
-// 在 64 位与 32 位 Windows 上，Value 联合体的大小均为一个指针宽度（uintptr）。
+// internetPerConnOption 对应 Win32 <wininet.h> INTERNET_PER_CONN_OPTIONW 结构体：
+//
+//	typedef struct {
+//	  DWORD dwOption;
+//	  union {
+//	    DWORD    dwValue;
+//	    LPWSTR   pszValue;
+//	    FILETIME ftValue; // 8 字节 (2 x DWORD)，4 字节对齐
+//	  } Value;
+//	} INTERNET_PER_CONN_OPTIONW;
+//
+// 关键跨架构对齐边界：
+//   - 在 32 位 Windows (386, ptrSize=4) 上：union Value 因含 FILETIME 固定为 8 字节（4 字节对齐），
+//     结构体总大小为 4 + 8 = 12 字节（[8/4]uintptr = [2]uintptr）。
+//   - 在 64 位 Windows (amd64, ptrSize=8) 上：union Value 因含 LPWSTR 为 8 字节（8 字节对齐），
+//     dwOption 后有 4 字节填充，结构体总大小为 4 + 4 + 8 = 16 字节（[8/8]uintptr = [1]uintptr）。
 type internetPerConnOption struct {
 	dwOption uint32
-	dwValue  uintptr
+	dwValue  [8 / ptrSize]uintptr
 }
 
 // internetPerConnOptionList 对应 Win32 INTERNET_PER_CONN_OPTION_LISTW 结构体。
@@ -154,10 +171,10 @@ func applyWinINetPerConn(flags uint32, proxyServer, proxyBypass, autoConfigURL s
 	pacPtr, _ := syscall.UTF16PtrFromString(autoConfigURL)
 
 	opts := [4]internetPerConnOption{
-		{dwOption: internetPerConnFlags, dwValue: uintptr(flags)},
-		{dwOption: internetPerConnProxyServer, dwValue: uintptr(unsafe.Pointer(srvPtr))},
-		{dwOption: internetPerConnProxyBypass, dwValue: uintptr(unsafe.Pointer(bypPtr))},
-		{dwOption: internetPerConnAutoConfigURL, dwValue: uintptr(unsafe.Pointer(pacPtr))},
+		{dwOption: internetPerConnFlags, dwValue: [8 / ptrSize]uintptr{0: uintptr(flags)}},
+		{dwOption: internetPerConnProxyServer, dwValue: [8 / ptrSize]uintptr{0: uintptr(unsafe.Pointer(srvPtr))}},
+		{dwOption: internetPerConnProxyBypass, dwValue: [8 / ptrSize]uintptr{0: uintptr(unsafe.Pointer(bypPtr))}},
+		{dwOption: internetPerConnAutoConfigURL, dwValue: [8 / ptrSize]uintptr{0: uintptr(unsafe.Pointer(pacPtr))}},
 	}
 
 	list := internetPerConnOptionList{
@@ -184,12 +201,17 @@ func notifyWinINetRefresh() {
 	_, _, _ = procInternetSetOption.Call(0, internetOptionRefresh, 0, 0)
 }
 
-// installCAOnPlatform 在 Windows 下调用 certutil -user -addstore Root 将本地 CA 导入当前用户受信任的根证书颁发机构（无需管理员权限即可弹窗确认安装）。
+// installCAOnPlatform 在 Windows 7~11 (32/64) 下调用 certutil 将本地 CA 导入受信任的根证书颁发机构。
+// 优先导入当前用户根证书库（-user，无需管理员权限即可弹窗确认安装），失败时回退尝试系统根证书库。
 func installCAOnPlatform(caPath string) error {
 	cmd := exec.Command("certutil", "-user", "-addstore", "Root", caPath)
 	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("certutil install failed: %w (%s)", err, strings.TrimSpace(string(out)))
+	if err == nil {
+		return nil
 	}
-	return nil
+	cmdSys := exec.Command("certutil", "-addstore", "Root", caPath)
+	if _, errSys := cmdSys.CombinedOutput(); errSys == nil {
+		return nil
+	}
+	return fmt.Errorf("certutil install failed: %w (%s)", err, strings.TrimSpace(string(out)))
 }

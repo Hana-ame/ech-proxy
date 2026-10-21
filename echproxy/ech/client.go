@@ -1,7 +1,8 @@
-// Package cloudflare_ech 封装上游传输隧道：
-//  1. Cloudflare ECH 域前置（Encrypted Client Hello + uTLS Chrome 指纹）
-//  2. SNI 伪装直连（DoH 解析真实 IP + 可配置/伪造 SNI + HTTP/2 与 HTTP/1.1 自适应传输）
-//  3. Direct 明文/标准 TLS 直连（默认 IPv4，支持 dual 双栈或 IPv6 协议族锁定）
+// Package cloudflare_ech 封装三种上游 GFW 绕过与传输隧道模块：
+//  1. 方式一（SNI 伪装）：通过 DoH 解析真实 IP + SNI 伪装绕过请求 + 核对服务端回传证书是否与伪装前真实域名（truedomain.com）一致、是否过期（见 sni.go）
+//  2. 方式二（ECH 加密）：通过 DoH 解析域名与 HTTPS/ECH 配置 + 使用 Cloudflare ECH 请求 + 核对服务端回传证书（见 client.go）
+//  3. 方式三（TLS 分片绕过 GFW）：通过 DoH 解析真实 IP + TLS ClientHello 记录分片（Fragmentation）绕过 GFW DPI + 核对服务端回传证书（见 fragment.go）
+//  4. 上游证书校验与强行访问放行控制（见 certcheck.go）
 //
 // 本模块仅依赖标准库、netdial、logger、utls 与 x/net/http2。
 package cloudflare_ech
@@ -273,9 +274,7 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				EncryptedClientHelloConfigList: echConfig,
 				MinVersion:                     tls.VersionTLS13,
 				NextProtos:                     []string{"h2", "http/1.1"},
-				// 不由 utls 做证书校验（InsecureSkipVerify），改由下方 validateUpstreamCert 手动校验返回证书
-				// （时间 + 主机名 + 信任链），使证书失败统一走 CertError 警告页、且 WithAllowBadCert 可跳过。
-				// ECH 伪装（外层 SNI=shell、内层加密真实域名）保持不变。
+				// 不由 utls 做自动证书校验，改由下方 validateUpstreamCert 统一核对回传证书与真实域名 host（时间 + 域名一致性 + 信任链）
 				InsecureSkipVerify: true,
 			}
 			mode := netdial.NormalizeIPMode(ipMode)
@@ -283,8 +282,19 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				mode = currentConfig().ipMode
 			}
 			mode = netdial.EffectiveIPMode(mode)
-			return netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
-				rawConn, err := netdial.DialContextIPMode(ctx, shellDomain, "443", mode, dialTimeout)
+
+			// 优先通过 DoH 解析 ECH 接入节点 IP（防止本地 UDP 53 DNS 被污染）
+			dialTarget := shellDomain
+			if dohIPs, derr := ResolveHostIPsByMode(ctx, shellDomain, mode); derr == nil && len(dohIPs) > 0 {
+				dialTarget = dohIPs[0]
+			}
+
+			var certErr error
+			conn, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
+				if certErr != nil {
+					return nil, certErr
+				}
+				rawConn, err := netdial.DialContextIPMode(ctx, dialTarget, "443", mode, dialTimeout)
 				if err != nil {
 					return nil, err
 				}
@@ -293,9 +303,10 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 					rawConn.Close()
 					return nil, err
 				}
-				// MITM 覆盖证书后客户端看不到上游真实证书，代理代为校验返回证书（不比对假 SNI）。
+				// 核对服务端回传证书是否与伪装前访问的真实域名 host 一致、是否过期
 				if cerr := validateUpstreamCert(ctx, host, uConn.ConnectionState().PeerCertificates); cerr != nil {
 					rawConn.Close()
+					certErr = cerr
 					return nil, cerr
 				}
 				if uConn.ConnectionState().NegotiatedProtocol != "h2" {
@@ -304,6 +315,10 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				}
 				return uConn, nil
 			})
+			if certErr != nil {
+				return nil, certErr
+			}
+			return conn, err
 		},
 	}
 }
@@ -363,7 +378,7 @@ func getECHClient(ipMode string) (*Client, error) {
 	return c, nil
 }
 
-// Do 通过 Cloudflare ECH 隧道发送请求（可选指定 "v4"、"v6" 或 "dual" 出口协议族）。
+// Do（方式 2）通过 DoH 解析域名与 ECH 配置，使用 Cloudflare ECH 隧道发送请求，并校验回传证书。
 func Do(req *http.Request, ipMode ...string) (*http.Response, error) {
 	mode := ""
 	if len(ipMode) > 0 {

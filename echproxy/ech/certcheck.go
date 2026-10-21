@@ -1,29 +1,25 @@
-// Package cloudflare_ech 上游证书校验（SNI 伪装路径专用）。
+// Package cloudflare_ech 上游证书校验模块（统一服务于 SNI 伪装、ECH、TLS 分片绕过与 Direct 直连路径）。
 //
-// 为什么需要：MITM 模式下代理用本地 CA 覆盖了客户端证书，客户端无法再自行判断上游真实证书，
-// 故由代理代为校验上游返回的证书。
+// 为什么需要：
+// 在 PAC + CONNECT MITM 本地 HTTPS 服务模式下，代理用本地自生成的 CA 证书与浏览器完成 TLS 握手，
+// 浏览器无法直接看到上游源站回传的真实证书，因此必须由本代理在上游 TLS 握手完成后立即核对源站回传的证书：
+//  1. 比较真实目标域名（truedomain.com，即伪装前的原始访问域名）与服务端回传证书是否一致（leaf.VerifyHostname）；
+//  2. 检查服务端回传证书是否过期或尚未生效（NotBefore / NotAfter）；
+//  3. 检查服务端回传证书链是否可信（leaf.Verify）。
 //
-// 为什么不比对 SNI/伪装域名：SNI 伪装下发的域名（fakedomain.com）与上游返回的证书域名
-// 必然不同——证书域名是真实域名（truedomain.com）。因此校验对象是「返回的证书是否覆盖
-// 真实请求域名」，而非是否匹配发送的假 SNI。伪装（假 SNI + InsecureSkipVerify）保持不变，
-// 绝不牺牲。
-//
-// 校验项（两类，提示不同）：
-//  1. 时间有效性（NotBefore/NotAfter）不过 -> ErrCertExpired（过期）
-//  2. 主机名是否覆盖真实请求域名（leaf.VerifyHostname）不过 -> ErrCertMismatch（不一致）
-//
-// 不做证书链/信任根校验（用户未要求；自签等第三类情形按需另行扩展）。
+// 当证书不一致或已过期时，返回结构化的 *CertError（区分 "expired" 与 "mismatch"），
+// 由上层渲染对应的中文警告页并提供「强行访问」按钮。
 package cloudflare_ech
 
 import (
 	"context"
+	"crypto/x509"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
 	"sync/atomic"
 	"time"
-
-	"crypto/x509"
 
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 )
@@ -31,18 +27,23 @@ import (
 var (
 	// ErrCertExpired 上游证书已过期或尚未生效（时间有效性失败）。
 	ErrCertExpired = errors.New("upstream certificate expired or not yet valid")
-	// ErrCertMismatch 上游证书未覆盖真实请求域名（主机名不一致，可能遭遇中间人/走错服务器）。
+	// ErrCertMismatch 上游证书未覆盖真实请求域名（主机名不一致，可能遭遇中间人或连接到了错误的服务器）。
 	ErrCertMismatch = errors.New("upstream certificate does not match the requested domain")
 	// ErrCertUntrusted 上游证书链未通过系统根证书信任校验（自签 / 未知 CA / 中间证书缺失）。
 	ErrCertUntrusted = errors.New("upstream certificate chain is not trusted by system roots")
 )
 
-// CertError 携带证书校验失败的具体上下文，Unwrap 到 ErrCertExpired 或 ErrCertMismatch。
+// CertError 携带上游证书校验失败的完整上下文，Unwrap 到 ErrCertExpired / ErrCertMismatch / ErrCertUntrusted。
 type CertError struct {
-	Host   string // 真实请求域名
-	Kind   string // "expired" | "mismatch"
-	Detail string // 人类可读细节
-	err    error  // ErrCertExpired 或 ErrCertMismatch
+	Host      string    // 伪装前访问的真实目标域名（如 truedomain.com）
+	Kind      string    // "expired" | "mismatch" | "chain"
+	Subject   string    // 服务端回传证书的 Subject
+	DNSNames  []string  // 服务端回传证书包含的 SAN 域名列表
+	Issuer    string    // 服务端回传证书的签发机构
+	NotBefore time.Time // 证书生效时间
+	NotAfter  time.Time // 证书过期时间
+	Detail    string    // 人类可读详细诊断信息
+	err       error
 }
 
 func (e *CertError) Error() string {
@@ -58,8 +59,6 @@ func IsCertError(err error) bool {
 
 // ClassifyCertError 从（可能被 http2/url 包装的）错误中判定证书校验失败类型。
 // 返回 kind ∈ {"expired","mismatch","chain"}、host、detail 与是否命中。
-// 优先 errors.As（走 CertError）；其次 errors.Is（%w 包装链）；最后字符串兜底
-// （http2/url 可能未保留 Unwrap 链）。
 func ClassifyCertError(err error) (kind, host, detail string, ok bool) {
 	if err == nil {
 		return "", "", "", false
@@ -111,29 +110,30 @@ func allowBadCert(ctx context.Context) bool {
 }
 
 // AllowBadCert 报告 ctx 是否携带「强行访问」标记（命中时跳过上游证书校验）。
-// 供测试与诊断使用。
 func AllowBadCert(ctx context.Context) bool { return allowBadCert(ctx) }
 
-// rootPoolOverride 仅用于测试：注入自定义根证书池以验证证书链通过/失败；nil 时用系统根证书池。
+// rootPoolOverride 仅用于测试：注入自定义根证书池以验证证书链通过/失败；nil 时使用系统根证书校验。
 var rootPoolOverride atomic.Pointer[x509.CertPool]
 
-// SetRootPoolOverride 设置（仅测试用）自定义根证书池；传 nil 恢复使用系统根证书池。
+// SetRootPoolOverride 设置（仅测试用）自定义根证书池；传 nil 恢复使用系统根证书校验。
 func SetRootPoolOverride(pool *x509.CertPool) { rootPoolOverride.Store(pool) }
 
-func effectiveRootPool() *x509.CertPool {
-	if p := rootPoolOverride.Load(); p != nil {
-		return p
+func normalizeCertDomain(raw string) string {
+	h := strings.ToLower(strings.TrimSpace(raw))
+	if host, _, err := net.SplitHostPort(h); err == nil {
+		h = host
 	}
-	return netdial.RootPool()
+	return strings.TrimSuffix(h, ".")
 }
 
-// validateUpstreamCert 校验 SNI 伪装路径返回的上游叶证书：
-//   - 时间有效性（NotBefore/NotAfter）不过 -> ErrCertExpired（过期）
-//   - 主机名是否覆盖真实请求域名 realDomain（leaf.VerifyHostname）不过 -> ErrCertMismatch（不一致）
-//   - 证书链 / 信任根（leaf.Verify，系统根证书池 + 上游返回的中间证书）不过 -> ErrCertUntrusted（不可信）
-//
-// 不比对假 SNI（伪装域名与证书域名必然不同）。ctx 携带 WithAllowBadCert 时直接放行（强行访问覆盖）。
-// 无证书可校验时放行（不阻塞伪装路径）。
+// ValidateUpstreamCert 核对服务端回传的证书与伪装前访问的真实目标域名（realDomain，如 truedomain.com）：
+//  1. 检查证书时间有效性（NotBefore / NotAfter）-> 若过期或尚未生效，返回 ErrCertExpired（kind="expired"）；
+//  2. 比较 realDomain 与回传证书的域名（leaf.VerifyHostname(realDomain)）-> 若不一致，返回 ErrCertMismatch（kind="mismatch"）；
+//  3. 校验服务端证书链是否受系统根证书信任 -> 若不可信，返回 ErrCertUntrusted（kind="chain"）。
+func ValidateUpstreamCert(ctx context.Context, realDomain string, peerCerts []*x509.Certificate) error {
+	return validateUpstreamCert(ctx, realDomain, peerCerts)
+}
+
 func validateUpstreamCert(ctx context.Context, realDomain string, peerCerts []*x509.Certificate) error {
 	if allowBadCert(ctx) {
 		return nil
@@ -141,47 +141,107 @@ func validateUpstreamCert(ctx context.Context, realDomain string, peerCerts []*x
 	if len(peerCerts) == 0 {
 		return nil
 	}
+	realDomain = normalizeCertDomain(realDomain)
+	if realDomain == "" {
+		return nil
+	}
+
 	leaf := peerCerts[0]
 	now := time.Now()
 	if now.Before(leaf.NotBefore) {
 		return &CertError{
-			Host:   realDomain,
-			Kind:   "expired",
-			Detail: fmt.Sprintf("certificate not yet valid (NotBefore=%s)", leaf.NotBefore.Format(time.RFC3339)),
-			err:    ErrCertExpired,
+			Host:      realDomain,
+			Kind:      "expired",
+			Subject:   leaf.Subject.String(),
+			DNSNames:  append([]string(nil), leaf.DNSNames...),
+			Issuer:    leaf.Issuer.String(),
+			NotBefore: leaf.NotBefore,
+			NotAfter:  leaf.NotAfter,
+			Detail: fmt.Sprintf("certificate for %s is not yet valid (NotBefore=%s, NotAfter=%s, now=%s)",
+				realDomain, leaf.NotBefore.Format(time.RFC3339), leaf.NotAfter.Format(time.RFC3339), now.Format(time.RFC3339)),
+			err: ErrCertExpired,
 		}
 	}
 	if now.After(leaf.NotAfter) {
 		return &CertError{
-			Host:   realDomain,
-			Kind:   "expired",
-			Detail: fmt.Sprintf("certificate expired on %s", leaf.NotAfter.Format(time.RFC3339)),
-			err:    ErrCertExpired,
+			Host:      realDomain,
+			Kind:      "expired",
+			Subject:   leaf.Subject.String(),
+			DNSNames:  append([]string(nil), leaf.DNSNames...),
+			Issuer:    leaf.Issuer.String(),
+			NotBefore: leaf.NotBefore,
+			NotAfter:  leaf.NotAfter,
+			Detail: fmt.Sprintf("certificate for %s expired on %s (NotBefore=%s, now=%s)",
+				realDomain, leaf.NotAfter.Format(time.RFC3339), leaf.NotBefore.Format(time.RFC3339), now.Format(time.RFC3339)),
+			err: ErrCertExpired,
 		}
 	}
 	if err := leaf.VerifyHostname(realDomain); err != nil {
 		return &CertError{
-			Host:   realDomain,
-			Kind:   "mismatch",
-			Detail: fmt.Sprintf("certificate not valid for %s: %v (subject=%s, DNSNames=%v)", realDomain, err, leaf.Subject, leaf.DNSNames),
-			err:    ErrCertMismatch,
+			Host:      realDomain,
+			Kind:      "mismatch",
+			Subject:   leaf.Subject.String(),
+			DNSNames:  append([]string(nil), leaf.DNSNames...),
+			Issuer:    leaf.Issuer.String(),
+			NotBefore: leaf.NotBefore,
+			NotAfter:  leaf.NotAfter,
+			Detail: fmt.Sprintf("certificate does not match true domain %s: %v (cert Subject=%s, DNSNames=%v)",
+				realDomain, err, leaf.Subject, leaf.DNSNames),
+			err: ErrCertMismatch,
 		}
 	}
-	// 证书链 / 信任根校验：用系统根证书池 + 上游返回的中间证书构建验证链。
+
+	// 证书链 / 信任根校验：
+	// - 若单元测试通过 SetRootPoolOverride 注入了测试根池，则严格使用该池校验；
+	// - 生产环境下（rootPoolOverride == nil），优先使用 Roots: nil 调用操作系统原生验证器
+	//   （在 Windows 7~11 上调用 CryptoAPI CertGetCertificateChain，自动支持系统根证书库与 AIA 中间证书补全），
+	//   若失败（如 Android/Termux 无标准系统证书目录）再回退使用 netdial.RootPool()。
 	intermediates := x509.NewCertPool()
 	for _, c := range peerCerts[1:] {
 		intermediates.AddCert(c)
 	}
+	if overridePool := rootPoolOverride.Load(); overridePool != nil {
+		if _, err := leaf.Verify(x509.VerifyOptions{
+			Roots:         overridePool,
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}); err != nil {
+			return &CertError{
+				Host:      realDomain,
+				Kind:      "chain",
+				Subject:   leaf.Subject.String(),
+				DNSNames:  append([]string(nil), leaf.DNSNames...),
+				Issuer:    leaf.Issuer.String(),
+				NotBefore: leaf.NotBefore,
+				NotAfter:  leaf.NotAfter,
+				Detail:    fmt.Sprintf("certificate chain not trusted by system roots: %v (issuer=%s)", err, leaf.Issuer),
+				err:       ErrCertUntrusted,
+			}
+		}
+		return nil
+	}
+
 	if _, err := leaf.Verify(x509.VerifyOptions{
-		Roots:         effectiveRootPool(),
+		Roots:         nil, // 使用 OS 原生根证书库（Windows CryptoAPI / macOS Security / Linux system roots）
 		Intermediates: intermediates,
 		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 	}); err != nil {
-		return &CertError{
-			Host:   realDomain,
-			Kind:   "chain",
-			Detail: fmt.Sprintf("certificate chain not trusted by system roots: %v (issuer=%s)", err, leaf.Issuer),
-			err:    ErrCertUntrusted,
+		if _, err2 := leaf.Verify(x509.VerifyOptions{
+			Roots:         netdial.RootPool(),
+			Intermediates: intermediates,
+			KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		}); err2 != nil {
+			return &CertError{
+				Host:      realDomain,
+				Kind:      "chain",
+				Subject:   leaf.Subject.String(),
+				DNSNames:  append([]string(nil), leaf.DNSNames...),
+				Issuer:    leaf.Issuer.String(),
+				NotBefore: leaf.NotBefore,
+				NotAfter:  leaf.NotAfter,
+				Detail:    fmt.Sprintf("certificate chain not trusted by system roots: %v (issuer=%s)", err, leaf.Issuer),
+				err:       ErrCertUntrusted,
+			}
 		}
 	}
 	return nil

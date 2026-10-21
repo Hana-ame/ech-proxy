@@ -172,6 +172,14 @@ type msg struct {
 	pt      point
 }
 
+type winGUID struct {
+	data1 uint32
+	data2 uint16
+	data3 uint16
+	data4 [8]byte
+}
+
+// notifyIconDataW 对应 Win32 <shellapi.h> 完整 NOTIFYICONDATAW 结构体（兼容 Windows 7~11 32/64 位）。
 type notifyIconDataW struct {
 	cbSize           uint32
 	hWnd             uintptr
@@ -186,6 +194,8 @@ type notifyIconDataW struct {
 	uVersion         uint32
 	szInfoTitle      [64]uint16
 	dwInfoFlags      uint32
+	guidItem         winGUID
+	hBalloonIcon     uintptr
 }
 
 var (

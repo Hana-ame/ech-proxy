@@ -220,7 +220,7 @@ type UpstreamConfig struct {
 	Host            string                `json:"host"`
 	Describe        string                `json:"describe,omitempty"`
 	Display         bool                  `json:"display,omitempty"`
-	Mode            string                `json:"mode,omitempty"`            // ""/"auto", "ech", "sni", "direct"
+	Mode            string                `json:"mode,omitempty"`            // ""/"auto", "ech", "sni", "fragment"/"bypass", "direct"
 	IPMode          string                `json:"ip_mode,omitempty"`         // 默认 "v4"/"4" (ipv4), "dual", "v6"/"6"
 	SNIServerName   string                `json:"sni_server_name,omitempty"` // 自定义 SNI 伪装域名（可选）
 	Referer         string                `json:"referer,omitempty"`
@@ -301,6 +301,8 @@ func normalizeMode(mode string) string {
 		return "ech"
 	case "sni":
 		return "sni"
+	case "fragment", "bypass", "gfw":
+		return "fragment"
 	case "direct":
 		return "direct"
 	case "auto", "":
@@ -453,7 +455,7 @@ func compileBodyReplace(rules []BodyReplaceRule) {
 //  1. 优先精确匹配 upstream.json 中的条目；
 //  2. 其次匹配 upstream.json 中的 Wildcard 泛域名规则；
 //  3. 若请求域名不属于 l.moonchan.xyz 体系（即通过 hosts=127.0.0.1 或 CONNECT 代理接入的任意真实域名），
-//     即使未显式写入 upstream.json，也自动生成原域名透传配置（Mode: "auto"，IPMode 默认 "v4"），交由 SNI/ECH 自动探测转发。
+//     即使未显式写入 upstream.json，也自动生成原域名透传配置（Mode: "auto"，IPMode 默认 "v4"），交由 SNI/ECH/Fragment 自动探测转发。
 func Resolve(upstreams UpstreamMap, host string) (UpstreamConfig, bool) {
 	host = cleanHost(host)
 	if host == "" {

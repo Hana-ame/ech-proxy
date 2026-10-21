@@ -50,7 +50,7 @@ var (
 		"mode", "ip_mode", "sni_server_name", "sw_inject", "rewrites", "body_replace",
 	}
 
-	validModes          = map[string]bool{"": true, "auto": true, "ech": true, "sni": true, "direct": true}
+	validModes          = map[string]bool{"": true, "auto": true, "ech": true, "sni": true, "fragment": true, "bypass": true, "gfw": true, "direct": true}
 	validIPModes        = map[string]bool{"": true, "auto": true, "dual": true, "v4": true, "ipv4": true, "4": true, "v6": true, "ipv6": true, "6": true}
 	validCookiePriority = map[string]bool{"": true, "browser": true, "seed": true}
 )
@@ -246,7 +246,7 @@ func checkMode(path, mode string) []ValidationIssue {
 		Severity: SeverityError,
 		Path:     path,
 		Message:  fmt.Sprintf("invalid mode %q", mode),
-		Hint:     `valid values are "auto", "ech", "sni", or "direct"`,
+		Hint:     `valid values are "auto", "ech", "sni", "fragment", or "direct"`,
 	}}
 }
 

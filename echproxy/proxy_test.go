@@ -368,7 +368,7 @@ func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 }
 
 // TestCertWarningPage 验证上游证书校验失败时渲染区分「过期 / 不一致」的 HTML 警告页，
-// 且页面含「强行访问」按钮（?__ech_proxy_force_cert__=1）。两类提示不得混用文案。
+// 且页面含「强行访问」按钮（?__ech_proxy_force_cert__=<token>），同时验证浏览器并发请求 /favicon.ico 不会覆盖主页面 token。
 func TestCertWarningPage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	orig := roundTripFn
@@ -436,7 +436,7 @@ func TestCertWarningPage(t *testing.T) {
 	// 3. 不可信链
 	assertWarning("chain", cloudflare_ech.ErrCertUntrusted, "不可信", "已过期", "不一致")
 
-	// 4. 强行访问：一次性 token + 会话级记忆
+	// 4. 强行访问：一次性 token + 并发 /favicon.ico 容错 + 会话级记忆
 	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		if !cloudflare_ech.AllowBadCert(req.Context()) {
 			return nil, fmt.Errorf("dial upstream: %w", cloudflare_ech.ErrCertMismatch)
@@ -447,7 +447,7 @@ func TestCertWarningPage(t *testing.T) {
 			Body:       io.NopCloser(strings.NewReader("forced-ok")),
 		}, nil
 	}
-	// 4a. 无参 -> 警告页（不一致），提取 token
+	// 4a. 无参请求主页面 -> 警告页（不一致），提取主页面 token
 	rec4a := httptest.NewRecorder()
 	r4a := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path", nil)
 	r4a.Host = "t.l.moonchan.xyz:8443"
@@ -459,7 +459,14 @@ func TestCertWarningPage(t *testing.T) {
 	if tok == "" {
 		t.Fatalf("4a: extracted force token empty: %s", rec4a.Body.String())
 	}
-	// 4b. 携带有效 token -> 消费并批准，跳过校验放行上游
+
+	// 4a-favicon: 模拟浏览器在渲染警告页后立即自动请求 /favicon.ico，确保不会使主页面的 tok 失效
+	recFav := httptest.NewRecorder()
+	rFav := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/favicon.ico", nil)
+	rFav.Host = "t.l.moonchan.xyz:8443"
+	engine.ServeHTTP(recFav, rFav)
+
+	// 4b. 用户点击主页面上的「强行访问」按钮（携带主页面 tok）-> 必须成功消费并放行上游
 	rec4b := httptest.NewRecorder()
 	r4b := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path?"+forceCertQueryParam+"="+tok, nil)
 	r4b.Host = "t.l.moonchan.xyz:8443"

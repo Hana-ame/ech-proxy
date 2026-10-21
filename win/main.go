@@ -94,6 +94,8 @@ type CLICommand struct {
 	SkipAdBlock      bool
 	AdScriptURL      string
 	WhitelistURL     string
+	EasyListURL      string
+	AdsAllowlistURL  string
 	AdultSitesURL    string
 	BlocklistURL     string
 	OnURL            string
@@ -265,6 +267,8 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	noAdScriptAlias := fs.Bool("no-ad-script", false, "--skip-ad-script 别名")
 	disableScriptAlias := fs.Bool("disable-ad-script", false, "--skip-ad-script 别名")
 	adScriptURL := fs.String("ad-script-url", getenv("ECH_PROXY_AD_SCRIPT_URL"), "ads.js 地址")
+	easyListURL := fs.String("easylist-url", getenv("ECH_PROXY_EASYLIST_URL"), "EasyList 地址（置为 - 可禁用）")
+	adsAllowlistURL := fs.String("ads-allowlist-url", getenv("ECH_PROXY_ADS_ALLOWLIST_URL"), "ads.js 解析失败时的放行清单 ads.txt 地址")
 	adScriptInterval := fs.Duration("ad-script-interval", defaultInterval, "自动更新间隔")
 	updateNow := fs.Bool("update", false, "立即更新")
 	checkUpdateAlias := fs.Bool("check-update", false, "立即更新")
@@ -451,6 +455,8 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		SkipAdBlock:      *skipAdBlock,
 		AdScriptURL:      strings.TrimSpace(*adScriptURL),
 		WhitelistURL:     resolvedWhitelistURL,
+		EasyListURL:      strings.TrimSpace(*easyListURL),
+		AdsAllowlistURL:  strings.TrimSpace(*adsAllowlistURL),
 		AdultSitesURL:    strings.TrimSpace(*adultSitesURL),
 		BlocklistURL:     strings.TrimSpace(*blocklistURL),
 		OnURL:            strings.TrimSpace(*onURL),
@@ -768,6 +774,8 @@ func main() {
 		SkipAdBlock:      cmd.SkipAdBlock,
 		AdScriptURL:      cmd.AdScriptURL,
 		WhitelistURL:     cmd.WhitelistURL,
+		EasyListURL:      cmd.EasyListURL,
+		AdsAllowlistURL:  cmd.AdsAllowlistURL,
 		AdultSitesURL:    cmd.AdultSitesURL,
 		BlocklistURL:     cmd.BlocklistURL,
 		OnURL:            cmd.OnURL,

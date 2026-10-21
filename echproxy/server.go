@@ -131,6 +131,8 @@ type ServerOptions struct {
 	SkipAdBlock         bool
 	AdScriptURL         string
 	WhitelistURL        string
+	EasyListURL         string
+	AdsAllowlistURL     string
 	AdultSitesURL       string
 	BlocklistURL        string
 	OnURL               string
@@ -317,6 +319,8 @@ func NewServer(opts ServerOptions) (*Server, error) {
 			ScriptURL:      strings.TrimSpace(opts.AdScriptURL),
 			WhitelistURL:   strings.TrimSpace(opts.WhitelistURL),
 			AdultSitesURL:  strings.TrimSpace(opts.AdultSitesURL),
+			EasyListURL:    strings.TrimSpace(opts.EasyListURL),
+			AdsAllowlistURL: strings.TrimSpace(opts.AdsAllowlistURL),
 			BlocklistURL:   strings.TrimSpace(opts.BlocklistURL),
 			OnURL:          strings.TrimSpace(opts.OnURL),
 			OnRetries:      opts.OnRetries,

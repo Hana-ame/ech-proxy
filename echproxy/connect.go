@@ -218,7 +218,7 @@ func parseConnectTarget(req *http.Request) (string, string, error) {
 		return "", "", fmt.Errorf("invalid connect authority %q: %w", raw, err)
 	}
 	host = strings.ToLower(strings.TrimSpace(host))
-	if host == "" || strings.ContainsAny(host, " /\\t\r\n") {
+	if host == "" || strings.ContainsAny(host, " \t\r\n/\\") {
 		return "", "", fmt.Errorf("empty or malformed connect host in %q", raw)
 	}
 	portNum, err := strconv.Atoi(portStr)

@@ -1,3 +1,19 @@
+## v3.4.0
+
+### Changes & Features
+
+- **AdScript 注入引擎重构 (Remote-Only Dynamic Injection)**:
+  - 彻底移除内置默认脚本 (`BuiltInAdScript`) 与 `on.txt` 远端轮询及状态开关，全面改为远端 `ads.js` 原样直插模式。
+  - 仅在拉取到远端有效脚本（或读取本地磁盘缓存 `<dataDir>/ads.js`）时插入代码；初次无脚本或未拉取到时不注入任何内容。
+  - 注入锚点严格限定在 HTML 的 `</body>` 标签前（页面无 `</body>` 时追加末尾），确保符合页面 DOM 渲染时序，不再插入 `</head>` 标签前。
+- **文档与托盘交互指南 (Tray UI & Quickstart)**:
+  - `README.md` 增加 Windows 任务栏系统托盘（System Tray）各项右键菜单功能对照表。
+  - 增加新用户初次使用流程指南（6 步新手安装、导入证书与启动配置）。
+  - 文档与 CLI 选项严格脱敏，不外露任何内部广告相关参数。
+- **预发布加固与跨平台校验 (Hardening & CI)**:
+  - 统一全局 DoH 域名单一信源。
+  - 修复 Windows `copylocks` 与 HTTP/1.1 MITM 阻塞问题，完善 Windows/Linux/macOS 多架构交叉编译与 smoke test 验证。
+
 ## v3.3.1
 
 ### Pre-Release Fixes (hardening pass)

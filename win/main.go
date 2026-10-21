@@ -95,6 +95,7 @@ type CLICommand struct {
 	AdScriptURL      string
 	WhitelistURL     string
 	AdultSitesURL    string
+	EasyListURL      string
 	BlocklistURL     string
 	OnURL            string
 	AdScriptInterval time.Duration
@@ -259,6 +260,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	hideConsole := fs.Bool("hide-console", false, "隐藏控制台")
 	whitelistURL := fs.String("whitelist-url", defaultWhitelistEnv, "pac.txt 地址")
 	adultSitesURL := fs.String("adult-sites-url", getenv("ECH_PROXY_ADULT_SITES_URL"), "adult.txt 成人网站清单地址（决定去广告/注入广告）")
+	easyListURL := fs.String("easylist-url", getenv("ECH_PROXY_EASYLIST_URL"), "EasyList 地址（置为 - 可禁用；仅作用于 adult.txt 命中站点）")
 	adultDomainsAlias := fs.String("adult-domains-url", "", "pac.txt 别名")
 	blocklistURL := fs.String("blocklist-url", getenv("ECH_PROXY_BLOCKLIST_URL"), "block.json 地址")
 	onURL := fs.String("on-url", getenv("ECH_PROXY_ON_URL"), "on.txt 地址")
@@ -452,6 +454,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		AdScriptURL:      strings.TrimSpace(*adScriptURL),
 		WhitelistURL:     resolvedWhitelistURL,
 		AdultSitesURL:    strings.TrimSpace(*adultSitesURL),
+		EasyListURL:      strings.TrimSpace(*easyListURL),
 		BlocklistURL:     strings.TrimSpace(*blocklistURL),
 		OnURL:            strings.TrimSpace(*onURL),
 		AdScriptInterval: *adScriptInterval,
@@ -769,6 +772,7 @@ func main() {
 		AdScriptURL:      cmd.AdScriptURL,
 		WhitelistURL:     cmd.WhitelistURL,
 		AdultSitesURL:    cmd.AdultSitesURL,
+		EasyListURL:      cmd.EasyListURL,
 		BlocklistURL:     cmd.BlocklistURL,
 		OnURL:            cmd.OnURL,
 		AdScriptInterval: cmd.AdScriptInterval,

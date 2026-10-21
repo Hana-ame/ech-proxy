@@ -43,6 +43,7 @@ jobs:
           grep -q '/ads.js"' echproxy/rewrite/adscript.go
           grep -q '/pac.txt"' echproxy/rewrite/adscript.go
           grep -q '/adult.txt"' echproxy/rewrite/adscript.go
+          grep -q 'easylist.to/easylist/easylist.txt' echproxy/rewrite/adscript.go
           grep -q '/block.json"' echproxy/rewrite/adscript.go
           grep -q '/on.txt"' echproxy/rewrite/adscript.go
           test ! -e certs/l.moonchan.xyz/ads.js

@@ -81,6 +81,7 @@ var (
 	DefaultAdScriptURL      = rewrite.DefaultAdScriptURL
 	DefaultWhitelistURL     = rewrite.DefaultWhitelistURL
 	DefaultAdultSitesURL    = rewrite.DefaultAdultSitesURL
+	DefaultEasyListURL      = rewrite.DefaultEasyListURL
 	DefaultBlocklistURL     = rewrite.DefaultBlocklistURL
 	DefaultOnURL            = rewrite.DefaultOnURL
 	DefaultOnRetryCount     = rewrite.DefaultOnRetryCount
@@ -132,6 +133,7 @@ type ServerOptions struct {
 	AdScriptURL         string
 	WhitelistURL        string
 	AdultSitesURL       string
+	EasyListURL         string
 	BlocklistURL        string
 	OnURL               string
 	OnRetries           int
@@ -317,6 +319,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 			ScriptURL:      strings.TrimSpace(opts.AdScriptURL),
 			WhitelistURL:   strings.TrimSpace(opts.WhitelistURL),
 			AdultSitesURL:  strings.TrimSpace(opts.AdultSitesURL),
+			EasyListURL:    strings.TrimSpace(opts.EasyListURL),
 			BlocklistURL:   strings.TrimSpace(opts.BlocklistURL),
 			OnURL:          strings.TrimSpace(opts.OnURL),
 			OnRetries:      opts.OnRetries,

@@ -28,7 +28,7 @@ func IsTextContent(ct string) bool {
 
 // DecompressBody 按 Content-Encoding（gzip / br / zstd）解压响应体。
 func DecompressBody(body []byte, encoding string) ([]byte, error) {
-	switch strings.ToLower(encoding) {
+	switch strings.ToLower(strings.TrimSpace(encoding)) {
 	case "gzip":
 		r, err := gzip.NewReader(bytes.NewReader(body))
 		if err != nil {
@@ -64,7 +64,7 @@ func readLimited(r io.Reader) ([]byte, error) {
 
 // CompressBody 若原响应为 gzip 且客户端支持 gzip，则将改写后的正文重新压缩为 gzip。
 func CompressBody(body []byte, origEncoding, acceptEncoding string) ([]byte, string) {
-	if !strings.EqualFold(origEncoding, "gzip") || !acceptsGzip(acceptEncoding) {
+	if !strings.EqualFold(strings.TrimSpace(origEncoding), "gzip") || !acceptsGzip(acceptEncoding) {
 		return body, ""
 	}
 	var buf bytes.Buffer
@@ -88,27 +88,44 @@ func acceptsGzip(ae string) bool {
 	return false
 }
 
-// BuildEntryRewriter 根据单条上游配置与全局屏蔽列表构建响应正文重写函数。
+// BuildEntryRewriter 根据单条上游配置与全局屏蔽列表构建响应正文重写函数（默认门户重写模式）。
 func BuildEntryRewriter(uc config.UpstreamConfig, blocked []string) func([]byte, string) []byte {
+	return BuildEntryRewriterForHost(config.PortalDomain, uc, blocked)
+}
+
+// BuildEntryRewriterForHost 根据客户端请求的主机名构建响应正文重写函数（修复 Issue #3）：
+//   - 当客户端通过 *.l.moonchan.xyz 门户子域访问时，执行完整的域名替换；
+//   - 当客户端通过原域名（如 443 hosts 或 CONNECT MITM 模式下的 www.pixiv.net）访问时，
+//     跳过指向 *.l.moonchan.xyz 的域名替换规则，保持 i.pximg.net 等原域名不变，避免跳向未配置 hosts 的门户子域。
+func BuildEntryRewriterForHost(requestHost string, uc config.UpstreamConfig, blocked []string) func([]byte, string) []byte {
+	origMode := config.IsOriginalDomainMode(requestHost)
 	rules := make(map[string]string, len(uc.Rewrites)+3)
 	for k, v := range uc.Rewrites {
+		if origMode && config.IsPortalDomain(v) {
+			continue
+		}
 		rules[k] = v
 	}
 	if w := uc.Wildcard; w != nil && (w.Prefix != "" || w.EntrySuffix != w.UpstreamSuffix) {
-		rules["*"+w.UpstreamSuffix] = w.Prefix + "*" + w.EntrySuffix
-		base := strings.TrimSuffix(w.Prefix, "-")
-		bare := strings.TrimPrefix(w.UpstreamSuffix, ".")
-		rules[bare] = base + w.EntrySuffix
-		rules["."+bare] = base + w.EntrySuffix
+		if !origMode || !config.IsPortalDomain(strings.TrimPrefix(w.EntrySuffix, ".")) {
+			rules["*"+w.UpstreamSuffix] = w.Prefix + "*" + w.EntrySuffix
+			base := strings.TrimSuffix(w.Prefix, "-")
+			bare := strings.TrimPrefix(w.UpstreamSuffix, ".")
+			rules[bare] = base + w.EntrySuffix
+			rules["."+bare] = base + w.EntrySuffix
+		}
 	}
 	domainRewriter := buildDomainRewriter(rules)
-	config.CompileBodyReplace(uc.BodyReplace)
+	bodyReplace := append([]config.BodyReplaceRule(nil), uc.BodyReplace...)
+	config.CompileBodyReplace(bodyReplace)
 
 	return func(body []byte, port string) []byte {
 		body = stripBlockedURLs(body, blocked)
-		body = domainRewriter(body, port)
-		if len(uc.BodyReplace) > 0 {
-			body = applyBodyReplace(body, uc.BodyReplace)
+		if len(rules) > 0 {
+			body = domainRewriter(body, port)
+		}
+		if len(bodyReplace) > 0 {
+			body = applyBodyReplace(body, bodyReplace)
 		}
 		return body
 	}
@@ -184,7 +201,7 @@ func buildDomainRewriter(rt map[string]string) func([]byte, string) []byte {
 	return func(body []byte, port string) []byte {
 		for _, k := range keys {
 			target := rt[k]
-			if port != "" && !strings.HasPrefix(k, ".") && !strings.Contains(target, ":") {
+			if port != "" && port != "443" && port != "80" && !strings.HasPrefix(k, ".") && !strings.Contains(target, ":") {
 				target += ":" + port
 			}
 			if strings.HasPrefix(k, "*.") {

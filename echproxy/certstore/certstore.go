@@ -1,7 +1,6 @@
-// Package certstore 提供双轨 TLS 证书管理（修复 #21 完整信任链与 SKID/AKID 扩展）：
-//  1. l.moonchan.xyz 及 *.l.moonchan.xyz 相关域名：使用公网受信证书。
-//  2. 其余所有通过修改 hosts=127.0.0.1 接入的域名（如 pixiv.net、i.pximg.net 等）：
-//     使用本机自生成的根证书（ca/ca.pem, ca/ca.key）按需动态签发带完整信任链的通配符叶子证书。
+// Package certstore 提供高内聚的 TLS 证书管理组件（供 PAC 方案、443 方案与 8443 方案按需复用）：
+//   - 本地自签 CA + 动态通配符叶子证书签发（Store，供 PAC 方案与 443 方案共享复用，存储于 <dataDir>/ca/ 下，与 certs/ 完全解耦）；
+//   - 公网真实证书加载（LoadRemoteCert，仅供 8443 门户方案使用，certs/ 路径完全与 8443 方案相关）。
 package certstore
 
 import (
@@ -30,7 +29,7 @@ import (
 const (
 	caCertName        = "ca.pem"
 	caKeyName         = "ca.key"
-	certsDir          = "certs"
+	leavesSubDir      = "leaves"
 	leafCertFile      = "fullchain.pem"
 	leafKeyFile       = "privkey.pem"
 	caValidDuration   = 10 * 365 * 24 * time.Hour
@@ -38,18 +37,35 @@ const (
 	leafSerialMax     = 1 << 62
 )
 
-// LoadRemoteCert 从配置的 cert_path 和 key_path 加载公网 TLS 证书（用于 l.moonchan.xyz 及其子域名）。
+var multiPartPublicSuffixes = map[string]bool{
+	"co.jp": true, "ne.jp": true, "or.jp": true, "ac.jp": true, "go.jp": true,
+	"com.cn": true, "net.cn": true, "org.cn": true, "gov.cn": true, "edu.cn": true,
+	"co.uk": true, "org.uk": true, "ac.uk": true, "gov.uk": true,
+	"co.kr": true, "or.kr": true, "ne.kr": true,
+	"com.tw": true, "org.tw": true, "edu.tw": true,
+	"com.hk": true, "org.hk": true, "edu.hk": true,
+	"com.au": true, "net.au": true, "org.au": true,
+	"com.sg": true, "com.my": true, "co.nz": true, "com.br": true,
+}
+
+// LoadRemoteCert 加载 8443 方案专属的公网真实证书（远端拉取失败时可静默回退至本地 certs/l.moonchan.xyz/）。
 func LoadRemoteCert(certPath, keyPath string) (*tls.Certificate, error) {
 	if certPath == "" || keyPath == "" {
 		return nil, errors.New("missing cert_path or key_path in config")
 	}
 	certPEM, err := netdial.FetchBytes(certPath)
 	if err != nil {
-		return nil, fmt.Errorf("fetch certificate: %w", err)
+		certPEM = readFallback8443File("fullchain.cer")
+		if len(certPEM) == 0 {
+			return nil, fmt.Errorf("fetch certificate: %w", err)
+		}
 	}
 	keyPEM, err := netdial.FetchBytes(keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("fetch key: %w", err)
+		keyPEM = readFallback8443File("privkey.pem")
+		if len(keyPEM) == 0 {
+			return nil, fmt.Errorf("fetch key: %w", err)
+		}
 	}
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
@@ -58,7 +74,18 @@ func LoadRemoteCert(certPath, keyPath string) (*tls.Certificate, error) {
 	return &cert, nil
 }
 
-// CA 表示本机自生成的根证书机构。
+func readFallback8443File(name string) []byte {
+	for _, cand := range []string{
+		filepath.Join("certs", "l.moonchan.xyz", name),
+		filepath.Join("..", "certs", "l.moonchan.xyz", name),
+	} {
+		if b, err := os.ReadFile(cand); err == nil && len(b) > 0 {
+			return b
+		}
+	}
+	return nil
+}
+
 type CA struct {
 	Cert     *x509.Certificate
 	Key      *rsa.PrivateKey
@@ -66,15 +93,32 @@ type CA struct {
 	KeyPath  string
 }
 
-// Store 管理本地自签名 CA 及按可注册域名缓存的叶子证书。
 type Store struct {
-	mu      sync.Mutex
-	DataDir string
-	ca      *CA
-	leaf    map[string]*tls.Certificate
+	mu         sync.Mutex
+	DataDir    string
+	ca         *CA
+	portalCert *tls.Certificate
+	leaf       map[string]*tls.Certificate
 }
 
-// DefaultDataDir 返回默认的本地证书存储目录（优先可执行文件同级目录，不可写时回退至系统用户配置目录）。
+func (st *Store) SetPortalCert(cert *tls.Certificate) {
+	if st == nil {
+		return
+	}
+	st.mu.Lock()
+	st.portalCert = cert
+	st.mu.Unlock()
+}
+
+func (st *Store) PortalCert() *tls.Certificate {
+	if st == nil {
+		return nil
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.portalCert
+}
+
 func DefaultDataDir() (string, error) {
 	exeDir := ""
 	if exe, err := os.Executable(); err == nil {
@@ -103,7 +147,6 @@ func canWrite(dir string) bool {
 	return os.Remove(name) == nil
 }
 
-// NewStore 初始化本地证书仓库：若已存在 CA 则直接加载，否则自动生成并落盘（权限 0700/0600）。
 func NewStore(dataDir string) (*Store, error) {
 	if dataDir == "" {
 		return nil, errors.New("certstore: empty data dir")
@@ -143,38 +186,51 @@ func (st *Store) CAPath() string {
 	return filepath.Join(st.DataDir, "ca", caCertName)
 }
 
+func (st *Store) CAPEM() ([]byte, error) {
+	if st == nil || st.ca == nil || st.ca.Cert == nil {
+		return nil, errors.New("certstore: CA not initialized")
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: st.ca.Cert.Raw}), nil
+}
+
 func (st *Store) CAValidUntil() time.Time {
-	if st.ca == nil {
+	if st == nil || st.ca == nil {
 		return time.Time{}
 	}
 	return st.ca.Cert.NotAfter
 }
 
-// TLSConfig 构建双轨分流的 tls.Config：
-//   - 当客户端 SNI 为 l.moonchan.xyz 或 *.l.moonchan.xyz（且公网证书已加载）时，返回公网证书；
-//   - 其余所有通过 hosts=127.0.0.1 访问的域名（如 pixiv.net、i.pximg.net 等），均由本地自签名 CA 动态签发证书。
 func (st *Store) TLSConfig(portalCert *tls.Certificate) *tls.Config {
+	if st != nil && portalCert != nil {
+		st.SetPortalCert(portalCert)
+	}
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			sni := strings.ToLower(strings.TrimSpace(hello.ServerName))
-			if (sni == "" || config.IsPortalDomain(sni)) && portalCert != nil {
-				return portalCert, nil
+			sni := netdial.CleanHost(hello.ServerName)
+			pc := portalCert
+			if st != nil && pc == nil {
+				st.mu.Lock()
+				pc = st.portalCert
+				st.mu.Unlock()
 			}
-			if st != nil {
+			if (sni == "" || config.IsPortalDomain(sni)) && pc != nil {
+				return pc, nil
+			}
+			if st != nil && sni != "" {
 				return st.CertificateFor(sni)
 			}
-			if portalCert != nil {
-				return portalCert, nil
+			if pc != nil {
+				return pc, nil
 			}
 			return nil, errors.New("no TLS certificate available")
 		},
 	}
 }
 
-// CertificateFor 为指定域名返回或按需签发包含主域名与 *.domain 通配符及完整 CA 链的 TLS 证书（#21）。
 func (st *Store) CertificateFor(host string) (*tls.Certificate, error) {
-	host = strings.ToLower(strings.TrimSpace(host))
+	host = netdial.CleanHost(host)
 	if host == "" {
 		return nil, errors.New("certstore: empty host")
 	}
@@ -185,7 +241,7 @@ func (st *Store) CertificateFor(host string) (*tls.Certificate, error) {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 
-	key := registrableDomain(host)
+	key := certGroupingDomain(host)
 	if c, ok := st.leaf[key]; ok {
 		return c, nil
 	}
@@ -204,8 +260,23 @@ func (st *Store) CertificateFor(host string) (*tls.Certificate, error) {
 	return cert, nil
 }
 
+func certGroupingDomain(host string) string {
+	labels := strings.Split(host, ".")
+	if len(labels) <= 2 {
+		return host
+	}
+	if len(labels) == 3 && multiPartPublicSuffixes[labels[1]+"."+labels[2]] {
+		return host
+	}
+	return strings.Join(labels[1:], ".")
+}
+
+func (st *Store) leafDir(domain string) string {
+	return filepath.Join(st.DataDir, "ca", leavesSubDir, sanitizeDomain(domain))
+}
+
 func (st *Store) loadLeaf(domain string) (*tls.Certificate, error) {
-	dir := filepath.Join(st.DataDir, certsDir, sanitizeDomain(domain))
+	dir := st.leafDir(domain)
 	certPEM, err := os.ReadFile(filepath.Join(dir, leafCertFile))
 	if err != nil {
 		return nil, err
@@ -234,8 +305,7 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 	if strings.Contains(domain, ".") {
 		sans = append(sans, "*."+domain)
 	}
-	pubBytes := x509.MarshalPKCS1PublicKey(&key.PublicKey)
-	skid := sha1.Sum(pubBytes)
+	skid := sha1.Sum(x509.MarshalPKCS1PublicKey(&key.PublicKey))
 
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
@@ -253,11 +323,10 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
-	dir := filepath.Join(st.DataDir, certsDir, sanitizeDomain(domain))
+	dir := st.leafDir(domain)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	// 将叶子证书与 CA 根证书一并写入 fullchain.pem，保证 TLS 握手提供完整信任链（#21）
 	var fullchainPEM strings.Builder
 	fullchainPEM.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
 	fullchainPEM.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: st.ca.Cert.Raw}))
@@ -317,8 +386,7 @@ func generateCA() (*CA, error) {
 	if err != nil {
 		return nil, err
 	}
-	pubBytes := x509.MarshalPKCS1PublicKey(&key.PublicKey)
-	skid := sha1.Sum(pubBytes)
+	skid := sha1.Sum(x509.MarshalPKCS1PublicKey(&key.PublicKey))
 
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
@@ -357,14 +425,6 @@ func persistCA(ca *CA, certPath, keyPath string) error {
 	}
 	ca.CertPath, ca.KeyPath = certPath, keyPath
 	return nil
-}
-
-func registrableDomain(host string) string {
-	labels := strings.Split(host, ".")
-	if len(labels) <= 2 {
-		return host
-	}
-	return strings.Join(labels[len(labels)-2:], ".")
 }
 
 func sanitizeDomain(s string) string {
@@ -406,4 +466,38 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+type tlsAlertFilterWriter struct {
+	mu       sync.Mutex
+	caPath   string
+	lastHint time.Time
+}
+
+func (w *tlsAlertFilterWriter) Write(p []byte) (int, error) {
+	msg := strings.TrimSpace(string(p))
+	lower := strings.ToLower(msg)
+	if strings.Contains(lower, "tls handshake error") &&
+		(strings.Contains(lower, "unknown certificate") || strings.Contains(lower, "bad certificate") || strings.Contains(lower, "certificate unknown")) {
+		w.mu.Lock()
+		now := time.Now()
+		shouldPrint := now.Sub(w.lastHint) >= 30*time.Second
+		if shouldPrint {
+			w.lastHint = now
+		}
+		w.mu.Unlock()
+		if shouldPrint {
+			log.Printf("[TLS CA Hint] Client rejected local CA certificate (%s). Please trust %q in your OS/Browser.", msg, w.caPath)
+		}
+		return len(p), nil
+	}
+	if strings.Contains(lower, "tls handshake error") && strings.HasSuffix(lower, ": eof") {
+		return len(p), nil
+	}
+	log.Print(msg)
+	return len(p), nil
+}
+
+func NewTLSAlertFilterLogger(caPath string) *log.Logger {
+	return log.New(&tlsAlertFilterWriter{caPath: caPath}, "", 0)
 }

@@ -2,6 +2,7 @@ package echproxy
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -14,11 +15,12 @@ import (
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
 	"github.com/Hana-ame/ech-proxy/echproxy/cookie"
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
+	"github.com/Hana-ame/ech-proxy/echproxy/logger"
+	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
 	"github.com/gin-gonic/gin"
 )
 
-// Debug 控制是否输出逐请求的详细调试日志（通过 CLI -v 开启）。
 var Debug bool
 
 func debugLogf(format string, args ...any) {
@@ -27,94 +29,192 @@ func debugLogf(format string, args ...any) {
 	}
 }
 
-const writeTimeout = 30 * time.Minute
+const (
+	writeTimeout        = 30 * time.Minute
+	maxSelfRedirectHops = 3
+	maxBufferedReqBody  = 1 << 20
+	forceCertQueryParam = "__ech_proxy_force_cert__"
+)
 
-// roundTripFn 供单元测试注入自定义传输层使用，生产环境默认调用 cloudflare_ech.RoundTrip。
 var roundTripFn = cloudflare_ech.RoundTrip
 
-// ModeName 返回传输模式的可读名称。
 func ModeName(mode string) string {
-	switch mode {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "sni":
-		return "SNI Camouflage"
+		return "SNI Camouflage (DoH + Fake SNI + Cert Check)"
+	case "fragment", "bypass", "gfw":
+		return "GFW Bypass (DoH + TLS ClientHello Fragment + Cert Check)"
 	case "direct":
-		return "Direct"
+		return "Direct (TLS Cert Check)"
+	case "auto":
+		return "Auto (DoH + SNI / ECH / Fragment + Cert Check)"
 	default:
-		return "Cloudflare ECH"
+		return "Cloudflare ECH (DoH + ECH + Cert Check)"
 	}
 }
 
-// ProxyHandler 核心反向代理处理器，统一承载：
-//   - 功能一（8443 门户反代模式）：将 *.l.moonchan.xyz 映射至真实上游并执行域名重写、SW 注入与 Cookie 转换
-//   - 功能二（443 本地透明反代模式）：将原域名（如 pixiv.net / *.pixiv.net）直接通过 ECH/SNI 隧道转发
 func ProxyHandler(upstreams config.UpstreamMap, blockedHosts []string) gin.HandlerFunc {
-	blocked := append([]string(nil), blockedHosts...)
+	return ProxyHandlerWithOptions(upstreams, blockedHosts, nil, nil)
+}
 
+func ProxyHandlerWithAuth(upstreams config.UpstreamMap, blockedHosts []string, auth *AuthConfig) gin.HandlerFunc {
+	return ProxyHandlerWithOptions(upstreams, blockedHosts, auth, nil)
+}
+
+func ProxyHandlerWithOptions(upstreams config.UpstreamMap, blockedHosts []string, auth *AuthConfig, adScript *rewrite.AdScriptManager) gin.HandlerFunc {
+	return ProxyHandlerWithConfig(&config.Config{
+		Upstreams:    upstreams,
+		BlockedHosts: append([]string(nil), blockedHosts...),
+	}, auth, adScript)
+}
+
+func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewrite.AdScriptManager) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		defer logger.RecoverAndLog("ProxyHandler", func(_ any, _ []byte) {
+			if !c.Writer.Written() {
+				c.String(http.StatusInternalServerError, "internal proxy error")
+			}
+		})
+
 		start := time.Now()
 		clientIP := c.ClientIP()
-		host := stripPort(c.Request.Host)
+		host := netdial.CleanHost(c.Request.Host)
+		reqPort := netdial.ExtractPort(c.Request.Host)
 
-		// 1. 匹配上游路由规则（精确匹配或泛子域名匹配）
+		if auth != nil && auth.Enabled() {
+			ok, err := auth.Check(c.Request, clientIP)
+			if errors.Is(err, ErrAuthRateLimited) {
+				rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+				c.String(http.StatusTooManyRequests, "too many authentication failures")
+				return
+			}
+			if !ok {
+				rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+				c.Header("WWW-Authenticate", `Basic realm="ech-proxy"`)
+				c.String(http.StatusUnauthorized, "authentication required")
+				return
+			}
+		}
+
+		// upstream.json 严格只与 8443 门户方案有关：
+		// 在 PAC 主线方案下（adScript != nil），非 *.l.moonchan.xyz 原域名完全不耦合 upstream.json。
+		var upstreams config.UpstreamMap
+		var blocked []string
+		if adScript == nil || config.IsPortalDomain(host) {
+			upstreams, blocked = cfg.Snapshot()
+		}
+
 		uc, ok := config.Resolve(upstreams, host)
 		if !ok {
-			log.Printf("[%s] Upstream config not found: %s", clientIP, host)
 			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
 			c.String(http.StatusBadGateway, "no upstream for host: %s", host)
 			return
 		}
 
 		ucForRewrite := uc
-		if ucForRewrite.Wildcard == nil {
+		if ucForRewrite.Wildcard == nil && len(upstreams) > 0 {
 			ucForRewrite.Wildcard = config.InheritWildcard(upstreams, host)
 		}
-		rewriter := rewrite.BuildEntryRewriter(ucForRewrite, blocked)
+		var rewriter func([]byte, string) []byte
+		if len(upstreams) > 0 || len(blocked) > 0 {
+			rewriter = rewrite.BuildEntryRewriterForHost(host, ucForRewrite, blocked)
+		}
 
-		// 2. 构造发往真实上游的 HTTP 请求
-		outReq, err := buildUpstreamRequest(c, uc)
+		clientSentPlainHTTP := c.Request.TLS == nil &&
+			(strings.HasPrefix(strings.ToLower(c.Request.RequestURI), "http://") ||
+				strings.EqualFold(c.Request.URL.Scheme, "http") ||
+				reqPort == "80")
+
+		targetScheme := "https"
+		if clientSentPlainHTTP && reqPort != "" && reqPort != "80" && reqPort != "443" && config.IsOriginalDomainMode(host) {
+			targetScheme = "http"
+		}
+
+		var bodyReplay []byte
+		if clientSentPlainHTTP && targetScheme == "https" && c.Request.Body != nil && c.Request.ContentLength <= maxBufferedReqBody {
+			if b, rerr := io.ReadAll(io.LimitReader(c.Request.Body, maxBufferedReqBody+1)); rerr == nil && len(b) <= maxBufferedReqBody {
+				bodyReplay = b
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyReplay))
+			}
+		}
+
+		// 仅对 adult.txt 命中的站点做广告处理：EasyList $removeparam 移除指定 query 参数。
+		isAdultSite := adScript != nil && adScript.IsAdultSite(host, uc.Host)
+		if isAdultSite && adScript != nil && !adScript.SkipAdBlock() {
+			if em := adScript.EasyListMatcher(); em != nil {
+				if params := em.RemoveParamsFor(host); len(params) > 0 {
+					stripQueryParams(c.Request, params)
+				}
+			}
+		}
+
+		outReq, err := buildUpstreamRequestWithScheme(c, uc, targetScheme, reqPort)
 		if err != nil {
 			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
 			c.String(http.StatusInternalServerError, "create request: %v", err)
 			return
 		}
 
-		// 3. 通过 ECH / SNI / Direct 隧道发送请求
 		resp, err := roundTripFn(outReq, uc.Mode, uc.IPMode)
-		if err != nil {
-			log.Printf("[%s] Upstream request failed (%s): %v", clientIP, uc.Host, err)
-			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
-			c.String(http.StatusBadGateway, "upstream: %v", err)
-			return
-		}
-		defer resp.Body.Close()
-
-		cookie.DefaultJar.SaveResponseCookies(uc.Host, resp)
-		debugLogf("[%s] %s %s -> %s (%s, %v)", clientIP, c.Request.Method, c.Request.URL.Path, uc.Host, resp.Status, time.Since(start))
-
-		// 4. 处理响应头（剔除逐跳头、改写 Set-Cookie Domain、重写 Location 重定向、注入 CORS）
-		port := extractPort(c.Request.Host)
-		cookieDomain := uc.CookieDomain
-		if cookieDomain == "" {
-			cookieDomain = host
-		}
-		prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, rewriter, port)
-
-		// 防止上游 Canonical 重定向（如 iwara.tv -> www.iwara.tv）被 rewriter 改写回自身导致 301 死循环
-		if resp.StatusCode/100 == 3 {
-			if loc := c.Writer.Header().Get("Location"); loc != "" && isSelfRedirect(loc, c.Request) {
-				if nextResp, ok := followSelfRedirect(c, outReq, resp, uc); ok {
-					resp.Body.Close()
-					resp = nextResp
-					defer resp.Body.Close()
-					cookie.DefaultJar.SaveResponseCookies(resp.Request.Host, resp)
-					clearHeaders(c.Writer.Header())
-					prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, rewriter, port)
+		if err != nil && clientSentPlainHTTP && targetScheme == "https" && !cloudflare_ech.IsCertError(err) && config.IsOriginalDomainMode(host) {
+			if bodyReplay != nil {
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyReplay))
+			}
+			if httpReq, herr := buildUpstreamRequestWithScheme(c, uc, "http", reqPort); herr == nil {
+				if httpResp, herr2 := roundTripFn(httpReq, uc.Mode, uc.IPMode); herr2 == nil {
+					outReq, resp, err = httpReq, httpResp, nil
+					targetScheme = "http"
 				}
 			}
 		}
 
-		// 5. 若开启了 sw_inject 且请求 /sw.js（而上游未返回 JS），则自动返回生成的 Service Worker 脚本
-		if uc.SWInject && c.Request.URL.Path == "/sw.js" && !rewrite.IsJavascriptResponse(resp) {
+		if err != nil {
+			log.Printf("[%s] Upstream request failed (%s): %v", clientIP, uc.Host, err)
+			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			if renderCertWarningIfMatch(c, uc.Host, err) {
+				return
+			}
+			c.String(http.StatusBadGateway, "upstream: %v", err)
+			return
+		}
+		defer func() {
+			if resp != nil && resp.Body != nil {
+				resp.Body.Close()
+			}
+		}()
+
+		cookie.DefaultJar.SaveResponseCookies(uc.Host, resp)
+		debugLogf("[%s] %s %s -> %s (%s, %v)", clientIP, c.Request.Method, c.Request.URL.Path, uc.Host, resp.Status, time.Since(start))
+
+		port := reqPort
+		cookieDomain := uc.CookieDomain
+		if cookieDomain == "" {
+			cookieDomain = host
+		}
+		effectiveRewriter := rewriter
+		if targetScheme == "http" && config.IsOriginalDomainMode(host) {
+			effectiveRewriter = nil
+		}
+		prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, effectiveRewriter, port)
+
+		for hop := 0; hop < maxSelfRedirectHops && resp.StatusCode/100 == 3; hop++ {
+			loc := c.Writer.Header().Get("Location")
+			if loc == "" || !isSelfRedirect(loc, c.Request) {
+				break
+			}
+			nextResp, ok := followSelfRedirect(c, outReq, resp, uc)
+			if !ok {
+				break
+			}
+			_ = resp.Body.Close()
+			resp = nextResp
+			outReq = nextResp.Request
+			cookie.DefaultJar.SaveResponseCookies(resp.Request.Host, resp)
+			clearHeaders(c.Writer.Header())
+			prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, effectiveRewriter, port)
+		}
+
+		if uc.SWInject && config.IsPortalDomain(host) && c.Request.URL.Path == "/sw.js" && !rewrite.IsJavascriptResponse(resp) {
 			c.Writer.Header().Del("Content-Length")
 			c.Writer.Header().Set("Content-Type", "application/javascript")
 			c.Writer.WriteHeader(http.StatusOK)
@@ -122,17 +222,19 @@ func ProxyHandler(upstreams config.UpstreamMap, blockedHosts []string) gin.Handl
 			return
 		}
 
-		// 6. 写回响应状态码并传输/重写响应体
 		c.Status(resp.StatusCode)
-		sendResponseBody(c, uc, resp, rewriter, port)
+		sendResponseBody(c, host, uc, resp, effectiveRewriter, port, adScript)
 	}
 }
 
-func buildUpstreamRequest(c *gin.Context, uc config.UpstreamConfig) (*http.Request, error) {
+func buildUpstreamRequestWithScheme(c *gin.Context, uc config.UpstreamConfig, scheme, reqPort string) (*http.Request, error) {
+	if scheme == "" {
+		scheme = "https"
+	}
 	reqURI := c.Request.RequestURI
 	if reqURI == "" {
 		reqURI = c.Request.URL.RequestURI()
-	} else if strings.HasPrefix(reqURI, "http://") || strings.HasPrefix(reqURI, "https://") {
+	} else if strings.HasPrefix(strings.ToLower(reqURI), "http://") || strings.HasPrefix(strings.ToLower(reqURI), "https://") {
 		if u, err := url.ParseRequestURI(reqURI); err == nil {
 			reqURI = u.RequestURI()
 		}
@@ -141,13 +243,27 @@ func buildUpstreamRequest(c *gin.Context, uc config.UpstreamConfig) (*http.Reque
 		reqURI = "/" + reqURI
 	}
 
-	outReq, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, "https://"+uc.Host+reqURI, c.Request.Body)
+	reqCtx := cloudflare_ech.WithSNIServerName(c.Request.Context(), uc.SNIServerName)
+	reqURI, forceCert := consumeForceCertParam(reqURI, uc.Host)
+	if forceCert {
+		reqCtx = cloudflare_ech.WithAllowBadCert(reqCtx)
+	}
+
+	targetHost := uc.Host
+	if scheme == "http" && reqPort != "" && reqPort != "80" && reqPort != "443" && !strings.Contains(targetHost, ":") {
+		targetHost = net.JoinHostPort(targetHost, reqPort)
+	}
+
+	outReq, err := http.NewRequestWithContext(reqCtx, c.Request.Method, scheme+"://"+targetHost+reqURI, c.Request.Body)
 	if err != nil {
 		return nil, err
 	}
 
 	cookie.DefaultJar.SaveClientCookies(uc.Host, c.Request)
 	rewrite.CopyHeaders(outReq.Header, c.Request.Header)
+	outReq.Header.Del("Proxy-Connection")
+	outReq.Header.Del("Proxy-Authenticate")
+	outReq.Header.Del("Proxy-Authorization")
 
 	if _, ok := uc.Headers["X-Forwarded-For"]; !ok {
 		outReq.Header.Del("X-Forwarded-For")
@@ -160,22 +276,48 @@ func buildUpstreamRequest(c *gin.Context, uc config.UpstreamConfig) (*http.Reque
 	}
 	rewrite.ApplyHeaderRules(outReq.Header, uc.Headers, true, c.Request)
 
-	outReq.Host = uc.Host
+	outReq.Host = targetHost
 	outReq.ContentLength = c.Request.ContentLength
 
 	fixedCookie := cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile)
 	if fixedCookie != "" {
 		cookie.DefaultJar.Seed(uc.Host, fixedCookie)
 	}
-	cookie.DefaultJar.ApplyToRequest(uc.Host, outReq, fixedCookie)
+	cookie.DefaultJar.ApplyToRequestWithPriority(uc.Host, outReq, fixedCookie, uc.CookiePriority)
 	return outReq, nil
+}
+
+func consumeForceCertParam(reqURI, upstreamHost string) (string, bool) {
+	approved := forceCerts.isApproved(upstreamHost)
+	if !strings.Contains(reqURI, forceCertQueryParam) {
+		return reqURI, approved
+	}
+	u, err := url.ParseRequestURI(reqURI)
+	if err != nil {
+		return reqURI, approved
+	}
+	q := u.Query()
+	tok := q.Get(forceCertQueryParam)
+	if tok == "" {
+		return reqURI, approved
+	}
+	q.Del(forceCertQueryParam)
+	u.RawQuery = q.Encode()
+	cleaned := u.RequestURI()
+	if forceCerts.consume(upstreamHost, tok) {
+		return cleaned, true
+	}
+	return cleaned, approved
 }
 
 func prepareResponseHeaders(dst, src http.Header, uc config.UpstreamConfig, cookieDomain string, req *http.Request, rewriter func([]byte, string) []byte, port string) {
 	rewrite.CopyHeaders(dst, src)
-	cookie.RewriteSetCookieHeaders(dst, cookieDomain, req.TLS == nil)
+	httpMode := req.TLS == nil && !strings.EqualFold(req.URL.Scheme, "https")
+	cookie.RewriteSetCookieHeaders(dst, cookieDomain, httpMode)
 	rewrite.ApplyHeaderRules(dst, uc.ResponseHeaders, false, nil)
-	rewrite.RewriteRedirectHeaders(dst, rewriter, port)
+	if rewriter != nil {
+		rewrite.RewriteRedirectHeaders(dst, rewriter, port)
+	}
 	rewrite.ApplyCORSHeaders(dst, req)
 }
 
@@ -203,13 +345,20 @@ func followSelfRedirect(c *gin.Context, outReq *http.Request, resp *http.Respons
 	if rawTarget.Scheme == "http" {
 		rawTarget.Scheme = "https"
 	}
-	nextReq, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, rawTarget.String(), nil)
+	method := c.Request.Method
+	if resp.StatusCode == http.StatusMovedPermanently || resp.StatusCode == http.StatusFound || resp.StatusCode == http.StatusSeeOther {
+		if method != http.MethodGet && method != http.MethodHead {
+			method = http.MethodGet
+		}
+	}
+	reqCtx := cloudflare_ech.WithSNIServerName(c.Request.Context(), uc.SNIServerName)
+	nextReq, err := http.NewRequestWithContext(reqCtx, method, rawTarget.String(), nil)
 	if err != nil {
 		return nil, false
 	}
 	rewrite.CopyHeaders(nextReq.Header, outReq.Header)
 	nextReq.Host = rawTarget.Host
-	cookie.DefaultJar.ApplyToRequest(rawTarget.Host, nextReq, cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile))
+	cookie.DefaultJar.ApplyToRequestWithPriority(rawTarget.Host, nextReq, cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile), uc.CookiePriority)
 	nextResp, err := roundTripFn(nextReq, uc.Mode, uc.IPMode)
 	if err != nil {
 		return nil, false
@@ -224,18 +373,30 @@ func clearHeaders(h http.Header) {
 	}
 }
 
-func sendResponseBody(c *gin.Context, uc config.UpstreamConfig, resp *http.Response, rewriter func([]byte, string) []byte, port string) {
+func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConfig, resp *http.Response, rewriter func([]byte, string) []byte, port string, adScript *rewrite.AdScriptManager) {
+	if c.Request.Method == http.MethodHead ||
+		resp.StatusCode == http.StatusNoContent ||
+		resp.StatusCode == http.StatusNotModified ||
+		(resp.StatusCode >= 100 && resp.StatusCode < 200) {
+		c.Writer.WriteHeaderNow()
+		return
+	}
+
 	rc := http.NewResponseController(c.Writer)
 
-	// 文本类且不超过 8MB：解压 -> 重写域名与内容 -> 注入 SW -> 重新压缩并发送
-	if rewriter != nil && rewrite.IsTextContent(resp.Header.Get("Content-Type")) &&
+	if (rewriter != nil || adScript != nil) && rewrite.IsTextContent(resp.Header.Get("Content-Type")) &&
 		(resp.ContentLength <= 0 || resp.ContentLength <= rewrite.MaxRewriteSize) {
 
 		body, err := io.ReadAll(io.LimitReader(resp.Body, rewrite.MaxRewriteSize+1))
 		if err != nil || len(body) > rewrite.MaxRewriteSize {
 			if len(body) > 0 {
 				_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
-				_, _ = c.Writer.Write(body)
+				if _, werr := c.Writer.Write(body); werr != nil {
+					return
+				}
+			}
+			if err == nil {
+				streamRemainingBody(c, rc, resp.Body)
 			}
 			return
 		}
@@ -243,15 +404,36 @@ func sendResponseBody(c *gin.Context, uc config.UpstreamConfig, resp *http.Respo
 		origEnc := resp.Header.Get("Content-Encoding")
 		plain, derr := rewrite.DecompressBody(body, origEnc)
 		if derr != nil {
+			c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
 			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
 			_, _ = c.Writer.Write(body)
 			return
 		}
 
-		plain = rewriter(plain, port)
+		if rewriter != nil {
+			plain = rewriter(plain, port)
+		}
 
-		if uc.SWInject && strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
-			!bytes.Contains(plain, []byte("serviceWorker")) {
+		isHTML := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html")
+		isAdultSite := adScript != nil && adScript.IsAdultSite(requestHost, uc.Host)
+		if isHTML && adScript != nil && (!adScript.SkipAdScript() || !adScript.SkipAdBlock()) {
+			beforeLen := len(plain)
+			plain = adScript.InjectIntoHTMLForHost(plain, requestHost, uc.Host)
+			if len(plain) != beforeLen {
+				c.Writer.Header().Del("Content-Security-Policy")
+				c.Writer.Header().Del("Content-Security-Policy-Report-Only")
+			}
+		}
+		// EasyList $csp：仅 adult.txt 命中站点，向 HTML 响应附加 CSP（须在写响应头之前设置）。
+		if isHTML && isAdultSite && !adScript.SkipAdBlock() {
+			if em := adScript.EasyListMatcher(); em != nil {
+				if dirs := em.CSPFor(requestHost); len(dirs) > 0 {
+					c.Writer.Header().Set("Content-Security-Policy", strings.Join(dirs, "; "))
+				}
+			}
+		}
+
+		if isHTML && uc.SWInject && config.IsPortalDomain(requestHost) && !bytes.Contains(plain, []byte("serviceWorker")) {
 			reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
 			if idx := bytes.Index(plain, []byte("</head>")); idx >= 0 {
 				plain = append(plain[:idx], append(reg, plain[idx:]...)...)
@@ -271,10 +453,13 @@ func sendResponseBody(c *gin.Context, uc config.UpstreamConfig, resp *http.Respo
 		return
 	}
 
-	// 二进制流或大文件（图片、视频等）：32KB 分块直接流式转发
+	streamRemainingBody(c, rc, resp.Body)
+}
+
+func streamRemainingBody(c *gin.Context, rc *http.ResponseController, body io.Reader) {
 	buf := make([]byte, 32*1024)
 	for {
-		n, rerr := resp.Body.Read(buf)
+		n, rerr := body.Read(buf)
 		if n > 0 {
 			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
@@ -290,9 +475,40 @@ func sendResponseBody(c *gin.Context, uc config.UpstreamConfig, resp *http.Respo
 	}
 }
 
-func extractPort(hostport string) string {
-	if _, p, err := net.SplitHostPort(hostport); err == nil {
-		return p
+// stripQueryParams 从请求 URL 与 RequestURI 中移除指定 query 参数（EasyList $removeparam，仅 adult 站调用）。
+func stripQueryParams(r *http.Request, params []string) {
+	if r == nil || r.URL == nil || len(params) == 0 {
+		return
 	}
-	return ""
+	strip := func(rawQuery string) (string, bool) {
+		if rawQuery == "" {
+			return "", false
+		}
+		vals, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			return rawQuery, false
+		}
+		changed := false
+		for _, p := range params {
+			if vals.Has(p) {
+				vals.Del(p)
+				changed = true
+			}
+		}
+		if !changed {
+			return rawQuery, false
+		}
+		return vals.Encode(), true
+	}
+	if q, ok := strip(r.URL.RawQuery); ok {
+		r.URL.RawQuery = q
+	}
+	if r.RequestURI != "" {
+		if pu, err := url.ParseRequestURI(r.RequestURI); err == nil {
+			if q, ok := strip(pu.RawQuery); ok {
+				pu.RawQuery = q
+				r.RequestURI = pu.RequestURI()
+			}
+		}
+	}
 }

@@ -1,3 +1,119 @@
+## v3.4.0
+
+### Changes & Features
+
+- **AdScript 注入引擎重构 (Remote-Only Dynamic Injection)**:
+  - 彻底移除内置默认脚本 (`BuiltInAdScript`) 与 `on.txt` 远端轮询及状态开关，全面改为远端 `ads.js` 原样直插模式。
+  - 仅在拉取到远端有效脚本（或读取本地磁盘缓存 `<dataDir>/ads.js`）时插入代码；初次无脚本或未拉取到时不注入任何内容。
+  - 注入锚点严格限定在 HTML 的 `</body>` 标签前（页面无 `</body>` 时追加末尾），确保符合页面 DOM 渲染时序，不再插入 `</head>` 标签前。
+- **文档与托盘交互指南 (Tray UI & Quickstart)**:
+  - `README.md` 增加 Windows 任务栏系统托盘（System Tray）各项右键菜单功能对照表。
+  - 增加新用户初次使用流程指南（6 步新手安装、导入证书与启动配置）。
+  - 文档与 CLI 选项严格脱敏，不外露任何内部广告相关参数。
+- **预发布加固与跨平台校验 (Hardening & CI)**:
+  - 统一全局 DoH 域名单一信源。
+  - 修复 Windows `copylocks` 与 HTTP/1.1 MITM 阻塞问题，完善 Windows/Linux/macOS 多架构交叉编译与 smoke test 验证。
+
+## v3.3.1
+
+### Pre-Release Fixes (hardening pass)
+
+- **Data races removed** — `config.ReplaceFrom` writing `UpstreamOrder` while the portal read it unlocked (8443 silent-compat loader) is fixed by a locked `OrderSnapshot()`; `BuildEntryRewriterForHost` no longer rewrites `Compiled`/`CompiledReplace` into the shared `BodyReplace` backing array on every request (compile-once, only when nil). `go test -race` is clean under concurrent requests.
+- **CONNECT/MITM TLS state & HEAD/204 body handling** — The `closeNotifyConn` wrapper hides `*tls.Conn` from `http.Server`, leaving `req.TLS == nil`; this stripped `; Secure` from HTTPS `Set-Cookie` headers (breaking `SameSite=None; Secure` sessions). `req.TLS` is now restored from `tlsConn.ConnectionState()` in the handler. `HEAD`, `204` and `304` responses are no longer rewritten or re-injected, and the upstream `Content-Length` is preserved.
+- **Windows `go vet` & clipboard** — `copyToClipboardOnPlatform` no longer converts `uintptr` to `unsafe.Pointer` (uses `kernel32!RtlMoveMemory`) and frees `hMem` with `GlobalFree` on failure. CI now runs `go vet` for `windows/amd64` and `windows/386` (previously Linux only) and verifies all 12 Flutter FFI exports (`ECHInit`, `GetProxyPort`, `IsEchReady` were previously unchecked).
+- **Docs & observability** — CLI help and `README.md` now describe the IPv4 (`-4`) default (previously a dual-stack default).
+
+## v3.3.0
+
+### Changes & Features
+
+- **Unified PAC Proxy Architecture (`127.0.0.1:8443`) & Strict `.443.exe` Isolation** —
+  - By default (`ech-proxy.exe`), the proxy runs strictly as a unified HTTP/HTTPS PAC proxy on `127.0.0.1:8443`, automatically configuring the Windows system PAC (`http://127.0.0.1:8443/proxy.pac?t=<ts>`) without opening `l.moonchan.xyz:8443` on startup (`l.moonchan.xyz` portal remains independently accessible via `ech-proxy.8443.exe portal` or the tray menu).
+  - When the executable filename does **not** end with `.443.exe` (and `-local` is not explicitly passed), port 443 is never bound and the local 443 transparent proxy code path is strictly not executed.
+- **Seamless HTTP & HTTPS Proxy Handling + 3 GFW-Bypass Transports** —
+  - **HTTPS (`CONNECT host:443`)**: Local CA (`CertStore`) dynamically signs leaf certificates with full chain, decrypts HTTP/1.1 & HTTP/2, and routes upstream via **(1) DoH + SNI Camouflage**, **(2) DoH + Cloudflare ECH**, or **(3) DoH + TLS ClientHello Fragment** (`DialFragmentedTLS`), with strict upstream certificate verification (`truedomain.com` hostname, expiration, and trust chain) and one-time token force-access (`?__ech_proxy_force_cert__=<token>`).
+  - **Plain HTTP (`http://`) & WebSocket**: Automatically strips `Proxy-*` hop-by-hop headers, upgrades standard port-80 requests to HTTPS via the 3 GFW-bypass modes when supported, and seamlessly falls back to DoH-resolved plain HTTP (`PlainHTTPDo`, preserving request bodies) for HTTP-only origins or custom HTTP ports. Also supports plaintext HTTP inside `CONNECT` tunnels via first-byte sniffing.
+- **IPv4 Default (`-4`) with Dual-Stack (`-dual`) / IPv6 (`-6`) & Built-in DoH Failover** —
+  - Defaults to IPv4-only (`-4` / `v4`), with `-dual` (dual-stack IPv4 + IPv6) and `-6` (IPv6 only) flags and runtime tray switching.
+  - Built-in DoH endpoints: primary `https://4545810.xyz/doh` and secondary `https://1.1.1.1/dns-query` with automatic failover.
+- **Decoupled Remote PAC Whitelist (`pac.txt`)** —
+  - Default PAC whitelist fetched from `https://4545810.xyz/pac.txt` (line-delimited domains, fallback to `[]` on failure; `-all` routes all domains through the proxy).
+- **One-Click CA Uninstall & GitHub Releases Auto-Updater (`win/updater.go`)** —
+  - Added `ech-proxy ca uninstall` (`-ca-uninstall`) and tray menu item to remove the local CA from Windows User Root store (`certutil -user -delstore Root`) and macOS keychain.
+  - Added automatic update checking and background downloading from `https://github.com/Hana-ame/ech-proxy/releases` with SHA-256 verification against `checksums.txt`, staging `.update.new` and applying atomic self-replacement on exit/restart (`ech-proxy update`, tray menu, or `--no-auto-update`).
+- **Fix: `SysProxyManager.AllMode()` getter & Gin proxied-host route isolation** —
+  - Added `SysProxyManager.AllMode()` in `win/sysproxy.go` for cross-platform compilation with `win/tray.go`.
+  - Added top-level Gin middleware in `echproxy/portal.go` so non-portal/non-loopback proxied requests across all HTTP methods (`POST /`, `HEAD /`, etc.) route directly to `proxyHandler`.
+
+---
+
+## v3.2.0
+
+### Changes & Features
+
+- **System Tray, Windows Auto-PAC, Local Rotating Logger & Multi-Arch Release Matrix** —
+  - Pure-Go Win32 system tray (`win/tray_windows.go`) with console show/hide toggle, PAC / Global / Direct mode switching, CA install, and log folder quick-open.
+  - Rotating file logger (`echproxy/logger`) with panic recovery and `crash-latest.log` dump.
+  - Expanded cross-compile matrix covering `386`, `amd64`, and `arm64` for Windows, Linux, macOS, and Android APKs.
+
+---
+
+## v3.1.1
+
+### Changes & Features
+
+- **Fix: goreleaser.yml / release.yml release-asset collision on plain tags** — On `v3.1.0` the `goreleaser` workflow failed (`422 already_exists`) because both `release.yml` and `goreleaser.yml` triggered on the same `v*` tag push and both uploaded same-named desktop binaries (`ech-proxy-{linux,windows}-{amd64,386}`) + `checksums.txt` to the same GitHub release. `release.yml`'s upload was non-fatal (warn-and-keep), `goreleaser`'s was fatal → flaky by timing (v3.0.0 happened to not interleave, v3.1.0 did).
+  - Fix: removed the desktop `build` matrix job from `release.yml` (it built `ech-proxy-{linux,windows}-{amd64,aarch64,386}`, all of which `goreleaser.yml` already builds as a superset — goreleaser also adds `darwin` + `ech-proxy.443.exe`). `release.yml` now owns **only the Android APKs + the release notes body**, restoring the documented design (see the `goreleaser.yml` header comment: "release.yml builds the Android APKs, GoReleaser builds the desktop binaries plus checksums. Their asset names do not collide."). No published artifact is lost; the arm64 naming becomes consistent (`arm64` across all platforms, previously `release.yml` used `aarch64` only for linux).
+  - Net effect: plain `v*` tags now publish cleanly through both workflows with no asset-name overlap.
+
+### Notes
+
+- No Go source changes this release; behavior identical to v3.1.0. `go test ./... -race` remains 11/11 green (verified locally; Go CI run `39571344307` on `merge/ech-proxy-20261021` was green).
+
+## v3.1.0
+
+### Changes & Features
+
+- **ECH & Direct paths now share the same upstream-cert validation + warning pages as the SNI path** — Previously only the SNI-camouflage path validated the upstream cert; ECH (`ech/client.go:newTransport`) and Direct (`netdial` via new `directDo`) cert failures surfaced as a bare `502 upstream: ...`. Now all three paths run `validateUpstreamCert` after the TLS handshake, so any cert failure renders the distinct HTML warning page:
+  - ECH path: switched to `InsecureSkipVerify` + manual check (ECH disguise — outer SNI = shell, inner encrypted real SNI — is untouched); the Cloudflare-served cert for the real host passes hostname + chain.
+  - Direct path: new `directDo` (`ech/sni.go`) uses `netdial.TransportWithIPModeAndCertCheck`, a dedicated transport that does `InsecureSkipVerify` + manual check (the shared `netdial.Transport` used by DoH/fetches is untouched).
+  - `RoundTrip`'s fallback chain propagates cert errors from the direct fallback too.
+- **Certificate chain / trust-root verification (third category)** — `validateUpstreamCert` now also runs `leaf.Verify({Roots: netdial.RootPool(), Intermediates: <peer chain>})` (after time + `VerifyHostname`). A self-signed / unknown-CA / missing-intermediate cert yields `ErrCertUntrusted` → a third, distinct warning page: 「上游证书链未被系统根信任」. Order: time → hostname → chain.
+- **「强行访问」session-level memory + one-time token + rate-limiting (anti silent-bypass)** — Replaces the trivial `?__ech_proxy_force_cert__=1` bypass, which any page could embed to silently skip cert checks:
+  - Each warning page issues a one-time random token (16 bytes, hex) bound to the upstream host, embedded only in ech-proxy's own warning-page HTML (cross-origin scripts can't read it). Force-access now requires `?__ech_proxy_force_cert__=<token>` matching (constant-time compare); the bare `=1` no longer bypasses.
+  - Consuming a valid token marks that host **approved for the session** (in-memory `approved` set), so subsequent subresource requests to it load without re-warning (usable UX) — and without needing the token.
+  - Rate-limit: max 6 tokens/min per host (sliding window); over-limit returns no button (shows a 「稍后刷新重试」 note). Approved-set capped at 256 hosts (session-level eviction).
+  - Net effect: an attacker-embedded `?__ech_proxy_force_cert__=1` link on a non-approved host is ignored → the request still runs the cert check → renders a warning, never silently bypassing.
+
+### Tests
+
+- `ech/certcheck_test.go` rewritten with a test CA: covers expired / not-yet-valid / mismatch / untrusted-chain / trusted-chain-pass / wildcard / force-bypass / no-cert / time-first / classify-non-cert-error (chain pass/fail are hermetic via `SetRootPoolOverride`).
+- `proxy_test.go:TestCertWarningPage`: distinct expired/mismatch/**chain** pages; one-time-token force flow (extract token → consume → approved → session memory loads subresources); anti-embed (a second host carrying `=1` is NOT bypassed → warning).
+- Verified: `go vet ./...` OK, `go build ./...` OK, `go test ./... -race` (CI's exact command) 11/11 PASS.
+
+### Notes
+
+- The MITM client-facing cert override (`certstore`) is unchanged. Disguise (fake SNI + `InsecureSkipVerify`) preserved on all paths — verification is always against the real domain, never the disguised SNI.
+- Force-access approval is session-level (process memory, not persisted); a host approved once stays approved until process restart. If you want stricter per-request re-approval, that's a follow-up.
+
+## v3.0.0
+
+### Changes & Features
+
+- **Upstream certificate validation in the SNI-camouflage path (MITM cert-override gap)** — Because ech-proxy in MITM mode presents its own locally-trusted CA leaf to the client, the client can no longer see or judge the *real* upstream certificate. The proxy now validates the upstream cert itself on the SNI-front dial (`ech/sni.go:dialUTLS`), **right after the TLS handshake**, without touching the disguise:
+  - Reads the peer certificate the server returns, then checks **(1) time validity** (`NotBefore`/`NotAfter`) and **(2) hostname coverage of the *real* requested domain** (`leaf.VerifyHostname(realDomain)`).
+  - The fake SNI (`cloudflare-ech.com` by default) and `InsecureSkipVerify` are **kept intact** — verification is against the real domain, never against the disguised SNI (the sent fake domain and the returned cert's domain are necessarily different, so SNI-matching is semantically wrong here). Disguise is not sacrificed.
+  - Two **distinctly-worded** HTML warning pages (HTTP 502 + `text/html`):
+    - **Expired / not yet valid** → 「上游证书已过期或尚未生效」(amber).
+    - **Hostname mismatch** (cert not valid for the requested domain — possible MITM or wrong server) → 「上游证书与请求域名不一致」(red).
+  - **「强行访问」(Force Access) button** on each warning page. Clicking re-requests the same URL with `?__ech_proxy_force_cert__=1`; the proxy injects a `WithAllowBadCert` context flag (stripping the param before it reaches upstream), so the cert check is skipped and the upstream is served — an explicit user opt-in, like a browser's "proceed anyway".
+  - `RoundTrip`'s auto fallback chain (ECH ↔ SNI ↔ direct) now **propagates cert errors immediately** instead of masking them behind a fallback attempt, so the warning page always surfaces.
+- **Tests** — `ech/certcheck_test.go` covers expired / not-yet-valid / mismatch / valid / wildcard / force-bypass / no-cert / time-first-precedence / classify-non-cert-error. `proxy_test.go:TestCertWarningPage` asserts the distinct expired vs mismatch pages render with the force-access button and that `?__ech_proxy_force_cert__=1` bypasses the check end-to-end.
+
+### Notes
+
+- Only the SNI-camouflage path performs this manual check this release (it is the one that previously used `InsecureSkipVerify:true`). The ECH (`ech/client.go:newTransport`) and plain-Direct (`netdial`) paths already verify normally and were left unchanged. Chain/trust-root verification is not added (only hostname + time, per the two failure categories); self-signed-but-correct-hostname is a known gap to be addressed in a follow-up if needed.
+
 ## v2.2.0
 
 ### Changes & Features

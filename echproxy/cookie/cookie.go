@@ -1,4 +1,4 @@
-// Package cookie 负责管理上游与客户端之间的 Cookie 注入、内存缓存与 Set-Cookie 域名改写。
+// Package cookie 负责管理上游与客户端之间的 Cookie 注入、内存缓存、登出过期清理与 Set-Cookie 域名改写。
 // 修复 #28：移除无鉴权控制面，并对 cookie_file 实施严格的受控目录校验，阻断任意文件读取外带风险。
 package cookie
 
@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,7 +21,7 @@ var (
 	setCookieSecureRE    = regexp.MustCompile(`(?i);\s*Secure`)
 )
 
-// Jar 是线程安全的内存 Cookie 存储器，支持按主机名及父域名共享 Cookie。
+// Jar 是线程安全的内存 Cookie 存储器，支持按主机名及父域名共享 Cookie，并正确处理过期/登出删除。
 type Jar struct {
 	mu    sync.Mutex
 	store map[string][]*http.Cookie
@@ -54,12 +55,14 @@ func ReadFixedCookie(cookieVal, cookieFile string) string {
 
 func readSafeCookieFile(rawPath string) (string, bool) {
 	p := strings.TrimSpace(strings.TrimPrefix(rawPath, "file://"))
-	if p == "" || filepath.IsAbs(p) || strings.Contains(p, "..") || strings.ContainsAny(p, "\r\n") {
+	if p == "" || filepath.IsAbs(p) || strings.Contains(p, "..") || strings.ContainsAny(p, `/\:`+"\r\n") {
 		return "", false
 	}
-	// 仅允许读取当前工作目录或上层目录下的 certs/ 受控子目录内的 .txt/.cookie 文件
 	clean := filepath.Clean(p)
 	baseName := filepath.Base(clean)
+	if baseName == "." || baseName == ".." || baseName != p {
+		return "", false
+	}
 	for _, candidate := range []string{
 		filepath.Join("certs", "l.moonchan.xyz", baseName),
 		filepath.Join("..", "certs", "l.moonchan.xyz", baseName),
@@ -123,7 +126,7 @@ func (j *Jar) Seed(host, raw string) {
 	}
 }
 
-// SaveClientCookies 将浏览器请求携带的新 Cookie 存入 Jar。
+// SaveClientCookies 将浏览器请求携带的 Cookie 同步更新到 Jar。
 func (j *Jar) SaveClientCookies(host string, req *http.Request) {
 	cookies := req.Cookies()
 	if len(cookies) == 0 {
@@ -133,7 +136,7 @@ func (j *Jar) SaveClientCookies(host string, req *http.Request) {
 	defer j.mu.Unlock()
 	now := time.Now()
 	for _, c := range cookies {
-		if c.Name == "" || j.hasAliveLocked(host, c.Name, now) {
+		if c.Name == "" {
 			continue
 		}
 		if c.Expires.IsZero() && c.MaxAge <= 0 {
@@ -143,8 +146,12 @@ func (j *Jar) SaveClientCookies(host string, req *http.Request) {
 	}
 }
 
-// SaveResponseCookies 将上游响应的 Set-Cookie 存入 Jar。
+// SaveResponseCookies 将上游响应的 Set-Cookie 存入 Jar；
+// 若上游下发了过期/登出指令（Max-Age <= 0、Expires 已过期或值为 "deleted"），则主动从 Jar 中清除该 Cookie。
 func (j *Jar) SaveResponseCookies(host string, resp *http.Response) {
+	if resp == nil {
+		return
+	}
 	scs := resp.Header.Values("Set-Cookie")
 	if len(scs) == 0 {
 		return
@@ -160,21 +167,30 @@ func (j *Jar) SaveResponseCookies(host string, resp *http.Response) {
 		if c.MaxAge > 0 && c.Expires.IsZero() {
 			c.Expires = now.Add(time.Duration(c.MaxAge) * time.Second)
 		}
-		if !isAlive(c, now) {
-			continue
-		}
 		key := host
 		if c.Domain != "" {
 			if d := strings.TrimPrefix(c.Domain, "."); strings.Contains(d, ".") {
 				key = "." + d
 			}
 		}
+		// 检测上游显式删除/使 Cookie 过期的情形（如 Pixiv 登出或 Session 失效下发 PHPSESSID=deleted; Max-Age=0）
+		if !isAlive(c, now) || strings.EqualFold(c.Value, "deleted") || c.Value == "" {
+			j.deleteCookieLocked(host, key, c.Name)
+			continue
+		}
 		j.saveOneLocked(key, c, now)
 	}
 }
 
-// ApplyToRequest 合并父域 Cookie、当前主机 Jar Cookie、客户端 Cookie 与预置固定 Cookie 并写入请求头。
+// ApplyToRequest 默认以浏览器优先模式合并父域 Cookie、当前主机 Jar Cookie、客户端 Cookie 与预置固定 Cookie。
 func (j *Jar) ApplyToRequest(host string, req *http.Request, fixedCookie string) {
+	j.ApplyToRequestWithPriority(host, req, fixedCookie, "browser")
+}
+
+// ApplyToRequestWithPriority 按指定优先级策略（"browser" 或 "seed"）合并 Cookie 并写入请求头：
+//   - "browser"（默认）：客户端请求携带的同名 Cookie 优先于 Jar/预置 Cookie，确保用户可在浏览器内正常登录/切换账号；
+//   - "seed"：配置中的 fixedCookie 优先覆盖同名 Cookie。
+func (j *Jar) ApplyToRequestWithPriority(host string, req *http.Request, fixedCookie, priority string) {
 	j.mu.Lock()
 	now := time.Now()
 	merged := make(map[string]string)
@@ -184,22 +200,40 @@ func (j *Jar) ApplyToRequest(host string, req *http.Request, fixedCookie string)
 	j.collectAliveLocked(host, now, merged)
 	j.mu.Unlock()
 
-	for _, c := range req.Cookies() {
-		if _, exists := merged[c.Name]; !exists && c.Name != "" {
-			merged[c.Name] = c.Value
+	fixedMap := ParseCookieString(fixedCookie)
+	if strings.EqualFold(priority, "seed") {
+		for _, c := range req.Cookies() {
+			if _, exists := merged[c.Name]; !exists && c.Name != "" {
+				merged[c.Name] = c.Value
+			}
 		}
-	}
-	if len(merged) == 0 && fixedCookie != "" {
-		for k, v := range ParseCookieString(fixedCookie) {
+		for k, v := range fixedMap {
 			merged[k] = v
 		}
+	} else {
+		for k, v := range fixedMap {
+			if _, exists := merged[k]; !exists {
+				merged[k] = v
+			}
+		}
+		for _, c := range req.Cookies() {
+			if c.Name != "" {
+				merged[c.Name] = c.Value
+			}
+		}
 	}
+
 	if len(merged) == 0 {
 		return
 	}
-	parts := make([]string, 0, len(merged))
-	for k, v := range merged {
-		parts = append(parts, k+"="+v)
+	names := make([]string, 0, len(merged))
+	for k := range merged {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, k := range names {
+		parts = append(parts, k+"="+merged[k])
 	}
 	req.Header.Set("Cookie", strings.Join(parts, "; "))
 }
@@ -248,6 +282,28 @@ func ParseCookieString(raw string) map[string]string {
 	return res
 }
 
+func (j *Jar) deleteCookieLocked(host, domainKey, name string) {
+	keys := []string{host, domainKey, "." + strings.TrimPrefix(host, ".")}
+	keys = append(keys, parentDomains(host)...)
+	for _, k := range keys {
+		list, ok := j.store[k]
+		if !ok {
+			continue
+		}
+		kept := list[:0]
+		for _, c := range list {
+			if c.Name != name {
+				kept = append(kept, c)
+			}
+		}
+		if len(kept) == 0 {
+			delete(j.store, k)
+		} else {
+			j.store[k] = kept
+		}
+	}
+}
+
 func (j *Jar) saveOneLocked(key string, c *http.Cookie, now time.Time) {
 	list := j.store[key]
 	keep := make(map[string]*http.Cookie, len(list)+1)
@@ -281,22 +337,6 @@ func (j *Jar) collectAliveLocked(key string, now time.Time, dst map[string]strin
 	} else {
 		j.store[key] = alive
 	}
-}
-
-func (j *Jar) hasAliveLocked(host, name string, now time.Time) bool {
-	for _, c := range j.store[host] {
-		if c.Name == name && isAlive(c, now) {
-			return true
-		}
-	}
-	for _, d := range parentDomains(host) {
-		for _, c := range j.store[d] {
-			if c.Name == name && isAlive(c, now) {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func isAlive(c *http.Cookie, now time.Time) bool {

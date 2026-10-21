@@ -50,14 +50,14 @@ jobs:
         run: CGO_ENABLED=1 go build -buildmode=c-shared -o libechproxy.so ./flutter/
 
       - name: Verify exported FFI symbols
-        # The 9 symbols the Dart side resolves with lookupFunction. Missing one
-        # makes the app fail at startup with an ArgumentError that names the
+        # All 12 symbols the Dart side resolves with lookupFunction (matching flutter/ffi_contract_test.go).
+        # Missing one makes the app fail at startup with an ArgumentError that names the
         # Dart side, not the Go side.
         run: |
           missing=0
-          for sym in ECHInitWithBootstrap ECHInitReady ECHInitLastError \
+          for sym in ECHInit ECHInitWithBootstrap ECHInitReady ECHInitLastError \
                       ECHSetDohURL ECHGetLogCount ECHGetLog FreeCString \
-                      StartProxy StopProxy; do
+                      StartProxy StopProxy GetProxyPort IsEchReady; do
             if nm -D libechproxy.so | grep -q " ${sym}$"; then
               echo "ok      ${sym}"
             else

@@ -1,108 +1,92 @@
 # ech-proxy
 
-支持 **全自动无干预 SNI / ECH 透明反向代理**、**门户导航（`l.moonchan.xyz`）** 与 **Android / Flutter 集成** 的轻量级反向代理工具。
+支持 **Windows 7 ~ 11 (32位 `386` / 64位 `amd64` / `arm64`) PAC 方式运行的本地 HTTP/HTTPS 代理（Mainstream）**，提供系统托盘控制、PAC 原子替换与旧值 `pop` 恢复、本地 CA 一键安装与卸载、自动检查并下载 GitHub Releases 更新（退出后再次打开自动替换）、双 DoH 冗余解析、三种上游 GFW 绕过隧道、服务端回传证书核对与强行访问放行。
 
-## 一、 核心工作原理
+---
 
-`ech-proxy` 采用双轨证书与全自动隧道分流设计：
+## 一、 初次使用步骤指南（推荐顺序）
 
-1. **`l.moonchan.xyz` 相关域名（门户与代理子域）**：
-   * 证书：使用 `upstream.json` 中配置的 `l.moonchan.xyz` 公网证书。
-   * 行为：访问 `https://l.moonchan.xyz:8443/` 展示门户列表；访问 `*.l.moonchan.xyz`（如 `dlsite.l.moonchan.xyz`）自动映射至对应目标网站并执行响应体域名替换与 Service Worker 注入。
-2. **除 `l.moonchan.xyz` 以外的所有域名（本地 `hosts -> 127.0.0.1` 透明反代模式）**：
-   * **本地自签名 CA 动态签发证书**：只要通过修改系统 `hosts` 将目标域名（如 `pixiv.net`、`i.pximg.net`、`sukebei.nyaa.si` 或任意其他域名）指向 `127.0.0.1` 并安装一次本机生成的 `ca/ca.pem` 根证书，`ech-proxy` 会在 TLS 握手阶段自动为该域名签发带通配符与完整信任链（`fullchain.pem`）的证书。
-   * **SNI / ECH 全自动无干预选择**：代理会自动通过 DoH 解析目标域名的真实 IP 并检测其是否属于 Cloudflare 网段：
-     * **Cloudflare 站点（如 `pixiv.net`、`e-hentai.org`、`archiveofourown.org`、`dlsite.com`）**：自动通过 **Cloudflare ECH（Encrypted Client Hello）** 隧道转发。
-     * **非 Cloudflare 站点（如 `i.pximg.net`、`s.pximg.net`、`sukebei.nyaa.si`）**：自动通过 **SNI 伪装直连**（同时兼容 HTTP/2 与 HTTP/1.1 源站）转发。
-     * **无感故障回退**：若首选隧道连接失败或被边缘拒绝，自动无感切换至备选隧道并缓存成功路由，全程无需手动干预 `mode`。
+首次运行 `ech-proxy` 时，建议按照以下步骤进行初始化设置：
 
-## 二、 语义化模块架构 (#29)
+1. **第一步：启动程序**
+   - 双击运行 `ech-proxy.exe`。
+   - 程序启动后会自动在后台初始化，并在 Windows 任务栏右下角通知区域生成系统托盘图标。
+   - 默认会显示黑色命令行控制台窗口（右上角 `[X]` 按钮已被保护锁定以防意外误关退出）。
 
-代码库按职责划分为 6 个正交语义子包与 1 个顶层组装层，模块间无环形依赖：
+2. **第二步：一键安装本地 CA 根证书（初次必须，仅需一次）**
+   - 鼠标右键点击右下角系统托盘小图标，在弹出菜单中点击 **「一键安装本地 CA 根证书 (Install CA)」**。
+   - 系统会弹出 Windows 安全警告 / UAC 授权确认对话框，点击 **“是”** 或 **“确认”**。
+   - 程序会自动将本地生成的自签根证书（存放于 `<dataDir>/ca/ca.pem`）安装导入至 Windows 系统的“受信任的根证书颁发机构”中。
+   - *说明：此步骤用于实现 HTTPS 流量解析与 ECH 探测，安装后浏览器访问加速站点时不会出现任何“不安全”或“证书错误”告警。*
 
-```text
-echproxy/
-├── netdial/      # [基础网络模块] 公共 DNS 解析、IPv4/IPv6 协议族优选、Cloudflare CIDR 识别、文件拉取与重试（0 内部依赖）
-├── config/       # [配置与路由模块] 解析 upstream.json，支持精确/泛域名匹配及任意非门户域名的自动透传（仅依赖 netdial）
-├── certstore/    # [证书管理模块] 公网证书加载 + 本地自签 CA 生成与按需动态签发完整信任链证书（仅依赖 config, netdial）
-├── cookie/       # [Cookie 管理模块] 受控 Cookie 加载、按域名的内存 CookieJar 与 Set-Cookie 域名改写（0 内部依赖）
-├── rewrite/      # [内容重写模块] 解压/重压缩、域名替换、HTTP->HTTPS 强制升级、SW 脚本生成与 Header/CORS 处理（仅依赖 config）
-├── ech/          # [传输隧道模块] Cloudflare ECH 隧道、SNI 伪装（H2/H1.1 双栈）与全自动无干预 RoundTrip 分发（仅依赖 netdial）
-├── portal.go     # [顶层门户路由] l.moonchan.xyz 导航页渲染与 Gin 路由注册
-├── proxy.go      # [顶层反代流水线] 串联路由解析、请求构造、自动隧道转发、自重定向熔断与响应重写
-└── server.go     # [顶层服务管理] 统一管理服务生命周期与双轨 TLS 证书挂载
-```
+3. **第三步：确认启用系统 PAC 代理模式**
+   - 鼠标右键点击托盘图标，确认 **「系统代理：自动配置 PAC 模式 (推荐)」** 处于勾选状态（程序默认启动时会自动配置开启）。
+   - 此时系统的自动代理配置脚本已指向本地 PAC 服务（`http://127.0.0.1:8443/proxy.pac`），系统仅对特定分流清单中的目标网站走代理通道，国内常规网站（如百度、淘宝、B站等）完全保持本地网络直连，互不影响。
 
-## 三、 本地透明反代使用步骤（以 Pixiv 为例）
+4. **第四步：选择出口协议族（可选）**
+   - 默认启用 **「强制 v4 出口」**。
+   - 若本地宽带或所处网络环境具备优质的原生 IPv6 连通性，可在右键菜单中根据需要切换为 **「双端出口」**（IPv4 + IPv6 自动优选）或 **「强制 v6 出口」**。
 
-### 步骤 1 — 启动 443 模式
-将下载的可执行文件重命名为以 `.443.exe` 结尾（如 `ech-proxy.443.exe`），并以**管理员 / `root` 权限**运行（也可以不重命名，直接运行 `ech-proxy -local -addr 127.0.0.1:443`）：
-```cmd
-ech-proxy.443.exe
-```
+5. **第五步：隐藏控制台，浏览器无感冲洗**
+   - 打开任意支持系统代理的浏览器（Microsoft Edge、Google Chrome、Firefox 等），即可直接流畅访问目标网站。
+   - 平时可以将黑框控制台隐藏：**双击托盘图标**，或右键选择 **「显示 / 隐藏控制台」**，控制台窗口将直接隐藏并在后台静默常驻运行。
 
-### 步骤 2 — 编辑系统 `hosts` 文件 (#18)
-> **重要说明**：操作系统的 `hosts` 文件（Windows 位于 `C:\Windows\System32\drivers\etc\hosts`，Linux/macOS 位于 `/etc/hosts`）**不支持 `*.pixiv.net` 通配符语法**！必须将实际访问的子域名与图片 CDN 域名（`i.pximg.net` / `s.pximg.net`）逐行写入 `hosts`：
+6. **第六步：安全退出**
+   - 如需关闭代理，在托盘菜单中点击 **「退出程序并清理系统代理 (Exit)」**。
+   - 程序会在退出前自动清除 Windows 系统的 PAC 设置并恢复原始代理状态，绝不在系统中残留任何失效代理配置。
 
-```hosts
-# Pixiv 主站与子域名
-127.0.0.1 pixiv.net
-127.0.0.1 www.pixiv.net
-127.0.0.1 accounts.pixiv.net
-127.0.0.1 account.pixiv.net
-127.0.0.1 api.sec.pixiv.net
-127.0.0.1 manga.pixiv.net
-127.0.0.1 novel.pixiv.net
-127.0.0.1 dic.pixiv.net
-127.0.0.1 fanbox.cc
-127.0.0.1 www.fanbox.cc
+---
 
-# Pixiv 图片与静态资源 CDN（缺少这两项会导致图片裂开或样式丢失 #17 #18）
-127.0.0.1 pximg.net
-127.0.0.1 i.pximg.net
-127.0.0.1 s.pximg.net
-```
-*(注：除 Pixiv 外，你也可以将任何其他需要代理的域名按 `127.0.0.1 <域名>` 格式加入 `hosts`，`ech-proxy` 会自动为其签发证书并自动选择 SNI/ECH 转发。)*
+## 二、 Windows 系统托盘功能详述
 
-### 步骤 3 — 安装本地 CA 根证书与浏览器信任配置 (#21)
-首次运行后，`ech-proxy` 会在程序所在目录（若不可写则位于 `%AppData%\ech-proxy\` 或 `~/.config/ech-proxy/`）生成 `ca/ca.pem`：
+右键点击任务栏托盘小图标，各菜单功能项说明如下：
 
-* **Windows（Chrome / Edge）**：右键点击 `ca\ca.pem` $ightarrow$ **安装证书** $ightarrow$ 选择 **本地计算机** $ightarrow$ 选择 **将所有的证书都放入下列存储** $ightarrow$ 浏览并选择 **受信任的根证书颁发机构** $ightarrow$ 完成并重启浏览器。
-* **macOS（Safari / Chrome）**：打开“钥匙串访问”，将 `ca/ca.pem` 拖入 **系统** 钥匙串，双击打开 `"ech-proxy local CA"`，展开“信任”并将“使用此证书时”设为 **始终信任**。
-* **Linux**：
-  ```bash
-  sudo cp ca/ca.pem /usr/local/share/ca-certificates/ech-proxy-ca.crt
-  sudo update-ca-certificates
-  ```
-* **Firefox 浏览器专属配置（必看 #21）**：
-  Firefox 默认使用内置的独立证书库，不会自动读取操作系统根证书库。请任选以下一种方式配置：
-  1. **方式 A（推荐，自动信任系统根证书）**：在 Firefox 地址栏输入 `about:config` 回车，搜索 `security.enterprise_roots.enabled`，双击将其值切换为 **`true`**。
-  2. **方式 B（手动导入 CA）**：打开 Firefox **设置** $ightarrow$ **隐私与安全** $ightarrow$ 滑到底部点击 **查看证书 (View Certificates)** $ightarrow$ 切换到 **证书颁发机构 (Authorities)** 标签页 $ightarrow$ 点击 **导入 (Import)**，选择 `ca/ca.pem`，勾选 **“信任由此证书颁发机构来标识网站”** 并确定。
+| 菜单项名称 | 功能说明与操作指南 |
+| :--- | :--- |
+| **显示 / 隐藏控制台 (双击托盘图标)** | 切换显示或隐藏后台控制台黑框窗口。为防止日常误点击右上角 `[X]` 导致服务意外中断，控制台右上角的关闭按钮已做锁定保护，日常通过双击托盘图标即可轻松在“静默后台”与“控制台前台”之间切换。 |
+| **系统代理：自动配置 PAC 模式 (推荐)** | 将 Windows 系统网络代理设为 PAC 自动脚本模式。依据远程规则动态分流，命中规则的站点走加速隧道，其余站点本地直连。 |
+| **系统代理：清除 / 禁用系统代理 (直连)** | 临时停用系统代理并恢复直连模式。当需要临时排查本地网络状况或暂停分流加速时点击此项。 |
+| **强制 v4 出口** | 强制所有上游请求通过 IPv4 出口发往远程目标服务器（默认启用，适合大多数常规网络）。 |
+| **强制 v6 出口** | 强制所有上游请求通过 IPv6 出口发往远程目标服务器（适合教育网或纯 IPv6 优质线路）。 |
+| **双端出口** | 启用 IPv4 / IPv6 双协议族并发并就近优选，兼顾连通性与低延迟。 |
+| **一键安装本地 CA 根证书 (Install CA)** | 首次使用必须运行。一键调用 Windows CryptoAPI 将本地 CA 导入系统受信任根证书库，消除 HTTPS 访问时的证书安全警告。 |
+| **卸载本地 CA 根证书 (Uninstall CA)** | 从系统证书库中彻底卸载并清理本地自签根证书，不留系统垃圾。 |
+| **检查更新 (Check Update)** | 手动检查 GitHub Releases 上的最新发布版本。若有新版将自动在后台下载；下载完毕后菜单将提示“新版本已下载，退出重开自动替换”，并在下一次程序退出时自动完成替换。 |
+| **反馈 (https://chatto.moonchan.xyz)** | 快速调用默认浏览器打开官方反馈讨论区。 |
+| **复制 PAC 地址 (Copy PAC URL)** | 将当前正在运行的 PAC 脚本完整地址（如 `http://127.0.0.1:8443/proxy.pac`）复制到剪贴板，方便配置到局域网手机、平板或其他终端设备。 |
+| **打开本地日志目录 (问题排查/上传日志)** | 一键在文件资源管理器中打开日志存储目录，方便在遇到异常、崩溃或连接问题时查看与提取日志文件。 |
+| **退出程序并清理系统代理 (Exit)** | 安全退出代理程序，并在退出前自动清理系统 PAC 设置，确保系统网络完全恢复为启动前的初始状态。 |
 
-## 四、 命令行参数与跨平台环境变量对照 (#27)
+> **鼠标悬停提示（Tooltip）**：鼠标指针悬停在托盘图标上时，将实时显示当前服务地址与工作状态，例如：  
+> `ech-proxy [127.0.0.1:8443] - 系统PAC自动分流 (v4出口)`
 
-桌面端（`win/`）与 Android 端（`android/`）对齐了核心环境变量配置：
+---
 
-| 功能说明 | 桌面端 CLI 参数 | 跨平台环境变量（桌面端 + Android） | 默认值 |
-| :--- | :--- | :--- | :--- |
-| 本地透明反代模式 | `-local` | （通过 `.443.exe` 后缀或 `-local` 开启） | `false`（`.443.exe` 为 `true`） |
-| 监听地址与端口 | `-addr` | — | `127.0.0.1:8443` / `127.0.0.1:443` |
-| 上游配置文件路径/URL | `-config` | `ECH_PROXY_CONFIG` | 默认远程 GitHub URL |
-| 锁定上游出口协议族 | `-ip-mode` | `IP_MODE`（`v4` 或 `v6`） | 自动（`pixiv`/`pximg` 已内置 `v4`） |
-| DoH 引导 IP | `-local-ip` | `LOCALIP` | 空 |
-| 本地 CA 存储目录 | `-data-dir` | `ECH_PROXY_DATA_DIR` | 程序所在目录（或系统用户配置目录） |
-| 纯 HTTP 模式 | `-http` | — | `false` |
-| 详细请求日志 | `-v` | — | `false`（Android 默认开启） |
+## 三、 三种运行方案与严格解耦边界
 
-## 五、 编译构建
+1. **PAC 方案（默认主流 Mainstream，`ech-proxy.exe`）**：
+   - 启动后默认将系统代理原子替换为本地 PAC 脚本（`http://127.0.0.1:8443/proxy.pac?t=<ts>`），并将旧系统代理状态压栈（退出或 `Pop` 时自动 `pop` 恢复旧值）。
+   - 严格仅依据远程白名单 `https://4545810.xyz/pac.txt`（一行一个 domain，支持原子替换 `SwapWhitelist` 与旧值 `PopWhitelist`）生成 PAC 规则，**与 `upstream.json` 及 `certs/` 路径完全解耦**。
+   - 本地自签 CA 与动态签发的域名叶子证书统一存放在 `<dataDir>/ca/`（`ca/ca.pem`、`ca/leaves/`），绝不触碰 `certs/` 目录。
+2. **443 方案（仅当文件名匹配 `.*.443.exe` 时开启）**：
+   - **只与 `listen 443` 有关**：仅在可执行文件名匹配 `.*.443.exe` 时开启，严格仅监听 `443` 端口（不回退到 `8443`），其余所有功能（PAC、8443 门户、系统代理、托盘、自动更新、CONNECT 隧道）一律不运行。
+   - 当文件名不匹配 `.*.443.exe` 时，严禁监听 443 端口且 443 方案绝不运行。
+3. **8443 方案（真实公网证书下发的代理，`upstream.json` + `certs/l.moonchan.xyz/`）**：
+   - `upstream.json` 与 `certs/` 路径（`certs/l.moonchan.xyz/fullchain.cer`、`privkey.pem`、`upstream.json`、`pixiv_cookie.txt`）**完全只与 8443 方案相关**。
+   - 在当前主流版本中，8443 方案单纯在后台协程中**静默非阻塞运行**（仅为了兼容性保留），即使拉取或解析报错也完全静默忽略，绝不影响其他功能，且绝不阻塞主线代码。
 
-```bash
-# 1. 运行全量测试（包含 upstream.json 校验）
-go test ./... -v
+---
 
-# 2. 编译桌面端常规版本
-go build -trimpath -ldflags="-s -w" -o ech-proxy ./win/
+## 四、 命令行 Flag 一览
 
-# 3. 编译 Windows 443 本地透明反代版本
-GOOS=windows GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o ech-proxy.443.exe ./win/
-```
+| Flag / 子命令 | 说明 |
+| :--- | :--- |
+| `-4` | 强制 v4 出口（IPv4 only，默认开启） |
+| `-6` | 强制 v6 出口（IPv6 only） |
+| `-dual` | 双端出口（IPv4 + IPv6 双栈自动优选） |
+| `-all` | 开启全局模式（无视 `pac.txt` 白名单，所有网站均通过 `ech-proxy` 代理；仅命令行 `-all` 可开启，不在托盘中显示） |
+| `-whitelist-url` | 自定义 `pac.txt` 地址（默认 `https://4545810.xyz/pac.txt`） |
+| `ca install` / `-ca-install` | 一键安装本地 CA 根证书到受信任根证书库 |
+| `ca uninstall` / `-ca-uninstall` | 一键从受信任根证书库卸载本地 CA 根证书 |
+| `update` / `-update` | 立即检查并下载 GitHub Releases 最新版本 |
+| `help` / `-h` | 打印完整命令行 Flag 一览 |

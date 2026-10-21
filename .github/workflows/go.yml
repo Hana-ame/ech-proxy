@@ -1,4 +1,4 @@
-name: Go CI
+name: Go CI & Smoke Test
 
 on:
   push:
@@ -13,23 +13,89 @@ on:
       - "**.md"
       - "LICENSE"
       - ".gitignore"
+  workflow_dispatch:
 
 jobs:
-  test:
+  test-and-verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
       - name: Install dependencies
         run: go mod download
-      - name: Run tests (including upstream.json validation)
-        run: go test ./... -race -coverprofile=coverage.out
-      - name: Run go vet
-        run: go vet ./...
+
+      - name: Run go vet across all packages (Linux & Windows targets)
+        run: |
+          go vet ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...
+          GOOS=windows GOARCH=386   CGO_ENABLED=0 go vet ./...
+
+      - name: Validate upstream.json configuration
+        run: go run ./win check -config certs/l.moonchan.xyz/upstream.json
+
+      - name: Validate remote asset defaults (single source; certs/ is 8443-only)
+        run: |
+          # certs/ 仅归属 8443 方案；ads.js / pac.txt / block.json 一律走远端默认地址。
+          grep -q 'DefaultSiteHost = "4545810.xyz"' echproxy/netdial/netdial.go
+          grep -q '/ads.js"' echproxy/rewrite/adscript.go
+          grep -q '/pac.txt"' echproxy/rewrite/adscript.go
+          grep -q '/adult.txt"' echproxy/rewrite/adscript.go
+          grep -q 'easylist.to/easylist/easylist.txt' echproxy/rewrite/adscript.go
+          grep -q '/block.json"' echproxy/rewrite/adscript.go
+          test ! -e certs/l.moonchan.xyz/ads.js
+          test ! -e certs/l.moonchan.xyz/pac.txt
+
+      - name: Run full unit & integration tests with race detector
+        run: go test ./... -race -v -coverprofile=coverage.out
+
+      - name: Cross-compile verification (Windows 386/amd64/arm64, Linux 386/amd64/arm64, macOS amd64)
+        run: |
+          mkdir -p build-check
+          GOOS=windows GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-386.exe ./win/
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-amd64.exe ./win/
+          GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-arm64.exe ./win/
+          GOOS=linux   GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-386 ./win/
+          GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-amd64 ./win/
+          GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-arm64 ./win/
+          GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-darwin-amd64 ./win/
+          rm -rf build-check
+
+      - name: Runtime smoke test (startup, PAC whitelist vs direct, -4/-6/-dual, ads.js, local log & graceful shutdown)
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o ./ech-proxy-ci ./win/
+          ./ech-proxy-ci version
+          ./ech-proxy-ci help | grep -q -- "-whitelist-url"
+          ./ech-proxy-ci check -config certs/l.moonchan.xyz/upstream.json
+          ./ech-proxy-ci pac -config certs/l.moonchan.xyz/upstream.json | grep -q "FindProxyForURL"
+          mkdir -p ./ci-logs
+          ./ech-proxy-ci -http -addr 127.0.0.1:18443 -no-tray -no-auto-update -sys-proxy off \
+            -dual \
+            -config certs/l.moonchan.xyz/upstream.json \
+            -log-dir ./ci-logs &
+          PID=$!
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:18443/healthz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:18443/healthz | grep -q "ok"
+          curl -fsS http://127.0.0.1:18443/statusz | grep -q '"ad_script_enabled":true'
+          curl -fsS http://127.0.0.1:18443/proxy.pac | grep -q "FindProxyForURL"
+          curl -fsS http://127.0.0.1:18443/__ech_proxy__/ads.js | grep -q "slimgather.com"
+          curl -fsS "http://127.0.0.1:18443/debug/log?download=1" | grep -q "ech-proxy session started"
+          kill -TERM "$PID"
+          wait "$PID" || true
+          test -s ./ci-logs/ech-proxy.log
+          ./ech-proxy-ci logs tail -log-dir ./ci-logs | grep -q "ech-proxy session started"
+          rm -rf ./ech-proxy-ci ./ci-logs
+
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:

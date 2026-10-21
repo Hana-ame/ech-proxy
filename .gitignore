@@ -26,3 +26,6 @@ android/release.keystore
 # Ignore IDE files
 .idea/
 *.iml
+
+# Local private docs (not versioned)
+docs/local/

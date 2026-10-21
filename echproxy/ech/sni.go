@@ -107,7 +107,8 @@ func DetectTransportModeWithStatus(ctx context.Context, host, ipMode string) (mo
 	return "ech", false
 }
 
-// RoundTrip 统一调度三种上游请求方案，并在所有路径上严格校验服务端回传证书（与 truedomain.com 比对域名一致性与过期时间）：
+// RoundTrip 统一调度三种上游请求方案，并在所有 HTTPS 路径上严格校验服务端回传证书（与 truedomain.com 比对域名一致性与过期时间）：
+//   - 当 req.URL.Scheme == "http" 时：通过 DoH 解析真实 IP 并执行明文 HTTP 请求（PlainHTTPDo），支持纯 HTTP 站点与自定义 HTTP 端口；
 //   - 方式 1 ("sni")：通过 DoH 解析域名 -> SNI 伪装绕过请求 -> 核对回传证书与伪装前真实域名一致且未过期；
 //   - 方式 2 ("ech")：通过 DoH 解析域名 -> 使用 ECH 请求 -> 核对回传证书与真实域名一致且未过期；
 //   - 方式 3 ("fragment" / 其他)：通过 DoH 解析域名 -> 使用 TLS ClientHello 分片方案绕过 GFW DPI -> 核对回传证书；
@@ -118,6 +119,11 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		normIPMode = currentConfig().ipMode
 	}
 	normIPMode = netdial.EffectiveIPMode(normIPMode)
+
+	// 若请求显式为明文 http:// 协议，使用基于 DoH 解析的明文 HTTP 传输
+	if req != nil && req.URL != nil && strings.EqualFold(req.URL.Scheme, "http") {
+		return PlainHTTPDo(req, normIPMode)
+	}
 
 	trimmedMode := strings.ToLower(strings.TrimSpace(mode))
 	if trimmedMode == "direct" {
@@ -201,6 +207,51 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		return nil, err3
 	}
 	return nil, err
+}
+
+// PlainHTTPDo 通过 DoH 解析目标域名真实 IP（防 DNS 污染），并发起明文 HTTP 请求（支持仅提供 HTTP 80 或自定义端口的目标站点）。
+func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
+	mode := ""
+	if len(ipMode) > 0 {
+		mode = ipMode[0]
+	}
+	normMode := netdial.NormalizeIPMode(mode)
+	if normMode == "" {
+		normMode = currentConfig().ipMode
+	}
+	normMode = netdial.EffectiveIPMode(normMode)
+
+	hostPort := req.URL.Host
+	if hostPort == "" {
+		hostPort = req.Host
+	}
+	host := hostPort
+	port := "80"
+	if h, p, err := net.SplitHostPort(hostPort); err == nil {
+		host = h
+		if p != "" {
+			port = p
+		}
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+
+	dialTarget := host
+	if ips, err := ResolveHostIPsByMode(req.Context(), host, normMode); err == nil && len(ips) > 0 {
+		dialTarget = ips[0]
+	}
+
+	tr := netdial.TransportWithIPMode(normMode).Clone()
+	tr.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return netdial.DialContextIPMode(ctx, dialTarget, port, normMode, dialTimeout)
+	}
+	c := &http.Client{
+		Transport: tr,
+		Timeout:   netdial.OpTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	return c.Do(req)
 }
 
 // directDo 经标准 TLS 直连上游（Direct 模式），并在握手后手动校验上游证书

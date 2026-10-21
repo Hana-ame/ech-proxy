@@ -18,6 +18,17 @@ func TestSetIPModeNormalizesAndSNIServerNameContext(t *testing.T) {
 	if got := GetIPMode(); got != "v6" {
 		t.Errorf("GetIPMode() after SetIPMode(IPV6) = %q, want v6", got)
 	}
+	SetIPMode("DUAL")
+	if got := GetIPMode(); got != "dual" {
+		t.Errorf("GetIPMode() after SetIPMode(DUAL) = %q, want dual", got)
+	}
+
+	if PrimaryDoHURL() != "https://4545810.xyz/doh" {
+		t.Errorf("default PrimaryDoHURL = %q, want https://4545810.xyz/doh", PrimaryDoHURL())
+	}
+	if SecondaryDoHURL() != "https://1.1.1.1/dns-query" {
+		t.Errorf("default SecondaryDoHURL = %q, want https://1.1.1.1/dns-query", SecondaryDoHURL())
+	}
 
 	ctx := context.Background()
 	if got := SNIServerNameFromContext(ctx); got != shellDomain {
@@ -33,8 +44,13 @@ func TestSetIPModeNormalizesAndSNIServerNameContext(t *testing.T) {
 	}
 }
 
-func TestResolveHostIPsByModeViaMockDoH(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestResolveHostIPsByModeViaMockDoHAndFallback(t *testing.T) {
+	primaryFail := false
+	primarySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if primaryFail {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
 		qtype := r.URL.Query().Get("type")
 		w.Header().Set("Content-Type", "application/json")
 		switch qtype {
@@ -46,10 +62,24 @@ func TestResolveHostIPsByModeViaMockDoH(t *testing.T) {
 			_, _ = w.Write([]byte(`{}`))
 		}
 	}))
-	defer srv.Close()
+	defer primarySrv.Close()
 
-	SetDohURL(srv.URL)
-	defer SetDohURL(defaultDohURL)
+	secondarySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/dns-query" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"Answer":[{"type":1,"TTL":120,"data":"104.16.99.88"}]}`))
+	}))
+	defer secondarySrv.Close()
+
+	SetDohURL(primarySrv.URL + "/doh")
+	SetFallbackDohURL(secondarySrv.URL + "/dns-query")
+	defer func() {
+		SetDohURL(defaultDohURL)
+		SetFallbackDohURL(fallbackDohURL)
+	}()
 
 	v4IPs, err := ResolveHostIPsByMode(context.Background(), "cf-test.example.org", "v4")
 	if err != nil || len(v4IPs) != 1 || v4IPs[0] != "104.16.10.20" {
@@ -63,5 +93,12 @@ func TestResolveHostIPsByModeViaMockDoH(t *testing.T) {
 	mode, confident := DetectTransportModeWithStatus(context.Background(), "cf-test.example.org", "v4")
 	if mode != "ech" || !confident {
 		t.Errorf("DetectTransportModeWithStatus for CF IP = (%q, %v), want (ech, true)", mode, confident)
+	}
+
+	// 验证当首选 DoH (https://4545810.xyz/doh) 故障时自动回退至次选 DoH (https://1.1.1.1/dns-query)
+	primaryFail = true
+	fbIPs, err := ResolveHostIPsByMode(context.Background(), "fallback-test.example.org", "v4")
+	if err != nil || len(fbIPs) != 1 || fbIPs[0] != "104.16.99.88" {
+		t.Fatalf("ResolveHostIPsByMode via secondary DoH fallback = %v, %v; want [104.16.99.88]", fbIPs, err)
 	}
 }

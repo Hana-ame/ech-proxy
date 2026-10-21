@@ -71,19 +71,22 @@ func TestOriginalDomainVsPortalDomainRewriteIsolation(t *testing.T) {
 	}
 }
 
-// TestUnifiedRemoteWhitelistAndEmptyFallback 验证：
-// 1. 远程只有一个唯一白名单（whitelist.json，支持 -whitelist-url 指定，留空默认 DefaultWhitelistURL，拉取失败 fallback = []）；
-// 2. 白名单 = 黄网 = 去掉原有广告 + 加上自己广告；
-// 3. 拉取失败 fallback = [] 时，任何网站均不会通过内置硬编码域名被误判为白名单/黄网。
-func TestUnifiedRemoteWhitelistAndEmptyFallback(t *testing.T) {
+// TestUnifiedRemotePACWhitelistAndAdsJSScriptTagInjection 验证：
+// 1. 默认白名单地址为 https://4545810.xyz/pac.txt（格式为一行一个 domain，支持 // pac.txt 注释），拉取失败 fallback = []；
+// 2. 默认广告脚本地址为 https://4545810.xyz/ads.js，拉取失败使用内置 fallback（slimgather.com + fussyreturn.com 两个 <script> 标签）；
+// 3. 支持 --skip-ad-script（跳过插入广告 JS）与 --skip-ad-block（禁止 block 原始广告）。
+func TestUnifiedRemotePACWhitelistAndAdsJSScriptTagInjection(t *testing.T) {
 	mgrDefault := NewAdScriptManager(AdScriptOptions{
 		Enabled: true,
 		FetchFn: func(url string) ([]byte, error) {
 			return nil, errors.New("network unreachable")
 		},
 	})
-	if mgrDefault.WhitelistURL() != DefaultWhitelistURL {
-		t.Errorf("default WhitelistURL = %q, want %q", mgrDefault.WhitelistURL(), DefaultWhitelistURL)
+	if mgrDefault.WhitelistURL() != "https://4545810.xyz/pac.txt" {
+		t.Errorf("default WhitelistURL = %q, want https://4545810.xyz/pac.txt", mgrDefault.WhitelistURL())
+	}
+	if mgrDefault.ScriptURL() != "https://4545810.xyz/ads.js" {
+		t.Errorf("default ScriptURL = %q, want https://4545810.xyz/ads.js", mgrDefault.ScriptURL())
 	}
 	if got := mgrDefault.Whitelist(); len(got) != 0 {
 		t.Errorf("initial Whitelist before fetch = %v, want empty []", got)
@@ -94,20 +97,17 @@ func TestUnifiedRemoteWhitelistAndEmptyFallback(t *testing.T) {
 	if got := mgrDefault.Whitelist(); len(got) != 0 {
 		t.Errorf("Whitelist on fetch failure = %v, want fallback = empty []", got)
 	}
-	if mgrDefault.IsWhitelisted("e-hentai.org", "pornhub.com") {
-		t.Errorf("IsWhitelisted must be false when remote list failed and fell back to empty []")
-	}
 
 	shouldFail := false
 	mgrCustom := NewAdScriptManager(AdScriptOptions{
 		Enabled:      true,
-		WhitelistURL: "https://example.com/whitelist.json",
+		WhitelistURL: "https://4545810.xyz/pac.txt",
 		FetchFn: func(u string) ([]byte, error) {
 			if shouldFail {
 				return nil, errors.New("502 bad gateway")
 			}
-			if u == "https://example.com/whitelist.json" {
-				return []byte(`["e-hentai.org", "*.dlsite.com", "iwara.tv"]`), nil
+			if u == "https://4545810.xyz/pac.txt" {
+				return []byte("// pac.txt\ne-hentai.org\n*.dlsite.com\niwara.tv\n"), nil
 			}
 			return []byte(BuiltInAdScript), nil
 		},
@@ -117,26 +117,47 @@ func TestUnifiedRemoteWhitelistAndEmptyFallback(t *testing.T) {
 		t.Fatalf("RefreshWhitelistOnce got (%v, %v), want 3 domains", domains, err)
 	}
 	if !mgrCustom.IsWhitelisted("e-hentai.org") || !mgrCustom.IsWhitelisted("www.dlsite.com") || !mgrCustom.IsWhitelisted("ec.iwara.tv") {
-		t.Errorf("expected domains in whitelist JSON (and their subdomains) to match IsWhitelisted")
+		t.Errorf("expected domains in pac.txt (and their subdomains) to match IsWhitelisted")
 	}
 	if mgrCustom.IsWhitelisted("github.com") {
 		t.Errorf("unlisted domain github.com must not match IsWhitelisted")
 	}
 
-	// 白名单站点 -> 判定为黄网 (data-is-adult="1")，剥离原网页广告并注入自有广告脚本
+	// 白名单站点 -> 剥离原网页广告，并将内置/远程 ads.js 的每个广告段放入 <script>...</script> 标签中插入
 	sampleHTML := []byte(`<!DOCTYPE html><html><head><title>Gallery</title><script src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script></head><body></body></html>`)
 	injected := string(mgrCustom.InjectIntoHTMLForHost(sampleHTML, "e-hentai.org"))
-	// NOTE: the injected blocker script (BuiltInAdScript) legitimately references
-	// "googlesyndication.com" inside its ad-selector match lists, so we must not
-	// assert the bare domain is absent. Instead assert the *original* ad tag's
-	// specific src URL was stripped (the impl blanks it to <script src=""></script>).
-	if !strings.Contains(injected, `id="ech-proxy-ad-script"`) || !strings.Contains(injected, `data-is-adult="1"`) || strings.Contains(injected, "pagead2.googlesyndication.com/pagead/js/adsbygoogle.js") {
-		t.Errorf("whitelisted domain e-hentai.org should have original ads stripped and custom script injected, got: %s", injected)
+	if !strings.Contains(injected, "slimgather.com") || !strings.Contains(injected, "fussyreturn.com") || !strings.Contains(injected, "<script>\n(function(augj){") {
+		t.Errorf("whitelisted domain e-hentai.org should have <script> tags for slimgather.com and fussyreturn.com injected, got: %s", injected)
 	}
+	if strings.Contains(injected, "pagead2.googlesyndication.com/pagead/js/adsbygoogle.js") {
+		t.Errorf("whitelisted domain e-hentai.org should have original ads stripped, got: %s", injected)
+	}
+
+	// 测试 --skip-ad-script：跳过插入广告商 JS，但仍拦截源站原始广告
+	mgrCustom.SetSkipAdScript(true)
+	onlyBlocked := string(mgrCustom.InjectIntoHTMLForHost(sampleHTML, "e-hentai.org"))
+	if strings.Contains(onlyBlocked, "slimgather.com") || strings.Contains(onlyBlocked, "fussyreturn.com") {
+		t.Errorf("--skip-ad-script should not insert advertiser <script> tags, got: %s", onlyBlocked)
+	}
+	if strings.Contains(onlyBlocked, "pagead2.googlesyndication.com/pagead/js/adsbygoogle.js") {
+		t.Errorf("--skip-ad-script (without --skip-ad-block) should still block original ads, got: %s", onlyBlocked)
+	}
+	mgrCustom.SetSkipAdScript(false)
+
+	// 测试 --skip-ad-block：禁止 block 源站原始广告，但仍插入广告商 JS
+	mgrCustom.SetSkipAdBlock(true)
+	onlyInjected := string(mgrCustom.InjectIntoHTMLForHost(sampleHTML, "e-hentai.org"))
+	if !strings.Contains(onlyInjected, "pagead2.googlesyndication.com/pagead/js/adsbygoogle.js") {
+		t.Errorf("--skip-ad-block must NOT strip original ads, got: %s", onlyInjected)
+	}
+	if !strings.Contains(onlyInjected, "slimgather.com") || !strings.Contains(onlyInjected, "fussyreturn.com") {
+		t.Errorf("--skip-ad-block (without --skip-ad-script) should still inject advertiser <script> tags, got: %s", onlyInjected)
+	}
+	mgrCustom.SetSkipAdBlock(false)
 
 	// 非白名单且无成人广告的站点 -> 原样返回
 	unlistedOut := mgrCustom.InjectIntoHTMLForHost(sampleHTML, "github.com")
-	if bytes.Contains(unlistedOut, []byte(`id="ech-proxy-ad-script"`)) {
+	if bytes.Contains(unlistedOut, []byte(`slimgather.com`)) {
 		t.Errorf("non-whitelisted site without adult ads should not be modified in default mode")
 	}
 
@@ -149,7 +170,7 @@ func TestUnifiedRemoteWhitelistAndEmptyFallback(t *testing.T) {
 }
 
 // TestHTMLContainsAdultWebsiteAds 验证：
-// HTML 中出现了成人网站广告（ExoClick / JuicyAds / TrafficJunky / EroAdvertising 等）的网站被判定为黄网（去掉原有广告 + 加上自己广告），
+// HTML 中出现了成人网站广告（ExoClick / JuicyAds / TrafficJunky / EroAdvertising 等）的网站被判定为黄网，
 // 而仅含常规 Google AdSense 或标题含 R-18/NSFW 的普通网站绝不误判为黄网。
 func TestHTMLContainsAdultWebsiteAds(t *testing.T) {
 	mgr := NewAdScriptManager(AdScriptOptions{
@@ -192,13 +213,13 @@ func TestAdScriptManagerAutoUpdateAndDisableFlag(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/whitelist.json":
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`["adult.example.com"]`))
+		case "/pac.txt":
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = w.Write([]byte("// pac.txt\nadult.example.com\n"))
 		default:
 			v := versionCounter.Load()
 			w.Header().Set("Content-Type", "application/javascript")
-			_, _ = w.Write([]byte(`(function(){ window.__REMOTE_VER__ = ` + string(rune('0'+v)) + `; })();`))
+			_, _ = w.Write([]byte("// ad1\n(function(){ window.__REMOTE_VER__ = " + string(rune('0'+v)) + "; })({});\n"))
 		}
 	}))
 	defer srv.Close()
@@ -206,8 +227,8 @@ func TestAdScriptManagerAutoUpdateAndDisableFlag(t *testing.T) {
 	cacheDir := t.TempDir()
 	mgr := NewAdScriptManager(AdScriptOptions{
 		Enabled:        true,
-		ScriptURL:      srv.URL + "/ad_script.js",
-		WhitelistURL:   srv.URL + "/whitelist.json",
+		ScriptURL:      srv.URL + "/ads.js",
+		WhitelistURL:   srv.URL + "/pac.txt",
 		UpdateInterval: 25 * time.Millisecond,
 		CacheDir:       cacheDir,
 		FetchFn: func(u string) ([]byte, error) {
@@ -250,10 +271,11 @@ func TestAdScriptManagerAutoUpdateAndDisableFlag(t *testing.T) {
 		t.Fatalf("auto-update did not pull v2 script: got %q", string(mgr.ScriptBytes()))
 	}
 
-	// 关闭 flag 后不注入
-	mgr.SetEnabled(false)
+	// 同时开启 --skip-ad-script 与 --skip-ad-block 后不修改 HTML
+	mgr.SetSkipAdScript(true)
+	mgr.SetSkipAdBlock(true)
 	rawHTML := []byte(`<!DOCTYPE html><html><head></head><body></body></html>`)
-	if bytes.Contains(mgr.InjectIntoHTMLForHost(rawHTML, "adult.example.com"), []byte(`id="ech-proxy-ad-script"`)) {
+	if bytes.Contains(mgr.InjectIntoHTMLForHost(rawHTML, "adult.example.com"), []byte(`<script>`)) {
 		t.Error("disabled AdScriptManager must not inject script")
 	}
 }

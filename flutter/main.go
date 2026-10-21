@@ -61,9 +61,9 @@ const apiHost = "x.moonchan.xyz"
 
 // DoH 服务器地址：服务的固有配置，硬编码。
 // bootstrapIP（连接 DoH 用的目标 IP）不在此处硬编码，由调用方通过
-// StartProxy(bootstrapIP) 传入，来源是运行时 DNS 解析 moonchan.xyz。
-const defaultDohHost = "moonchan.xyz"
-const defaultDohURL = "https://moonchan.xyz/doh"
+// StartProxy(bootstrapIP) 传入，来源是运行时 DNS 解析 4545810.xyz。
+const defaultDohHost = "4545810.xyz"
+const defaultDohURL = "https://4545810.xyz/doh"
 
 // ─── 状态 ────────────────────────────────────────────────────────────────────
 

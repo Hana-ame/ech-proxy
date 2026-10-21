@@ -2,9 +2,14 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -54,100 +59,83 @@ func TestFilenameIs443(t *testing.T) {
 	}
 }
 
-func TestParseCLIArgsWhitelistIPModeAndAllMode(t *testing.T) {
+func TestParseCLIArgsSubcommandsFlagsAndSysProxyDefaults(t *testing.T) {
 	noEnv := func(string) string { return "" }
 
-	// 1. 默认启动为 smart 白名单模式，监听 127.0.0.1:8443，ipmode 默认为 ipv4 ("v4")，AllMode=false，WhitelistURL=""
+	// 1. 默认启动为 smart 模式（PAC HTTPS Proxy），默认 ipmode = ipv4 ("v4")，监听 127.0.0.1:8443，不开启 PortalMode 或 LocalProxy
 	c1, err := parseCLIArgs("ech-proxy", nil, noEnv)
-	if err != nil || c1.Action != "run" || c1.Mode != "smart" || c1.AllMode || c1.IPMode != "v4" || c1.WhitelistURL != "" {
-		t.Errorf("default parseCLIArgs = %+v, %v (want IPMode=v4)", c1, err)
+	if err != nil || c1.Action != "run" || c1.Mode != "smart" || c1.AllMode || c1.PortalMode || c1.IPMode != "v4" || c1.Addr != "127.0.0.1:8443" || c1.LocalProxy {
+		t.Errorf("default parseCLIArgs = %+v, %v", c1, err)
 	}
-	if c1.SysProxy != SysProxyPAC || !c1.EnableTray || c1.HideConsole || c1.NoAdScript {
-		t.Errorf("smart mode defaults: SysProxy=%q EnableTray=%v HideConsole=%v NoAdScript=%v", c1.SysProxy, c1.EnableTray, c1.HideConsole, c1.NoAdScript)
-	}
-
-	// 2. 验证 ipmode flag: [default]=ipv4 ("v4"), dual = 双栈 ("dual"), 4 = ipv4 only ("v4"), 6 = ipv6 only ("v6")
-	cIPDual, err := parseCLIArgs("ech-proxy", []string{"-ipmode", "dual"}, noEnv)
-	if err != nil || cIPDual.IPMode != "dual" {
-		t.Errorf("-ipmode dual got IPMode=%q, err=%v; want dual", cIPDual.IPMode, err)
-	}
-	cIP4, err := parseCLIArgs("ech-proxy", []string{"-ipmode", "4"}, noEnv)
-	if err != nil || cIP4.IPMode != "v4" {
-		t.Errorf("-ipmode 4 got IPMode=%q, err=%v; want v4", cIP4.IPMode, err)
-	}
-	cIPv4, err := parseCLIArgs("ech-proxy", []string{"-ipmode", "ipv4"}, noEnv)
-	if err != nil || cIPv4.IPMode != "v4" {
-		t.Errorf("-ipmode ipv4 got IPMode=%q, err=%v; want v4", cIPv4.IPMode, err)
-	}
-	cIP6, err := parseCLIArgs("ech-proxy", []string{"-ipmode", "6"}, noEnv)
-	if err != nil || cIP6.IPMode != "v6" {
-		t.Errorf("-ipmode 6 got IPMode=%q, err=%v; want v6", cIP6.IPMode, err)
-	}
-	if _, err := parseCLIArgs("ech-proxy", []string{"-ipmode", "invalid"}, noEnv); err == nil {
-		t.Error("expected error for invalid -ipmode value")
+	if c1.SysProxy != SysProxyPAC || !c1.EnableTray || c1.HideConsole || c1.SkipAdScript || c1.SkipAdBlock {
+		t.Errorf("smart mode defaults: SysProxy=%q EnableTray=%v HideConsole=%v SkipAdScript=%v SkipAdBlock=%v",
+			c1.SysProxy, c1.EnableTray, c1.HideConsole, c1.SkipAdScript, c1.SkipAdBlock)
 	}
 
-	// 3. 验证 all 模式（-all / -mode all / 子命令 all）
-	for _, args := range [][]string{{"-all"}, {"-mode", "all"}, {"all"}} {
-		cAll, err := parseCLIArgs("ech-proxy", args, noEnv)
-		if err != nil || !cAll.AllMode {
-			t.Errorf("args %v got AllMode=%v, err=%v; want AllMode=true", args, cAll.AllMode, err)
-		}
+	// 2. 测试快捷 Flag 一览：-4, -6, -dual, -all, --skip-ad-script, --skip-ad-block
+	cFlag4, err := parseCLIArgs("ech-proxy", []string{"-4"}, noEnv)
+	if err != nil || cFlag4.IPMode != "v4" {
+		t.Errorf("-4 parseCLIArgs = %+v, %v", cFlag4, err)
+	}
+	cFlag6, err := parseCLIArgs("ech-proxy", []string{"-6"}, noEnv)
+	if err != nil || cFlag6.IPMode != "v6" {
+		t.Errorf("-6 parseCLIArgs = %+v, %v", cFlag6, err)
+	}
+	cFlagDual, err := parseCLIArgs("ech-proxy", []string{"-dual"}, noEnv)
+	if err != nil || cFlagDual.IPMode != "dual" {
+		t.Errorf("-dual parseCLIArgs = %+v, %v", cFlagDual, err)
+	}
+	if _, err := parseCLIArgs("ech-proxy", []string{"-4", "-6"}, noEnv); err == nil {
+		t.Error("expected error when both -4 and -6 are passed")
 	}
 
-	// 4. 显式传入 -whitelist-url、-ad-script-url、-no-ad-script 等参数
-	c3, err := parseCLIArgs("ech-proxy", []string{
-		"-sys-proxy", "global",
-		"-hide-console",
-		"-no-tray",
-		"-no-ad-script",
-		"-all",
-		"-ipmode", "4",
-		"-ad-script-url", "https://example.com/custom.js",
-		"-whitelist-url", "https://example.com/whitelist.json",
-		"-ad-script-interval", "10m",
-		"-log-dir", "/tmp/my-logs",
-	}, noEnv)
-	if err != nil || c3.SysProxy != SysProxyGlobal || !c3.HideConsole || c3.EnableTray || !c3.NoAdScript ||
-		!c3.AllMode || c3.IPMode != "v4" ||
-		c3.AdScriptURL != "https://example.com/custom.js" ||
-		c3.WhitelistURL != "https://example.com/whitelist.json" ||
-		c3.AdScriptInterval != 10*time.Minute || c3.LogDir != "/tmp/my-logs" {
-		t.Errorf("explicit flags failed: %+v, %v", c3, err)
+	cAllSkip, err := parseCLIArgs("ech-proxy", []string{"-all", "--skip-ad-script", "--skip-ad-block"}, noEnv)
+	if err != nil || !cAllSkip.AllMode || !cAllSkip.SkipAdScript || !cAllSkip.SkipAdBlock {
+		t.Errorf("-all --skip-ad-script --skip-ad-block parseCLIArgs = %+v, %v", cAllSkip, err)
 	}
 
-	// 5. 子命令 sysproxy pac / global / clear / status 与 logs path / tail / crash / clean
-	for _, sub := range []struct {
-		args []string
-		want string
-	}{
-		{[]string{"sysproxy", "pac"}, "sysproxy-pac"},
-		{[]string{"sysproxy", "global"}, "sysproxy-global"},
-		{[]string{"sysproxy", "clear"}, "sysproxy-clear"},
-		{[]string{"sysproxy", "status"}, "sysproxy-status"},
-		{[]string{"logs", "path"}, "logs-path"},
-		{[]string{"logs", "tail"}, "logs-tail"},
-		{[]string{"logs", "crash"}, "logs-crash"},
-		{[]string{"logs", "clean"}, "logs-clean"},
+	// 3. 验证当文件名不包含 .443.exe 时，严禁开启 443 模式或监听 443 端口
+	for _, forbiddenArgs := range [][]string{
+		{"local"},
+		{"443"},
+		{"-local"},
+		{"-mode", "local"},
+		{"-addr", "127.0.0.1:443"},
+		{"-addr", ":443"},
 	} {
-		cmd, err := parseCLIArgs("ech-proxy", sub.args, noEnv)
-		if err != nil || cmd.Action != sub.want {
-			t.Errorf("%v got Action=%q, err=%v; want %q", sub.args, cmd.Action, err, sub.want)
+		if _, err := parseCLIArgs("ech-proxy.exe", forbiddenArgs, noEnv); err == nil {
+			t.Errorf("expected error for non-.443.exe with args %v, got nil", forbiddenArgs)
 		}
 	}
 
-	// 6. -local 与 -http 互斥报错
-	if _, err := parseCLIArgs("ech-proxy", []string{"-local", "-http"}, noEnv); err == nil {
+	// 4. .443.exe 自动进入 local 模式并监听 127.0.0.1:443（默认不改系统代理 SysProxyOff，保留托盘）
+	c2, err := parseCLIArgs("ech-proxy.443.exe", nil, noEnv)
+	if err != nil || !c2.LocalProxy || c2.Addr != "127.0.0.1:443" || c2.FallbackAddr != "127.0.0.1:8443" || c2.SysProxy != SysProxyOff {
+		t.Errorf(".443.exe parseCLIArgs = %+v, %v", c2, err)
+	}
+
+	// 5. 子命令 ca install / ca uninstall / update / logs
+	cUninstall, err := parseCLIArgs("ech-proxy", []string{"ca", "uninstall"}, noEnv)
+	if err != nil || cUninstall.Action != "ca-uninstall" {
+		t.Errorf("ca uninstall got %+v, %v", cUninstall, err)
+	}
+	cUpdate, err := parseCLIArgs("ech-proxy", []string{"update"}, noEnv)
+	if err != nil || cUpdate.Action != "update" {
+		t.Errorf("update subcommand got %+v, %v", cUpdate, err)
+	}
+
+	// 6. .443.exe 下 -local 与 -http 互斥报错
+	if _, err := parseCLIArgs("ech-proxy.443.exe", []string{"-local", "-http"}, noEnv); err == nil {
 		t.Error("expected error when both -local and -http are set")
 	}
 }
 
-func TestSysProxyManagerLifecycleAndAllModePAC(t *testing.T) {
+func TestSysProxyManagerLifecycleAndExitCleanup(t *testing.T) {
 	drv := &noopSysProxyDriver{}
 	mgr := NewSysProxyManager("0.0.0.0:8443", drv)
 	mgr.nowUnix = func() int64 { return 1700000000 }
 
-	// 1. 默认白名单 PAC 模式
+	// 1. 切换为默认白名单 PAC 模式（带 ?t= 时间戳防缓存参数）
 	if err := mgr.SetMode(SysProxyPAC); err != nil {
 		t.Fatalf("SetMode(PAC): %v", err)
 	}
@@ -157,15 +145,15 @@ func TestSysProxyManagerLifecycleAndAllModePAC(t *testing.T) {
 		t.Errorf("after SetMode(PAC): state=%+v, want AutoConfigURL=%q", st, wantPAC)
 	}
 
-	// 2. 开启 all 模式后，PAC URL 自动附带 ?mode=all
+	// 2. 开启 all 模式后切换为 PAC 模式（带 ?mode=all&t= 参数）
 	mgr.SetAllMode(true)
 	if err := mgr.SetMode(SysProxyPAC); err != nil {
 		t.Fatalf("SetMode(PAC all): %v", err)
 	}
 	st, _ = drv.Query()
 	wantAllPAC := "http://127.0.0.1:8443/proxy.pac?mode=all&t=1700000000"
-	if st.AutoConfigURL != wantAllPAC {
-		t.Errorf("after SetAllMode(true): AutoConfigURL=%q, want %q", st.AutoConfigURL, wantAllPAC)
+	if st.Mode != SysProxyPAC || st.AutoConfigURL != wantAllPAC {
+		t.Errorf("after SetMode(PAC all): state=%+v, want AutoConfigURL=%q", st, wantAllPAC)
 	}
 
 	// 3. 退出时自动清理系统代理（防止浏览器断网）
@@ -176,27 +164,112 @@ func TestSysProxyManagerLifecycleAndAllModePAC(t *testing.T) {
 	}
 }
 
-func TestTrayControllerConsoleToggleAndMenuCommands(t *testing.T) {
+func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 	drv := &noopSysProxyDriver{}
 	sysMgr := NewSysProxyManager("127.0.0.1:8443", drv)
 	console := &memoryConsoleDriver{visible: true}
-	adMgr := echproxy.NewAdScriptManager(echproxy.AdScriptOptions{Enabled: true})
 
-	var openedURL, copiedText, installedCA string
+	var openedURL, copiedText, installedCA, uninstalledCA, switchedIPMode string
+	updateChecked := false
 	exited := false
+	// mu 串行化「异步托盘回调写入」与「测试主 goroutine 读取」，消除 -race 数据竞争
+	// （InstallCA / UninstallCA / CheckUpdate / OpenFeedback 经 echproxy.SafeGo 异步执行）。
+	var mu sync.Mutex
 
 	tc := NewTrayController("127.0.0.1:8443", "https://l.moonchan.xyz:8443", "/tmp/ca.pem", sysMgr, console, func() {
 		exited = true
 	})
-	tc.AdScript = adMgr
-	tc.LogDir = "/tmp/ech-logs"
-	tc.OpenURLFn = func(u string) { openedURL = u }
-	tc.CopyClipboardFn = func(s string) error { copiedText = s; return nil }
-	tc.InstallCAFn = func(p string) error { installedCA = p; return nil }
+	tc.SetIPModeFn = func(m string) { mu.Lock(); switchedIPMode = m; mu.Unlock() }
+	tc.OpenURLFn = func(u string) { mu.Lock(); openedURL = u; mu.Unlock() }
+	tc.CopyClipboardFn = func(s string) error { mu.Lock(); copiedText = s; mu.Unlock(); return nil }
+	tc.InstallCAFn = func(p string) error { mu.Lock(); installedCA = p; mu.Unlock(); return nil }
+	tc.UninstallCAFn = func(p string) error { mu.Lock(); uninstalledCA = p; mu.Unlock(); return nil }
+	tc.CheckUpdateFn = func() (bool, error) { mu.Lock(); updateChecked = true; mu.Unlock(); return true, nil }
 
-	if !tc.IsConsoleVisible() {
-		t.Fatal("console should start visible")
+	// 1. 检查托盘菜单结构：
+	//    - 包含「反馈 (https://chatto.moonchan.xyz)」
+	//    - 包含「强制 v4 出口」、「强制 v6 出口」、「双端出口」
+	//    - 包含「一键安装本地 CA 根证书 (Install CA)」与「卸载本地 CA 根证书 (Uninstall CA)」
+	//    - 包含「检查更新 (Check Update)」
+	//    - 不包含「全局」模式，也不包含任何「广告 / Ad Script」设置
+	items := tc.MenuItems()
+	var titles []string
+	for _, it := range items {
+		if !it.Separator {
+			titles = append(titles, it.Title)
+		}
+		if strings.Contains(it.Title, "全局") {
+			t.Errorf("tray menu must NOT display global proxy mode, found: %q", it.Title)
+		}
+		if strings.Contains(it.Title, "广告") || strings.Contains(strings.ToLower(it.Title), "ad script") {
+			t.Errorf("tray menu must hide ad settings, found: %q", it.Title)
+		}
+		if strings.Contains(it.Title, "打开 Web 门户") {
+			t.Errorf("tray menu should replace 打开门户 with 反馈, found: %q", it.Title)
+		}
 	}
+	joined := strings.Join(titles, " | ")
+	for _, mustHave := range []string{
+		"反馈 (https://chatto.moonchan.xyz)",
+		"强制 v4 出口",
+		"强制 v6 出口",
+		"双端出口",
+		"一键安装本地 CA 根证书 (Install CA)",
+		"卸载本地 CA 根证书 (Uninstall CA)",
+		"检查更新 (Check Update)",
+	} {
+		if !strings.Contains(joined, mustHave) {
+			t.Errorf("tray menu missing %q in items: %s", mustHave, joined)
+		}
+	}
+
+	// 2. 测试切换出口协议族：强制 v6 出口 / 双端出口 / 强制 v4 出口
+	tc.HandleCommand(TrayCmdIPModeV6)
+	if tc.CurrentIPMode() != "v6" || switchedIPMode != "v6" || !strings.Contains(tc.TooltipText(), "v6出口") {
+		t.Errorf("after TrayCmdIPModeV6: cur=%q switched=%q tooltip=%q", tc.CurrentIPMode(), switchedIPMode, tc.TooltipText())
+	}
+	tc.HandleCommand(TrayCmdIPModeDual)
+	if tc.CurrentIPMode() != "dual" || switchedIPMode != "dual" || !strings.Contains(tc.TooltipText(), "双端出口") {
+		t.Errorf("after TrayCmdIPModeDual: cur=%q switched=%q tooltip=%q", tc.CurrentIPMode(), switchedIPMode, tc.TooltipText())
+	}
+	tc.HandleCommand(TrayCmdIPModeV4)
+	if tc.CurrentIPMode() != "v4" || switchedIPMode != "v4" || !strings.Contains(tc.TooltipText(), "v4出口") {
+		t.Errorf("after TrayCmdIPModeV4: cur=%q switched=%q tooltip=%q", tc.CurrentIPMode(), switchedIPMode, tc.TooltipText())
+	}
+
+	// 3. 测试点击「卸载本地 CA 根证书」与「检查更新」与「反馈」
+	tc.HandleCommand(TrayCmdInstallCA)
+	tc.HandleCommand(TrayCmdUninstallCA)
+	tc.HandleCommand(TrayCmdCheckUpdate)
+	tc.HandleCommand(TrayCmdOpenFeedback)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		done := openedURL != "" && uninstalledCA != "" && updateChecked && installedCA != ""
+		mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	mu.Lock()
+	gotInstalled, gotUninstalled, gotUpdateChecked, gotOpenedURL := installedCA, uninstalledCA, updateChecked, openedURL
+	mu.Unlock()
+	if gotInstalled != "/tmp/ca.pem" {
+		t.Errorf("TrayCmdInstallCA got %q, want /tmp/ca.pem", gotInstalled)
+	}
+	if gotUninstalled != "/tmp/ca.pem" {
+		t.Errorf("TrayCmdUninstallCA got %q, want /tmp/ca.pem", gotUninstalled)
+	}
+	if !gotUpdateChecked {
+		t.Errorf("TrayCmdCheckUpdate did not invoke CheckUpdateFn")
+	}
+	if gotOpenedURL != "https://chatto.moonchan.xyz" {
+		t.Errorf("TrayCmdOpenFeedback opened %q, want https://chatto.moonchan.xyz", gotOpenedURL)
+	}
+
+	// 4. 测试双击/菜单切换 Console 窗口显隐
 	tc.HandleCommand(TrayCmdToggleConsole)
 	if tc.IsConsoleVisible() {
 		t.Error("console should be hidden after first toggle")
@@ -206,26 +279,130 @@ func TestTrayControllerConsoleToggleAndMenuCommands(t *testing.T) {
 		t.Error("console should be visible after second toggle")
 	}
 
-	tc.HandleCommand(TrayCmdToggleAdScript)
-	if adMgr.Enabled() {
-		t.Error("adScript should be disabled after toggle")
-	}
-	tc.HandleCommand(TrayCmdToggleAdScript)
-	if !adMgr.Enabled() {
-		t.Error("adScript should be enabled after second toggle")
+	// 5. 测试托盘右键切换 PAC / Clear 模式与退出清理
+	tc.HandleCommand(TrayCmdSysProxyPAC)
+	tc.HandleCommand(TrayCmdCopyPACURL)
+	if copiedText != "http://127.0.0.1:8443/proxy.pac" {
+		t.Errorf("copied PAC URL = %q, want http://127.0.0.1:8443/proxy.pac", copiedText)
 	}
 
 	if shouldExit := tc.HandleCommand(TrayCmdExit); !shouldExit || !exited {
 		t.Errorf("TrayCmdExit should return true and invoke OnExit")
 	}
-	_ = openedURL
-	_ = copiedText
-	_ = installedCA
+	if sysMgr.Mode() != SysProxyOff {
+		t.Errorf("TrayCmdExit must clean up system proxy, got mode=%q", sysMgr.Mode())
+	}
+}
+
+func TestUpdaterParseChecksumsAndAutoDownloadReplaceOnExit(t *testing.T) {
+	// 1. 验证 ParseChecksumsTxt 同时支持 GitHub Release 页面多行格式与标准 sha256sum 格式
+	releaseText := `
+checksums.txt
+sha256:29ec803c87048d5033fdf7d4c3dd91724090c3657e31a598e5b75fb1f36ca3dc
+715 Bytes
+ech-proxy-android-3.2.0.apk
+sha256:408668f480df4413b5d7346801092b765bff4713e33b45f6a1eaadc09aa47a2f
+ech-proxy-darwin-amd64
+sha256:7c35b82fbcd51f9dc06a06e016f7af9af6ed7105565c3df1a79d3a2e661547f3
+ech-proxy-linux-386
+sha256:ca1c64497f97624a9c86349b465bcb0b4ba1fa8aafb35ca0531dea4e256cdd61
+ech-proxy-linux-amd64
+sha256:67d8b51ba5f1cdeff88564dabda44038fce2a7ddb0c6001b74a3e26cc9854f55
+ech-proxy-linux-arm64
+sha256:04fb2de70675d29499782a6791907b37de7c86c1afa8c65884bc155936c3fedf
+ech-proxy-windows-386.exe
+sha256:08e7e3e7b4668ae5ec49bf3715c646b59dc3171eb25ce6fcb50b61aa6b14a9a5
+ech-proxy-windows-amd64.exe
+sha256:a711c923e0dd55e3aef0610c76ccf48bb8123624d40feda3afcacaffe19aa4ee
+ech-proxy-windows-arm64.exe
+sha256:fcb8f707ccc5317a7813036ede4e89a5f5bff3bfc1ae74f9ae9046d39a3e95ca
+`
+	parsed := ParseChecksumsTxt([]byte(releaseText))
+	wantHashes := map[string]string{
+		"ech-proxy-windows-386.exe":   "08e7e3e7b4668ae5ec49bf3715c646b59dc3171eb25ce6fcb50b61aa6b14a9a5",
+		"ech-proxy-windows-amd64.exe": "a711c923e0dd55e3aef0610c76ccf48bb8123624d40feda3afcacaffe19aa4ee",
+		"ech-proxy-windows-arm64.exe": "fcb8f707ccc5317a7813036ede4e89a5f5bff3bfc1ae74f9ae9046d39a3e95ca",
+		"ech-proxy-linux-386":         "ca1c64497f97624a9c86349b465bcb0b4ba1fa8aafb35ca0531dea4e256cdd61",
+		"ech-proxy-linux-amd64":       "67d8b51ba5f1cdeff88564dabda44038fce2a7ddb0c6001b74a3e26cc9854f55",
+		"ech-proxy-linux-arm64":       "04fb2de70675d29499782a6791907b37de7c86c1afa8c65884bc155936c3fedf",
+		"ech-proxy-darwin-amd64":      "7c35b82fbcd51f9dc06a06e016f7af9af6ed7105565c3df1a79d3a2e661547f3",
+	}
+	for asset, wantH := range wantHashes {
+		if parsed[asset] != wantH {
+			t.Errorf("ParseChecksumsTxt[%q] = %q, want %q", asset, parsed[asset], wantH)
+		}
+	}
+
+	// 2. 测试自动下载新版本 (<exe>.new) 并在退出后替换 (<exe>)
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "ech-proxy.exe")
+	oldBinary := bytes.Repeat([]byte("OLD_VERSION_BIN_"), 128) // 2048 bytes
+	newBinary := bytes.Repeat([]byte("NEW_VERSION_BIN_"), 128) // 2048 bytes
+	newSum := sha256.Sum256(newBinary)
+	newHashHex := hex.EncodeToString(newSum[:])
+
+	if err := os.WriteFile(exePath, oldBinary, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/checksums.txt":
+			_, _ = w.Write([]byte(newHashHex + "  ech-proxy-windows-amd64.exe\n"))
+		case "/ech-proxy-windows-amd64.exe":
+			_, _ = w.Write(newBinary)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	upd := NewUpdater(UpdaterOptions{
+		ExePath:         exePath,
+		GOOS:            "windows",
+		GOARCH:          "amd64",
+		ChecksumsURL:    srv.URL + "/checksums.txt",
+		DownloadBaseURL: srv.URL,
+		MinBinaryBytes:  512,
+		FetchFn:         echproxy.FetchBytes,
+	})
+
+	staged, err := upd.CheckAndDownloadOnce()
+	if err != nil || !staged || !upd.IsUpdateStaged() {
+		t.Fatalf("CheckAndDownloadOnce got staged=%v, err=%v", staged, err)
+	}
+	if _, err := os.Stat(upd.StagedPath()); err != nil {
+		t.Fatalf("staged file %s missing: %v", upd.StagedPath(), err)
+	}
+
+	// 退出时自动替换可执行文件
+	replaced, err := upd.ApplyStagedUpdateOnExit()
+	if err != nil || !replaced {
+		t.Fatalf("ApplyStagedUpdateOnExit got replaced=%v, err=%v", replaced, err)
+	}
+	gotAfterExit, err := os.ReadFile(exePath)
+	if err != nil || !bytes.Equal(gotAfterExit, newBinary) {
+		t.Fatalf("executable was not replaced with new binary on exit")
+	}
+
+	// 再次检查更新应识别已是最新，不再重复下载
+	stagedAgain, err := upd.CheckAndDownloadOnce()
+	if err != nil || stagedAgain {
+		t.Errorf("second CheckAndDownloadOnce after update should report already up to date, got staged=%v err=%v", stagedAgain, err)
+	}
 }
 
 func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
+	// 0. 测试 help 子命令打印 Flag 一览
 	var out bytes.Buffer
-	code := runToolAction(CLICommand{
+	code := runToolAction(CLICommand{Action: "help"}, &out)
+	if code != 0 || !strings.Contains(out.String(), "--skip-ad-script") || !strings.Contains(out.String(), "--skip-ad-block") || !strings.Contains(out.String(), "-dual") {
+		t.Errorf("help action returned code=%d, out=%q", code, out.String())
+	}
+
+	// 1. 测试 check 子命令校验生产配置返回 0
+	out.Reset()
+	code = runToolAction(CLICommand{
 		Action:    "check",
 		ConfigURL: "../certs/l.moonchan.xyz/upstream.json",
 	}, &out)
@@ -233,6 +410,7 @@ func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
 		t.Errorf("check valid config returned code=%d, out=%q", code, out.String())
 	}
 
+	// 2. 测试 check 子命令对不存在文件返回 2
 	out.Reset()
 	code = runToolAction(CLICommand{
 		Action:    "check",
@@ -242,6 +420,7 @@ func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
 		t.Errorf("check nonexistent file returned code=%d, want 2", code)
 	}
 
+	// 3. 测试 ca export 子命令
 	out.Reset()
 	dir := t.TempDir()
 	exportFile := filepath.Join(dir, "exported-ca.crt")
@@ -257,14 +436,29 @@ func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
 		t.Errorf("exported CA file invalid: err=%v", err)
 	}
 
+	// 4. 测试 logs path / tail / crash / clean 子命令
 	logDir := t.TempDir()
-	logFile := filepath.Join(logDir, "ech-proxy.log")
-	_ = os.WriteFile(logFile, []byte("line1\nline2\n"), 0o644)
+	mgr, err := echproxy.NewLogger(echproxy.LoggerOptions{
+		LogDir:     logDir,
+		ConsoleOut: &bytes.Buffer{},
+	})
+	if err != nil {
+		t.Fatalf("NewLogger: %v", err)
+	}
+	_, _ = mgr.Write([]byte("hello from local log\n"))
+	mgr.RecordCrash("test-comp", "boom", []byte("stack-line-1\n"))
+	_ = mgr.Close()
 
 	out.Reset()
-	if code := runToolAction(CLICommand{Action: "logs-tail", LogDir: logDir}, &out); code != 0 || !strings.Contains(out.String(), "line2") {
+	if code := runToolAction(CLICommand{Action: "logs-tail", LogDir: logDir}, &out); code != 0 || !strings.Contains(out.String(), "hello from local log") {
 		t.Errorf("logs-tail failed: code=%d out=%q", code, out.String())
 	}
+
+	out.Reset()
+	if code := runToolAction(CLICommand{Action: "logs-crash", LogDir: logDir}, &out); code != 0 || !strings.Contains(out.String(), "boom") {
+		t.Errorf("logs-crash failed: code=%d out=%q", code, out.String())
+	}
+
 	out.Reset()
 	if code := runToolAction(CLICommand{Action: "logs-clean", LogDir: logDir}, &out); code != 0 {
 		t.Errorf("logs-clean failed: code=%d out=%q", code, out.String())

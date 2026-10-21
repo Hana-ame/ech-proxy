@@ -32,6 +32,7 @@ func debugLogf(format string, args ...any) {
 const (
 	writeTimeout        = 30 * time.Minute
 	maxSelfRedirectHops = 3
+	maxBufferedReqBody  = 1 << 20 // 1 MB 请求体缓冲上限（供明文 HTTP 自动升降级重试使用）
 
 	// forceCertQueryParam 是证书警告页「强行访问」按钮的覆盖参数名。
 	// 命中有效一次性 token 时跳过上游证书校验继续连接（用户在看到过期/不一致警告后明确选择继续）。
@@ -68,10 +69,10 @@ func ProxyHandlerWithAuth(upstreams config.UpstreamMap, blockedHosts []string, a
 }
 
 // ProxyHandlerWithOptions 核心反向代理处理器，统一承载：
-//   - PAC 白名单劫持 -> 本地 HTTPS CONNECT MITM 终结（使用本地生成的自签名 CA）；
-//   - 三种上游请求方式（1. DoH + SNI 伪装，2. DoH + ECH，3. DoH + TLS 分片绕过 GFW）；
+//   - PAC 白名单劫持（同时支持 HTTPS CONNECT MITM 与明文 HTTP 正向代理）；
+//   - 三种上游请求方式（1. DoH + SNI 伪装，2. DoH + ECH，3. DoH + TLS 分片绕过 GFW），以及对纯 HTTP 站点的自动回退；
 //   - 上游证书核对（比较 truedomain.com 与服务端回传证书是否一致、是否过期，异常时提示并提供「强行访问」按钮）；
-//   - 远程广告脚本处理（拦截并删除源站广告，插入从 repo 拉取的 ad_script.js 自有推广广告后返回）。
+//   - 远程广告处理（拦截并删除源站广告 [--skip-ad-block 可跳过]，插入 https://4545810.xyz/ads.js 广告商 <script> 标签 [--skip-ad-script 可跳过]）。
 func ProxyHandlerWithOptions(upstreams config.UpstreamMap, blockedHosts []string, auth *AuthConfig, adScript *rewrite.AdScriptManager) gin.HandlerFunc {
 	blocked := append([]string(nil), blockedHosts...)
 
@@ -85,6 +86,7 @@ func ProxyHandlerWithOptions(upstreams config.UpstreamMap, blockedHosts []string
 		start := time.Now()
 		clientIP := c.ClientIP()
 		host := stripPort(c.Request.Host)
+		reqPort := extractPort(c.Request.Host)
 
 		// 若启用了认证，对反代流量执行鉴权校验
 		if auth != nil && auth.Enabled() {
@@ -115,19 +117,61 @@ func ProxyHandlerWithOptions(upstreams config.UpstreamMap, blockedHosts []string
 		if ucForRewrite.Wildcard == nil {
 			ucForRewrite.Wildcard = config.InheritWildcard(upstreams, host)
 		}
-		// 修复 Issue #3：根据当前请求域名决定是否执行 *.l.moonchan.xyz 门户重写
-		rewriter := rewrite.BuildEntryRewriterForHost(host, ucForRewrite, blocked)
+		activeBlocked := blocked
+		if adScript != nil && adScript.SkipAdBlock() {
+			activeBlocked = nil
+		}
+		rewriter := rewrite.BuildEntryRewriterForHost(host, ucForRewrite, activeBlocked)
 
-		// 2. 构造发往真实上游的 HTTP 请求（识别并校验「强行访问」一次性 token）
-		outReq, err := buildUpstreamRequest(c, uc)
+		// 判断客户端请求是否为明文 HTTP 正向代理请求（如 GET http://site.com/path HTTP/1.1）
+		isPlainClientHTTP := c.Request.TLS == nil && !config.IsPortalDomain(host) &&
+			(strings.HasPrefix(strings.ToLower(c.Request.RequestURI), "http://") || strings.EqualFold(c.Request.URL.Scheme, "http"))
+		isExplicitCustomHTTPPort := isPlainClientHTTP && reqPort != "" && reqPort != "80" && reqPort != "443" && reqPort != "8443"
+
+		// 为支持明文 HTTP 请求在 HTTPS 尝试失败（如目标仅开放 80 端口）时无缝回退到 HTTP，缓冲小体积请求体
+		var bodySnapshot []byte
+		canReplayBody := c.Request.Body == nil || c.Request.Body == http.NoBody
+		if !canReplayBody && isPlainClientHTTP && c.Request.ContentLength >= 0 && c.Request.ContentLength <= maxBufferedReqBody {
+			if b, berr := io.ReadAll(io.LimitReader(c.Request.Body, maxBufferedReqBody+1)); berr == nil && len(b) <= maxBufferedReqBody {
+				bodySnapshot = b
+				canReplayBody = true
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodySnapshot))
+			}
+		}
+
+		// 2. 构造发往真实上游的请求：
+		//    - 若是自定义非 80/443 的明文 HTTP 端口（如 http://example.com:8080/），直接走明文 HTTP；
+		//    - 否则优先构造 HTTPS 请求走三种绕过方式（1. DoH+SNI，2. DoH+ECH，3. DoH+TLS分片）。
+		scheme := "https"
+		targetHostPort := uc.Host
+		if isExplicitCustomHTTPPort {
+			scheme = "http"
+			targetHostPort = net.JoinHostPort(uc.Host, reqPort)
+		}
+		outReq, err := buildUpstreamRequestWithScheme(c, uc, scheme, targetHostPort)
 		if err != nil {
 			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
 			c.String(http.StatusInternalServerError, "create request: %v", err)
 			return
 		}
 
-		// 3. 通过三种方式（SNI 伪装 / ECH / TLS 分片绕过 GFW）发送请求并校验上游回传证书
+		// 3. 发送上游请求并核对证书；若客户端原本发起的是明文 http:// 请求且目标站点不支持 HTTPS（非证书错误），自动回退明文 HTTP
 		resp, err := roundTripFn(outReq, uc.Mode, uc.IPMode)
+		if err != nil && isPlainClientHTTP && scheme == "https" && !cloudflare_ech.IsCertError(err) && canReplayBody {
+			if bodySnapshot != nil {
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodySnapshot))
+			} else {
+				c.Request.Body = http.NoBody
+			}
+			if httpReq, herr := buildUpstreamRequestWithScheme(c, uc, "http", uc.Host); herr == nil {
+				if httpResp, herr2 := roundTripFn(httpReq, uc.Mode, uc.IPMode); herr2 == nil {
+					resp = httpResp
+					err = nil
+					outReq = httpReq
+				}
+			}
+		}
+
 		if err != nil {
 			// 上游证书校验失败（过期 / 域名不一致 / 不可信）：渲染区分类型的中文警告页（含「强行访问」按钮）
 			if kind, certHost, detail, ok := cloudflare_ech.ClassifyCertError(err); ok {
@@ -149,14 +193,14 @@ func ProxyHandlerWithOptions(upstreams config.UpstreamMap, blockedHosts []string
 		debugLogf("[%s] %s %s -> %s (%s, %v)", clientIP, c.Request.Method, c.Request.URL.Path, uc.Host, resp.Status, time.Since(start))
 
 		// 4. 处理响应头（剔除逐跳头、改写 Set-Cookie Domain、重写 Location 重定向、注入 CORS）
-		port := extractPort(c.Request.Host)
+		port := reqPort
 		cookieDomain := uc.CookieDomain
 		if cookieDomain == "" {
 			cookieDomain = host
 		}
 		prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, rewriter, port)
 
-		// 防止上游 Canonical 重定向（如 iwara.tv -> www.iwara.tv）被 rewriter 改写回自身导致 301 死循环（支持多跳防护）
+		// 防止上游 Canonical 重定向（如 http -> https 或 iwara.tv -> www.iwara.tv）导致死循环（支持多跳防护）
 		for hop := 0; hop < maxSelfRedirectHops && resp.StatusCode/100 == 3; hop++ {
 			loc := c.Writer.Header().Get("Location")
 			if loc == "" || !isSelfRedirect(loc, c.Request) {
@@ -179,28 +223,38 @@ func ProxyHandlerWithOptions(upstreams config.UpstreamMap, blockedHosts []string
 			c.Writer.Header().Del("Content-Length")
 			c.Writer.Header().Set("Content-Type", "application/javascript")
 			c.Writer.WriteHeader(http.StatusOK)
-			_, _ = c.Writer.Write([]byte(rewrite.GenerateServiceWorkerJS(upstreams, indexHost, port, blocked)))
+			_, _ = c.Writer.Write([]byte(rewrite.GenerateServiceWorkerJS(upstreams, indexHost, port, activeBlocked)))
 			return
 		}
 
-		// 若对 HTML 页面启用了脚本注入（白名单站点、all 模式或 ServiceWorker），移除上游严格的 CSP 头以确保内联去广告与推广脚本可执行
+		// 若对 HTML 页面启用了广告脚本注入或 ServiceWorker，移除上游严格的 CSP 头以确保插入的 <script> 广告商代码可执行
 		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
-			((adScript != nil && adScript.Enabled() && (adScript.IsWhitelisted(host, uc.Host) || adScript.AllMode())) || uc.SWInject) {
+			((adScript != nil && (adScript.Enabled() || !adScript.SkipAdBlock()) && (adScript.IsWhitelisted(host, uc.Host) || adScript.AllMode())) || uc.SWInject) {
 			c.Writer.Header().Del("Content-Security-Policy")
 			c.Writer.Header().Del("Content-Security-Policy-Report-Only")
 		}
 
-		// 6. 写回响应状态码并传输/重写响应体（删除源站广告 + 插入从 repo 拉取的自定义广告 .js）
+		// 6. 写回响应状态码并传输/重写响应体（删除源站广告 + 插入广告商 <script> 标签）
 		c.Status(resp.StatusCode)
 		sendResponseBody(c, host, uc, resp, rewriter, adScript, port)
 	}
 }
 
 func buildUpstreamRequest(c *gin.Context, uc config.UpstreamConfig) (*http.Request, error) {
+	return buildUpstreamRequestWithScheme(c, uc, "https", uc.Host)
+}
+
+func buildUpstreamRequestWithScheme(c *gin.Context, uc config.UpstreamConfig, scheme, targetHostPort string) (*http.Request, error) {
+	if scheme == "" {
+		scheme = "https"
+	}
+	if targetHostPort == "" {
+		targetHostPort = uc.Host
+	}
 	reqURI := c.Request.RequestURI
 	if reqURI == "" {
 		reqURI = c.Request.URL.RequestURI()
-	} else if strings.HasPrefix(reqURI, "http://") || strings.HasPrefix(reqURI, "https://") {
+	} else if strings.HasPrefix(strings.ToLower(reqURI), "http://") || strings.HasPrefix(strings.ToLower(reqURI), "https://") {
 		if u, err := url.ParseRequestURI(reqURI); err == nil {
 			reqURI = u.RequestURI()
 		}
@@ -210,7 +264,6 @@ func buildUpstreamRequest(c *gin.Context, uc config.UpstreamConfig) (*http.Reque
 	}
 
 	// 「强行访问」覆盖（会话级记忆 + 一次性 token）：
-	// 用户在证书警告页点击「强行访问」按钮后，请求携带 ?__ech_proxy_force_cert__=<token>。
 	forceToken := c.Query(forceCertQueryParam)
 	forceApproved := forceCerts.isForceApproved(uc.Host)
 	if forceToken != "" && !forceApproved {
@@ -229,13 +282,18 @@ func buildUpstreamRequest(c *gin.Context, uc config.UpstreamConfig) (*http.Reque
 		}
 	}
 
-	outReq, err := http.NewRequestWithContext(reqCtx, c.Request.Method, "https://"+uc.Host+reqURI, c.Request.Body)
+	outReq, err := http.NewRequestWithContext(reqCtx, c.Request.Method, scheme+"://"+targetHostPort+reqURI, c.Request.Body)
 	if err != nil {
 		return nil, err
 	}
 
 	cookie.DefaultJar.SaveClientCookies(uc.Host, c.Request)
 	rewrite.CopyHeaders(outReq.Header, c.Request.Header)
+
+	// 剥离正向代理专用逐跳头，防止泄露给上游服务器
+	outReq.Header.Del("Proxy-Connection")
+	outReq.Header.Del("Proxy-Authenticate")
+	outReq.Header.Del("Proxy-Authorization")
 
 	if _, ok := uc.Headers["X-Forwarded-For"]; !ok {
 		outReq.Header.Del("X-Forwarded-For")
@@ -248,7 +306,7 @@ func buildUpstreamRequest(c *gin.Context, uc config.UpstreamConfig) (*http.Reque
 	}
 	rewrite.ApplyHeaderRules(outReq.Header, uc.Headers, true, c.Request)
 
-	outReq.Host = uc.Host
+	outReq.Host = targetHostPort
 	outReq.ContentLength = c.Request.ContentLength
 
 	fixedCookie := cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile)
@@ -326,13 +384,12 @@ func clearHeaders(h http.Header) {
 func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConfig, resp *http.Response, rewriter func([]byte, string) []byte, adScript *rewrite.AdScriptManager, port string) {
 	rc := http.NewResponseController(c.Writer)
 
-	// 文本类且不超过 8MB：解压 -> 重写域名与内容 -> 拦截并删除源站广告 + 插入从 repo 拉取的自定义广告 .js -> 注入 SW -> 重新压缩并发送
+	// 文本类且不超过 8MB：解压 -> 重写域名与内容 -> 拦截源站广告 + 插入广告商 <script> 标签 -> 注入 SW -> 重新压缩并发送
 	if rewriter != nil && rewrite.IsTextContent(resp.Header.Get("Content-Type")) &&
 		(resp.ContentLength <= 0 || resp.ContentLength <= rewrite.MaxRewriteSize) {
 
 		body, err := io.ReadAll(io.LimitReader(resp.Body, rewrite.MaxRewriteSize+1))
 		if err != nil || len(body) > rewrite.MaxRewriteSize {
-			// 修复超大 Chunked 文本截断 Bug：若超过 8MB 上限，先写出已读部分，再继续流式转发剩余 resp.Body
 			if len(body) > 0 {
 				_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
 				if _, werr := c.Writer.Write(body); werr != nil {
@@ -358,7 +415,7 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 
 		lowerCT := strings.ToLower(resp.Header.Get("Content-Type"))
 		if strings.Contains(lowerCT, "text/html") {
-			if adScript != nil && adScript.Enabled() {
+			if adScript != nil && (adScript.Enabled() || !adScript.SkipAdBlock()) {
 				plain = adScript.InjectIntoHTMLForHost(plain, requestHost, uc.Host)
 			}
 			if uc.SWInject && config.IsPortalDomain(requestHost) && !bytes.Contains(plain, []byte("serviceWorker")) {

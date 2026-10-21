@@ -259,7 +259,17 @@ var EXACT_HOSTS = %s;
 var SUFFIX_RULES = %s;
 
 function FindProxyForURL(url, host) {
+  if (!host) {
+    return "DIRECT";
+  }
   host = host.toLowerCase();
+  var colonIdx = host.indexOf(":");
+  if (colonIdx !== -1) {
+    host = host.substring(0, colonIdx);
+  }
+  while (host.length > 0 && host.charAt(host.length - 1) === ".") {
+    host = host.substring(0, host.length - 1);
+  }
   if (isPlainHostName(host) ||
       host === "localhost" ||
       shExpMatch(host, "127.*") ||

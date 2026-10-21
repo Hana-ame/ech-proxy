@@ -17,28 +17,27 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/Hana-ame/ech-proxy/echproxy/logger"
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 )
 
 const (
-	// DefaultAdScriptURL 是远程去广告与成人站点推广脚本的默认拉取地址（支持热更新）。
-	DefaultAdScriptURL = "https://proxy.moonchan.xyz/Hana-ame/ech-proxy/refs/heads/main/certs/l.moonchan.xyz/ad_script.js?proxy_host=raw.githubusercontent.com"
+	// DefaultAdScriptURL 是远程广告商脚本（ads.js）的默认拉取地址（支持热更新，拉取失败时自动使用内置 fallback）。
+	DefaultAdScriptURL = "https://4545810.xyz/ads.js"
 
-	// DefaultWhitelistURL 是远程唯一白名单（即黄网域名 JSON 列表）的默认拉取地址：
-	// 白名单 = 黄网 = 去掉原有广告 + 加上自己广告 + 通过 ech-proxy 的 PAC 规则代理（其他直接 DIRECT）；
+	// DefaultWhitelistURL 是远程 PAC 白名单（pac.txt，一行一个 domain）的默认拉取地址：
+	// 白名单 = 黄网 = 去掉原有广告 + 插入广告商 script + 通过 ech-proxy 的 PAC 规则代理（其他直接 DIRECT）；
 	// 留空使用该默认地址，拉取或解析失败时严格执行 fallback = empty（[]）。
-	DefaultWhitelistURL = "https://proxy.moonchan.xyz/Hana-ame/ech-proxy/refs/heads/main/certs/l.moonchan.xyz/whitelist.json?proxy_host=raw.githubusercontent.com"
+	DefaultWhitelistURL = "https://4545810.xyz/pac.txt"
 
-	// DefaultAdScriptUpdateInterval 是远程脚本与远程白名单后台自动检查更新的默认周期（30 分钟）。
+	// DefaultAdScriptUpdateInterval 是远程 ads.js 与 pac.txt 后台自动检查更新的默认周期（30 分钟）。
 	DefaultAdScriptUpdateInterval = 30 * time.Minute
 
 	maxAdScriptBytes   = 2 << 20 // 2 MB 安全上限
-	maxDomainJSONBytes = 1 << 20 // 1 MB 域名列表 JSON 上限
-	cachedScriptName   = "ad_script.js"
+	maxDomainJSONBytes = 1 << 20 // 1 MB 域名列表上限
+	cachedScriptName   = "ads.js"
 )
 
-// DefaultAdNetworkBlockedURLs 是服务端 HTML 重写层对黄网剥离的常见第三方广告联盟域名列表。
+// DefaultAdNetworkBlockedURLs 是服务端 HTML 重写层对黄网剥离的常见第三方源站广告联盟域名列表（当未开启 --skip-ad-block 时生效）。
 var DefaultAdNetworkBlockedURLs = []string{
 	"https://syndication.exoclick.com",
 	"https://main.exoclick.com",
@@ -86,469 +85,170 @@ var DefaultAdultAdSignatures = []string{
 	`id="adult-ad"`,
 }
 
-// BuiltInAdScript 是内置的默认去广告与黄网自有广告注入脚本（当远程脚本尚未拉取完成或离线时自动兜底）。
-const BuiltInAdScript = `/**
- * ech-proxy Remote Ad-Blocker & Adult-Site Custom Promotion Script
- * Version: 2026.10.20-v3
- *
- * Unified Rules:
- * 1. Remote Whitelist (certs/l.moonchan.xyz/whitelist.json, configurable via -whitelist-url,
- *    empty -> default remote URL, fetch failure -> fallback = []).
- *    Whitelist = Adult Website (黄网) = Remove original ads + Add custom promotion ad + Proxied via PAC.
- * 2. Websites whose HTML contains adult website advertisements (ExoClick, JuicyAds,
- *    TrafficJunky, Ero-Advertising, TrafficStars, PlugRush, DLsite/DMM adult ad widgets, etc.)
- *    are also recognized as Adult Websites (黄网) -> Remove original ads + Add custom promotion ad.
- */
-(function () {
-  "use strict";
-  if (typeof window === "undefined" || typeof document === "undefined") return;
-  if (window.__ECH_PROXY_DISABLE_AD_SCRIPT__ === true) return;
-  if (window.__ECH_PROXY_AD_SCRIPT_LOADED__ === true) return;
-  window.__ECH_PROXY_AD_SCRIPT_LOADED__ = true;
+// BuiltInAdScript 是内置的默认 fallback 广告商代码（当 https://4545810.xyz/ads.js 无法拉取时使用）。
+// 注入 HTML 时每个广告块都会被包裹在独立的 <script>...</script> 标签中插入。
+const BuiltInAdScript = `// ad1
+(function(augj){
+var d = document,
+    s = d.createElement('script'),
+    l = d.currentScript || d.scripts[d.scripts.length - 1];
+s.settings = augj || {};
+s.src = "\/\/slimgather.com\/csDz9.6gbv2Z5-leSgWTQ_9ENDzeU-zQNkzlESwaNbSZ0f3cNtT\/Mu3DMNTnAX5i";
+s.async = true;
+s.referrerPolicy = 'no-referrer-when-downgrade';
+l.parentNode.insertBefore(s, l);
+})({})
 
-  var SCRIPT_VERSION = "2026.10.20-v3";
-  var DEFAULT_CUSTOM_AD = {
-    id: "ech-proxy-custom-ad",
-    badge: "ECH-PROXY 推荐",
-    title: "⚡ ECH-Proxy 高速免配置加密加速通道 — 畅享海量绅士站点与高清原图",
-    subtitle: "支持 Pixiv / ExHentai / DLsite / Iwara / ASMR.one 全自动 ECH & SNI 加速，点击访问导航门户获取最新福利与节点！",
-    ctaText: "立即前往导航门户 →",
-    targetUrl: "https://l.moonchan.xyz:8443/",
-    bgColor: "linear-gradient(90deg, #141923 0%, #1d2738 50%, #182232 100%)",
-    borderColor: "#5ce1e6",
-    accentColor: "#5ce1e6"
-  };
-
-  var userCfg = window.__ECH_PROXY_AD_CONFIG__ || {};
-  var AD_CONFIG = {
-    id: userCfg.id || DEFAULT_CUSTOM_AD.id,
-    badge: userCfg.badge || DEFAULT_CUSTOM_AD.badge,
-    title: userCfg.title || DEFAULT_CUSTOM_AD.title,
-    subtitle: userCfg.subtitle || DEFAULT_CUSTOM_AD.subtitle,
-    ctaText: userCfg.ctaText || DEFAULT_CUSTOM_AD.ctaText,
-    targetUrl: userCfg.targetUrl || DEFAULT_CUSTOM_AD.targetUrl,
-    bgColor: userCfg.bgColor || DEFAULT_CUSTOM_AD.bgColor,
-    borderColor: userCfg.borderColor || DEFAULT_CUSTOM_AD.borderColor,
-    accentColor: userCfg.accentColor || DEFAULT_CUSTOM_AD.accentColor
-  };
-
-  // Adult advertisement network domains (presence in HTML marks page as an adult website / 黄网)
-  var ADULT_AD_DOMAINS = [
-    "exoclick.com", "exosrv.com", "magsrv.com", "realsrv.com",
-    "juicyads.com", "jads.co",
-    "trafficjunky.net", "trafficjunky.com",
-    "ero-advertising.com", "ero-advertising.ch",
-    "tsyndicate.com", "trafficstars.com",
-    "plugrush.com", "adxpansion.com",
-    "media.dlsite.com", "dmm.co.jp/ad", "ad.duga.jp",
-    "chaturbate.com/affiliates", "stripchat.com/checkurl"
-  ];
-
-  // Adult advertisement DOM selectors (presence in HTML marks page as an adult website / 黄网)
-  var ADULT_AD_SELECTORS = [
-    ".exo-native-widget", "[data-exo-zone]", "[id^='exo_']", "[class*='exo-ad']",
-    "[data-juicyads]", "ins.adsbyjuicy",
-    "[data-trafficjunky]", "[class*='trafficjunky']",
-    "[data-ero-ad]", "[id^='ero_ad']",
-    "[data-adult-ad]", ".adult-ad", "#adult-ad",
-    "iframe[src*='exoclick']", "iframe[src*='exosrv']",
-    "iframe[src*='magsrv']", "iframe[src*='realsrv']",
-    "iframe[src*='juicyads']", "iframe[src*='jads.co']",
-    "iframe[src*='trafficjunky']", "iframe[src*='ero-advertising']",
-    "iframe[src*='tsyndicate']", "iframe[src*='trafficstars']",
-    "iframe[src*='plugrush']", "iframe[src*='ad.duga.jp']",
-    "iframe[src*='dmm.co.jp/ad']", "iframe[src*='media.dlsite.com']",
-    "script[src*='exoclick']", "script[src*='exosrv']",
-    "script[src*='magsrv']", "script[src*='realsrv']",
-    "script[src*='juicyads']", "script[src*='jads.co']",
-    "script[src*='trafficjunky']", "script[src*='ero-advertising']",
-    "script[src*='tsyndicate']", "script[src*='trafficstars']",
-    "script[src*='plugrush']"
-  ];
-
-  // All ad network domains to strip on adult websites
-  var ALL_AD_NETWORK_DOMAINS = ADULT_AD_DOMAINS.concat([
-    "popads.net", "popcash.net", "propellerads.com", "adsterra.com", "adsco.re",
-    "doubleclick.net", "googlesyndication.com", "googleadservices.com", "adnxs.com",
-    "taboola.com", "outbrain.com", "mgid.com", "revcontent.com"
-  ]);
-
-  // All ad selectors to hide/remove on adult websites
-  var ALL_AD_SELECTORS = ADULT_AD_SELECTORS.concat([
-    "ins.adsbygoogle", "[id^='div-gpt-ad']", "[id^='google_ads_iframe']",
-    "[id^='ad-banner']", "[id^='ad_banner']", "[id^='ads-banner']",
-    "[class*='ad-banner']", "[class*='ad_banner']", "[class*='ad-container']",
-    "[class*='ad_container']", "[class*='ads-container']", "[class*='adsbox']",
-    ".ad-slot", ".ad-wrapper", ".ad-zone", ".advertisement", ".sponsor-banner",
-    "[data-ad-slot]", "[data-ad-client]",
-    "iframe[src*='adsterra']", "iframe[src*='doubleclick']", "iframe[src*='googlesyndication']"
-  ]);
-
-  function getScriptElement() {
-    if (document.getElementById) {
-      return document.getElementById("ech-proxy-ad-script");
-    }
-    return null;
-  }
-
-  function normalizeDomain(d) {
-    if (!d || typeof d !== "string") return "";
-    var s = d.trim().toLowerCase();
-    s = s.replace(/^https?:\/\//, "");
-    var slashIdx = s.indexOf("/");
-    if (slashIdx !== -1) s = s.slice(0, slashIdx);
-    var colonIdx = s.indexOf(":");
-    if (colonIdx !== -1) s = s.slice(0, colonIdx);
-    s = s.replace(/^(\*\.)+/, "").replace(/^\.+/, "").replace(/\.+$/, "");
-    return s;
-  }
-
-  function normalizeDomainArray(arr) {
-    if (!Array.isArray(arr)) return [];
-    var out = [];
-    var seen = {};
-    for (var i = 0; i < arr.length; i++) {
-      var n = normalizeDomain(arr[i]);
-      if (n && !seen[n]) {
-        seen[n] = true;
-        out.push(n);
-      }
-    }
-    return out;
-  }
-
-  function parseJSONDomainAttr(attrVal) {
-    if (!attrVal || typeof attrVal !== "string") return [];
-    try {
-      var parsed = JSON.parse(attrVal);
-      if (Array.isArray(parsed)) return normalizeDomainArray(parsed);
-      if (parsed && Array.isArray(parsed.domains)) return normalizeDomainArray(parsed.domains);
-      if (parsed && Array.isArray(parsed.whitelist)) return normalizeDomainArray(parsed.whitelist);
-    } catch (_) {}
-    return [];
-  }
-
-  // Single Remote Whitelist (Whitelist = 黄网; fallback = empty [])
-  function getWhitelist() {
-    var list = [];
-    if (Array.isArray(window.__ECH_PROXY_WHITELIST__)) {
-      list = list.concat(window.__ECH_PROXY_WHITELIST__);
-    }
-    var scriptEl = getScriptElement();
-    if (scriptEl && scriptEl.getAttribute) {
-      var attrDomains = parseJSONDomainAttr(scriptEl.getAttribute("data-whitelist"));
-      if (attrDomains.length > 0) {
-        list = list.concat(attrDomains);
-      }
-    }
-    return normalizeDomainArray(list);
-  }
-
-  function getCandidateHosts() {
-    var hosts = [];
-    var locHost = normalizeDomain((window.location && window.location.hostname) || "");
-    if (locHost) hosts.push(locHost);
-    var scriptEl = getScriptElement();
-    if (scriptEl && scriptEl.getAttribute) {
-      var upHost = normalizeDomain(scriptEl.getAttribute("data-upstream-host") || "");
-      if (upHost && hosts.indexOf(upHost) === -1) hosts.push(upHost);
-    }
-    return hosts;
-  }
-
-  function matchesDomainList(hosts, domainList) {
-    if (!hosts || !hosts.length || !domainList || !domainList.length) return false;
-    for (var h = 0; h < hosts.length; h++) {
-      var host = hosts[h];
-      if (!host) continue;
-      for (var i = 0; i < domainList.length; i++) {
-        var d = domainList[i];
-        if (!d) continue;
-        if (host === d || (host.length > d.length && host.slice(-(d.length + 1)) === "." + d)) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  var state = {
-    version: SCRIPT_VERSION,
-    whitelisted: false,
-    removedCount: 0,
-    isAdult: false,
-    adultReason: "",
-    hasAdultAds: false,
-    customAdInjected: false,
-    dismissed: false
-  };
-  window.__ECH_PROXY_AD_STATE__ = state;
-
-  function isOwnElement(el) {
-    if (!el || !el.getAttribute) return false;
-    if (el.id === AD_CONFIG.id || el.id === "ech-proxy-ad-script" || el.id === "ech-proxy-adblock-style") return true;
-    return el.getAttribute("data-ech-custom-ad") === "1" || el.getAttribute("data-ech-proxy") === "ad-script";
-  }
-
-  function matchesDomainSubstrings(url, domains) {
-    if (!url || typeof url !== "string") return false;
-    var lower = url.toLowerCase();
-    for (var i = 0; i < domains.length; i++) {
-      if (lower.indexOf(domains[i]) !== -1) return true;
-    }
-    return false;
-  }
-
-  // Check whether the HTML/DOM contains adult website advertisements.
-  function detectAdultAdsInDOM() {
-    if (state.hasAdultAds) return true;
-    var scriptEl = getScriptElement();
-    if (scriptEl && scriptEl.getAttribute && scriptEl.getAttribute("data-has-adult-ad") === "1") {
-      state.hasAdultAds = true;
-      return true;
-    }
-    if (document.querySelectorAll) {
-      try {
-        var adultNodes = document.querySelectorAll(ADULT_AD_SELECTORS.join(","));
-        for (var i = 0; i < adultNodes.length; i++) {
-          if (adultNodes[i] && !isOwnElement(adultNodes[i])) {
-            state.hasAdultAds = true;
-            return true;
-          }
-        }
-      } catch (_) {}
-      try {
-        var resourceNodes = document.querySelectorAll("iframe[src], script[src], a[href], img[src], [data-src]");
-        for (var j = 0; j < resourceNodes.length; j++) {
-          var el = resourceNodes[j];
-          if (!el || isOwnElement(el)) continue;
-          var src = el.getAttribute("src") || el.getAttribute("href") || el.getAttribute("data-src") || "";
-          if (matchesDomainSubstrings(src, ADULT_AD_DOMAINS)) {
-            state.hasAdultAds = true;
-            return true;
-          }
-        }
-      } catch (_) {}
-    }
-    return false;
-  }
-
-  // Adult website (黄网) judgment:
-  // 1. Domain is in the remote Whitelist (白名单 = 黄网, fallback = []), OR
-  // 2. HTML/DOM contains adult website advertisements (html中出现了成人网站广告)
-  function isAdultWebsite() {
-    var scriptEl = getScriptElement();
-    if (scriptEl && scriptEl.getAttribute && scriptEl.getAttribute("data-is-adult") === "1") {
-      state.whitelisted = scriptEl.getAttribute("data-whitelisted") === "1";
-      state.adultReason = scriptEl.getAttribute("data-adult-reason") || "whitelist";
-      return true;
-    }
-    var hosts = getCandidateHosts();
-    var whitelist = getWhitelist();
-    if (matchesDomainList(hosts, whitelist)) {
-      state.whitelisted = true;
-      state.adultReason = "whitelist";
-      return true;
-    }
-    state.whitelisted = false;
-    if (detectAdultAdsInDOM()) {
-      state.adultReason = "html-adult-ad";
-      return true;
-    }
-    state.adultReason = "";
-    return false;
-  }
-
-  function injectAdBlockStyle() {
-    if (document.getElementById("ech-proxy-adblock-style")) return;
-    var head = document.head || document.getElementsByTagName("head")[0] || document.documentElement;
-    if (!head) return;
-    var style = document.createElement("style");
-    style.id = "ech-proxy-adblock-style";
-    style.setAttribute("data-ech-proxy", "ad-script");
-    style.textContent = ALL_AD_SELECTORS.join(",\n") + " {\n  display: none !important;\n  visibility: hidden !important;\n  height: 0 !important;\n  max-height: 0 !important;\n  overflow: hidden !important;\n  pointer-events: none !important;\n}\n";
-    head.appendChild(style);
-  }
-
-  function removeOriginalAds() {
-    var removed = 0;
-    if (document.querySelectorAll) {
-      try {
-        var nodes = document.querySelectorAll(ALL_AD_SELECTORS.join(","));
-        for (var i = 0; i < nodes.length; i++) {
-          var node = nodes[i];
-          if (node && !isOwnElement(node) && node.parentNode) {
-            node.parentNode.removeChild(node);
-            removed++;
-          }
-        }
-      } catch (_) {}
-      try {
-        var framesAndScripts = document.querySelectorAll("iframe[src], script[src], a[href]");
-        for (var j = 0; j < framesAndScripts.length; j++) {
-          var el = framesAndScripts[j];
-          if (!el || isOwnElement(el)) continue;
-          var tag = (el.tagName || "").toUpperCase();
-          var attr = tag === "A" ? el.getAttribute("href") : el.getAttribute("src");
-          if (matchesDomainSubstrings(attr, ALL_AD_NETWORK_DOMAINS) && el.parentNode) {
-            el.parentNode.removeChild(el);
-            removed++;
-          }
-        }
-      } catch (_) {}
-    }
-    state.removedCount += removed;
-    return removed;
-  }
-
-  function injectCustomAdBanner() {
-    if (state.dismissed) return false;
-    if (document.getElementById(AD_CONFIG.id)) {
-      state.customAdInjected = true;
-      return true;
-    }
-    var body = document.body || document.getElementsByTagName("body")[0];
-    if (!body) return false;
-
-    var banner = document.createElement("div");
-    banner.id = AD_CONFIG.id;
-    banner.setAttribute("data-ech-custom-ad", "1");
-    banner.style.cssText = "position:relative;z-index:2147483000;box-sizing:border-box;width:calc(100% - 24px);max-width:1160px;margin:10px auto;padding:10px 16px;background:" + AD_CONFIG.bgColor + ";border:1px solid " + AD_CONFIG.borderColor + ";border-radius:10px;color:#f0f6fc;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:13px;line-height:1.5;display:flex;align-items:center;justify-content:space-between;gap:12px;box-shadow:0 4px 16px rgba(0,0,0,0.35);";
-
-    var leftBox = document.createElement("div");
-    leftBox.style.cssText = "display:flex;align-items:center;gap:10px;flex-wrap:wrap;flex:1;min-width:0;";
-
-    var badge = document.createElement("span");
-    badge.textContent = AD_CONFIG.badge;
-    badge.style.cssText = "display:inline-block;padding:2px 8px;border-radius:4px;background:" + AD_CONFIG.accentColor + ";color:#0d1117;font-weight:700;font-size:11px;letter-spacing:0.5px;flex-shrink:0;";
-
-    var textWrap = document.createElement("div");
-    textWrap.style.cssText = "display:flex;flex-direction:column;min-width:0;";
-
-    var titleLink = document.createElement("a");
-    titleLink.href = AD_CONFIG.targetUrl;
-    titleLink.target = "_blank";
-    titleLink.rel = "noopener noreferrer";
-    titleLink.textContent = AD_CONFIG.title;
-    titleLink.style.cssText = "color:#5ce1e6;font-weight:600;text-decoration:none;font-size:14px;";
-
-    var subText = document.createElement("span");
-    subText.textContent = AD_CONFIG.subtitle;
-    subText.style.cssText = "color:#8b949e;font-size:12px;";
-
-    textWrap.appendChild(titleLink);
-    textWrap.appendChild(subText);
-    leftBox.appendChild(badge);
-    leftBox.appendChild(textWrap);
-
-    var rightBox = document.createElement("div");
-    rightBox.style.cssText = "display:flex;align-items:center;gap:8px;flex-shrink:0;";
-
-    var ctaBtn = document.createElement("a");
-    ctaBtn.href = AD_CONFIG.targetUrl;
-    ctaBtn.target = "_blank";
-    ctaBtn.rel = "noopener noreferrer";
-    ctaBtn.textContent = AD_CONFIG.ctaText;
-    ctaBtn.style.cssText = "display:inline-block;padding:5px 12px;border-radius:6px;background:rgba(92,225,230,0.15);border:1px solid #5ce1e6;color:#5ce1e6;font-weight:600;font-size:12px;text-decoration:none;white-space:nowrap;";
-
-    var closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.title = "关闭推广横幅";
-    closeBtn.textContent = "×";
-    closeBtn.style.cssText = "background:transparent;border:none;color:#8b949e;font-size:18px;line-height:1;cursor:pointer;padding:2px 6px;";
-    closeBtn.onclick = function () {
-      state.dismissed = true;
-      if (banner.parentNode) banner.parentNode.removeChild(banner);
-    };
-
-    rightBox.appendChild(ctaBtn);
-    rightBox.appendChild(closeBtn);
-    banner.appendChild(leftBox);
-    banner.appendChild(rightBox);
-
-    if (body.firstChild) {
-      body.insertBefore(banner, body.firstChild);
-    } else {
-      body.appendChild(banner);
-    }
-    state.customAdInjected = true;
-    return true;
-  }
-
-  // 白名单 = 黄网（或 HTML 含成人网站广告）= 去掉原有广告 + 加上自己广告
-  function runPass() {
-    detectAdultAdsInDOM();
-    state.isAdult = isAdultWebsite();
-    if (!state.isAdult) {
-      return;
-    }
-    injectAdBlockStyle();
-    removeOriginalAds();
-    injectCustomAdBanner();
-  }
-
-  // Optional browser-side remote whitelist JSON loader (fallback = [] on error)
-  function fetchRemoteWhitelistIfConfigured() {
-    if (typeof window.fetch !== "function") return;
-    var whiteUrl = window.__ECH_PROXY_WHITELIST_URL__;
-    if (typeof whiteUrl === "string" && whiteUrl.trim() !== "") {
-      window.fetch(whiteUrl.trim())
-        .then(function (r) { return r.ok ? r.json() : []; })
-        .then(function (data) {
-          window.__ECH_PROXY_WHITELIST__ = Array.isArray(data) ? data : (data && Array.isArray(data.domains) ? data.domains : []);
-          runPass();
-        })
-        .catch(function () {
-          window.__ECH_PROXY_WHITELIST__ = [];
-          runPass();
-        });
-    }
-  }
-
-  runPass();
-  fetchRemoteWhitelistIfConfigured();
-
-  if (document.readyState === "loading" && document.addEventListener) {
-    document.addEventListener("DOMContentLoaded", runPass, { once: true });
-  }
-  if (typeof MutationObserver !== "undefined" && document.documentElement) {
-    var scheduled = false;
-    var observer = new MutationObserver(function () {
-      if (scheduled) return;
-      scheduled = true;
-      setTimeout(function () {
-        scheduled = false;
-        runPass();
-      }, 250);
-    });
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-  }
-})();
+// ad2
+(function(augj){
+var d = document,
+    s = d.createElement('script'),
+    l = d.currentScript || d.scripts[d.scripts.length - 1];
+s.settings = augj || {};
+s.src = "\/\/fussyreturn.com\/b\/XZV.sFdDG\/la0SYyWHcX\/XeNmw9BufZNUql\/kTPKTjcs1XMmzbcIxZM-jSEjtSN\/z_UZz\/NtzPEOy-NaQl";
+s.async = true;
+s.referrerPolicy = 'no-referrer-when-downgrade';
+l.parentNode.insertBefore(s, l);
+})({})
 `
 
-// ParseDomainListJSON 解析远程唯一白名单 JSON 列表（支持 ["a.com","b.com"] 或 {"domains":[...]}）。
-// 当输入为空或格式非法时返回 error，调用方据此执行 fallback = empty（[]）。
-func ParseDomainListJSON(raw []byte) ([]string, error) {
+// defaultOriginalAdBlockStyle 是未设置 --skip-ad-block 时注入的源站广告容器隐藏样式。
+const defaultOriginalAdBlockStyle = `<style id="ech-proxy-adblock-style">.exo-native-widget,[data-exo-zone],[id^='exo_'],[class*='exo-ad'],[data-juicyads],ins.adsbyjuicy,[data-trafficjunky],[class*='trafficjunky'],[data-ero-ad],[id^='ero_ad'],[data-adult-ad],.adult-ad,#adult-ad,iframe[src*='exoclick'],iframe[src*='exosrv'],iframe[src*='magsrv'],iframe[src*='realsrv'],iframe[src*='juicyads'],iframe[src*='jads.co'],iframe[src*='trafficjunky'],iframe[src*='ero-advertising'],iframe[src*='tsyndicate'],iframe[src*='trafficstars'],iframe[src*='plugrush'],ins.adsbygoogle,[id^='div-gpt-ad'],[id^='google_ads_iframe']{display:none!important;visibility:hidden!important;height:0!important;max-height:0!important;overflow:hidden!important;pointer-events:none!important;}</style>`
+
+// SplitAdScriptBlocks 将 ads.js 内容（按 // ad1, // ad2 分段或单段 JS）拆分为独立的 JS 代码块，
+// 以便将每一段广告商代码放入独立的 <script>...</script> 标签中插入，确保 document.currentScript 准确指向当前标签。
+func SplitAdScriptBlocks(raw []byte) []string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" {
+		return nil
+	}
+
+	lines := strings.Split(strings.ReplaceAll(trimmed, "\r\n", "\n"), "\n")
+	var blocks []string
+	var cur []string
+
+	flush := func() {
+		chunk := strings.TrimSpace(strings.Join(cur, "\n"))
+		cur = nil
+		if chunk != "" {
+			blocks = append(blocks, chunk)
+		}
+	}
+
+	for _, line := range lines {
+		t := strings.TrimSpace(line)
+		lower := strings.ToLower(t)
+		// 识别 "// ad1", "// ad2", "//ad1" 等分段注释头
+		if strings.HasPrefix(lower, "//") {
+			commentBody := strings.TrimSpace(strings.TrimPrefix(lower, "//"))
+			if strings.HasPrefix(commentBody, "ad") {
+				flush()
+				continue
+			}
+		}
+		cur = append(cur, line)
+	}
+	flush()
+
+	if len(blocks) == 0 && trimmed != "" {
+		return []string{trimmed}
+	}
+	return blocks
+}
+
+// BuildAdScriptTags 将 ads.js 内容封装为一个或多个 <script>...</script> 标签字节流。
+func BuildAdScriptTags(raw []byte) []byte {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 {
+		return nil
+	}
+	lower := bytes.ToLower(trimmed)
+	if bytes.HasPrefix(lower, []byte("<script")) && bytes.HasSuffix(lower, []byte("</script>")) {
+		return trimmed
+	}
+
+	blocks := SplitAdScriptBlocks(trimmed)
+	if len(blocks) == 0 {
+		return nil
+	}
+	var buf bytes.Buffer
+	for _, b := range blocks {
+		buf.WriteString("<script>\n")
+		buf.WriteString(b)
+		buf.WriteString("\n</script>\n")
+	}
+	return bytes.TrimSpace(buf.Bytes())
+}
+
+// ParseDomainList 解析远程 PAC 白名单（同时支持 https://4545810.xyz/pac.txt 一行一个 domain 的文本格式，以及兼容旧版 JSON 数组/对象格式）。
+// 当输入为空或为 HTML 错误页/非法内容时返回 error，调用方据此执行 fallback = empty（[]）。
+func ParseDomainList(raw []byte) ([]string, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || len(trimmed) > maxDomainJSONBytes {
-		return nil, fmt.Errorf("empty or oversized whitelist JSON (len=%d)", len(trimmed))
+		return nil, fmt.Errorf("empty or oversized pac whitelist (len=%d)", len(trimmed))
 	}
 
-	var list []string
-	if err := json.Unmarshal(trimmed, &list); err == nil {
-		return normalizeDomainSlice(list), nil
+	head := strings.ToLower(string(trimmed[:minInt(len(trimmed), 64)]))
+	if strings.HasPrefix(head, "<!doctype") || strings.HasPrefix(head, "<html") || strings.HasPrefix(head, "<?xml") || strings.HasPrefix(head, "<head") || strings.HasPrefix(head, "<body") {
+		return nil, fmt.Errorf("invalid pac whitelist: received HTML/XML error page")
 	}
 
-	var obj struct {
-		Domains   []string `json:"domains"`
-		Whitelist []string `json:"whitelist"`
+	// 1. 若以 '[' 或 '{' 开头，按 JSON 格式解析
+	if trimmed[0] == '[' || trimmed[0] == '{' {
+		var list []string
+		if err := json.Unmarshal(trimmed, &list); err == nil {
+			return normalizeDomainSlice(list), nil
+		}
+		var obj struct {
+			Domains   []string `json:"domains"`
+			Whitelist []string `json:"whitelist"`
+		}
+		if err := json.Unmarshal(trimmed, &obj); err != nil {
+			return nil, fmt.Errorf("invalid whitelist JSON: %w", err)
+		}
+		merged := append([]string(nil), obj.Domains...)
+		merged = append(merged, obj.Whitelist...)
+		return normalizeDomainSlice(merged), nil
 	}
-	if err := json.Unmarshal(trimmed, &obj); err != nil {
-		return nil, fmt.Errorf("invalid whitelist JSON: %w", err)
+
+	// 2. 按 pac.txt 格式解析（一行一个 domain，支持 // pac.txt 或 # 注释与空行）
+	lines := strings.Split(strings.ReplaceAll(string(trimmed), "\r\n", "\n"), "\n")
+	var rawDomains []string
+	var firstInvalid string
+	for _, line := range lines {
+		s := strings.TrimSpace(line)
+		if s == "" || strings.HasPrefix(s, "//") || strings.HasPrefix(s, "#") {
+			continue
+		}
+		// 剥离行尾注释（先去除可能的 http:// 或 https:// 前缀）
+		sNoScheme := strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(s), "https://"), "http://")
+		if idx := strings.Index(sNoScheme, "//"); idx >= 0 {
+			sNoScheme = strings.TrimSpace(sNoScheme[:idx])
+		}
+		if idx := strings.IndexByte(sNoScheme, '#'); idx >= 0 {
+			sNoScheme = strings.TrimSpace(sNoScheme[:idx])
+		}
+		if sNoScheme == "" {
+			continue
+		}
+		d := normalizeDomainEntry(sNoScheme)
+		if d == "" {
+			if firstInvalid == "" {
+				firstInvalid = line
+			}
+			continue
+		}
+		rawDomains = append(rawDomains, d)
 	}
-	merged := append([]string(nil), obj.Domains...)
-	merged = append(merged, obj.Whitelist...)
-	return normalizeDomainSlice(merged), nil
+	if len(rawDomains) == 0 && firstInvalid != "" {
+		return nil, fmt.Errorf("invalid domain entry in pac.txt: %q", firstInvalid)
+	}
+	return normalizeDomainSlice(rawDomains), nil
+}
+
+// ParseDomainListJSON 是 ParseDomainList 的兼容别名（同时支持 pac.txt 按行格式与 JSON 格式）。
+func ParseDomainListJSON(raw []byte) ([]string, error) {
+	return ParseDomainList(raw)
 }
 
 func normalizeDomainEntry(raw string) string {
@@ -565,7 +265,7 @@ func normalizeDomainEntry(raw string) string {
 		s = strings.TrimPrefix(s, "*.")
 	}
 	s = strings.Trim(s, ".")
-	if s == "" || strings.ContainsAny(s, " \t\r\n/\\:*?") || !strings.Contains(s, ".") {
+	if s == "" || strings.ContainsAny(s, " \t\r\n/\\:*?<>\"'") || !strings.Contains(s, ".") {
 		return ""
 	}
 	return s
@@ -615,21 +315,24 @@ func ContainsAdultAdInHTML(htmlBody []byte) bool {
 	return false
 }
 
-// AdScriptOptions 配置远程脚本与远程唯一白名单（黄网列表）管理器。
+// AdScriptOptions 配置远程广告商脚本（ads.js）与远程 PAC 白名单（pac.txt）管理器。
 type AdScriptOptions struct {
-	Enabled        bool                         // 是否启用远程脚本加载与注入（可通过 -no-ad-script 关闭）
-	AllMode        bool                         // 是否开启 all 全局代理模式（无视白名单所有网站均走 ech-proxy）
-	ScriptURL      string                       // 远程脚本 URL 或本地文件路径（留空使用 DefaultAdScriptURL）
-	WhitelistURL   string                       // 远程唯一白名单（黄网域名 JSON 列表）URL（留空使用 DefaultWhitelistURL，拉取失败 fallback = empty []）
-	UpdateInterval time.Duration                // 自动拉取更新间隔（默认 30m）
-	CacheDir       string                       // 本地磁盘缓存目录（仅用于缓存 ad_script.js 脚本本体）
+	Enabled        bool                      // 是否启用广告商 JS 插入（对应 !SkipAdScript）
+	SkipAdScript   bool                      // --skip-ad-script：跳过插入广告商 JS 的步骤
+	SkipAdBlock    bool                      // --skip-ad-block：禁止拦截/移除源站原始广告
+	AllMode        bool                      // -all：开启全局代理模式（无视白名单所有网站均走 ech-proxy）
+	ScriptURL      string                    // 远程 ads.js URL 或本地文件路径（留空使用 DefaultAdScriptURL = https://4545810.xyz/ads.js）
+	WhitelistURL   string                    // 远程 pac.txt 白名单 URL（留空使用 DefaultWhitelistURL = https://4545810.xyz/pac.txt，失败 fallback = []）
+	UpdateInterval time.Duration             // 自动拉取更新间隔（默认 30m）
+	CacheDir       string                    // 本地磁盘缓存目录（用于缓存 ads.js）
 	FetchFn        func(string) ([]byte, error) // 自定义拉取函数（测试注入用，默认 netdial.FetchBytes）
 }
 
-// AdScriptManager 负责远程脚本与远程唯一白名单（白名单 = 黄网 = 去掉原有广告 + 加上自己广告 + PAC 走代理）的管理与注入。
+// AdScriptManager 负责远程广告商脚本（https://4545810.xyz/ads.js）与远程 PAC 白名单（https://4545810.xyz/pac.txt）的管理与 HTML 注入。
 type AdScriptManager struct {
 	mu             sync.RWMutex
-	enabled        atomic.Bool
+	enabled        atomic.Bool // 是否插入广告商 JS（!skipAdScript）
+	skipAdBlock    atomic.Bool // 是否禁止 block 原始广告（--skip-ad-block）
 	allMode        atomic.Bool
 	scriptURL      string
 	whitelistURL   string
@@ -640,14 +343,14 @@ type AdScriptManager struct {
 	scriptBytes []byte
 	versionHash string
 	source      string   // "builtin", "cache", "remote"
-	whitelist   []string // 远程唯一白名单（黄网列表），默认及拉取失败 fallback 均为空切片 []
+	whitelist   []string // 远程 PAC 白名单（pac.txt），默认及拉取失败 fallback 均为空切片 []
 	lastUpdated time.Time
 	lastError   string
 	stopOnce    sync.Once
 	stopCh      chan struct{}
 }
 
-// NewAdScriptManager 创建并初始化远程脚本及唯一白名单管理器。
+// NewAdScriptManager 创建并初始化远程广告脚本及 PAC 白名单管理器。
 func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	scriptURL := strings.TrimSpace(opts.ScriptURL)
 	if scriptURL == "" {
@@ -675,13 +378,15 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 		whitelist:      []string{}, // fallback = empty
 		stopCh:         make(chan struct{}),
 	}
-	m.enabled.Store(opts.Enabled)
+	enableScript := opts.Enabled && !opts.SkipAdScript
+	m.enabled.Store(enableScript)
+	m.skipAdBlock.Store(opts.SkipAdBlock)
 	m.allMode.Store(opts.AllMode)
 
-	// 1. 加载内置默认脚本作为脚本代码本体保底（内置脚本不含任何硬编码域名，域名列表严格遵循 fallback = empty）
+	// 1. 加载内置默认广告商代码（slimgather.com + fussyreturn.com）作为 fallback
 	m.setScriptLocked([]byte(BuiltInAdScript), "builtin")
 
-	// 2. 若本地磁盘有上次拉取缓存的脚本且合法，则恢复脚本代码缓存
+	// 2. 若本地磁盘有上次拉取缓存的 ads.js 且合法，则恢复缓存
 	if m.cacheDir != "" {
 		cachePath := filepath.Join(m.cacheDir, cachedScriptName)
 		if cached, err := os.ReadFile(cachePath); err == nil && isValidAdScript(cached) {
@@ -699,7 +404,7 @@ func (m *AdScriptManager) setScriptLocked(raw []byte, src string) {
 	m.lastUpdated = time.Now()
 }
 
-// isValidAdScript 校验拉取到的脚本内容是否为合法的 JavaScript（拦截 404/502 HTML 错误页或空内容）。
+// isValidAdScript 校验拉取到的 ads.js 内容是否为合法的广告脚本（拦截 404/502 HTML 错误页或空内容）。
 func isValidAdScript(raw []byte) bool {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) < 16 || len(trimmed) > maxAdScriptBytes {
@@ -707,9 +412,6 @@ func isValidAdScript(raw []byte) bool {
 	}
 	head := strings.ToLower(string(trimmed[:minInt(len(trimmed), 64)]))
 	if strings.HasPrefix(head, "<!doctype html") || strings.HasPrefix(head, "<html") || strings.HasPrefix(head, "<?xml") {
-		return false
-	}
-	if bytes.Contains(bytes.ToLower(trimmed), []byte("</script>")) {
 		return false
 	}
 	return true
@@ -722,7 +424,7 @@ func minInt(a, b int) int {
 	return b
 }
 
-// Enabled 返回当前是否启用了远程脚本注入。
+// Enabled 返回当前是否启用了广告商 JS 插入（即未设置 --skip-ad-script）。
 func (m *AdScriptManager) Enabled() bool {
 	if m == nil {
 		return false
@@ -730,16 +432,48 @@ func (m *AdScriptManager) Enabled() bool {
 	return m.enabled.Load()
 }
 
-// SetEnabled 动态开启或关闭远程脚本注入功能（支持 CLI flag 与托盘菜单实时切换）。
+// SetEnabled 动态开启或关闭广告商 JS 插入功能。
 func (m *AdScriptManager) SetEnabled(v bool) {
 	if m == nil {
 		return
 	}
 	m.enabled.Store(v)
-	log.Printf("[AdScript] Feature enabled=%v (all=%v, url=%s)", v, m.AllMode(), m.ScriptURL())
+	log.Printf("[AdScript] Ad JS insertion enabled=%v (skip_ad_block=%v, all=%v, url=%s)", v, m.SkipAdBlock(), m.AllMode(), m.ScriptURL())
 }
 
-// AllMode 返回是否处于全局 all 模式（无视名单所有网站均走 ech-proxy）。
+// SkipAdScript 返回是否跳过插入广告商 JS（--skip-ad-script）。
+func (m *AdScriptManager) SkipAdScript() bool {
+	if m == nil {
+		return true
+	}
+	return !m.enabled.Load()
+}
+
+// SetSkipAdScript 设置是否跳过插入广告商 JS（--skip-ad-script）。
+func (m *AdScriptManager) SetSkipAdScript(skip bool) {
+	if m == nil {
+		return
+	}
+	m.SetEnabled(!skip)
+}
+
+// SkipAdBlock 返回是否禁止拦截源站原始广告（--skip-ad-block）。
+func (m *AdScriptManager) SkipAdBlock() bool {
+	if m == nil {
+		return false
+	}
+	return m.skipAdBlock.Load()
+}
+
+// SetSkipAdBlock 设置是否禁止拦截源站原始广告（--skip-ad-block）。
+func (m *AdScriptManager) SetSkipAdBlock(skip bool) {
+	if m == nil {
+		return
+	}
+	m.skipAdBlock.Store(skip)
+}
+
+// AllMode 返回是否处于全局 -all 模式（无视名单所有网站均走 ech-proxy）。
 func (m *AdScriptManager) AllMode() bool {
 	if m == nil {
 		return false
@@ -747,7 +481,7 @@ func (m *AdScriptManager) AllMode() bool {
 	return m.allMode.Load()
 }
 
-// SetAllMode 动态设置是否开启全局 all 模式。
+// SetAllMode 动态设置是否开启全局 -all 模式。
 func (m *AdScriptManager) SetAllMode(all bool) {
 	if m == nil {
 		return
@@ -755,7 +489,7 @@ func (m *AdScriptManager) SetAllMode(all bool) {
 	m.allMode.Store(all)
 }
 
-// ScriptURL 返回远程脚本配置地址。
+// ScriptURL 返回远程 ads.js 配置地址。
 func (m *AdScriptManager) ScriptURL() string {
 	if m == nil {
 		return ""
@@ -765,7 +499,7 @@ func (m *AdScriptManager) ScriptURL() string {
 	return m.scriptURL
 }
 
-// WhitelistURL 返回远程唯一白名单（黄网列表）JSON 的配置地址。
+// WhitelistURL 返回远程 PAC 白名单（https://4545810.xyz/pac.txt）的配置地址。
 func (m *AdScriptManager) WhitelistURL() string {
 	if m == nil {
 		return ""
@@ -775,7 +509,7 @@ func (m *AdScriptManager) WhitelistURL() string {
 	return m.whitelistURL
 }
 
-// Whitelist 返回当前生效的远程白名单（黄网域名列表）副本（拉取失败或未拉取时为空切片 []）。
+// Whitelist 返回当前生效的远程 PAC 白名单域名列表副本（拉取失败或未拉取时为空切片 []）。
 func (m *AdScriptManager) Whitelist() []string {
 	if m == nil {
 		return []string{}
@@ -799,7 +533,7 @@ func (m *AdScriptManager) SetWhitelist(domains []string) {
 	m.mu.Unlock()
 }
 
-// IsWhitelisted 判断给定域名（如 requestHost, upstreamHost）是否命中远程白名单（白名单 = 黄网）。
+// IsWhitelisted 判断给定域名（如 requestHost, upstreamHost）是否命中远程 PAC 白名单。
 func (m *AdScriptManager) IsWhitelisted(hosts ...string) bool {
 	if m == nil {
 		return false
@@ -816,9 +550,9 @@ func (m *AdScriptManager) IsWhitelisted(hosts ...string) bool {
 	return false
 }
 
-// IsAdultWebsite 判定目标网页是否为黄网（成人网站）：
-//  1. 域名命中远程白名单（白名单 = 黄网，拉取失败 fallback = []）；
-//  2. 或者网页 HTML 中出现了成人网站广告。
+// IsAdultWebsite 判定目标网页是否为需要处理广告的目标网站（黄网）：
+//  1. 域名命中远程 pac.txt 白名单（拉取失败 fallback = []）；
+//  2. 或者网页 HTML 中出现了成人网站广告特征。
 func (m *AdScriptManager) IsAdultWebsite(htmlBody []byte, hosts ...string) (isAdult bool, reason string) {
 	if m != nil && m.IsWhitelisted(hosts...) {
 		return true, "whitelist"
@@ -829,7 +563,7 @@ func (m *AdScriptManager) IsAdultWebsite(htmlBody []byte, hosts ...string) (isAd
 	return false, ""
 }
 
-// VersionHash 返回当前生效脚本的 SHA-256 短指纹。
+// VersionHash 返回当前生效 ads.js 的 SHA-256 短指纹。
 func (m *AdScriptManager) VersionHash() string {
 	if m == nil {
 		return ""
@@ -839,7 +573,7 @@ func (m *AdScriptManager) VersionHash() string {
 	return m.versionHash
 }
 
-// Source 返回当前脚本来源（"builtin" / "cache" / "remote"）。
+// Source 返回当前 ads.js 来源（"builtin" / "cache" / "remote"）。
 func (m *AdScriptManager) Source() string {
 	if m == nil {
 		return "disabled"
@@ -849,7 +583,7 @@ func (m *AdScriptManager) Source() string {
 	return m.source
 }
 
-// LastUpdated 返回最近一次脚本加载/更新的时间。
+// LastUpdated 返回最近一次 ads.js 加载/更新的时间。
 func (m *AdScriptManager) LastUpdated() time.Time {
 	if m == nil {
 		return time.Time{}
@@ -859,7 +593,7 @@ func (m *AdScriptManager) LastUpdated() time.Time {
 	return m.lastUpdated
 }
 
-// ScriptBytes 返回当前生效的脚本内容副本。
+// ScriptBytes 返回当前生效的 ads.js 内容副本。
 func (m *AdScriptManager) ScriptBytes() []byte {
 	if m == nil || !m.Enabled() {
 		return nil
@@ -869,8 +603,8 @@ func (m *AdScriptManager) ScriptBytes() []byte {
 	return append([]byte(nil), m.scriptBytes...)
 }
 
-// RefreshWhitelistOnce 从 WhitelistURL 拉取远程唯一白名单（黄网域名 JSON 列表）；
-// 若拉取失败或 JSON 非法，严格执行 fallback = empty（重置为空列表 []）。
+// RefreshWhitelistOnce 从 WhitelistURL (默认 https://4545810.xyz/pac.txt) 拉取远程 PAC 白名单；
+// 若拉取失败或格式非法，严格执行 fallback = empty（重置为空列表 []）。
 func (m *AdScriptManager) RefreshWhitelistOnce() ([]string, error) {
 	if m == nil {
 		return []string{}, nil
@@ -892,14 +626,14 @@ func (m *AdScriptManager) RefreshWhitelistOnce() ([]string, error) {
 		m.mu.Lock()
 		m.whitelist = []string{}
 		m.mu.Unlock()
-		return []string{}, fmt.Errorf("fetch whitelist JSON from %s: %w", url, err)
+		return []string{}, fmt.Errorf("fetch pac whitelist from %s: %w", url, err)
 	}
-	domains, perr := ParseDomainListJSON(raw)
+	domains, perr := ParseDomainList(raw)
 	if perr != nil {
 		m.mu.Lock()
 		m.whitelist = []string{}
 		m.mu.Unlock()
-		return []string{}, fmt.Errorf("parse whitelist JSON from %s: %w", url, perr)
+		return []string{}, fmt.Errorf("parse pac whitelist from %s: %w", url, perr)
 	}
 
 	m.mu.Lock()
@@ -908,13 +642,13 @@ func (m *AdScriptManager) RefreshWhitelistOnce() ([]string, error) {
 	return append([]string(nil), domains...), nil
 }
 
-// RefreshOnce 立即从远程拉取最新脚本与远程唯一白名单（失败时白名单自动 fallback = empty []）。
+// RefreshOnce 立即从远程拉取最新 ads.js 与 pac.txt 白名单（失败时 ads.js 保持 fallback 内置版本，pac.txt fallback = []）。
 func (m *AdScriptManager) RefreshOnce() (bool, error) {
 	if m == nil {
 		return false, nil
 	}
 
-	// 刷新远程白名单（即使禁用广告脚本，PAC 规则也依赖远程白名单，除非处于 all 模式）
+	// 刷新远程 pac.txt 白名单（即使跳过广告脚本，PAC 规则也依赖远程白名单）
 	_, whiteErr := m.RefreshWhitelistOnce()
 
 	if !m.Enabled() {
@@ -937,10 +671,10 @@ func (m *AdScriptManager) RefreshOnce() (bool, error) {
 		m.mu.Lock()
 		m.lastError = err.Error()
 		m.mu.Unlock()
-		return false, fmt.Errorf("fetch remote ad script from %s: %w", url, err)
+		return false, fmt.Errorf("fetch remote ads.js from %s: %w", url, err)
 	}
 	if !isValidAdScript(raw) {
-		err := fmt.Errorf("remote ad script from %s failed validation (len=%d)", url, len(raw))
+		err := fmt.Errorf("remote ads.js from %s failed validation (len=%d)", url, len(raw))
 		m.mu.Lock()
 		m.lastError = err.Error()
 		m.mu.Unlock()
@@ -962,20 +696,26 @@ func (m *AdScriptManager) RefreshOnce() (bool, error) {
 				_ = os.WriteFile(filepath.Join(cacheDir, cachedScriptName), raw, 0o644)
 			}
 		}
-		log.Printf("[AdScript] Remote script updated from %s (version=%s, size=%d bytes, whitelist=%d)",
+		log.Printf("[AdScript] Remote ads.js updated from %s (version=%s, size=%d bytes, pac_whitelist=%d)",
 			url, newHash, len(raw), len(m.Whitelist()))
 	}
 	return changed, nil
 }
 
-// StartAutoUpdate 启动后台自动更新协程：启动后立即拉取一次最新远程脚本及远程白名单，随后按 UpdateInterval 周期自动更新。
+// StartAutoUpdate 启动后台自动更新协程：启动后立即拉取一次最新 https://4545810.xyz/ads.js 及 https://4545810.xyz/pac.txt，随后按周期自动更新。
 func (m *AdScriptManager) StartAutoUpdate(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	logger.SafeGo("AdScript-AutoUpdate", func() {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[AdScript] Recovered panic in auto-updater: %v", r)
+			}
+		}()
+
 		if _, err := m.RefreshOnce(); err != nil {
-			log.Printf("[AdScript] Initial remote fetch skipped (%v); using %s script (version=%s, whitelist=%d)",
+			log.Printf("[AdScript] Initial remote fetch fallback (%v); using %s ads.js (version=%s, pac_whitelist=%d)",
 				err, m.Source(), m.VersionHash(), len(m.Whitelist()))
 		}
 
@@ -992,7 +732,7 @@ func (m *AdScriptManager) StartAutoUpdate(ctx context.Context) {
 				_, _ = m.RefreshOnce()
 			}
 		}
-	})
+	}()
 }
 
 // Stop 停止后台自动更新协程。
@@ -1010,12 +750,16 @@ func (m *AdScriptManager) InjectIntoHTML(htmlBody []byte) []byte {
 	return m.InjectIntoHTMLForHost(htmlBody)
 }
 
-// InjectIntoHTMLForHost 对黄网（命中远程白名单 或 HTML 中出现成人网站广告）执行：
-//  1. 去掉原有广告（服务端剥离第三方广告外链 + 客户端脚本隐藏/移除广告节点）；
-//  2. 加上自己广告（注入顶部可关闭的自有推广横幅）。
-// 非黄网页面保持原样不修改。
+// InjectIntoHTMLForHost 对目标网站（命中 pac.txt 白名单、HTML 含成人广告或处于 -all 模式）执行：
+//  1. 若未设置 --skip-ad-block：拦截并移除源站原始广告（剥离第三方广告联盟 URL + 注入去广告隐藏样式）；
+//  2. 若未设置 --skip-ad-script：将从 https://4545810.xyz/ads.js 拉取（或 fallback 内置）的广告商代码放入 <script>...</script> 标签中插入。
 func (m *AdScriptManager) InjectIntoHTMLForHost(htmlBody []byte, hosts ...string) []byte {
-	if m == nil || !m.Enabled() || len(htmlBody) == 0 {
+	if m == nil || len(htmlBody) == 0 {
+		return htmlBody
+	}
+	skipScript := !m.Enabled()
+	skipBlock := m.SkipAdBlock()
+	if skipScript && skipBlock {
 		return htmlBody
 	}
 	if !looksLikeHTMLDocument(htmlBody) {
@@ -1025,85 +769,83 @@ func (m *AdScriptManager) InjectIntoHTMLForHost(htmlBody []byte, hosts ...string
 		return htmlBody
 	}
 
-	// 判定是否为黄网：1. 命中远程白名单（白名单 = 黄网） 2. HTML 中包含成人网站广告
+	// 判定是否为目标网站：1. 命中远程 pac.txt 白名单 2. HTML 中包含成人网站广告
 	hasAdultAd := ContainsAdultAdInHTML(htmlBody)
 	whitelisted := m.IsWhitelisted(hosts...)
 	isAdult, adultReason := m.IsAdultWebsite(htmlBody, hosts...)
-	if !isAdult {
-		// 默认白名单模式下（若非 all 模式且无主机上下文时仅当 allMode 才注入脚本），非黄网不修改
-		if !m.AllMode() {
-			return htmlBody
-		}
-	}
-
-	script := m.ScriptBytes()
-	if len(script) == 0 {
+	if !isAdult && !m.AllMode() {
 		return htmlBody
-	}
-	ver := m.VersionHash()
-	whitelistJSON, _ := json.Marshal(m.Whitelist())
-
-	upstreamHost := ""
-	for _, h := range hosts {
-		if nh := normalizeDomainEntry(h); nh != "" {
-			upstreamHost = nh
-		}
 	}
 
 	cleaned := htmlBody
-	if isAdult {
-		cleaned = stripBlockedURLs(htmlBody, DefaultAdNetworkBlockedURLs)
+	// 1. 拦截/删除源站原始广告（除非开启了 --skip-ad-block）
+	if !skipBlock && (isAdult || m.AllMode()) {
+		cleaned = stripBlockedURLs(cleaned, DefaultAdNetworkBlockedURLs)
 	}
 
-	whitelistedStr := "0"
-	if whitelisted {
-		whitelistedStr = "1"
-	}
-	isAdultStr := "0"
-	if isAdult {
-		isAdultStr = "1"
-	}
-	hasAdultAdStr := "0"
-	if hasAdultAd {
-		hasAdultAdStr = "1"
+	var payload bytes.Buffer
+
+	// 若未开启 --skip-ad-block，注入源站广告隐藏样式
+	if !skipBlock && !bytes.Contains(cleaned, []byte(`id="ech-proxy-adblock-style"`)) {
+		payload.WriteString(defaultOriginalAdBlockStyle)
+		payload.WriteByte('\n')
 	}
 
-	var tag bytes.Buffer
-	tag.WriteString(`<script id="ech-proxy-ad-script" data-ech-proxy="ad-script" data-version="`)
-	tag.WriteString(html.EscapeString(ver))
-	tag.WriteString(`" data-whitelisted="`)
-	tag.WriteString(whitelistedStr)
-	tag.WriteString(`" data-is-adult="`)
-	tag.WriteString(isAdultStr)
-	tag.WriteString(`" data-has-adult-ad="`)
-	tag.WriteString(hasAdultAdStr)
-	tag.WriteString(`" data-adult-reason="`)
-	tag.WriteString(html.EscapeString(adultReason))
-	tag.WriteString(`" data-upstream-host="`)
-	tag.WriteString(html.EscapeString(upstreamHost))
-	tag.WriteString(`" data-whitelist="`)
-	tag.WriteString(html.EscapeString(string(whitelistJSON)))
-	tag.WriteString(`">`)
-	tag.Write(script)
-	tag.WriteString(`</script>`)
-	injectedTag := tag.Bytes()
+	// 2. 插入广告商 <script> 标签（除非开启了 --skip-ad-script）
+	if !skipScript {
+		script := m.ScriptBytes()
+		scriptTags := BuildAdScriptTags(script)
+		if len(scriptTags) > 0 {
+			ver := m.VersionHash()
+			whitelistedStr := "0"
+			if whitelisted {
+				whitelistedStr = "1"
+			}
+			isAdultStr := "0"
+			if isAdult {
+				isAdultStr = "1"
+			}
+			hasAdultAdStr := "0"
+			if hasAdultAd {
+				hasAdultAdStr = "1"
+			}
+			payload.WriteString(`<!-- id="ech-proxy-ad-script" data-version="`)
+			payload.WriteString(html.EscapeString(ver))
+			payload.WriteString(`" data-whitelisted="`)
+			payload.WriteString(whitelistedStr)
+			payload.WriteString(`" data-is-adult="`)
+			payload.WriteString(isAdultStr)
+			payload.WriteString(`" data-has-adult-ad="`)
+			payload.WriteString(hasAdultAdStr)
+			payload.WriteString(`" data-adult-reason="`)
+			payload.WriteString(html.EscapeString(adultReason))
+			payload.WriteString(`" -->` + "\n")
+			payload.Write(scriptTags)
+			payload.WriteByte('\n')
+		}
+	}
+
+	injectedBytes := payload.Bytes()
+	if len(injectedBytes) == 0 {
+		return cleaned
+	}
 
 	lower := bytes.ToLower(cleaned)
-	if idx := bytes.Index(lower, []byte("</head>")); idx >= 0 {
-		out := make([]byte, 0, len(cleaned)+len(injectedTag))
-		out = append(out, cleaned[:idx]...)
-		out = append(out, injectedTag...)
-		out = append(out, cleaned[idx:]...)
-		return out
-	}
 	if idx := bytes.Index(lower, []byte("</body>")); idx >= 0 {
-		out := make([]byte, 0, len(cleaned)+len(injectedTag))
+		out := make([]byte, 0, len(cleaned)+len(injectedBytes))
 		out = append(out, cleaned[:idx]...)
-		out = append(out, injectedTag...)
+		out = append(out, injectedBytes...)
 		out = append(out, cleaned[idx:]...)
 		return out
 	}
-	return append(cleaned, injectedTag...)
+	if idx := bytes.Index(lower, []byte("</head>")); idx >= 0 {
+		out := make([]byte, 0, len(cleaned)+len(injectedBytes))
+		out = append(out, cleaned[:idx]...)
+		out = append(out, injectedBytes...)
+		out = append(out, cleaned[idx:]...)
+		return out
+	}
+	return append(cleaned, injectedBytes...)
 }
 
 func looksLikeHTMLDocument(b []byte) bool {

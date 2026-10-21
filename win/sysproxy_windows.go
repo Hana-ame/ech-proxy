@@ -3,7 +3,12 @@
 package main
 
 import (
+	"crypto/sha1"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/pem"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"syscall"
@@ -38,22 +43,7 @@ var (
 	procInternetSetOption = modwininet.NewProc("InternetSetOptionW")
 )
 
-// internetPerConnOption 对应 Win32 <wininet.h> INTERNET_PER_CONN_OPTIONW 结构体：
-//
-//	typedef struct {
-//	  DWORD dwOption;
-//	  union {
-//	    DWORD    dwValue;
-//	    LPWSTR   pszValue;
-//	    FILETIME ftValue; // 8 字节 (2 x DWORD)，4 字节对齐
-//	  } Value;
-//	} INTERNET_PER_CONN_OPTIONW;
-//
-// 关键跨架构对齐边界：
-//   - 在 32 位 Windows (386, ptrSize=4) 上：union Value 因含 FILETIME 固定为 8 字节（4 字节对齐），
-//     结构体总大小为 4 + 8 = 12 字节（[8/4]uintptr = [2]uintptr）。
-//   - 在 64 位 Windows (amd64, ptrSize=8) 上：union Value 因含 LPWSTR 为 8 字节（8 字节对齐），
-//     dwOption 后有 4 字节填充，结构体总大小为 4 + 4 + 8 = 16 字节（[8/8]uintptr = [1]uintptr）。
+// internetPerConnOption 对应 Win32 <wininet.h> INTERNET_PER_CONN_OPTIONW 结构体。
 type internetPerConnOption struct {
 	dwOption uint32
 	dwValue  [8 / ptrSize]uintptr
@@ -202,7 +192,6 @@ func notifyWinINetRefresh() {
 }
 
 // installCAOnPlatform 在 Windows 7~11 (32/64) 下调用 certutil 将本地 CA 导入受信任的根证书颁发机构。
-// 优先导入当前用户根证书库（-user，无需管理员权限即可弹窗确认安装），失败时回退尝试系统根证书库。
 func installCAOnPlatform(caPath string) error {
 	cmd := exec.Command("certutil", "-user", "-addstore", "Root", caPath)
 	out, err := cmd.CombinedOutput()
@@ -214,4 +203,57 @@ func installCAOnPlatform(caPath string) error {
 		return nil
 	}
 	return fmt.Errorf("certutil install failed: %w (%s)", err, strings.TrimSpace(string(out)))
+}
+
+// uninstallCAOnPlatform 在 Windows 7~11 (32/64) 下从当前用户及系统受信任的根证书颁发机构（Root）中卸载 ech-proxy 本地 CA 证书。
+func uninstallCAOnPlatform(caPath string) error {
+	var thumbprint string
+	if strings.TrimSpace(caPath) != "" {
+		if raw, err := os.ReadFile(caPath); err == nil {
+			if block, _ := pem.Decode(raw); block != nil {
+				if cert, perr := x509.ParseCertificate(block.Bytes); perr == nil {
+					sum := sha1.Sum(cert.Raw)
+					thumbprint = hex.EncodeToString(sum[:])
+				}
+			}
+		}
+	}
+
+	var succeeded bool
+	var lastErr error
+	var lastOut string
+
+	targets := []string{"ech-proxy local CA"}
+	if thumbprint != "" {
+		targets = append([]string{thumbprint}, targets...)
+	}
+
+	for _, id := range targets {
+		if out, err := exec.Command("certutil", "-user", "-delstore", "Root", id).CombinedOutput(); err == nil {
+			succeeded = true
+		} else {
+			lastErr = err
+			lastOut = strings.TrimSpace(string(out))
+		}
+		if _, err := exec.Command("certutil", "-delstore", "Root", id).CombinedOutput(); err == nil {
+			succeeded = true
+		}
+	}
+
+	if succeeded {
+		return nil
+	}
+	if lastErr != nil {
+		return fmt.Errorf("certutil uninstall failed: %w (%s)", lastErr, lastOut)
+	}
+	return nil
+}
+
+// scheduleWindowsDelayedMove 在进程即将退出时启动后台延迟替换命令，确保运行中的 .exe 退出后立即被 .new 覆盖。
+func scheduleWindowsDelayedMove(stagedPath, targetExePath, backupPath string) {
+	script := fmt.Sprintf(`ping 127.0.0.1 -n 2 > nul & move /Y "%s" "%s" > nul 2>&1 & del /F /Q "%s" > nul 2>&1`,
+		stagedPath, targetExePath, backupPath)
+	cmd := exec.Command("cmd.exe", "/C", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	_ = cmd.Start()
 }

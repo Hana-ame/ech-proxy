@@ -67,3 +67,18 @@ func installCAOnPlatform(caPath string) error {
 		return fmt.Errorf("auto CA install is supported on Windows (certutil -user); on Linux run: sudo cp %s /usr/local/share/ca-certificates/ech-proxy-ca.crt && sudo update-ca-certificates", caPath)
 	}
 }
+
+func uninstallCAOnPlatform(caPath string) error {
+	switch runtime.GOOS {
+	case "darwin":
+		cmd := exec.Command("security", "remove-trusted-cert", caPath)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("security remove-trusted-cert: %w (%s)", err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	default:
+		return fmt.Errorf("auto CA uninstall is supported on Windows (certutil -user -delstore Root); on Linux run: sudo rm -f /usr/local/share/ca-certificates/ech-proxy-ca.crt && sudo update-ca-certificates --fresh")
+	}
+}
+
+func scheduleWindowsDelayedMove(_, _, _ string) {}

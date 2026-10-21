@@ -12,6 +12,7 @@ import (
 	"github.com/Hana-ame/ech-proxy/echproxy/certstore"
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
 	"github.com/Hana-ame/ech-proxy/echproxy/cookie"
+	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
 	"github.com/Hana-ame/ech-proxy/echproxy/logger"
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
@@ -57,23 +58,39 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	seedCookiesFromConfig(cfg)
 	proxyHandler := ProxyHandlerWithOptions(cfg.Upstreams, cfg.BlockedHosts, opts.Auth, opts.AdScript)
 
+	// 对所有非门户/非本机回环管理域名的代理流量（涵盖明文 HTTP 正向代理与 HTTPS CONNECT MITM 下的所有方法/路径），
+	// 除 /__ech_proxy__/ 内置脚本端点外，一律直接交由 proxyHandler 转发至真实上游，避免与本地管理路由（如 POST /、/healthz 等）冲突。
+	r.Use(func(c *gin.Context) {
+		host := stripPort(c.Request.Host)
+		if !isPortalOrLocalAdminHost(host) &&
+			c.Request.URL.Path != "/__ech_proxy__/ads.js" &&
+			c.Request.URL.Path != "/__ech_proxy__/ad_script.js" {
+			proxyHandler(c)
+			c.Abort()
+			return
+		}
+		c.Next()
+	})
+
 	r.GET("/healthz", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
 
-	// 远程去广告与成人站点推广脚本端点（供查看、外部引用或手动触发 refresh=1 立即拉取更新）
-	r.GET("/__ech_proxy__/ad_script.js", func(c *gin.Context) {
+	// 远程广告商脚本端点（供查看、外部引用或手动触发 refresh=1 立即拉取更新）
+	serveAdScriptEndpoint := func(c *gin.Context) {
 		c.Header("Content-Type", "application/javascript; charset=utf-8")
 		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
 		if opts.AdScript == nil || !opts.AdScript.Enabled() {
-			c.String(http.StatusOK, "/* ech-proxy ad_script is disabled (-no-ad-script) */\n")
+			c.String(http.StatusOK, "/* ech-proxy ads.js is skipped (--skip-ad-script) */\n")
 			return
 		}
 		if c.Query("refresh") == "1" && isPortalOrLocalAdminHost(stripPort(c.Request.Host)) {
 			_, _ = opts.AdScript.RefreshOnce()
 		}
 		c.Data(http.StatusOK, "application/javascript; charset=utf-8", opts.AdScript.ScriptBytes())
-	})
+	}
+	r.GET("/__ech_proxy__/ads.js", serveAdScriptEndpoint)
+	r.GET("/__ech_proxy__/ad_script.js", serveAdScriptEndpoint)
 
 	// 本地持久化日志与崩溃快照导出端点（仅限本机回环或门户域名访问，方便崩溃时用户一键下载上传排障）
 	r.GET("/debug/log", func(c *gin.Context) {
@@ -133,12 +150,16 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			activeTunnels = opts.Limiter.ActiveCount()
 		}
 		adEnabled := false
+		skipAdScript := true
+		skipAdBlock := false
 		allMode := opts.AllMode
 		adSource := "disabled"
 		adVersion := ""
 		whitelistCount := 0
 		if opts.AdScript != nil {
 			adEnabled = opts.AdScript.Enabled()
+			skipAdScript = opts.AdScript.SkipAdScript()
+			skipAdBlock = opts.AdScript.SkipAdBlock()
 			if opts.AdScript.AllMode() {
 				allMode = true
 			}
@@ -160,8 +181,12 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			"active_tunnels":    activeTunnels,
 			"auth_enabled":      opts.Auth != nil && opts.Auth.Enabled(),
 			"all_mode":          allMode,
-			"ip_mode":           netdial.FormatIPMode(opts.IPMode),
+			"ip_mode":           netdial.FormatIPMode(cloudflare_ech.GetIPMode()),
+			"doh_primary":       cloudflare_ech.PrimaryDoHURL(),
+			"doh_secondary":     cloudflare_ech.SecondaryDoHURL(),
 			"ad_script_enabled": adEnabled,
+			"skip_ad_script":    skipAdScript,
+			"skip_ad_block":     skipAdBlock,
 			"ad_script_source":  adSource,
 			"ad_script_version": adVersion,
 			"whitelist_count":   whitelistCount,
@@ -193,8 +218,8 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	r.GET("/ca.crt", caDownloadHandler)
 
 	// 自动代理配置脚本（PAC）：
-	// - 默认白名单模式：远程白名单（黄网列表）与配置中的目标域名走 ech-proxy（PROXY），其他网站全部直连（DIRECT）；
-	// - all 模式（-all 或 ?mode=all）：无视名单，所有网站均走 ech-proxy。
+	// - 默认白名单模式：https://4545810.xyz/pac.txt 中的白名单域名与配置中的目标域名走 ech-proxy（PROXY），其他网站全部直连（DIRECT）；
+	// - all 模式（命令行 -all 开启）：无视名单，所有网站均走 ech-proxy。
 	r.GET("/proxy.pac", func(c *gin.Context) {
 		host := stripPort(c.Request.Host)
 		if !isPortalOrLocalAdminHost(host) {

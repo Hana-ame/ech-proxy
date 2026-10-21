@@ -36,40 +36,39 @@ jobs:
       - name: Validate upstream.json configuration
         run: go run ./win check -config certs/l.moonchan.xyz/upstream.json
 
-      - name: Validate remote ad_script.js and unified whitelist.json
+      - name: Validate remote ads.js and pac.txt
         run: |
-          node --check certs/l.moonchan.xyz/ad_script.js
-          node -e '
-            const fs = require("fs");
-            const arr = JSON.parse(fs.readFileSync("certs/l.moonchan.xyz/whitelist.json", "utf8"));
-            if (!Array.isArray(arr) || arr.length === 0) throw new Error("Invalid whitelist.json");
-          '
+          node --check certs/l.moonchan.xyz/ads.js
+          test -s certs/l.moonchan.xyz/pac.txt
 
       - name: Run full unit & integration tests with race detector
         run: go test ./... -race -v -coverprofile=coverage.out
 
-      - name: Cross-compile verification (Windows / Linux / macOS)
+      - name: Cross-compile verification (Windows 386/amd64/arm64, Linux 386/amd64/arm64, macOS amd64)
         run: |
           mkdir -p build-check
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-win-amd64.exe ./win/
-          GOOS=windows GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-win-386.exe ./win/
+          GOOS=windows GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-386.exe ./win/
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-amd64.exe ./win/
+          GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-arm64.exe ./win/
+          GOOS=linux   GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-386 ./win/
           GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-amd64 ./win/
           GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-arm64 ./win/
           GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-darwin-amd64 ./win/
           rm -rf build-check
 
-      - name: Runtime smoke test (startup, PAC whitelist vs direct, ipmode, ad-script, local log & graceful shutdown)
+      - name: Runtime smoke test (startup, PAC whitelist vs direct, -4/-6/-dual, ads.js, local log & graceful shutdown)
         run: |
           CGO_ENABLED=0 go build -trimpath -o ./ech-proxy-ci ./win/
           ./ech-proxy-ci version
+          ./ech-proxy-ci help | grep -q -- "--skip-ad-script"
           ./ech-proxy-ci check -config certs/l.moonchan.xyz/upstream.json
-          ./ech-proxy-ci pac -config certs/l.moonchan.xyz/upstream.json -whitelist-url certs/l.moonchan.xyz/whitelist.json | grep -q "FindProxyForURL"
+          ./ech-proxy-ci pac -config certs/l.moonchan.xyz/upstream.json -whitelist-url certs/l.moonchan.xyz/pac.txt | grep -q "FindProxyForURL"
           mkdir -p ./ci-logs
-          ./ech-proxy-ci -http -addr 127.0.0.1:18443 -no-tray -no-browser -sys-proxy off \
-            -ipmode dual \
+          ./ech-proxy-ci -http -addr 127.0.0.1:18443 -no-tray -no-auto-update -sys-proxy off \
+            -dual \
             -config certs/l.moonchan.xyz/upstream.json \
-            -ad-script-url certs/l.moonchan.xyz/ad_script.js \
-            -whitelist-url certs/l.moonchan.xyz/whitelist.json \
+            -ad-script-url certs/l.moonchan.xyz/ads.js \
+            -whitelist-url certs/l.moonchan.xyz/pac.txt \
             -log-dir ./ci-logs &
           PID=$!
           for i in $(seq 1 20); do
@@ -81,7 +80,7 @@ jobs:
           curl -fsS http://127.0.0.1:18443/healthz | grep -q "ok"
           curl -fsS http://127.0.0.1:18443/statusz | grep -q '"ad_script_enabled":true'
           curl -fsS http://127.0.0.1:18443/proxy.pac | grep -q '"missav.com":true'
-          curl -fsS http://127.0.0.1:18443/__ech_proxy__/ad_script.js | grep -q "ech-proxy-custom-ad"
+          curl -fsS http://127.0.0.1:18443/__ech_proxy__/ads.js | grep -q "fussyreturn.com"
           curl -fsS "http://127.0.0.1:18443/debug/log?download=1" | grep -q "ech-proxy session started"
           kill -TERM "$PID"
           wait "$PID" || true

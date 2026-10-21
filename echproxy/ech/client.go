@@ -29,12 +29,19 @@ import (
 )
 
 const (
-	shellDomain   = "cloudflare-ech.com"
-	defaultDohURL = "https://moonchan.xyz/doh"
-	dialTimeout   = netdial.DialTimeout
-	dohTimeout    = netdial.DoHTimeout
-	minTTL        = 60
-	maxTTL        = 24 * 3600
+	shellDomain = "cloudflare-ech.com"
+
+	// DefaultPrimaryDoHURL 是首选 DoH 端点（https://4545810.xyz/doh）。
+	DefaultPrimaryDoHURL = "https://4545810.xyz/doh"
+	// DefaultSecondaryDoHURL 是次选兜底 DoH 端点（Cloudflare 1.1.1.1 官方 DoH JSON/Wire 路径：https://1.1.1.1/dns-query）。
+	DefaultSecondaryDoHURL = "https://1.1.1.1/dns-query"
+
+	defaultDohURL  = DefaultPrimaryDoHURL
+	fallbackDohURL = DefaultSecondaryDoHURL
+	dialTimeout    = netdial.DialTimeout
+	dohTimeout     = netdial.DoHTimeout
+	minTTL         = 60
+	maxTTL         = 24 * 3600
 )
 
 // Client 是基于 cloudflare-ech.com ECH 域前置的 HTTP 客户端。
@@ -48,9 +55,10 @@ type echEntry struct {
 }
 
 type runtimeConfig struct {
-	dohURL string
-	dialIP string
-	ipMode string
+	dohURL      string
+	fallbackURL string
+	dialIP      string
+	ipMode      string
 }
 
 var (
@@ -72,25 +80,55 @@ func currentConfig() *runtimeConfig {
 		return c
 	}
 	c := &runtimeConfig{
-		dohURL: defaultDohURL,
-		ipMode: netdial.DefaultIPMode, // 默认 ipv4 ("v4")
+		dohURL:      defaultDohURL,
+		fallbackURL: fallbackDohURL,
+		ipMode:      netdial.DefaultIPMode, // 默认 ipv4 ("v4")
 	}
 	cfgPtr.Store(c)
 	return c
 }
 
-// SetDohURL 设置 DoH 服务端完整 URL。
+// PrimaryDoHURL 返回当前配置的首选 DoH URL。
+func PrimaryDoHURL() string {
+	return currentConfig().dohURL
+}
+
+// SecondaryDoHURL 返回当前配置的次选 DoH URL。
+func SecondaryDoHURL() string {
+	return currentConfig().fallbackURL
+}
+
+// SetDohURL 设置首选 DoH 服务端完整 URL（次选默认保留 https://1.1.1.1/dns-query）。
 func SetDohURL(u string) {
 	nc := *currentConfig()
+	if u == "" {
+		u = defaultDohURL
+	}
 	nc.dohURL = u
+	if nc.fallbackURL == "" {
+		nc.fallbackURL = fallbackDohURL
+	}
 	nc.dialIP = ""
 	cfgPtr.Store(&nc)
 }
 
-// SetDoHConfig 通过域名与引导 IP 配置 DoH（跳过对 DoH 域名的本地 DNS 解析）。
+// SetFallbackDohURL 设置次选（兜底）DoH 服务端完整 URL。
+func SetFallbackDohURL(u string) {
+	nc := *currentConfig()
+	nc.fallbackURL = u
+	cfgPtr.Store(&nc)
+}
+
+// SetDoHConfig 通过域名与引导 IP 配置首选 DoH（跳过对首选 DoH 域名的本地 DNS 解析，次选仍为 https://1.1.1.1/dns-query）。
 func SetDoHConfig(host, bootstrapIP string) {
 	nc := *currentConfig()
+	if host == "" {
+		host = "4545810.xyz"
+	}
 	nc.dohURL = fmt.Sprintf("https://%s/doh", host)
+	if nc.fallbackURL == "" {
+		nc.fallbackURL = fallbackDohURL
+	}
 	nc.dialIP = bootstrapIP
 	cfgPtr.Store(&nc)
 }
@@ -116,9 +154,9 @@ func GetIPMode() string {
 	return currentConfig().ipMode
 }
 
-// CheckDualStack 检查 moonchan.xyz 是否发布 A / AAAA 记录。
+// CheckDualStack 检查 4545810.xyz 是否发布 A / AAAA 记录。
 func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
-	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, "moonchan.xyz")
+	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, "4545810.xyz")
 	if err != nil {
 		return false, false
 	}
@@ -132,24 +170,47 @@ func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
 	return
 }
 
-// QueryDoH 向当前配置的 DoH 节点发起 DNS 查询（JSON 格式）。
+// QueryDoH 向当前配置的 DoH 节点发起 DNS 查询（JSON 格式）：
+//   - 首选请求 https://4545810.xyz/doh；
+//   - 若首选请求失败或返回非 200 状态码，自动无缝切换次选 https://1.1.1.1/dns-query。
 func QueryDoH(ctx context.Context, name string, qtype int) (*http.Response, error) {
-	u := fmt.Sprintf("%s?name=%s&type=%d", currentConfig().dohURL, url.QueryEscape(name), qtype)
-	return doDohRequest(ctx, u)
+	cfg := currentConfig()
+	primaryURL := fmt.Sprintf("%s?name=%s&type=%d", cfg.dohURL, url.QueryEscape(name), qtype)
+	resp, err := doDohRequest(ctx, primaryURL, cfg.dialIP, cfg.ipMode)
+	if err == nil && resp != nil && resp.StatusCode == http.StatusOK {
+		return resp, nil
+	}
+
+	// 首选失败：若配置了次选 DoH（默认 https://1.1.1.1/dns-query），自动回退请求次选
+	if cfg.fallbackURL != "" && cfg.fallbackURL != cfg.dohURL {
+		secondaryURL := fmt.Sprintf("%s?name=%s&type=%d", cfg.fallbackURL, url.QueryEscape(name), qtype)
+		resp2, err2 := doDohRequest(ctx, secondaryURL, "", cfg.ipMode)
+		if err2 == nil && resp2 != nil && resp2.StatusCode == http.StatusOK {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			return resp2, nil
+		}
+		if resp2 != nil && resp2.Body != nil {
+			_ = resp2.Body.Close()
+		}
+		if err != nil && err2 != nil {
+			return nil, fmt.Errorf("primary DoH (%s) failed: %v; secondary DoH (%s) failed: %w", cfg.dohURL, err, cfg.fallbackURL, err2)
+		}
+	}
+	return resp, err
 }
 
-func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
+func doDohRequest(ctx context.Context, urlStr, dialIP, ipMode string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, urlStr, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Accept", "application/dns-json")
 
-	cfg := currentConfig()
 	tr := netdial.Transport()
-	if cfg.dialIP != "" {
+	if dialIP != "" {
 		tr = tr.Clone()
-		dialIP := cfg.dialIP
 		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			_, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -160,8 +221,16 @@ func doDohRequest(ctx context.Context, urlStr string) (*http.Response, error) {
 		if uParsed, err := url.Parse(urlStr); err == nil && uParsed != nil {
 			tr.TLSClientConfig = &tls.Config{ServerName: uParsed.Host}
 		}
-	} else if cfg.ipMode != "" {
-		tr = netdial.TransportWithIPMode(cfg.ipMode)
+	} else if ipMode != "" {
+		// 若 URL 主机本身是 IPv4 字面量（如次选 1.1.1.1）而当前处于 v6 模式，允许直连该 IP 字面量以防 DoH 死锁
+		useMode := ipMode
+		if uParsed, err := url.Parse(urlStr); err == nil && uParsed != nil {
+			h := uParsed.Hostname()
+			if ip := net.ParseIP(h); ip != nil && ip.To4() != nil && ipMode == "v6" {
+				useMode = "dual"
+			}
+		}
+		tr = netdial.TransportWithIPMode(useMode)
 	}
 	return (&http.Client{Transport: tr, Timeout: dohTimeout}).Do(req)
 }

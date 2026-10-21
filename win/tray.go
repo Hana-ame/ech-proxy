@@ -3,23 +3,38 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/Hana-ame/ech-proxy/echproxy"
 )
 
-// 托盘右键菜单命令 ID 常量（参考 V2rayN 托盘菜单布局）。
+// DefaultFeedbackURL 是托盘「反馈」菜单项打开的目标地址。
+const DefaultFeedbackURL = "https://chatto.moonchan.xyz"
+
+// 托盘右键菜单命令 ID 常量。
+// 注意：
+//   - 全局模式（-all）不在托盘中显示，仅能通过命令行 -all 开启；
+//   - 广告相关设置（--skip-ad-script / --skip-ad-block）在托盘中隐藏，仅通过命令行控制；
+//   - 托盘提供「强制 v4 出口」、「强制 v6 出口」、「双端出口」三项出口协议族实时切换；
+//   - 提供「一键安装本地 CA 根证书」与「一键卸载本地 CA 根证书」选项；
+//   - 提供「检查更新 / 自动下载更新」选项（后台自动检查 https://github.com/Hana-ame/ech-proxy/releases，退出后再次打开自动替换）；
+//   - 原「打开门户」改为「反馈」，打开 https://chatto.moonchan.xyz。
 const (
-	TrayCmdToggleConsole  uintptr = 1001
-	TrayCmdSysProxyPAC    uintptr = 1002
-	TrayCmdSysProxyGlobal uintptr = 1003
-	TrayCmdSysProxyClear  uintptr = 1004
-	TrayCmdOpenPortal     uintptr = 1005
-	TrayCmdCopyPACURL     uintptr = 1006
-	TrayCmdInstallCA      uintptr = 1007
-	TrayCmdExit           uintptr = 1008
-	TrayCmdToggleAdScript uintptr = 1009
-	TrayCmdOpenLogs       uintptr = 1010
+	TrayCmdToggleConsole uintptr = 1001
+	TrayCmdSysProxyPAC   uintptr = 1002
+	TrayCmdSysProxyClear uintptr = 1004
+	TrayCmdOpenFeedback  uintptr = 1005
+	TrayCmdOpenPortal    uintptr = TrayCmdOpenFeedback // 兼容别名
+	TrayCmdCopyPACURL    uintptr = 1006
+	TrayCmdInstallCA     uintptr = 1007
+	TrayCmdExit          uintptr = 1008
+	TrayCmdOpenLogs      uintptr = 1010
+	TrayCmdIPModeV4      uintptr = 1011
+	TrayCmdIPModeV6      uintptr = 1012
+	TrayCmdIPModeDual    uintptr = 1013
+	TrayCmdUninstallCA   uintptr = 1014
+	TrayCmdCheckUpdate   uintptr = 1015
 )
 
 // ConsoleWindowDriver 抽象控制台窗口显隐控制接口（Windows 下由 GetConsoleWindow + ShowWindow 实现）。
@@ -37,38 +52,75 @@ type TrayMenuItem struct {
 	Separator bool
 }
 
-// TrayController 统一管理托盘菜单状态、控制台窗口显隐、远程广告脚本开关、日志目录打开与系统代理模式切换。
+// TrayController 统一管理托盘菜单状态、控制台窗口显隐、出口协议族（v4/v6/dual）切换、CA 安装/卸载、自动检查更新、反馈页面打开与系统代理模式切换。
 type TrayController struct {
 	mu              sync.Mutex
 	ListenAddr      string
+	FeedbackURL     string
 	PortalURL       string
 	CAPath          string
 	LogDir          string
+	IPMode          string // "v4" (强制 v4 出口), "v6" (强制 v6 出口), "dual" (双端出口)
 	SysProxy        *SysProxyManager
-	AdScript        *echproxy.AdScriptManager
+	AdScript        *echproxy.AdScriptManager // 内部持有引用（不在托盘菜单中暴露任何广告设置）
+	Updater         *Updater                  // 自动更新管理器（检查 GitHub Releases 并自动下载暂存）
 	Console         ConsoleWindowDriver
+	SetIPModeFn     func(string)
 	OpenURLFn       func(string)
 	CopyClipboardFn func(string) error
 	InstallCAFn     func(string) error
+	UninstallCAFn   func(string) error
+	CheckUpdateFn   func() (bool, error)
 	OnExit          func()
 	OnStateChanged  func()
 }
 
-// NewTrayController 创建托盘控制器。
+// NewTrayController 创建托盘控制器（默认反馈地址为 https://chatto.moonchan.xyz）。
 func NewTrayController(listenAddr, portalURL, caPath string, sysProxy *SysProxyManager, console ConsoleWindowDriver, onExit func()) *TrayController {
 	if console == nil {
 		console = newPlatformConsoleDriver()
 	}
+	curIPMode := echproxy.EffectiveIPMode(echproxy.GetGlobalIPMode())
 	return &TrayController{
 		ListenAddr:      NormalizeLoopbackHostPort(listenAddr),
+		FeedbackURL:     DefaultFeedbackURL,
 		PortalURL:       portalURL,
 		CAPath:          caPath,
+		IPMode:          curIPMode,
 		SysProxy:        sysProxy,
 		Console:         console,
+		SetIPModeFn:     echproxy.SetGlobalIPMode,
 		OpenURLFn:       openBrowser,
 		CopyClipboardFn: copyToClipboardOnPlatform,
 		InstallCAFn:     installCAOnPlatform,
+		UninstallCAFn:   uninstallCAOnPlatform,
 		OnExit:          onExit,
+	}
+}
+
+// CurrentIPMode 返回当前选中的出口协议族（"v4", "v6", "dual"）。
+func (tc *TrayController) CurrentIPMode() string {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return echproxy.EffectiveIPMode(tc.IPMode)
+}
+
+// SetIPMode 切换出口协议族（"v4" / "v6" / "dual"）并通知底层传输层立即生效。
+func (tc *TrayController) SetIPMode(mode string) {
+	norm := echproxy.EffectiveIPMode(mode)
+	tc.mu.Lock()
+	tc.IPMode = norm
+	fn := tc.SetIPModeFn
+	cb := tc.OnStateChanged
+	tc.mu.Unlock()
+
+	if fn != nil {
+		fn(norm)
+	} else {
+		echproxy.SetGlobalIPMode(norm)
+	}
+	if cb != nil {
+		cb()
 	}
 }
 
@@ -113,7 +165,7 @@ func (tc *TrayController) ToggleConsole() bool {
 	return next
 }
 
-// TooltipText 生成托盘悬停提示文字（类似 V2rayN 显示当前监听地址与系统代理状态）。
+// TooltipText 生成托盘悬停提示文字（显示当前监听地址、PAC代理状态与出口 IP 模式）。
 func (tc *TrayController) TooltipText() string {
 	modeStr := "直连(未改系统代理)"
 	if tc.SysProxy != nil {
@@ -124,29 +176,57 @@ func (tc *TrayController) TooltipText() string {
 			modeStr = "全局系统代理"
 		}
 	}
-	return fmt.Sprintf("ech-proxy [%s] - %s", tc.ListenAddr, modeStr)
+	ipStr := "v4出口"
+	switch tc.CurrentIPMode() {
+	case "v6":
+		ipStr = "v6出口"
+	case "dual":
+		ipStr = "双端出口"
+	}
+	return fmt.Sprintf("ech-proxy [%s] - %s (%s)", tc.ListenAddr, modeStr, ipStr)
 }
 
-// MenuItems 生成当前托盘右键菜单结构及勾选状态。
+// MenuItems 生成当前托盘右键菜单结构及勾选状态：
+//   - 不显示全局模式（全局模式仅能通过命令行 -all 开启）；
+//   - 隐藏所有广告相关设置；
+//   - 显示「强制 v4 出口」、「强制 v6 出口」、「双端出口」选项；
+//   - 显示「一键安装本地 CA 根证书」与「卸载本地 CA 根证书」选项；
+//   - 显示「检查更新」选项（当已自动下载新版本时显示已就绪提示）；
+//   - 「打开门户」改为「反馈」(https://chatto.moonchan.xyz)。
 func (tc *TrayController) MenuItems() []TrayMenuItem {
 	consoleVis := tc.IsConsoleVisible()
 	var curMode SysProxyMode = SysProxyOff
 	if tc.SysProxy != nil {
 		curMode = tc.SysProxy.Mode()
 	}
-	adEnabled := tc.AdScript != nil && tc.AdScript.Enabled()
+	curIPMode := tc.CurrentIPMode()
+	feedbackURL := strings.TrimSpace(tc.FeedbackURL)
+	if feedbackURL == "" {
+		feedbackURL = DefaultFeedbackURL
+	}
+	updateTitle := "检查更新 (Check Update)"
+	updateStaged := tc.Updater != nil && tc.Updater.IsUpdateStaged()
+	if updateStaged {
+		updateTitle = "检查更新 (新版本已下载，退出重开自动替换)"
+	}
+
 	consoleLabel := "显示 / 隐藏控制台 (双击托盘图标)"
 	return []TrayMenuItem{
 		{ID: TrayCmdToggleConsole, Title: consoleLabel, Checked: consoleVis},
 		{Separator: true},
 		{ID: TrayCmdSysProxyPAC, Title: "系统代理：自动配置 PAC 模式 (推荐)", Checked: curMode == SysProxyPAC},
-		{ID: TrayCmdSysProxyGlobal, Title: "系统代理：全局 HTTP/HTTPS 模式", Checked: curMode == SysProxyGlobal},
 		{ID: TrayCmdSysProxyClear, Title: "系统代理：清除 / 禁用系统代理 (直连)", Checked: curMode == SysProxyOff},
 		{Separator: true},
-		{ID: TrayCmdToggleAdScript, Title: "启用远程去广告与推广脚本 (Ad Script)", Checked: adEnabled},
-		{ID: TrayCmdOpenPortal, Title: "打开 Web 门户导航页 (" + tc.PortalURL + ")"},
-		{ID: TrayCmdCopyPACURL, Title: "复制 PAC 地址 (Copy PAC URL)"},
+		{ID: TrayCmdIPModeV4, Title: "强制 v4 出口", Checked: curIPMode == "v4"},
+		{ID: TrayCmdIPModeV6, Title: "强制 v6 出口", Checked: curIPMode == "v6"},
+		{ID: TrayCmdIPModeDual, Title: "双端出口", Checked: curIPMode == "dual"},
+		{Separator: true},
 		{ID: TrayCmdInstallCA, Title: "一键安装本地 CA 根证书 (Install CA)"},
+		{ID: TrayCmdUninstallCA, Title: "卸载本地 CA 根证书 (Uninstall CA)"},
+		{Separator: true},
+		{ID: TrayCmdCheckUpdate, Title: updateTitle, Checked: updateStaged},
+		{ID: TrayCmdOpenFeedback, Title: "反馈 (" + feedbackURL + ")"},
+		{ID: TrayCmdCopyPACURL, Title: "复制 PAC 地址 (Copy PAC URL)"},
 		{ID: TrayCmdOpenLogs, Title: "打开本地日志目录 (问题排查/上传日志)"},
 		{Separator: true},
 		{ID: TrayCmdExit, Title: "退出程序并清理系统代理 (Exit)"},
@@ -170,16 +250,6 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 			tc.OnStateChanged()
 		}
 
-	case TrayCmdSysProxyGlobal:
-		if tc.SysProxy != nil {
-			if err := tc.SysProxy.SetMode(SysProxyGlobal); err != nil {
-				log.Printf("[Tray] Failed to set Global proxy mode: %v", err)
-			}
-		}
-		if tc.OnStateChanged != nil {
-			tc.OnStateChanged()
-		}
-
 	case TrayCmdSysProxyClear:
 		if tc.SysProxy != nil {
 			if err := tc.SysProxy.SetMode(SysProxyOff); err != nil {
@@ -190,36 +260,17 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 			tc.OnStateChanged()
 		}
 
-	case TrayCmdToggleAdScript:
-		if tc.AdScript != nil {
-			next := !tc.AdScript.Enabled()
-			tc.AdScript.SetEnabled(next)
-			if next {
-				echproxy.SafeGo("TrayAdScriptRefresh", func() {
-					_, _ = tc.AdScript.RefreshOnce()
-				})
-			}
-		}
-		if tc.OnStateChanged != nil {
-			tc.OnStateChanged()
-		}
+	case TrayCmdIPModeV4:
+		tc.SetIPMode("v4")
+		log.Printf("[Tray] Egress IP mode switched to: 强制 v4 出口 (v4)")
 
-	case TrayCmdOpenPortal:
-		if tc.OpenURLFn != nil && tc.PortalURL != "" {
-			echproxy.SafeGo("TrayOpenPortal", func() {
-				tc.OpenURLFn(tc.PortalURL)
-			})
-		}
+	case TrayCmdIPModeV6:
+		tc.SetIPMode("v6")
+		log.Printf("[Tray] Egress IP mode switched to: 强制 v6 出口 (v6)")
 
-	case TrayCmdCopyPACURL:
-		pacURL := BuildPACURL(tc.ListenAddr, false, 0)
-		if tc.CopyClipboardFn != nil {
-			if err := tc.CopyClipboardFn(pacURL); err != nil {
-				log.Printf("[Tray] Copy PAC URL failed (%v), PAC URL is: %s", err, pacURL)
-			} else {
-				log.Printf("[Tray] PAC URL copied to clipboard: %s", pacURL)
-			}
-		}
+	case TrayCmdIPModeDual:
+		tc.SetIPMode("dual")
+		log.Printf("[Tray] Egress IP mode switched to: 双端出口 (dual)")
 
 	case TrayCmdInstallCA:
 		if tc.InstallCAFn != nil && tc.CAPath != "" {
@@ -230,6 +281,68 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 					log.Printf("[Tray] Local CA certificate installed into user Root store: %s", tc.CAPath)
 				}
 			})
+		}
+
+	case TrayCmdUninstallCA:
+		if tc.UninstallCAFn != nil {
+			echproxy.SafeGo("TrayUninstallCA", func() {
+				if err := tc.UninstallCAFn(tc.CAPath); err != nil {
+					log.Printf("[Tray] Uninstall CA failed: %v", err)
+				} else {
+					log.Printf("[Tray] Local CA certificate uninstalled from Root store")
+				}
+			})
+		}
+
+	case TrayCmdCheckUpdate:
+		echproxy.SafeGo("TrayCheckUpdate", func() {
+			if tc.CheckUpdateFn != nil {
+				staged, err := tc.CheckUpdateFn()
+				if err != nil {
+					log.Printf("[Tray] Check update failed: %v", err)
+				} else if staged {
+					log.Printf("[Tray] Update downloaded and staged; exit and relaunch ech-proxy to replace")
+				} else {
+					log.Printf("[Tray] Already running the latest version")
+				}
+			} else if tc.Updater != nil {
+				staged, err := tc.Updater.CheckAndDownloadOnce()
+				if err != nil {
+					log.Printf("[Tray] Check update failed: %v", err)
+				} else if staged {
+					log.Printf("[Tray] Update downloaded and staged (%s); exit and relaunch ech-proxy to replace", tc.Updater.StagedPath())
+				} else {
+					log.Printf("[Tray] Already running the latest version")
+				}
+			}
+			if tc.OnStateChanged != nil {
+				tc.OnStateChanged()
+			}
+		})
+
+	case TrayCmdOpenFeedback:
+		feedbackURL := strings.TrimSpace(tc.FeedbackURL)
+		if feedbackURL == "" {
+			feedbackURL = DefaultFeedbackURL
+		}
+		if tc.OpenURLFn != nil {
+			echproxy.SafeGo("TrayOpenFeedback", func() {
+				tc.OpenURLFn(feedbackURL)
+			})
+		}
+
+	case TrayCmdCopyPACURL:
+		allMode := false
+		if tc.SysProxy != nil {
+			allMode = tc.SysProxy.AllMode()
+		}
+		pacURL := BuildPACURL(tc.ListenAddr, allMode, 0)
+		if tc.CopyClipboardFn != nil {
+			if err := tc.CopyClipboardFn(pacURL); err != nil {
+				log.Printf("[Tray] Copy PAC URL failed (%v), PAC URL is: %s", err, pacURL)
+			} else {
+				log.Printf("[Tray] PAC URL copied to clipboard: %s", pacURL)
+			}
 		}
 
 	case TrayCmdOpenLogs:
@@ -247,6 +360,9 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 		log.Printf("[Tray] Exit requested from system tray")
 		if tc.SysProxy != nil {
 			tc.SysProxy.CleanupOnExit()
+		}
+		if tc.Updater != nil {
+			_, _ = tc.Updater.ApplyStagedUpdateOnExit()
 		}
 		if tc.OnExit != nil {
 			tc.OnExit()

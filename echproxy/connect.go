@@ -21,6 +21,7 @@ import (
 
 	"github.com/Hana-ame/ech-proxy/echproxy/certstore"
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
+	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
 	"github.com/Hana-ame/ech-proxy/echproxy/logger"
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	"golang.org/x/net/http2"
@@ -35,8 +36,8 @@ const (
 )
 
 // ConnectMode 定义 HTTP CONNECT 请求的处理策略：
-//   - "auto" / "mitm": 对 443 端口且拥有本地 CA 时自动执行 TLS 终结并通过 ECH/SNI 管道转发（无需改 hosts、无需 443 权限即可代理 Pixiv/pximg 等全量站点）；非 443 端口自动回退为 TCP 隧道；
-//   - "tunnel": 始终作为纯 TCP 字节流隧道透传（不终结 TLS）。
+//   - "auto" / "mitm": 对 HTTPS/HTTP 端口且拥有本地 CA 时自动嗅探首字节（TLS 0x16 执行 MITM 终结并经由 DoH+SNI/ECH/Fragment 转发，明文 HTTP 亦直接进入反代流水线）；
+//   - "tunnel": 始终作为纯 TCP 字节流隧道透传（不终结 TLS，优先通过 DoH 解析目标 IP）。
 const (
 	ConnectModeAuto   = "auto"
 	ConnectModeMITM   = "mitm"
@@ -199,9 +200,25 @@ func (l *TunnelLimiter) ActiveCount() int {
 	return int(l.globalCur.Load())
 }
 
-// dialConnectFn 供单元测试注入自定义拨号函数。
+// dialConnectFn 供单元测试注入自定义拨号函数；生产环境优先通过 DoH 解析真实 IP 后再拨号，防止 DNS 污染。
 var dialConnectFn = func(ctx context.Context, host, port, ipMode string) (net.Conn, error) {
-	return netdial.DialContextIPMode(ctx, host, port, ipMode, netdial.DialTimeout)
+	target := host
+	if net.ParseIP(host) == nil {
+		if ips, err := cloudflare_ech.ResolveHostIPsByMode(ctx, host, ipMode); err == nil && len(ips) > 0 {
+			target = ips[0]
+		}
+	}
+	return netdial.DialContextIPMode(ctx, target, port, ipMode, netdial.DialTimeout)
+}
+
+// isMITMCapablePort 判断 CONNECT 目标端口是否支持 HTTP/HTTPS 协议终结（含 443、80 及常见 Cloudflare HTTPS 端口）。
+func isMITMCapablePort(port string) bool {
+	switch port {
+	case "443", "80", "8443", "2053", "2083", "2087", "2096":
+		return true
+	default:
+		return false
+	}
 }
 
 // parseConnectTarget 解析并严格校验 CONNECT 请求的 host:port（CONNECT-boundaries.md B5）。
@@ -323,11 +340,11 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 		return
 	}
 
-	// 判断是否走 Smart MITM ECH/SNI 终结模式
+	// 判断是否走 Smart MITM ECH/SNI/Fragment 终结模式
 	useMITM := false
 	mode := strings.ToLower(strings.TrimSpace(opts.Mode))
 	if (mode == "" || mode == ConnectModeAuto || mode == ConnectModeMITM) &&
-		port == "443" && opts.CertStore != nil && opts.HTTPHandler != nil && net.ParseIP(host) == nil {
+		isMITMCapablePort(port) && opts.CertStore != nil && opts.HTTPHandler != nil && net.ParseIP(host) == nil {
 		useMITM = true
 	}
 
@@ -402,7 +419,9 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 	}()
 }
 
-// serveMITMConnect 在 CONNECT 隧道内用本地自签 CA 终结 TLS，并将解密后的 HTTP/1.1 或 HTTP/2 请求交由 ECH/SNI 反代引擎处理。
+// serveMITMConnect 在 CONNECT 隧道内嗅探首字节：
+//   - 若首字节为 0x16（TLS ClientHello），用本地自签 CA 终结 TLS，并将解密后的 HTTP/1.1 或 HTTP/2 请求交由 ECH/SNI/Fragment 反代引擎处理；
+//   - 若首字节为明文 HTTP（如部分客户端在 CONNECT 隧道内发送明文 HTTP），则直接交由反代引擎处理，兼顾 HTTP 与 HTTPS。
 func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHost string, opts ConnectOptions) {
 	defer clientConn.Close()
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
@@ -410,6 +429,36 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 	}
 
 	wrapped := newPrefixConn(clientConn, clientBuf)
+	_ = wrapped.SetReadDeadline(time.Now().Add(netdial.DialTimeout))
+	br := bufio.NewReaderSize(wrapped, 4096)
+	first, perr := br.Peek(1)
+	_ = wrapped.SetReadDeadline(time.Time{})
+	if perr != nil {
+		return
+	}
+	peekedConn := &bufferedConn{Conn: wrapped, r: br}
+
+	// 若客户端在 CONNECT 隧道内发送的是明文 HTTP 请求（首字节非 0x16 TLS Handshake）
+	if first[0] != 0x16 {
+		plainHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if req.Host == "" {
+				req.Host = targetHost
+			}
+			req.URL.Scheme = "http"
+			if req.URL.Host == "" {
+				req.URL.Host = req.Host
+			}
+			opts.HTTPHandler.ServeHTTP(w, req)
+		})
+		plainSrv := &http.Server{
+			Handler:           plainHandler,
+			ReadHeaderTimeout: 15 * time.Second,
+			IdleTimeout:       90 * time.Second,
+		}
+		_ = plainSrv.Serve(newSingleConnListener(peekedConn))
+		return
+	}
+
 	baseTLS := opts.CertStore.TLSConfig(opts.PortalCert)
 	tlsCfg := baseTLS.Clone()
 	// 若客户端未发送 SNI，使用 CONNECT 请求行中的 targetHost 签发证书
@@ -420,7 +469,7 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 		return baseTLS.GetCertificate(hello)
 	}
 
-	tlsConn := tls.Server(wrapped, tlsCfg)
+	tlsConn := tls.Server(peekedConn, tlsCfg)
 	ctx, cancel := context.WithTimeout(context.Background(), netdial.DialTimeout)
 	err := tlsConn.HandshakeContext(ctx)
 	cancel()
@@ -570,8 +619,6 @@ func (d *deadlineConn) Write(b []byte) (int, error) {
 }
 
 // singleConnListener 向 http.Server.Serve 提供恰好一条连接。
-// 第二次 Accept 会阻塞到该连接被关闭为止，避免 Serve 在请求仍在处理时
-// 提前返回（并触发调用方关闭底层连接）导致 MITM 请求被截断为连接重置。
 type singleConnListener struct {
 	conn   net.Conn
 	done   chan struct{}
@@ -605,8 +652,6 @@ func (l *singleConnListener) Addr() net.Addr {
 	return &net.TCPAddr{}
 }
 
-// closeNotifyConn 在底层连接关闭时关闭 done 通道，使 singleConnListener 阻塞的
-// 第二次 Accept 得以返回。
 type closeNotifyConn struct {
 	net.Conn
 	done chan struct{}

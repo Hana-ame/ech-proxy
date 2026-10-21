@@ -119,6 +119,13 @@ func (m *SysProxyManager) SetAllMode(all bool) {
 	m.mu.Unlock()
 }
 
+// AllMode 返回当前 PAC 是否启用全局 all 模式。
+func (m *SysProxyManager) AllMode() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.allMode
+}
+
 // Mode 返回当前生效的系统代理模式。
 func (m *SysProxyManager) Mode() SysProxyMode {
 	m.mu.Lock()

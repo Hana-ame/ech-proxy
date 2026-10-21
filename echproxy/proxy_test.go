@@ -140,9 +140,9 @@ func TestLargeChunkedTextResponseNotTruncated(t *testing.T) {
 }
 
 // TestUnifiedWhitelistPACAndAdultAdInjection 验证：
-// 1. 远程唯一白名单（whitelist = 黄网 = 去原有广告 + 加自己广告 + PAC 走 proxy，其他直接 direct）；
-// 2. all 模式（AllMode = true）：PAC 对所有网站返回 PROXY，且 HTML 中含成人广告的未知网站也会去广告并加自有推广；
-// 3. /__ech_proxy__/ad_script.js、/debug/log、/proxy.pac 与 /statusz 端点正常工作。
+// 1. 远程 PAC 白名单（pac.txt = 去原有广告 + 插入广告商 <script> 标签 + PAC 走 proxy，其他直接 direct）；
+// 2. all 模式（-all）：PAC 对所有网站返回 PROXY；
+// 3. --skip-ad-script 与 --skip-ad-block 行为正确，且 /__ech_proxy__/ads.js、/debug/log、/proxy.pac 与 /statusz 端点正常工作。
 func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	logDir := t.TempDir()
@@ -210,37 +210,54 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	}
 	adMgr.SetAllMode(false)
 
-	// 3. 访问白名单中的黄网 (ex.l.moonchan.xyz -> e-hentai.org)：剥离原有广告并注入自有广告脚本
+	// 3. 访问白名单中的站点 (ex.l.moonchan.xyz -> e-hentai.org)：剥离原有广告并注入广告商 <script> 标签
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "https://ex.l.moonchan.xyz:8443/", nil)
 	req.Host = "ex.l.moonchan.xyz:8443"
 	engine.ServeHTTP(rec, req)
 	bodyStr := rec.Body.String()
-	if !strings.Contains(bodyStr, `id="ech-proxy-ad-script"`) || !strings.Contains(bodyStr, `data-is-adult="1"`) {
-		t.Errorf("expected injected ad script with data-is-adult=\"1\" in HTML response, got: %s", bodyStr)
+	if !strings.Contains(bodyStr, "slimgather.com") || !strings.Contains(bodyStr, "fussyreturn.com") || !strings.Contains(bodyStr, "<script>\n(function(augj){") {
+		t.Errorf("expected injected <script> tags for slimgather.com and fussyreturn.com in HTML response, got: %s", bodyStr)
 	}
 	if strings.Contains(bodyStr, "syndication.exoclick.com") {
 		t.Errorf("expected exoclick ad URL to be stripped from HTML")
 	}
 
-	// 4. 关闭 flag (SetEnabled(false)) 时，不再注入脚本
-	adMgr.SetEnabled(false)
+	// 4. 开启 --skip-ad-script 时，不再插入广告商 <script> 标签，但仍移除源站广告
+	adMgr.SetSkipAdScript(true)
 	rec2 := httptest.NewRecorder()
 	req2 := httptest.NewRequest(http.MethodGet, "https://ex.l.moonchan.xyz:8443/", nil)
 	req2.Host = "ex.l.moonchan.xyz:8443"
 	engine.ServeHTTP(rec2, req2)
-	if strings.Contains(rec2.Body.String(), `id="ech-proxy-ad-script"`) {
-		t.Errorf("expected no ad script when disabled via flag")
+	if strings.Contains(rec2.Body.String(), "slimgather.com") {
+		t.Errorf("expected no advertiser script when --skip-ad-script is enabled")
 	}
-	adMgr.SetEnabled(true)
+	if strings.Contains(rec2.Body.String(), "syndication.exoclick.com") {
+		t.Errorf("expected original exoclick ad still stripped when only --skip-ad-script is set")
+	}
+	adMgr.SetSkipAdScript(false)
 
-	// 5. 验证 /__ech_proxy__/ad_script.js 与 /debug/log 端点
+	// 5. 开启 --skip-ad-block 时，保留源站原始广告，同时正常插入广告商 <script> 标签
+	adMgr.SetSkipAdBlock(true)
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodGet, "https://ex.l.moonchan.xyz:8443/", nil)
+	req3.Host = "ex.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec3, req3)
+	if !strings.Contains(rec3.Body.String(), "syndication.exoclick.com") {
+		t.Errorf("expected original exoclick ad to be preserved when --skip-ad-block is enabled")
+	}
+	if !strings.Contains(rec3.Body.String(), "slimgather.com") {
+		t.Errorf("expected advertiser <script> still injected when only --skip-ad-block is set")
+	}
+	adMgr.SetSkipAdBlock(false)
+
+	// 6. 验证 /__ech_proxy__/ads.js 与 /debug/log 端点
 	recScript := httptest.NewRecorder()
-	reqScript := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/__ech_proxy__/ad_script.js", nil)
+	reqScript := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/__ech_proxy__/ads.js", nil)
 	reqScript.Host = "127.0.0.1:8443"
 	engine.ServeHTTP(recScript, reqScript)
-	if recScript.Code != http.StatusOK || !strings.Contains(recScript.Body.String(), "isAdultWebsite") {
-		t.Errorf("/__ech_proxy__/ad_script.js unexpected response: code=%d", recScript.Code)
+	if recScript.Code != http.StatusOK || !strings.Contains(recScript.Body.String(), "fussyreturn.com") {
+		t.Errorf("/__ech_proxy__/ads.js unexpected response: code=%d body=%q", recScript.Code, recScript.Body.String())
 	}
 
 	recLog := httptest.NewRecorder()
@@ -491,5 +508,87 @@ func TestCertWarningPage(t *testing.T) {
 	engine.ServeHTTP(rec5, r5)
 	if rec5.Code != http.StatusBadGateway || !strings.Contains(rec5.Body.String(), "不一致") {
 		t.Fatalf("5 embedded-link: want 502+不一致 (not bypassed), got status=%d body=%q", rec5.Code, rec5.Body.String())
+	}
+}
+
+// TestPlainHTTPAndHTTPSProxyRoutingAndFallback 验证：
+// 1. 浏览器通过 PAC 发来的明文 HTTP 正向代理请求（GET/POST http://host/path）自动剥离 Proxy-Connection 等逐跳头；
+// 2. 标准 80 端口的 http:// 请求优先尝试 https:// GFW 绕过通道，若源站不支持 HTTPS（非证书校验错误）则无缝自动回退至 DoH 明文 HTTP（且完整保留 POST 请求体）；
+// 3. 显式非标端口（如 http://host:8080/path）直接按明文 HTTP 转发；
+// 4. 被代理域名的 POST / 或 GET /healthz 等请求直接进入 proxyHandler，绝不与本地管理路由冲突。
+func TestPlainHTTPAndHTTPSProxyRoutingAndFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	orig := roundTripFn
+	defer func() { roundTripFn = orig }()
+
+	var seenSchemes []string
+	var seenProxyConn string
+	var seenPostBody string
+
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		seenSchemes = append(seenSchemes, req.URL.Scheme+"://"+req.URL.Host+req.URL.RequestURI())
+		seenProxyConn = req.Header.Get("Proxy-Connection")
+		if req.Body != nil {
+			b, _ := io.ReadAll(req.Body)
+			seenPostBody = string(b)
+		}
+		// 模拟 http-only.example.com 不支持 HTTPS（连接被拒绝），仅支持明文 HTTP
+		if strings.HasPrefix(req.Host, "http-only.example.com") && req.URL.Scheme == "https" {
+			return nil, fmt.Errorf("dial tcp: connection refused")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+			Body:       io.NopCloser(strings.NewReader("ok:" + req.Method + ":" + req.URL.Scheme + "://" + req.URL.Host + req.URL.RequestURI())),
+		}, nil
+	}
+
+	cfg := &config.Config{
+		Upstreams: config.UpstreamMap{
+			"pixiv.net": {Host: "www.pixiv.net"},
+		},
+	}
+	engine := NewEngine(cfg)
+
+	// A. 明文 HTTP 访问仅支持 HTTP 的源站（POST /submit，带请求体与 Proxy-Connection 头）
+	seenSchemes = nil
+	rec1 := httptest.NewRecorder()
+	req1 := httptest.NewRequest(http.MethodPost, "http://http-only.example.com/submit?k=1", strings.NewReader("payload=123"))
+	req1.Host = "http-only.example.com"
+	req1.RequestURI = "http://http-only.example.com/submit?k=1"
+	req1.Header.Set("Proxy-Connection", "keep-alive")
+	engine.ServeHTTP(rec1, req1)
+
+	if rec1.Code != http.StatusOK || rec1.Body.String() != "ok:POST:http://http-only.example.com/submit?k=1" {
+		t.Fatalf("HTTP fallback failed: code=%d body=%q", rec1.Code, rec1.Body.String())
+	}
+	if len(seenSchemes) != 2 || !strings.HasPrefix(seenSchemes[0], "https://") || !strings.HasPrefix(seenSchemes[1], "http://") {
+		t.Errorf("expected https attempt followed by http fallback, got %v", seenSchemes)
+	}
+	if seenProxyConn != "" {
+		t.Errorf("Proxy-Connection header leaked to upstream: %q", seenProxyConn)
+	}
+	if seenPostBody != "payload=123" {
+		t.Errorf("POST body lost during https->http fallback: got %q, want payload=123", seenPostBody)
+	}
+
+	// B. 显式非标端口 http://legacy.example.com:8080/api 直接走明文 HTTP
+	seenSchemes = nil
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "http://legacy.example.com:8080/api", nil)
+	req2.Host = "legacy.example.com:8080"
+	req2.RequestURI = "http://legacy.example.com:8080/api"
+	engine.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK || len(seenSchemes) != 1 || seenSchemes[0] != "http://legacy.example.com:8080/api" {
+		t.Errorf("custom port HTTP request mismatch: code=%d schemes=%v body=%q", rec2.Code, seenSchemes, rec2.Body.String())
+	}
+
+	// C. 被代理域名的 POST / 与 GET /healthz 必须走代理转发而非命中本地 Gin 路由
+	rec3 := httptest.NewRecorder()
+	req3 := httptest.NewRequest(http.MethodPost, "https://pixiv.net/", strings.NewReader("login=1"))
+	req3.Host = "pixiv.net"
+	engine.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK || rec3.Body.String() != "ok:POST:https://www.pixiv.net/" {
+		t.Errorf("POST / on proxied host failed: code=%d body=%q", rec3.Code, rec3.Body.String())
 	}
 }

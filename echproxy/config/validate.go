@@ -35,7 +35,7 @@ func (v ValidationIssue) String() string {
 
 var (
 	knownTopLevelKeys = []string{
-		"cert_path", "key_path", "ip_mode", "upstreams", "blocked_hosts",
+		"cert_path", "key_path", "ip_mode", "whitelist_url", "ad_script_url", "ad_script_disabled", "upstreams", "blocked_hosts",
 	}
 	knownEntryKeys = []string{
 		"host", "describe", "display", "mode", "ip_mode", "sni_server_name",
@@ -50,9 +50,9 @@ var (
 		"mode", "ip_mode", "sni_server_name", "sw_inject", "rewrites", "body_replace",
 	}
 
-	validModes           = map[string]bool{"": true, "auto": true, "ech": true, "sni": true, "direct": true}
-	validIPModes         = map[string]bool{"": true, "auto": true, "v4": true, "v6": true}
-	validCookiePriority  = map[string]bool{"": true, "browser": true, "seed": true}
+	validModes          = map[string]bool{"": true, "auto": true, "ech": true, "sni": true, "direct": true}
+	validIPModes        = map[string]bool{"": true, "auto": true, "dual": true, "v4": true, "ipv4": true, "4": true, "v6": true, "ipv6": true, "6": true}
+	validCookiePriority = map[string]bool{"": true, "browser": true, "seed": true}
 )
 
 // Validate 对 upstream.json 原始字节执行严格静态校验，主动捕获 S1–S6 静默失败面。
@@ -268,7 +268,7 @@ func checkIPMode(path, ipMode string) []ValidationIssue {
 		Severity: SeverityError,
 		Path:     path,
 		Message:  fmt.Sprintf("invalid ip_mode %q", ipMode),
-		Hint:     `valid values are "v4", "v6", or "auto"`,
+		Hint:     `valid values are "v4" (or "ipv4"/"4", default), "dual", or "v6" (or "ipv6"/"6")`,
 	}}
 }
 

@@ -6,11 +6,14 @@ import (
 	"html"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/Hana-ame/ech-proxy/echproxy/certstore"
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
 	"github.com/Hana-ame/ech-proxy/echproxy/cookie"
+	"github.com/Hana-ame/ech-proxy/echproxy/logger"
+	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
 	"github.com/gin-gonic/gin"
 )
@@ -23,12 +26,16 @@ const (
 	defaultPort = "8443"
 )
 
-// EngineOptions 定义创建路由引擎时的可选扩展组件（本地 CA、CONNECT 限流器、认证策略等）。
+// EngineOptions 定义创建路由引擎时的可选扩展组件（本地 CA、CONNECT 限流器、认证策略、远程广告脚本/白名单与本地日志器等）。
 type EngineOptions struct {
 	Config    *config.Config
 	CertStore *certstore.Store
 	Auth      *AuthConfig
 	Limiter   *TunnelLimiter
+	AdScript  *rewrite.AdScriptManager
+	Logger    *logger.Manager
+	AllMode   bool
+	IPMode    string
 	Port      uint16
 }
 
@@ -48,10 +55,62 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	r.Use(gin.Recovery(), corsMiddleware())
 
 	seedCookiesFromConfig(cfg)
-	proxyHandler := ProxyHandlerWithAuth(cfg.Upstreams, cfg.BlockedHosts, opts.Auth)
+	proxyHandler := ProxyHandlerWithOptions(cfg.Upstreams, cfg.BlockedHosts, opts.Auth, opts.AdScript)
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
+	})
+
+	// 远程去广告与成人站点推广脚本端点（供查看、外部引用或手动触发 refresh=1 立即拉取更新）
+	r.GET("/__ech_proxy__/ad_script.js", func(c *gin.Context) {
+		c.Header("Content-Type", "application/javascript; charset=utf-8")
+		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
+		if opts.AdScript == nil || !opts.AdScript.Enabled() {
+			c.String(http.StatusOK, "/* ech-proxy ad_script is disabled (-no-ad-script) */\n")
+			return
+		}
+		if c.Query("refresh") == "1" && isPortalOrLocalAdminHost(stripPort(c.Request.Host)) {
+			_, _ = opts.AdScript.RefreshOnce()
+		}
+		c.Data(http.StatusOK, "application/javascript; charset=utf-8", opts.AdScript.ScriptBytes())
+	})
+
+	// 本地持久化日志与崩溃快照导出端点（仅限本机回环或门户域名访问，方便崩溃时用户一键下载上传排障）
+	r.GET("/debug/log", func(c *gin.Context) {
+		host := stripPort(c.Request.Host)
+		if !isPortalOrLocalAdminHost(host) {
+			proxyHandler(c)
+			return
+		}
+		logMgr := opts.Logger
+		if logMgr == nil {
+			logMgr = logger.Default()
+		}
+		if c.Query("crash") == "1" && logMgr != nil && logMgr.CrashLogPath() != "" {
+			if data, err := os.ReadFile(logMgr.CrashLogPath()); err == nil {
+				c.Header("Content-Type", "text/plain; charset=utf-8")
+				c.Header("Content-Disposition", `attachment; filename="ech-proxy-crash-latest.log"`)
+				c.Data(http.StatusOK, "text/plain; charset=utf-8", data)
+				return
+			}
+			c.String(http.StatusNotFound, "no crash log recorded")
+			return
+		}
+		if c.Query("download") == "1" && logMgr != nil && logMgr.LogFilePath() != "" {
+			logMgr.Sync()
+			if data, err := os.ReadFile(logMgr.LogFilePath()); err == nil {
+				c.Header("Content-Type", "text/plain; charset=utf-8")
+				c.Header("Content-Disposition", `attachment; filename="ech-proxy.log"`)
+				c.Data(http.StatusOK, "text/plain; charset=utf-8", data)
+				return
+			}
+		}
+		c.Header("Content-Type", "text/plain; charset=utf-8")
+		if logMgr != nil {
+			c.String(http.StatusOK, logMgr.RecentLines(300))
+			return
+		}
+		c.String(http.StatusOK, "local logger is not initialized")
 	})
 
 	// 运行时状态诊断端点
@@ -73,13 +132,40 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		if opts.Limiter != nil {
 			activeTunnels = opts.Limiter.ActiveCount()
 		}
+		adEnabled := false
+		allMode := opts.AllMode
+		adSource := "disabled"
+		adVersion := ""
+		whitelistCount := 0
+		if opts.AdScript != nil {
+			adEnabled = opts.AdScript.Enabled()
+			if opts.AdScript.AllMode() {
+				allMode = true
+			}
+			adSource = opts.AdScript.Source()
+			adVersion = opts.AdScript.VersionHash()
+			whitelistCount = len(opts.AdScript.Whitelist())
+		}
+		logFile := ""
+		if opts.Logger != nil {
+			logFile = opts.Logger.LogFilePath()
+		} else if logger.Default() != nil {
+			logFile = logger.Default().LogFilePath()
+		}
 		c.JSON(http.StatusOK, gin.H{
-			"status":         "ok",
-			"upstreams":      len(cfg.Upstreams),
-			"ca_path":        caPath,
-			"ca_valid_until": caValid,
-			"active_tunnels": activeTunnels,
-			"auth_enabled":   opts.Auth != nil && opts.Auth.Enabled(),
+			"status":            "ok",
+			"upstreams":         len(cfg.Upstreams),
+			"ca_path":           caPath,
+			"ca_valid_until":    caValid,
+			"active_tunnels":    activeTunnels,
+			"auth_enabled":      opts.Auth != nil && opts.Auth.Enabled(),
+			"all_mode":          allMode,
+			"ip_mode":           netdial.FormatIPMode(opts.IPMode),
+			"ad_script_enabled": adEnabled,
+			"ad_script_source":  adSource,
+			"ad_script_version": adVersion,
+			"whitelist_count":   whitelistCount,
+			"log_file":          logFile,
 		})
 	})
 
@@ -106,7 +192,9 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	r.GET("/ca.pem", caDownloadHandler)
 	r.GET("/ca.crt", caDownloadHandler)
 
-	// 自动代理配置脚本（PAC）：让用户无需修改 hosts、无需管理员 443 权限即可按需代理所有目标站点
+	// 自动代理配置脚本（PAC）：
+	// - 默认白名单模式：远程白名单（黄网列表）与配置中的目标域名走 ech-proxy（PROXY），其他网站全部直连（DIRECT）；
+	// - all 模式（-all 或 ?mode=all）：无视名单，所有网站均走 ech-proxy。
 	r.GET("/proxy.pac", func(c *gin.Context) {
 		host := stripPort(c.Request.Host)
 		if !isPortalOrLocalAdminHost(host) {
@@ -124,8 +212,12 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			_, p, _ := net.SplitHostPort(proxyAddr)
 			proxyAddr = "127.0.0.1:" + p
 		}
-		global := c.Query("mode") == "all" || c.Query("global") == "1"
-		pac := config.GeneratePAC(cfg, proxyAddr, global)
+		global := opts.AllMode || (opts.AdScript != nil && opts.AdScript.AllMode()) || c.Query("mode") == "all" || c.Query("global") == "1"
+		var whitelist []string
+		if opts.AdScript != nil {
+			whitelist = opts.AdScript.Whitelist()
+		}
+		pac := config.GeneratePAC(cfg, proxyAddr, global, whitelist)
 		c.Header("Content-Type", "application/x-ns-proxy-autoconfig; charset=utf-8")
 		c.String(http.StatusOK, pac)
 	})

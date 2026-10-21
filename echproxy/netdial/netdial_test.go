@@ -60,15 +60,29 @@ func TestIsPrivateOrReservedIP(t *testing.T) {
 	}
 }
 
-func TestNormalizeIPModeAndFilterIPs(t *testing.T) {
-	if got := NormalizeIPMode("V4"); got != "v4" {
-		t.Errorf("NormalizeIPMode(V4) = %q, want v4", got)
+func TestNormalizeValidateIPModeAndFilterIPs(t *testing.T) {
+	// Default (empty) and 4/v4/ipv4 all validate to "v4" (ipv4 only)
+	for _, v := range []string{"", "4", "v4", "V4", "ipv4", "IPV4"} {
+		if got, err := ValidateIPMode(v); err != nil || got != "v4" {
+			t.Errorf("ValidateIPMode(%q) = (%q, %v), want (v4, nil)", v, got, err)
+		}
 	}
-	if got := NormalizeIPMode(" ipv6 "); got != "v6" {
-		t.Errorf("NormalizeIPMode(ipv6) = %q, want v6", got)
+	for _, v := range []string{"6", "v6", " ipv6 "} {
+		if got, err := ValidateIPMode(v); err != nil || got != "v6" {
+			t.Errorf("ValidateIPMode(%q) = (%q, %v), want (v6, nil)", v, got, err)
+		}
 	}
-	if got := NormalizeIPMode("auto"); got != "" {
-		t.Errorf("NormalizeIPMode(auto) = %q, want empty", got)
+	for _, v := range []string{"dual", "DUAL", "auto"} {
+		if got, err := ValidateIPMode(v); err != nil || got != "dual" {
+			t.Errorf("ValidateIPMode(%q) = (%q, %v), want ('dual', nil)", v, got, err)
+		}
+	}
+	if _, err := ValidateIPMode("5"); err == nil {
+		t.Error("ValidateIPMode(5) should return error")
+	}
+
+	if got := EffectiveIPMode(""); got != "v4" {
+		t.Errorf("EffectiveIPMode('') = %q, want v4 (default ipv4)", got)
 	}
 
 	ips := []net.IP{
@@ -76,17 +90,22 @@ func TestNormalizeIPModeAndFilterIPs(t *testing.T) {
 		net.ParseIP("2606:4700::1"),
 		net.ParseIP("104.16.0.1"), // duplicate
 	}
-	v4 := FilterIPsByMode(ips, "V4")
+	// Default empty mode filters to IPv4 only
+	v4Default := FilterIPsByMode(ips, "")
+	if len(v4Default) != 1 || v4Default[0] != "104.16.0.1" {
+		t.Errorf("FilterIPsByMode default ('') = %v, want [104.16.0.1]", v4Default)
+	}
+	v4 := FilterIPsByMode(ips, "4")
 	if len(v4) != 1 || v4[0] != "104.16.0.1" {
-		t.Errorf("FilterIPsByMode v4 = %v, want [104.16.0.1]", v4)
+		t.Errorf("FilterIPsByMode 4 = %v, want [104.16.0.1]", v4)
 	}
-	v6 := FilterIPsByMode(ips, "v6")
+	v6 := FilterIPsByMode(ips, "6")
 	if len(v6) != 1 || v6[0] != "2606:4700::1" {
-		t.Errorf("FilterIPsByMode v6 = %v, want [2606:4700::1]", v6)
+		t.Errorf("FilterIPsByMode 6 = %v, want [2606:4700::1]", v6)
 	}
-	all := FilterIPsByMode(ips, "auto")
+	all := FilterIPsByMode(ips, "dual")
 	if len(all) != 2 {
-		t.Errorf("FilterIPsByMode auto = %v, want 2 unique IPs", all)
+		t.Errorf("FilterIPsByMode dual = %v, want 2 unique IPs", all)
 	}
 }
 

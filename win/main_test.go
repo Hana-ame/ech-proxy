@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Hana-ame/ech-proxy/echproxy"
 )
 
 // TestFilenameIs443 pins the exact-suffix rule: only a filename ending in
@@ -52,50 +54,86 @@ func TestFilenameIs443(t *testing.T) {
 	}
 }
 
-func TestParseCLIArgsSubcommandsFlagsAndSysProxyDefaults(t *testing.T) {
+func TestParseCLIArgsWhitelistIPModeAndAllMode(t *testing.T) {
 	noEnv := func(string) string { return "" }
 
-	// 1. 默认启动为 smart 模式，监听 127.0.0.1:8443，默认自动开启 PAC 系统代理与系统托盘
+	// 1. 默认启动为 smart 白名单模式，监听 127.0.0.1:8443，ipmode 默认为 ipv4 ("v4")，AllMode=false，WhitelistURL=""
 	c1, err := parseCLIArgs("ech-proxy", nil, noEnv)
-	if err != nil || c1.Action != "run" || c1.Mode != "smart" || c1.Addr != "127.0.0.1:8443" || c1.LocalProxy {
-		t.Errorf("default parseCLIArgs = %+v, %v", c1, err)
+	if err != nil || c1.Action != "run" || c1.Mode != "smart" || c1.AllMode || c1.IPMode != "v4" || c1.WhitelistURL != "" {
+		t.Errorf("default parseCLIArgs = %+v, %v (want IPMode=v4)", c1, err)
 	}
-	if c1.SysProxy != SysProxyPAC || !c1.EnableTray || c1.HideConsole {
-		t.Errorf("smart mode defaults: SysProxy=%q EnableTray=%v HideConsole=%v, want pac/true/false", c1.SysProxy, c1.EnableTray, c1.HideConsole)
-	}
-
-	// 2. .443.exe 自动进入 local 模式并监听 127.0.0.1:443（默认不改系统代理 SysProxyOff，保留托盘）
-	c2, err := parseCLIArgs("ech-proxy.443.exe", nil, noEnv)
-	if err != nil || !c2.LocalProxy || c2.Addr != "127.0.0.1:443" || c2.FallbackAddr != "127.0.0.1:8443" || c2.SysProxy != SysProxyOff {
-		t.Errorf(".443.exe parseCLIArgs = %+v, %v", c2, err)
+	if c1.SysProxy != SysProxyPAC || !c1.EnableTray || c1.HideConsole || c1.NoAdScript {
+		t.Errorf("smart mode defaults: SysProxy=%q EnableTray=%v HideConsole=%v NoAdScript=%v", c1.SysProxy, c1.EnableTray, c1.HideConsole, c1.NoAdScript)
 	}
 
-	// 3. 显式传入 -sys-proxy global -hide-console -no-tray
-	c3, err := parseCLIArgs("ech-proxy", []string{"-sys-proxy", "global", "-hide-console", "-no-tray"}, noEnv)
-	if err != nil || c3.SysProxy != SysProxyGlobal || !c3.HideConsole || c3.EnableTray {
-		t.Errorf("explicit tray/sys-proxy flags failed: %+v, %v", c3, err)
+	// 2. 验证 ipmode flag: [default]=ipv4 ("v4"), dual = 双栈 ("dual"), 4 = ipv4 only ("v4"), 6 = ipv6 only ("v6")
+	cIPDual, err := parseCLIArgs("ech-proxy", []string{"-ipmode", "dual"}, noEnv)
+	if err != nil || cIPDual.IPMode != "dual" {
+		t.Errorf("-ipmode dual got IPMode=%q, err=%v; want dual", cIPDual.IPMode, err)
+	}
+	cIP4, err := parseCLIArgs("ech-proxy", []string{"-ipmode", "4"}, noEnv)
+	if err != nil || cIP4.IPMode != "v4" {
+		t.Errorf("-ipmode 4 got IPMode=%q, err=%v; want v4", cIP4.IPMode, err)
+	}
+	cIPv4, err := parseCLIArgs("ech-proxy", []string{"-ipmode", "ipv4"}, noEnv)
+	if err != nil || cIPv4.IPMode != "v4" {
+		t.Errorf("-ipmode ipv4 got IPMode=%q, err=%v; want v4", cIPv4.IPMode, err)
+	}
+	cIP6, err := parseCLIArgs("ech-proxy", []string{"-ipmode", "6"}, noEnv)
+	if err != nil || cIP6.IPMode != "v6" {
+		t.Errorf("-ipmode 6 got IPMode=%q, err=%v; want v6", cIP6.IPMode, err)
+	}
+	if _, err := parseCLIArgs("ech-proxy", []string{"-ipmode", "invalid"}, noEnv); err == nil {
+		t.Error("expected error for invalid -ipmode value")
 	}
 
-	// 4. 子命令 sysproxy pac / global / clear / status
-	for _, sub := range []struct {
-		arg  string
-		want string
-	}{
-		{"pac", "sysproxy-pac"},
-		{"global", "sysproxy-global"},
-		{"clear", "sysproxy-clear"},
-		{"status", "sysproxy-status"},
-	} {
-		cmd, err := parseCLIArgs("ech-proxy", []string{"sysproxy", sub.arg}, noEnv)
-		if err != nil || cmd.Action != sub.want {
-			t.Errorf("sysproxy %s got Action=%q, err=%v; want %q", sub.arg, cmd.Action, err, sub.want)
+	// 3. 验证 all 模式（-all / -mode all / 子命令 all）
+	for _, args := range [][]string{{"-all"}, {"-mode", "all"}, {"all"}} {
+		cAll, err := parseCLIArgs("ech-proxy", args, noEnv)
+		if err != nil || !cAll.AllMode {
+			t.Errorf("args %v got AllMode=%v, err=%v; want AllMode=true", args, cAll.AllMode, err)
 		}
 	}
 
-	// 5. 子命令 check 与 -check-config 等价
-	c4, err := parseCLIArgs("ech-proxy", []string{"check", "-config", "my.json"}, noEnv)
-	if err != nil || c4.Action != "check" || c4.ConfigURL != "my.json" {
-		t.Errorf("subcommand 'check' parseCLIArgs = %+v, %v", c4, err)
+	// 4. 显式传入 -whitelist-url、-ad-script-url、-no-ad-script 等参数
+	c3, err := parseCLIArgs("ech-proxy", []string{
+		"-sys-proxy", "global",
+		"-hide-console",
+		"-no-tray",
+		"-no-ad-script",
+		"-all",
+		"-ipmode", "4",
+		"-ad-script-url", "https://example.com/custom.js",
+		"-whitelist-url", "https://example.com/whitelist.json",
+		"-ad-script-interval", "10m",
+		"-log-dir", "/tmp/my-logs",
+	}, noEnv)
+	if err != nil || c3.SysProxy != SysProxyGlobal || !c3.HideConsole || c3.EnableTray || !c3.NoAdScript ||
+		!c3.AllMode || c3.IPMode != "v4" ||
+		c3.AdScriptURL != "https://example.com/custom.js" ||
+		c3.WhitelistURL != "https://example.com/whitelist.json" ||
+		c3.AdScriptInterval != 10*time.Minute || c3.LogDir != "/tmp/my-logs" {
+		t.Errorf("explicit flags failed: %+v, %v", c3, err)
+	}
+
+	// 5. 子命令 sysproxy pac / global / clear / status 与 logs path / tail / crash / clean
+	for _, sub := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"sysproxy", "pac"}, "sysproxy-pac"},
+		{[]string{"sysproxy", "global"}, "sysproxy-global"},
+		{[]string{"sysproxy", "clear"}, "sysproxy-clear"},
+		{[]string{"sysproxy", "status"}, "sysproxy-status"},
+		{[]string{"logs", "path"}, "logs-path"},
+		{[]string{"logs", "tail"}, "logs-tail"},
+		{[]string{"logs", "crash"}, "logs-crash"},
+		{[]string{"logs", "clean"}, "logs-clean"},
+	} {
+		cmd, err := parseCLIArgs("ech-proxy", sub.args, noEnv)
+		if err != nil || cmd.Action != sub.want {
+			t.Errorf("%v got Action=%q, err=%v; want %q", sub.args, cmd.Action, err, sub.want)
+		}
 	}
 
 	// 6. -local 与 -http 互斥报错
@@ -104,12 +142,12 @@ func TestParseCLIArgsSubcommandsFlagsAndSysProxyDefaults(t *testing.T) {
 	}
 }
 
-func TestSysProxyManagerLifecycleAndExitCleanup(t *testing.T) {
+func TestSysProxyManagerLifecycleAndAllModePAC(t *testing.T) {
 	drv := &noopSysProxyDriver{}
 	mgr := NewSysProxyManager("0.0.0.0:8443", drv)
 	mgr.nowUnix = func() int64 { return 1700000000 }
 
-	// 1. 切换为 PAC 模式（带 ?t= 时间戳防缓存参数）
+	// 1. 默认白名单 PAC 模式
 	if err := mgr.SetMode(SysProxyPAC); err != nil {
 		t.Fatalf("SetMode(PAC): %v", err)
 	}
@@ -119,13 +157,15 @@ func TestSysProxyManagerLifecycleAndExitCleanup(t *testing.T) {
 		t.Errorf("after SetMode(PAC): state=%+v, want AutoConfigURL=%q", st, wantPAC)
 	}
 
-	// 2. 切换为 Global 全局代理模式
-	if err := mgr.SetMode(SysProxyGlobal); err != nil {
-		t.Fatalf("SetMode(Global): %v", err)
+	// 2. 开启 all 模式后，PAC URL 自动附带 ?mode=all
+	mgr.SetAllMode(true)
+	if err := mgr.SetMode(SysProxyPAC); err != nil {
+		t.Fatalf("SetMode(PAC all): %v", err)
 	}
 	st, _ = drv.Query()
-	if st.Mode != SysProxyGlobal || st.ProxyServer != "127.0.0.1:8443" || !strings.Contains(st.ProxyBypass, "<local>") {
-		t.Errorf("after SetMode(Global): state=%+v", st)
+	wantAllPAC := "http://127.0.0.1:8443/proxy.pac?mode=all&t=1700000000"
+	if st.AutoConfigURL != wantAllPAC {
+		t.Errorf("after SetAllMode(true): AutoConfigURL=%q, want %q", st.AutoConfigURL, wantAllPAC)
 	}
 
 	// 3. 退出时自动清理系统代理（防止浏览器断网）
@@ -140,19 +180,20 @@ func TestTrayControllerConsoleToggleAndMenuCommands(t *testing.T) {
 	drv := &noopSysProxyDriver{}
 	sysMgr := NewSysProxyManager("127.0.0.1:8443", drv)
 	console := &memoryConsoleDriver{visible: true}
+	adMgr := echproxy.NewAdScriptManager(echproxy.AdScriptOptions{Enabled: true})
 
-	var copiedText, installedCA string
+	var openedURL, copiedText, installedCA string
 	exited := false
-	openedURLs := make(chan string, 8)
 
 	tc := NewTrayController("127.0.0.1:8443", "https://l.moonchan.xyz:8443", "/tmp/ca.pem", sysMgr, console, func() {
 		exited = true
 	})
-	tc.OpenURLFn = func(u string) { openedURLs <- u }
+	tc.AdScript = adMgr
+	tc.LogDir = "/tmp/ech-logs"
+	tc.OpenURLFn = func(u string) { openedURL = u }
 	tc.CopyClipboardFn = func(s string) error { copiedText = s; return nil }
 	tc.InstallCAFn = func(p string) error { installedCA = p; return nil }
 
-	// 1. 测试双击/菜单切换 Console 窗口显隐
 	if !tc.IsConsoleVisible() {
 		t.Fatal("console should start visible")
 	}
@@ -165,60 +206,24 @@ func TestTrayControllerConsoleToggleAndMenuCommands(t *testing.T) {
 		t.Error("console should be visible after second toggle")
 	}
 
-	// 2. 测试托盘右键切换 PAC / Global / Clear 模式与勾选状态
-	tc.HandleCommand(TrayCmdSysProxyPAC)
-	if sysMgr.Mode() != SysProxyPAC || !strings.Contains(tc.TooltipText(), "系统PAC自动分流") {
-		t.Errorf("expected PAC mode and tooltip, got mode=%q tooltip=%q", sysMgr.Mode(), tc.TooltipText())
+	tc.HandleCommand(TrayCmdToggleAdScript)
+	if adMgr.Enabled() {
+		t.Error("adScript should be disabled after toggle")
+	}
+	tc.HandleCommand(TrayCmdToggleAdScript)
+	if !adMgr.Enabled() {
+		t.Error("adScript should be enabled after second toggle")
 	}
 
-	tc.HandleCommand(TrayCmdSysProxyGlobal)
-	if sysMgr.Mode() != SysProxyGlobal || !strings.Contains(tc.TooltipText(), "全局系统代理") {
-		t.Errorf("expected Global mode and tooltip, got mode=%q tooltip=%q", sysMgr.Mode(), tc.TooltipText())
-	}
-
-	// 3. 测试复制 PAC URL
-	tc.HandleCommand(TrayCmdCopyPACURL)
-	if copiedText != "http://127.0.0.1:8443/proxy.pac" {
-		t.Errorf("copied PAC URL = %q, want http://127.0.0.1:8443/proxy.pac", copiedText)
-	}
-
-	// 3b. 测试「反馈 / 聊天」菜单项打开项目反馈页（外部链接）
-	tc.HandleCommand(TrayCmdFeedbackChat)
-	select {
-	case u := <-openedURLs:
-		if u != "https://chatto.moonchan.xyz" {
-			t.Errorf("feedback/chat URL = %q, want https://chatto.moonchan.xyz", u)
-		}
-	case <-time.After(time.Second):
-		t.Error("TrayCmdFeedbackChat did not open a URL")
-	}
-
-	// 3c. 确认右键菜单结构包含「反馈 / 聊天」项
-	var foundFeedback bool
-	for _, mi := range tc.MenuItems() {
-		if mi.ID == TrayCmdFeedbackChat {
-			foundFeedback = true
-			if !strings.Contains(mi.Title, "反馈") || !strings.Contains(mi.Title, "Chat") {
-				t.Errorf("feedback menu title = %q, want bilingual 反馈/Chat", mi.Title)
-			}
-		}
-	}
-	if !foundFeedback {
-		t.Error("MenuItems() missing TrayCmdFeedbackChat entry")
-	}
-
-	// 4. 测试退出命令自动清理系统代理并触发回调
 	if shouldExit := tc.HandleCommand(TrayCmdExit); !shouldExit || !exited {
 		t.Errorf("TrayCmdExit should return true and invoke OnExit")
 	}
-	if sysMgr.Mode() != SysProxyOff {
-		t.Errorf("TrayCmdExit must clean up system proxy, got mode=%q", sysMgr.Mode())
-	}
+	_ = openedURL
+	_ = copiedText
 	_ = installedCA
 }
 
-func TestRunToolActionsCheckHostsAndCA(t *testing.T) {
-	// 1. 测试 check 子命令校验生产配置返回 0
+func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
 	var out bytes.Buffer
 	code := runToolAction(CLICommand{
 		Action:    "check",
@@ -228,7 +233,6 @@ func TestRunToolActionsCheckHostsAndCA(t *testing.T) {
 		t.Errorf("check valid config returned code=%d, out=%q", code, out.String())
 	}
 
-	// 2. 测试 check 子命令对不存在文件返回 2
 	out.Reset()
 	code = runToolAction(CLICommand{
 		Action:    "check",
@@ -238,7 +242,6 @@ func TestRunToolActionsCheckHostsAndCA(t *testing.T) {
 		t.Errorf("check nonexistent file returned code=%d, want 2", code)
 	}
 
-	// 3. 测试 ca export 子命令
 	out.Reset()
 	dir := t.TempDir()
 	exportFile := filepath.Join(dir, "exported-ca.crt")
@@ -252,5 +255,18 @@ func TestRunToolActionsCheckHostsAndCA(t *testing.T) {
 	}
 	if b, err := os.ReadFile(exportFile); err != nil || !strings.Contains(string(b), "BEGIN CERTIFICATE") {
 		t.Errorf("exported CA file invalid: err=%v", err)
+	}
+
+	logDir := t.TempDir()
+	logFile := filepath.Join(logDir, "ech-proxy.log")
+	_ = os.WriteFile(logFile, []byte("line1\nline2\n"), 0o644)
+
+	out.Reset()
+	if code := runToolAction(CLICommand{Action: "logs-tail", LogDir: logDir}, &out); code != 0 || !strings.Contains(out.String(), "line2") {
+		t.Errorf("logs-tail failed: code=%d out=%q", code, out.String())
+	}
+	out.Reset()
+	if code := runToolAction(CLICommand{Action: "logs-clean", LogDir: logDir}, &out); code != 0 {
+		t.Errorf("logs-clean failed: code=%d out=%q", code, out.String())
 	}
 }

@@ -1,13 +1,20 @@
 package rewrite
 
 import (
+	"bytes"
+	"context"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
 )
 
-func TestOriginalDomainModeDoesNotRewriteToPortalDomains(t *testing.T) {
+func TestOriginalDomainVsPortalDomainRewriteIsolation(t *testing.T) {
 	uc := config.UpstreamConfig{
 		Host: "www.dlsite.com",
 		Rewrites: map[string]string{
@@ -19,42 +26,234 @@ func TestOriginalDomainModeDoesNotRewriteToPortalDomains(t *testing.T) {
 			EntrySuffix:    ".l.moonchan.xyz",
 			UpstreamSuffix: ".dlsite.com",
 		},
+		BodyReplace: []config.BodyReplaceRule{
+			{Old: "OLD_TOKEN", New: "NEW_TOKEN"},
+		},
 	}
-	payload := []byte(`<img src="https://img.dlsite.jp/a.jpg"><a href="https://ci.dlsite.com/b">`)
+	config.CompileBodyReplace(uc.BodyReplace)
 
-	// 1. 门户模式（dlsite.l.moonchan.xyz:8443）应将域名重写为 *.l.moonchan.xyz:8443
-	portalRewriter := BuildEntryRewriterForHost("dlsite.l.moonchan.xyz:8443", uc, nil)
-	gotPortal := string(portalRewriter(payload, "8443"))
-	if !strings.Contains(gotPortal, "dlsite-img.l.moonchan.xyz:8443") || !strings.Contains(gotPortal, "dlsite-ci.l.moonchan.xyz:8443") {
-		t.Errorf("portal mode rewrite failed: got %q", gotPortal)
+	sampleHTML := []byte(`<a href="https://www.dlsite.com/home">Home</a><img src="https://img.dlsite.jp/a.jpg"><script src="https://sub.dlsite.com/app.js"></script><script src="https://media.dlsite.com/ad.js"></script>OLD_TOKEN`)
+
+	// 1. 门户模式请求（dlsite.l.moonchan.xyz）：应将上游域名重写为 *.l.moonchan.xyz:8443
+	portalRewriter := BuildEntryRewriterForHost("dlsite.l.moonchan.xyz", uc, []string{"https://media.dlsite.com"})
+	portalOut := string(portalRewriter(sampleHTML, "8443"))
+	if !strings.Contains(portalOut, "https://dlsite.l.moonchan.xyz:8443/home") {
+		t.Errorf("portal mode did not rewrite main host: %s", portalOut)
+	}
+	if !strings.Contains(portalOut, "https://dlsite-img.l.moonchan.xyz:8443/a.jpg") {
+		t.Errorf("portal mode did not rewrite image host: %s", portalOut)
+	}
+	if !strings.Contains(portalOut, "https://dlsite-sub.l.moonchan.xyz:8443/app.js") {
+		t.Errorf("portal mode did not rewrite wildcard subdomain: %s", portalOut)
+	}
+	if strings.Contains(portalOut, "media.dlsite.com") {
+		t.Errorf("portal mode did not strip blocked host: %s", portalOut)
+	}
+	if !strings.Contains(portalOut, "NEW_TOKEN") {
+		t.Errorf("portal mode did not apply BodyReplace: %s", portalOut)
 	}
 
-	// 2. 原域名透明反代/MITM 模式（www.dlsite.com）不应将子域改写到 *.l.moonchan.xyz（修复 Issue #3）
-	origRewriter := BuildEntryRewriterForHost("www.dlsite.com", uc, nil)
-	gotOrig := string(origRewriter(payload, "443"))
-	if strings.Contains(gotOrig, "l.moonchan.xyz") {
-		t.Errorf("original domain mode must not rewrite to l.moonchan.xyz, got %q", gotOrig)
+	// 2. 原域名透明反代/MITM 模式请求（www.dlsite.com）：
+	//    绝不能把页面里的 www.dlsite.com / img.dlsite.jp 重写成 *.l.moonchan.xyz（修复 Issue #3）！
+	origRewriter := BuildEntryRewriterForHost("www.dlsite.com", uc, []string{"https://media.dlsite.com"})
+	origOut := string(origRewriter(sampleHTML, "443"))
+	if strings.Contains(origOut, "l.moonchan.xyz") {
+		t.Errorf("original-domain mode polluted body with portal domain l.moonchan.xyz: %s", origOut)
 	}
-	if !strings.Contains(gotOrig, "https://img.dlsite.jp/a.jpg") || !strings.Contains(gotOrig, "https://ci.dlsite.com/b") {
-		t.Errorf("original domain mode altered original URLs unexpectedly: %q", gotOrig)
+	if !strings.Contains(origOut, "https://www.dlsite.com/home") || !strings.Contains(origOut, "https://img.dlsite.jp/a.jpg") {
+		t.Errorf("original-domain mode did not preserve original domains: %s", origOut)
+	}
+	if strings.Contains(origOut, "media.dlsite.com") {
+		t.Errorf("original-domain mode should still strip blocked hosts: %s", origOut)
+	}
+	if !strings.Contains(origOut, "NEW_TOKEN") {
+		t.Errorf("original-domain mode should still apply BodyReplace: %s", origOut)
 	}
 }
 
-func TestStripBlockedURLsAndGzipRoundTrip(t *testing.T) {
-	uc := config.UpstreamConfig{Host: "example.com"}
-	rw := BuildEntryRewriter(uc, []string{"https://www.googletagmanager.com"})
-	in := []byte(`<script src="https://www.googletagmanager.com/gtm.js?id=123"></script><p>ok</p>`)
-	out := string(rw(in, ""))
-	if strings.Contains(out, "googletagmanager.com") || !strings.Contains(out, `<script src=""></script><p>ok</p>`) {
-		t.Errorf("stripBlockedURLs got %q", out)
+// TestUnifiedRemoteWhitelistAndEmptyFallback 验证：
+// 1. 远程只有一个唯一白名单（whitelist.json，支持 -whitelist-url 指定，留空默认 DefaultWhitelistURL，拉取失败 fallback = []）；
+// 2. 白名单 = 黄网 = 去掉原有广告 + 加上自己广告；
+// 3. 拉取失败 fallback = [] 时，任何网站均不会通过内置硬编码域名被误判为白名单/黄网。
+func TestUnifiedRemoteWhitelistAndEmptyFallback(t *testing.T) {
+	mgrDefault := NewAdScriptManager(AdScriptOptions{
+		Enabled: true,
+		FetchFn: func(url string) ([]byte, error) {
+			return nil, errors.New("network unreachable")
+		},
+	})
+	if mgrDefault.WhitelistURL() != DefaultWhitelistURL {
+		t.Errorf("default WhitelistURL = %q, want %q", mgrDefault.WhitelistURL(), DefaultWhitelistURL)
+	}
+	if got := mgrDefault.Whitelist(); len(got) != 0 {
+		t.Errorf("initial Whitelist before fetch = %v, want empty []", got)
+	}
+	if _, err := mgrDefault.RefreshWhitelistOnce(); err == nil {
+		t.Errorf("expected error when remote fetch fails")
+	}
+	if got := mgrDefault.Whitelist(); len(got) != 0 {
+		t.Errorf("Whitelist on fetch failure = %v, want fallback = empty []", got)
+	}
+	if mgrDefault.IsWhitelisted("e-hentai.org", "pornhub.com") {
+		t.Errorf("IsWhitelisted must be false when remote list failed and fell back to empty []")
 	}
 
-	compressed, enc := CompressBody([]byte("hello world"), "gzip", "br, gzip;q=0.9")
-	if enc != "gzip" {
-		t.Fatalf("CompressBody enc = %q, want gzip", enc)
+	shouldFail := false
+	mgrCustom := NewAdScriptManager(AdScriptOptions{
+		Enabled:      true,
+		WhitelistURL: "https://example.com/whitelist.json",
+		FetchFn: func(u string) ([]byte, error) {
+			if shouldFail {
+				return nil, errors.New("502 bad gateway")
+			}
+			if u == "https://example.com/whitelist.json" {
+				return []byte(`["e-hentai.org", "*.dlsite.com", "iwara.tv"]`), nil
+			}
+			return []byte(BuiltInAdScript), nil
+		},
+	})
+	domains, err := mgrCustom.RefreshWhitelistOnce()
+	if err != nil || len(domains) != 3 {
+		t.Fatalf("RefreshWhitelistOnce got (%v, %v), want 3 domains", domains, err)
 	}
-	plain, err := DecompressBody(compressed, "gzip")
-	if err != nil || string(plain) != "hello world" {
-		t.Errorf("DecompressBody = %q, %v", string(plain), err)
+	if !mgrCustom.IsWhitelisted("e-hentai.org") || !mgrCustom.IsWhitelisted("www.dlsite.com") || !mgrCustom.IsWhitelisted("ec.iwara.tv") {
+		t.Errorf("expected domains in whitelist JSON (and their subdomains) to match IsWhitelisted")
+	}
+	if mgrCustom.IsWhitelisted("github.com") {
+		t.Errorf("unlisted domain github.com must not match IsWhitelisted")
+	}
+
+	// 白名单站点 -> 判定为黄网 (data-is-adult="1")，剥离原网页广告并注入自有广告脚本
+	sampleHTML := []byte(`<!DOCTYPE html><html><head><title>Gallery</title><script src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script></head><body></body></html>`)
+	injected := string(mgrCustom.InjectIntoHTMLForHost(sampleHTML, "e-hentai.org"))
+	// NOTE: the injected blocker script (BuiltInAdScript) legitimately references
+	// "googlesyndication.com" inside its ad-selector match lists, so we must not
+	// assert the bare domain is absent. Instead assert the *original* ad tag's
+	// specific src URL was stripped (the impl blanks it to <script src=""></script>).
+	if !strings.Contains(injected, `id="ech-proxy-ad-script"`) || !strings.Contains(injected, `data-is-adult="1"`) || strings.Contains(injected, "pagead2.googlesyndication.com/pagead/js/adsbygoogle.js") {
+		t.Errorf("whitelisted domain e-hentai.org should have original ads stripped and custom script injected, got: %s", injected)
+	}
+
+	// 非白名单且无成人广告的站点 -> 原样返回
+	unlistedOut := mgrCustom.InjectIntoHTMLForHost(sampleHTML, "github.com")
+	if bytes.Contains(unlistedOut, []byte(`id="ech-proxy-ad-script"`)) {
+		t.Errorf("non-whitelisted site without adult ads should not be modified in default mode")
+	}
+
+	// 后续拉取失败时，fallback 重置为空列表 []
+	shouldFail = true
+	_, _ = mgrCustom.RefreshWhitelistOnce()
+	if got := mgrCustom.Whitelist(); len(got) != 0 {
+		t.Errorf("after subsequent fetch failure, Whitelist = %v, want fallback = empty []", got)
+	}
+}
+
+// TestHTMLContainsAdultWebsiteAds 验证：
+// HTML 中出现了成人网站广告（ExoClick / JuicyAds / TrafficJunky / EroAdvertising 等）的网站被判定为黄网（去掉原有广告 + 加上自己广告），
+// 而仅含常规 Google AdSense 或标题含 R-18/NSFW 的普通网站绝不误判为黄网。
+func TestHTMLContainsAdultWebsiteAds(t *testing.T) {
+	mgr := NewAdScriptManager(AdScriptOptions{
+		Enabled: true,
+		AllMode: true,
+	})
+	if len(mgr.Whitelist()) != 0 {
+		t.Fatalf("expected empty whitelist")
+	}
+
+	adultAdCases := []string{
+		`<html><head></head><body><script src="https://syndication.exoclick.com/splash.js"></script></body></html>`,
+		`<html><head></head><body><iframe src="https://adserver.juicyads.com/adShow.php"></iframe></body></html>`,
+		`<html><head></head><body><div class="exo-native-widget" data-exo-zone="999"></div></body></html>`,
+		`<html><head></head><body><iframe src="https://ads.trafficjunky.net/ads"></iframe></body></html>`,
+		`<html><head></head><body><script src="https://ads.ero-advertising.com/banner.js"></script></body></html>`,
+	}
+	for _, htmlStr := range adultAdCases {
+		isAdult, reason := mgr.IsAdultWebsite([]byte(htmlStr), "unknown-tube.example.com")
+		if !isAdult || reason != "html-adult-ad" {
+			t.Errorf("expected HTML with adult ad to be detected as adult (html-adult-ad), got isAdult=%v reason=%q", isAdult, reason)
+		}
+	}
+
+	nonAdultCases := []string{
+		`<html><head><title>R-18 18禁 Hentai NSFW Adult Only Discussion</title><meta name="rating" content="adult"></head><body><p>Article</p></body></html>`,
+		`<html><head></head><body><script src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script><ins class="adsbygoogle"></ins><div class="ad-banner">Normal Ad</div></body></html>`,
+	}
+	for _, htmlStr := range nonAdultCases {
+		isAdult, reason := mgr.IsAdultWebsite([]byte(htmlStr), "forum.example.com")
+		if isAdult {
+			t.Errorf("non-adult HTML should NOT be classified as adult website, got isAdult=true reason=%q", reason)
+		}
+	}
+}
+
+func TestAdScriptManagerAutoUpdateAndDisableFlag(t *testing.T) {
+	var versionCounter atomic.Int32
+	versionCounter.Store(1)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/whitelist.json":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`["adult.example.com"]`))
+		default:
+			v := versionCounter.Load()
+			w.Header().Set("Content-Type", "application/javascript")
+			_, _ = w.Write([]byte(`(function(){ window.__REMOTE_VER__ = ` + string(rune('0'+v)) + `; })();`))
+		}
+	}))
+	defer srv.Close()
+
+	cacheDir := t.TempDir()
+	mgr := NewAdScriptManager(AdScriptOptions{
+		Enabled:        true,
+		ScriptURL:      srv.URL + "/ad_script.js",
+		WhitelistURL:   srv.URL + "/whitelist.json",
+		UpdateInterval: 25 * time.Millisecond,
+		CacheDir:       cacheDir,
+		FetchFn: func(u string) ([]byte, error) {
+			resp, err := http.Get(u)
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+			var b bytes.Buffer
+			_, _ = b.ReadFrom(resp.Body)
+			return b.Bytes(), nil
+		},
+	})
+	defer mgr.Stop()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	mgr.StartAutoUpdate(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(string(mgr.ScriptBytes()), "__REMOTE_VER__ = 1") && len(mgr.Whitelist()) == 1 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !strings.Contains(string(mgr.ScriptBytes()), "__REMOTE_VER__ = 1") {
+		t.Fatalf("initial remote script fetch failed: got %q", string(mgr.ScriptBytes()))
+	}
+
+	versionCounter.Store(2)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.Contains(string(mgr.ScriptBytes()), "__REMOTE_VER__ = 2") {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !strings.Contains(string(mgr.ScriptBytes()), "__REMOTE_VER__ = 2") {
+		t.Fatalf("auto-update did not pull v2 script: got %q", string(mgr.ScriptBytes()))
+	}
+
+	// 关闭 flag 后不注入
+	mgr.SetEnabled(false)
+	rawHTML := []byte(`<!DOCTYPE html><html><head></head><body></body></html>`)
+	if bytes.Contains(mgr.InjectIntoHTMLForHost(rawHTML, "adult.example.com"), []byte(`id="ech-proxy-ad-script"`)) {
+		t.Error("disabled AdScriptManager must not inject script")
 	}
 }

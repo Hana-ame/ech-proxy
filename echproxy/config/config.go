@@ -22,6 +22,84 @@ const DefaultConfigURL = "https://proxy.moonchan.xyz/Hana-ame/ech-proxy/refs/hea
 // PortalDomain 是门户与 8443 代理子域名的根域名。
 const PortalDomain = "l.moonchan.xyz"
 
+// FallbackConfigJSON 是当远程配置与本地磁盘缓存均不可用时的最小内置兜底配置（防止离线或网络抖动时启动闪退）。
+const FallbackConfigJSON = `{
+  "ip_mode": "v4",
+  "upstreams": {
+    "l.moonchan.xyz": {
+      "host": "reminder.moonchan.xyz",
+      "mode": "direct",
+      "ip_mode": "v4",
+      "describe": "Main Portal / Reminder Service",
+      "display": false
+    },
+    "ex.l.moonchan.xyz": {
+      "host": "e-hentai.org",
+      "ip_mode": "v4",
+      "describe": "ExHentai Gallery",
+      "display": false
+    },
+    "iwara.l.moonchan.xyz": {
+      "host": "www.iwara.tv",
+      "ip_mode": "v4",
+      "referer": "https://www.iwara.tv/",
+      "describe": "Iwara Video Site",
+      "display": true,
+      "wildcard": {
+        "prefix": "iwara-",
+        "entry_suffix": ".l.moonchan.xyz",
+        "upstream_suffix": ".iwara.tv",
+        "referer": "https://www.iwara.tv/"
+      }
+    },
+    "dlsite.l.moonchan.xyz": {
+      "host": "www.dlsite.com",
+      "ip_mode": "v4",
+      "referer": "https://www.dlsite.com/",
+      "describe": "DLsite Digital Store",
+      "display": true,
+      "wildcard": {
+        "prefix": "dlsite-",
+        "entry_suffix": ".l.moonchan.xyz",
+        "upstream_suffix": ".dlsite.com",
+        "referer": "https://www.dlsite.com/"
+      }
+    },
+    "pixiv.net": {
+      "host": "pixiv.net",
+      "ip_mode": "v4",
+      "wildcard": {
+        "entry_suffix": ".pixiv.net",
+        "upstream_suffix": ".pixiv.net"
+      },
+      "display": false
+    },
+    "pximg.net": {
+      "host": "pximg.net",
+      "ip_mode": "v4",
+      "referer": "https://www.pixiv.net/",
+      "wildcard": {
+        "entry_suffix": ".pximg.net",
+        "upstream_suffix": ".pximg.net",
+        "referer": "https://www.pixiv.net/"
+      },
+      "display": false
+    },
+    "i.pximg.net": {
+      "host": "i.pximg.net",
+      "ip_mode": "v4",
+      "referer": "https://www.pixiv.net/",
+      "display": false
+    },
+    "s.pximg.net": {
+      "host": "s.pximg.net",
+      "ip_mode": "v4",
+      "referer": "https://www.pixiv.net/",
+      "display": false
+    }
+  }
+}`
+
 // IsPortalDomain 判断域名是否为 l.moonchan.xyz 或 *.l.moonchan.xyz。
 // 除该域名体系外，其余所有域名均使用本地自签 CA 证书并通过自动 SNI/ECH 转发至真实服务器。
 func IsPortalDomain(host string) bool {
@@ -143,7 +221,7 @@ type UpstreamConfig struct {
 	Describe        string                `json:"describe,omitempty"`
 	Display         bool                  `json:"display,omitempty"`
 	Mode            string                `json:"mode,omitempty"`            // ""/"auto", "ech", "sni", "direct"
-	IPMode          string                `json:"ip_mode,omitempty"`         // ""/"auto", "v4", "v6"
+	IPMode          string                `json:"ip_mode,omitempty"`         // 默认 "v4"/"4" (ipv4), "dual", "v6"/"6"
 	SNIServerName   string                `json:"sni_server_name,omitempty"` // 自定义 SNI 伪装域名（可选）
 	Referer         string                `json:"referer,omitempty"`
 	Origin          string                `json:"origin,omitempty"`
@@ -165,21 +243,27 @@ type UpstreamMap map[string]UpstreamConfig
 
 // Config 表示完整的 upstream.json 配置结构。
 type Config struct {
-	CertPath      string      `json:"cert_path"`
-	KeyPath       string      `json:"key_path"`
-	IPMode        string      `json:"ip_mode,omitempty"` // 顶层默认 ip_mode（修复 S1）
-	Upstreams     UpstreamMap `json:"upstreams"`
-	BlockedHosts  []string    `json:"blocked_hosts"`
-	UpstreamOrder []string    `json:"-"`
+	CertPath         string      `json:"cert_path"`
+	KeyPath          string      `json:"key_path"`
+	IPMode           string      `json:"ip_mode,omitempty"`            // 顶层默认 ip_mode（默认 "v4"）
+	WhitelistURL     string      `json:"whitelist_url,omitempty"`      // 远程唯一白名单（黄网列表）URL（可选）
+	AdScriptURL      string      `json:"ad_script_url,omitempty"`      // 远程广告处理脚本 URL（可选）
+	AdScriptDisabled bool        `json:"ad_script_disabled,omitempty"` // 是否在配置层默认禁用远程脚本（可选）
+	Upstreams        UpstreamMap `json:"upstreams"`
+	BlockedHosts     []string    `json:"blocked_hosts"`
+	UpstreamOrder    []string    `json:"-"`
 }
 
-// Load 从本地路径或远程 URL 加载并解析 upstream.json。
+// Load 从本地路径或远程 URL 加载并解析 upstream.json（失败时回退内置兜底配置）。
 func Load(source string) (*Config, error) {
 	if source == "" {
 		source = DefaultConfigURL
 	}
 	buf, err := netdial.FetchBytes(source)
 	if err != nil {
+		if fallbackCfg, ferr := Parse([]byte(FallbackConfigJSON)); ferr == nil {
+			return fallbackCfg, fmt.Errorf("fetch upstream config (%w); using fallback", err)
+		}
 		return nil, fmt.Errorf("fetch upstream config: %w", err)
 	}
 	return Parse(buf)
@@ -238,12 +322,12 @@ func normalizeCookiePriority(p string) string {
 }
 
 func normalize(cfg *Config) {
-	cfg.IPMode = netdial.NormalizeIPMode(cfg.IPMode)
+	cfg.IPMode = netdial.EffectiveIPMode(cfg.IPMode) // 默认 ipv4 ("v4")
 
 	for host, uc := range cfg.Upstreams {
 		uc.Mode = normalizeMode(uc.Mode)
 		uc.IPMode = netdial.NormalizeIPMode(uc.IPMode)
-		if uc.IPMode == "" && cfg.IPMode != "" {
+		if uc.IPMode == "" {
 			uc.IPMode = cfg.IPMode
 		}
 		uc.CookiePriority = normalizeCookiePriority(uc.CookiePriority)
@@ -369,7 +453,7 @@ func compileBodyReplace(rules []BodyReplaceRule) {
 //  1. 优先精确匹配 upstream.json 中的条目；
 //  2. 其次匹配 upstream.json 中的 Wildcard 泛域名规则；
 //  3. 若请求域名不属于 l.moonchan.xyz 体系（即通过 hosts=127.0.0.1 或 CONNECT 代理接入的任意真实域名），
-//     即使未显式写入 upstream.json，也自动生成原域名透传配置（Mode: "auto"），交由 SNI/ECH 自动探测转发。
+//     即使未显式写入 upstream.json，也自动生成原域名透传配置（Mode: "auto"，IPMode 默认 "v4"），交由 SNI/ECH 自动探测转发。
 func Resolve(upstreams UpstreamMap, host string) (UpstreamConfig, bool) {
 	host = cleanHost(host)
 	if host == "" {
@@ -381,11 +465,12 @@ func Resolve(upstreams UpstreamMap, host string) (UpstreamConfig, bool) {
 	if uc, ok := MatchWildcard(upstreams, host); ok {
 		return uc, true
 	}
-	// 非 l.moonchan.xyz 域名（且为合法域名而非纯 IP）：自动启用原域名透明反代，由底层自动选择 SNI/ECH
+	// 非 l.moonchan.xyz 域名（且为合法域名而非纯 IP）：自动启用原域名透明反代，默认走 IPv4
 	if !IsPortalDomain(host) && net.ParseIP(host) == nil && strings.Contains(host, ".") {
 		return UpstreamConfig{
 			Host:           host,
 			Mode:           "auto",
+			IPMode:         netdial.DefaultIPMode,
 			CookiePriority: "browser",
 		}, true
 	}

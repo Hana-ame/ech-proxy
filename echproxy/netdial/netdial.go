@@ -27,6 +27,9 @@ const (
 
 	RetryAttempts = 3
 	RetryBackoff  = 1500 * time.Millisecond
+
+	// DefaultIPMode 是全局默认的出口 IP 协议族（默认 ipv4 = "v4"）。
+	DefaultIPMode = "v4"
 )
 
 var dnsServers = []string{
@@ -115,15 +118,59 @@ func IsPrivateOrReservedIP(ip net.IP) bool {
 	return false
 }
 
-// NormalizeIPMode 将出口协议族归一化为 "v4"、"v6" 或 ""（代表自动选择）。
+// NormalizeIPMode 将显式出口协议族字符串归一化：
+//   - "4" / "v4" / "ipv4" -> "v4" (ipv4 only)
+//   - "6" / "v6" / "ipv6" -> "v6" (ipv6 only)
+//   - "dual" / "auto"     -> "dual" (dual-stack)
+//   - ""                  -> "" (未显式指定，交由上层继承或取默认值 DefaultIPMode="v4")
 func NormalizeIPMode(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
-	case "v4", "ipv4", "4":
+	case "4", "v4", "ipv4":
 		return "v4"
-	case "v6", "ipv6", "6":
+	case "6", "v6", "ipv6":
 		return "v6"
+	case "dual", "auto":
+		return "dual"
 	default:
 		return ""
+	}
+}
+
+// EffectiveIPMode 返回最终生效的出口 IP 协议族（未指定时默认返回 DefaultIPMode = "v4"，即默认 ipv4）。
+func EffectiveIPMode(mode string) string {
+	norm := NormalizeIPMode(mode)
+	if norm == "" {
+		return DefaultIPMode
+	}
+	return norm
+}
+
+// ValidateIPMode 校验并归一化命令行或配置传入的 ipmode 值：
+//   - "" / "4" / "v4" / "ipv4" -> "v4" (默认 ipv4 only)
+//   - "dual" / "auto"          -> "dual" (双栈)
+//   - "6" / "v6" / "ipv6"      -> "v6" (ipv6 only)
+func ValidateIPMode(raw string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", "4", "v4", "ipv4":
+		return "v4", nil
+	case "dual", "auto":
+		return "dual", nil
+	case "6", "v6", "ipv6":
+		return "v6", nil
+	default:
+		return "", fmt.Errorf("invalid ipmode %q (valid: ipv4/4 [default], dual, ipv6/6)", raw)
+	}
+}
+
+// FormatIPMode 返回出口协议族的可读描述（默认 "ipv4 (4 = ipv4 only)" / "dual" / "ipv6 (6 = ipv6 only)"）。
+func FormatIPMode(mode string) string {
+	switch EffectiveIPMode(mode) {
+	case "v4":
+		return "ipv4 (4 = ipv4 only)"
+	case "v6":
+		return "ipv6 (6 = ipv6 only)"
+	default:
+		return "dual"
 	}
 }
 
@@ -187,9 +234,9 @@ func Dialer() *net.Dialer {
 	}
 }
 
-// FilterIPsByMode 按指定的协议族（"v4"、"v6" 或 ""/"auto"）过滤 IP 列表。
+// FilterIPsByMode 按指定的协议族（默认 "v4"、"v6" 或 "dual"）过滤 IP 列表。
 func FilterIPsByMode(ips []net.IP, mode string) []string {
-	norm := NormalizeIPMode(mode)
+	norm := EffectiveIPMode(mode)
 	var out []string
 	seen := make(map[string]bool, len(ips))
 	for _, ip := range ips {
@@ -212,12 +259,13 @@ func FilterIPsByMode(ips []net.IP, mode string) []string {
 	return out
 }
 
-// ResolveIPs 按指定的协议族（"v4"、"v6" 或 ""/"auto"）解析域名并返回所有匹配的 IP。
+// ResolveIPs 按指定的协议族（默认 "v4"、"v6" 或 "dual"）解析域名并返回所有匹配的 IP。
 func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
+	norm := EffectiveIPMode(mode)
 	if ip := net.ParseIP(host); ip != nil {
-		filtered := FilterIPsByMode([]net.IP{ip}, mode)
+		filtered := FilterIPsByMode([]net.IP{ip}, norm)
 		if len(filtered) == 0 {
-			return nil, fmt.Errorf("IP %s does not match ip_mode %q", host, mode)
+			return nil, fmt.Errorf("IP %s does not match ip_mode %q", host, norm)
 		}
 		return filtered, nil
 	}
@@ -229,9 +277,9 @@ func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
 	for _, a := range addrs {
 		ips = append(ips, a.IP)
 	}
-	filtered := FilterIPsByMode(ips, mode)
+	filtered := FilterIPsByMode(ips, norm)
 	if len(filtered) == 0 {
-		if norm := NormalizeIPMode(mode); norm != "" {
+		if norm != "dual" {
 			return nil, fmt.Errorf("no %s address for %s", norm, host)
 		}
 		return nil, fmt.Errorf("no IP address for %s", host)
@@ -239,7 +287,7 @@ func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
 	return filtered, nil
 }
 
-// ResolvePreferredIP 按指定的协议族（"v4"、"v6" 或 ""/"auto"）解析域名并返回首个匹配的 IP。
+// ResolvePreferredIP 按指定的协议族（默认 "v4"、"v6" 或 "dual"）解析域名并返回首个匹配的 IP。
 func ResolvePreferredIP(ctx context.Context, host, mode string) (string, error) {
 	ips, err := ResolveIPs(ctx, host, mode)
 	if err != nil {
@@ -248,12 +296,12 @@ func ResolvePreferredIP(ctx context.Context, host, mode string) (string, error) 
 	return ips[0], nil
 }
 
-// DialContextIPMode 根据 ipMode（"v4"、"v6" 或 ""/"auto"）向目标 host:port 发起 TCP 连接。
+// DialContextIPMode 根据 ipMode（默认 "v4"、"v6" 或 "dual"）向目标 host:port 发起 TCP 连接。
 func DialContextIPMode(ctx context.Context, host, port, mode string, timeout time.Duration) (net.Conn, error) {
 	if timeout <= 0 {
 		timeout = DialTimeout
 	}
-	norm := NormalizeIPMode(mode)
+	norm := EffectiveIPMode(mode)
 	if norm == "v4" || norm == "v6" {
 		ips, err := ResolveIPs(ctx, host, norm)
 		if err != nil {
@@ -282,7 +330,7 @@ func DialContextIPMode(ctx context.Context, host, port, mode string, timeout tim
 	}).DialContext(ctx, "tcp", net.JoinHostPort(host, port))
 }
 
-// Transport 返回全局复用的默认 HTTP Transport。
+// Transport 返回全局复用的 HTTP Transport。
 func Transport() *http.Transport {
 	transportOnce.Do(func() {
 		cachedTransport = &http.Transport{
@@ -296,9 +344,9 @@ func Transport() *http.Transport {
 	return cachedTransport
 }
 
-// TransportWithIPMode 返回锁定出口 IP 协议族（"v4" 或 "v6"）的 HTTP Transport。
+// TransportWithIPMode 返回锁定出口 IP 协议族（默认 "v4"、"v6" 或 "dual"）的 HTTP Transport。
 func TransportWithIPMode(mode string) *http.Transport {
-	norm := NormalizeIPMode(mode)
+	norm := EffectiveIPMode(mode)
 	if norm != "v4" && norm != "v6" {
 		return Transport()
 	}
@@ -317,9 +365,9 @@ func TransportWithIPMode(mode string) *http.Transport {
 	}
 }
 
-// Client 返回不自动跟随重定向的 HTTP 客户端。
+// Client 返回不自动跟随重定向的默认 HTTP 客户端（默认走 IPv4）。
 func Client(timeout time.Duration) *http.Client {
-	return ClientWithIPMode("", timeout)
+	return ClientWithIPMode(DefaultIPMode, timeout)
 }
 
 // ClientWithIPMode 返回按指定 IP 协议族拨号、不自动跟随重定向的 HTTP 客户端。

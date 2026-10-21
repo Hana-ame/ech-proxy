@@ -8,6 +8,8 @@ import (
 	"sync"
 	"syscall"
 	"unsafe"
+
+	"github.com/Hana-ame/ech-proxy/echproxy"
 )
 
 const (
@@ -33,11 +35,11 @@ const (
 	swShow    = 5
 	swRestore = 9
 
-	mfString     = 0x00000000
-	mfChecked    = 0x00000008
-	mfSeparator  = 0x00000800
-	mfByCommand  = 0x00000000
-	tpmRightBtn  = 0x0002
+	mfString       = 0x00000000
+	mfChecked      = 0x00000008
+	mfSeparator    = 0x00000800
+	mfByCommand    = 0x00000000
+	tpmRightBtn    = 0x0002
 	tpmBottomAlign = 0x0020
 
 	scClose        = 0xF060
@@ -55,35 +57,35 @@ var (
 	procGlobalLock       = modkernel32.NewProc("GlobalLock")
 	procGlobalUnlock     = modkernel32.NewProc("GlobalUnlock")
 
-	moduser32              = syscall.NewLazyDLL("user32.dll")
-	procShowWindow         = moduser32.NewProc("ShowWindow")
-	procIsWindowVisible    = moduser32.NewProc("IsWindowVisible")
-	procSetForegroundWin   = moduser32.NewProc("SetForegroundWindow")
-	procGetSystemMenu      = moduser32.NewProc("GetSystemMenu")
-	procDeleteMenu         = moduser32.NewProc("DeleteMenu")
-	procRegisterClassExW   = moduser32.NewProc("RegisterClassExW")
-	procCreateWindowExW    = moduser32.NewProc("CreateWindowExW")
-	procDefWindowProcW     = moduser32.NewProc("DefWindowProcW")
-	procGetMessageW        = moduser32.NewProc("GetMessageW")
-	procTranslateMessage   = moduser32.NewProc("TranslateMessage")
-	procDispatchMessageW   = moduser32.NewProc("DispatchMessageW")
-	procPostQuitMessage    = moduser32.NewProc("PostQuitMessage")
-	procPostMessageW       = moduser32.NewProc("PostMessageW")
-	procCreatePopupMenu    = moduser32.NewProc("CreatePopupMenu")
-	procAppendMenuW        = moduser32.NewProc("AppendMenuW")
-	procTrackPopupMenu     = moduser32.NewProc("TrackPopupMenu")
-	procDestroyMenu        = moduser32.NewProc("DestroyMenu")
-	procGetCursorPos       = moduser32.NewProc("GetCursorPos")
-	procLoadIconW          = moduser32.NewProc("LoadIconW")
-	procCreateIcon         = moduser32.NewProc("CreateIcon")
-	procDestroyIcon        = moduser32.NewProc("DestroyIcon")
-	procOpenClipboard      = moduser32.NewProc("OpenClipboard")
-	procEmptyClipboard     = moduser32.NewProc("EmptyClipboard")
-	procSetClipboardData   = moduser32.NewProc("SetClipboardData")
-	procCloseClipboard     = moduser32.NewProc("CloseClipboard")
+	moduser32            = syscall.NewLazyDLL("user32.dll")
+	procShowWindow       = moduser32.NewProc("ShowWindow")
+	procIsWindowVisible  = moduser32.NewProc("IsWindowVisible")
+	procSetForegroundWin = moduser32.NewProc("SetForegroundWindow")
+	procGetSystemMenu    = moduser32.NewProc("GetSystemMenu")
+	procDeleteMenu       = moduser32.NewProc("DeleteMenu")
+	procRegisterClassExW = moduser32.NewProc("RegisterClassExW")
+	procCreateWindowExW  = moduser32.NewProc("CreateWindowExW")
+	procDefWindowProcW   = moduser32.NewProc("DefWindowProcW")
+	procGetMessageW      = moduser32.NewProc("GetMessageW")
+	procTranslateMessage = moduser32.NewProc("TranslateMessage")
+	procDispatchMessageW = moduser32.NewProc("DispatchMessageW")
+	procPostQuitMessage  = moduser32.NewProc("PostQuitMessage")
+	procPostMessageW     = moduser32.NewProc("PostMessageW")
+	procCreatePopupMenu  = moduser32.NewProc("CreatePopupMenu")
+	procAppendMenuW      = moduser32.NewProc("AppendMenuW")
+	procTrackPopupMenu   = moduser32.NewProc("TrackPopupMenu")
+	procDestroyMenu      = moduser32.NewProc("DestroyMenu")
+	procGetCursorPos     = moduser32.NewProc("GetCursorPos")
+	procLoadIconW        = moduser32.NewProc("LoadIconW")
+	procCreateIcon       = moduser32.NewProc("CreateIcon")
+	procDestroyIcon      = moduser32.NewProc("DestroyIcon")
+	procOpenClipboard    = moduser32.NewProc("OpenClipboard")
+	procEmptyClipboard   = moduser32.NewProc("EmptyClipboard")
+	procSetClipboardData = moduser32.NewProc("SetClipboardData")
+	procCloseClipboard   = moduser32.NewProc("CloseClipboard")
 
-	modshell32            = syscall.NewLazyDLL("shell32.dll")
-	procShellNotifyIconW  = modshell32.NewProc("Shell_NotifyIconW")
+	modshell32           = syscall.NewLazyDLL("shell32.dll")
+	procShellNotifyIconW = modshell32.NewProc("Shell_NotifyIconW")
 )
 
 type win32ConsoleDriver struct {
@@ -204,8 +206,17 @@ func startPlatformTray(tc *TrayController) func() {
 
 	ready := make(chan struct{})
 	var closeOnce sync.Once
+	var readyOnce sync.Once
+	markReady := func() {
+		readyOnce.Do(func() {
+			close(ready)
+		})
+	}
 
 	go func() {
+		defer echproxy.RecoverAndLog("Win32TrayLoop", func(_ any, _ []byte) {
+			markReady()
+		})
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
@@ -231,7 +242,7 @@ func startPlatformTray(tc *TrayController) func() {
 		)
 		if hwnd == 0 {
 			log.Printf("[Tray] WARNING: CreateWindowExW failed, system tray unavailable")
-			close(ready)
+			markReady()
 			return
 		}
 
@@ -245,7 +256,7 @@ func startPlatformTray(tc *TrayController) func() {
 		tc.OnStateChanged = updateTrayTooltip
 		addOrUpdateTrayIcon(hwnd, hIcon, tc.TooltipText(), true)
 		log.Printf("[Tray] System tray initialized (click/double-click icon to show/hide console, right-click for PAC/Proxy menu)")
-		close(ready)
+		markReady()
 
 		var m msg
 		for {
@@ -279,6 +290,7 @@ func startPlatformTray(tc *TrayController) func() {
 }
 
 func trayWndProc(hwnd uintptr, uMsg uint32, wParam, lParam uintptr) uintptr {
+	defer echproxy.RecoverAndLog("trayWndProc", nil)
 	switch uMsg {
 	case wmTrayCallback:
 		switch uint32(lParam) {

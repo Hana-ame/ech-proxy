@@ -104,7 +104,7 @@ func CollectProxyDomains(cfg *Config) (originalDomains []string, portalDomains [
 				if w.UpstreamSuffix != "" {
 					addSuffix(w.UpstreamSuffix)
 				}
-				if w.EntrySuffix != "" && !IsPortalDomain( strings.TrimPrefix(w.EntrySuffix, ".") ) {
+				if w.EntrySuffix != "" && !IsPortalDomain(strings.TrimPrefix(w.EntrySuffix, ".")) {
 					addSuffix(w.EntrySuffix)
 				}
 			}
@@ -199,24 +199,54 @@ func stripManagedHostsBlock(content string) string {
 }
 
 // GeneratePAC 生成浏览器/系统自动代理配置（PAC）脚本：
-//   - 当 global=false 时，仅对 upstream.json 涵盖的目标域名、泛域名及 l.moonchan.xyz 走代理，其余直连；
-//   - 当 global=true 时，除本机环回与局域网外的所有域名均走代理。
-func GeneratePAC(cfg *Config, proxyHostPort string, global bool) string {
+//   - 当 global=false（默认白名单模式）时：远程白名单（extraWhitelist）及配置中的目标域名通过 ech-proxy 代理（PROXY），其余所有域名直接返回 DIRECT；
+//   - 当 global=true（all 模式）时：无视白名单，除本机环回与局域网外的所有网站均走 ech-proxy 代理。
+func GeneratePAC(cfg *Config, proxyHostPort string, global bool, extraWhitelist ...[]string) string {
 	if strings.TrimSpace(proxyHostPort) == "" {
 		proxyHostPort = "127.0.0.1:8443"
 	}
 	origDomains, portalDomains, suffixes := CollectProxyDomains(cfg)
 	exactMap := make(map[string]bool, len(origDomains)+len(portalDomains))
+	suffixSeen := make(map[string]bool, len(suffixes)+1)
+	var finalSuffixes []string
+
+	addSuffix := func(s string) {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if !strings.HasPrefix(s, ".") {
+			s = "." + s
+		}
+		if len(s) > 1 && !suffixSeen[s] {
+			suffixSeen[s] = true
+			finalSuffixes = append(finalSuffixes, s)
+		}
+	}
+
 	for _, d := range origDomains {
 		exactMap[d] = true
 	}
 	for _, d := range portalDomains {
 		exactMap[d] = true
 	}
-	suffixes = append(suffixes, "."+PortalDomain)
+	for _, s := range suffixes {
+		addSuffix(s)
+	}
+	addSuffix("." + PortalDomain)
+
+	// 将远程白名单（黄网列表）中的域名及其子域后缀加入 PAC 代理规则（白名单 -> PROXY，其他 -> DIRECT）
+	for _, list := range extraWhitelist {
+		for _, raw := range list {
+			d := cleanHost(strings.TrimPrefix(strings.TrimSpace(raw), "*."))
+			d = strings.TrimPrefix(d, ".")
+			if d != "" && strings.Contains(d, ".") {
+				exactMap[d] = true
+				addSuffix("." + d)
+			}
+		}
+	}
+	sort.Strings(finalSuffixes)
 
 	exactJSON, _ := json.Marshal(exactMap)
-	suffixJSON, _ := json.Marshal(suffixes)
+	suffixJSON, _ := json.Marshal(finalSuffixes)
 	globalStr := "false"
 	if global {
 		globalStr = "true"

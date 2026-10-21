@@ -1,4 +1,4 @@
-name: Go CI
+name: Go CI & Smoke Test
 
 on:
   push:
@@ -13,23 +13,82 @@ on:
       - "**.md"
       - "LICENSE"
       - ".gitignore"
+  workflow_dispatch:
 
 jobs:
-  test:
+  test-and-verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
+
       - name: Install dependencies
         run: go mod download
-      - name: Run tests (including upstream.json validation)
-        run: go test ./... -race -coverprofile=coverage.out
-      - name: Run go vet
+
+      - name: Run go vet across all packages
         run: go vet ./...
+
+      - name: Validate upstream.json configuration
+        run: go run ./win check -config certs/l.moonchan.xyz/upstream.json
+
+      - name: Validate remote ad_script.js and unified whitelist.json
+        run: |
+          node --check certs/l.moonchan.xyz/ad_script.js
+          node -e '
+            const fs = require("fs");
+            const arr = JSON.parse(fs.readFileSync("certs/l.moonchan.xyz/whitelist.json", "utf8"));
+            if (!Array.isArray(arr) || arr.length === 0) throw new Error("Invalid whitelist.json");
+          '
+
+      - name: Run full unit & integration tests with race detector
+        run: go test ./... -race -v -coverprofile=coverage.out
+
+      - name: Cross-compile verification (Windows / Linux / macOS)
+        run: |
+          mkdir -p build-check
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-win-amd64.exe ./win/
+          GOOS=windows GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-win-386.exe ./win/
+          GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-amd64 ./win/
+          GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-arm64 ./win/
+          GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-darwin-amd64 ./win/
+          rm -rf build-check
+
+      - name: Runtime smoke test (startup, PAC whitelist vs direct, ipmode, ad-script, local log & graceful shutdown)
+        run: |
+          CGO_ENABLED=0 go build -trimpath -o ./ech-proxy-ci ./win/
+          ./ech-proxy-ci version
+          ./ech-proxy-ci check -config certs/l.moonchan.xyz/upstream.json
+          ./ech-proxy-ci pac -config certs/l.moonchan.xyz/upstream.json -whitelist-url certs/l.moonchan.xyz/whitelist.json | grep -q "FindProxyForURL"
+          mkdir -p ./ci-logs
+          ./ech-proxy-ci -http -addr 127.0.0.1:18443 -no-tray -no-browser -sys-proxy off \
+            -ipmode dual \
+            -config certs/l.moonchan.xyz/upstream.json \
+            -ad-script-url certs/l.moonchan.xyz/ad_script.js \
+            -whitelist-url certs/l.moonchan.xyz/whitelist.json \
+            -log-dir ./ci-logs &
+          PID=$!
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:18443/healthz >/dev/null 2>&1; then
+              break
+            fi
+            sleep 0.5
+          done
+          curl -fsS http://127.0.0.1:18443/healthz | grep -q "ok"
+          curl -fsS http://127.0.0.1:18443/statusz | grep -q '"ad_script_enabled":true'
+          curl -fsS http://127.0.0.1:18443/proxy.pac | grep -q '"missav.com":true'
+          curl -fsS http://127.0.0.1:18443/__ech_proxy__/ad_script.js | grep -q "ech-proxy-custom-ad"
+          curl -fsS "http://127.0.0.1:18443/debug/log?download=1" | grep -q "ech-proxy session started"
+          kill -TERM "$PID"
+          wait "$PID" || true
+          test -s ./ci-logs/ech-proxy.log
+          ./ech-proxy-ci logs tail -log-dir ./ci-logs | grep -q "ech-proxy session started"
+          rm -rf ./ech-proxy-ci ./ci-logs
+
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:

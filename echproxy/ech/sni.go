@@ -115,6 +115,7 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	if normIPMode == "" {
 		normIPMode = currentConfig().ipMode
 	}
+	normIPMode = netdial.EffectiveIPMode(normIPMode)
 
 	if strings.EqualFold(mode, "direct") {
 		return netdial.ClientWithIPMode(normIPMode, netdial.OpTimeout).Do(req)
@@ -209,7 +210,7 @@ func ResolveHostIPs(ctx context.Context, host string) ([]string, error) {
 	return ResolveHostIPsByMode(ctx, host, "")
 }
 
-// ResolveHostIPsByMode 按指定的 ipMode（"v4"、"v6" 或 ""/"auto"）通过 DoH 查询 A/AAAA 记录并缓存（修复 S3 与 Issue #9）。
+// ResolveHostIPsByMode 按指定的 ipMode（默认 "v4"、"v6" 或 "dual"）通过 DoH 查询 A/AAAA 记录并缓存（修复 S3 与 Issue #9）。
 func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, error) {
 	host = strings.ToLower(strings.TrimSpace(host))
 	if h, _, err := net.SplitHostPort(host); err == nil {
@@ -219,6 +220,7 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 	if normMode == "" {
 		normMode = currentConfig().ipMode
 	}
+	normMode = netdial.EffectiveIPMode(normMode)
 
 	if parsed := net.ParseIP(host); parsed != nil {
 		filtered := netdial.FilterIPsByMode([]net.IP{parsed}, normMode)
@@ -239,11 +241,11 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 	var qtypes []int
 	switch normMode {
 	case "v4":
-		qtypes = []int{1} // A
+		qtypes = []int{1} // A (IPv4 only, default)
 	case "v6":
-		qtypes = []int{28} // AAAA
+		qtypes = []int{28} // AAAA (IPv6 only)
 	default:
-		qtypes = []int{1, 28} // A 优先，AAAA 补充
+		qtypes = []int{1, 28} // dual: A 优先，AAAA 补充
 	}
 
 	var ips []string
@@ -282,8 +284,8 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 			}
 			resp.Body.Close()
 		}
-		// 若 auto 模式下已拿到 IPv4 A 记录，无需再额外阻塞等待 AAAA
-		if normMode == "" && len(ips) > 0 {
+		// 若 dual 模式下已拿到 IPv4 A 记录，无需再额外阻塞等待 AAAA
+		if normMode == "dual" && len(ips) > 0 {
 			break
 		}
 	}
@@ -293,7 +295,7 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 		if fallbackIPs, rerr := netdial.ResolveIPs(ctx, host, normMode); rerr == nil && len(fallbackIPs) > 0 {
 			ips = fallbackIPs
 		} else {
-			if normMode != "" {
+			if normMode != "dual" {
 				return nil, fmt.Errorf("no %s record for %s", normMode, host)
 			}
 			return nil, fmt.Errorf("no A/AAAA record for %s", host)
@@ -407,6 +409,7 @@ func SNIFrontDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 	if normMode == "" {
 		normMode = currentConfig().ipMode
 	}
+	normMode = netdial.EffectiveIPMode(normMode)
 
 	host := req.Host
 	if host == "" {

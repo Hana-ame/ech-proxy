@@ -92,6 +92,7 @@ func NormalizeLoopbackHostPort(listenAddr string) string {
 type SysProxyManager struct {
 	mu         sync.Mutex
 	listenAddr string
+	allMode    bool
 	mode       SysProxyMode
 	modified   bool
 	driver     SysProxyDriver
@@ -111,6 +112,13 @@ func NewSysProxyManager(listenAddr string, driver SysProxyDriver) *SysProxyManag
 	}
 }
 
+// SetAllMode 设置 PAC 是否启用全局 all 模式（无视白名单所有网站均走 ech-proxy）。
+func (m *SysProxyManager) SetAllMode(all bool) {
+	m.mu.Lock()
+	m.allMode = all
+	m.mu.Unlock()
+}
+
 // Mode 返回当前生效的系统代理模式。
 func (m *SysProxyManager) Mode() SysProxyMode {
 	m.mu.Lock()
@@ -122,8 +130,9 @@ func (m *SysProxyManager) Mode() SysProxyMode {
 func (m *SysProxyManager) PACURL() string {
 	m.mu.Lock()
 	addr := m.listenAddr
+	all := m.allMode
 	m.mu.Unlock()
-	return BuildPACURL(addr, false, 0)
+	return BuildPACURL(addr, all, 0)
 }
 
 // SetListenAddr 更新代理监听地址。
@@ -140,7 +149,7 @@ func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
 
 	switch mode {
 	case SysProxyPAC:
-		pacURL := BuildPACURL(m.listenAddr, false, m.nowUnix())
+		pacURL := BuildPACURL(m.listenAddr, m.allMode, m.nowUnix())
 		if err := m.driver.ApplyPAC(pacURL); err != nil {
 			return fmt.Errorf("apply system PAC (%s): %w", pacURL, err)
 		}

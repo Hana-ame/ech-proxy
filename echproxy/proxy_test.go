@@ -17,6 +17,7 @@ import (
 
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
 	"github.com/Hana-ame/ech-proxy/echproxy/cookie"
+	"github.com/Hana-ame/ech-proxy/echproxy/logger"
 	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
 	"github.com/gin-gonic/gin"
 )
@@ -134,6 +135,119 @@ func TestLargeChunkedTextResponseNotTruncated(t *testing.T) {
 	}
 	if rec.Body.Len() != largeSize {
 		t.Errorf("large chunked body truncated: got %d bytes, want %d bytes", rec.Body.Len(), largeSize)
+	}
+}
+
+// TestUnifiedWhitelistPACAndAdultAdInjection 验证：
+// 1. 远程唯一白名单（whitelist = 黄网 = 去原有广告 + 加自己广告 + PAC 走 proxy，其他直接 direct）；
+// 2. all 模式（AllMode = true）：PAC 对所有网站返回 PROXY，且 HTML 中含成人广告的未知网站也会去广告并加自有推广；
+// 3. /__ech_proxy__/ad_script.js、/debug/log、/proxy.pac 与 /statusz 端点正常工作。
+func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logDir := t.TempDir()
+	logMgr, err := logger.NewManager(logger.Options{
+		LogDir:     logDir,
+		ConsoleOut: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer logMgr.Close()
+	_, _ = logMgr.Write([]byte("diagnostic log line 1\n"))
+
+	adMgr := NewAdScriptManager(AdScriptOptions{
+		Enabled:  true,
+		AllMode:  false,
+		CacheDir: t.TempDir(),
+	})
+	adMgr.SetWhitelist([]string{"e-hentai.org", "missav.com"})
+
+	upstreamHTML := `<!DOCTYPE html><html><head><title>Gallery</title><script src="https://syndication.exoclick.com/ads.js"></script></head><body><div class="ad-banner">Ad</div></body></html>`
+
+	orig := roundTripFn
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type":            []string{"text/html; charset=utf-8"},
+				"Content-Security-Policy": []string{"script-src 'self'"},
+			},
+			Body: io.NopCloser(strings.NewReader(upstreamHTML)),
+		}, nil
+	}
+	defer func() { roundTripFn = orig }()
+
+	cfg := &config.Config{
+		Upstreams: config.UpstreamMap{
+			"ex.l.moonchan.xyz": {Host: "e-hentai.org"},
+		},
+	}
+	engine := NewEngineWithOptions(EngineOptions{
+		Config:   cfg,
+		AdScript: adMgr,
+		Logger:   logMgr,
+	})
+
+	// 1. 验证默认白名单模式下 /proxy.pac 包含远程白名单域名 (missav.com / e-hentai.org) 且 GLOBAL_MODE = false
+	recPAC := httptest.NewRecorder()
+	reqPAC := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/proxy.pac", nil)
+	reqPAC.Host = "127.0.0.1:8443"
+	engine.ServeHTTP(recPAC, reqPAC)
+	pacStr := recPAC.Body.String()
+	if !strings.Contains(pacStr, "var GLOBAL_MODE = false;") || !strings.Contains(pacStr, `"missav.com":true`) {
+		t.Errorf("default PAC should include remote whitelist domain missav.com and GLOBAL_MODE=false, got: %s", pacStr)
+	}
+
+	// 2. 验证 all 模式下 /proxy.pac 设置 GLOBAL_MODE = true（所有网站走 ech-proxy）
+	adMgr.SetAllMode(true)
+	recPACAll := httptest.NewRecorder()
+	reqPACAll := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/proxy.pac", nil)
+	reqPACAll.Host = "127.0.0.1:8443"
+	engine.ServeHTTP(recPACAll, reqPACAll)
+	if !strings.Contains(recPACAll.Body.String(), "var GLOBAL_MODE = true;") {
+		t.Errorf("all mode PAC should set GLOBAL_MODE = true, got: %s", recPACAll.Body.String())
+	}
+	adMgr.SetAllMode(false)
+
+	// 3. 访问白名单中的黄网 (ex.l.moonchan.xyz -> e-hentai.org)：剥离原有广告并注入自有广告脚本
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://ex.l.moonchan.xyz:8443/", nil)
+	req.Host = "ex.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec, req)
+	bodyStr := rec.Body.String()
+	if !strings.Contains(bodyStr, `id="ech-proxy-ad-script"`) || !strings.Contains(bodyStr, `data-is-adult="1"`) {
+		t.Errorf("expected injected ad script with data-is-adult=\"1\" in HTML response, got: %s", bodyStr)
+	}
+	if strings.Contains(bodyStr, "syndication.exoclick.com") {
+		t.Errorf("expected exoclick ad URL to be stripped from HTML")
+	}
+
+	// 4. 关闭 flag (SetEnabled(false)) 时，不再注入脚本
+	adMgr.SetEnabled(false)
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "https://ex.l.moonchan.xyz:8443/", nil)
+	req2.Host = "ex.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec2, req2)
+	if strings.Contains(rec2.Body.String(), `id="ech-proxy-ad-script"`) {
+		t.Errorf("expected no ad script when disabled via flag")
+	}
+	adMgr.SetEnabled(true)
+
+	// 5. 验证 /__ech_proxy__/ad_script.js 与 /debug/log 端点
+	recScript := httptest.NewRecorder()
+	reqScript := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/__ech_proxy__/ad_script.js", nil)
+	reqScript.Host = "127.0.0.1:8443"
+	engine.ServeHTTP(recScript, reqScript)
+	if recScript.Code != http.StatusOK || !strings.Contains(recScript.Body.String(), "isAdultWebsite") {
+		t.Errorf("/__ech_proxy__/ad_script.js unexpected response: code=%d", recScript.Code)
+	}
+
+	recLog := httptest.NewRecorder()
+	reqLog := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/debug/log?download=1", nil)
+	reqLog.Host = "127.0.0.1:8443"
+	engine.ServeHTTP(recLog, reqLog)
+	if recLog.Code != http.StatusOK || !strings.Contains(recLog.Body.String(), "diagnostic log line 1") {
+		t.Errorf("/debug/log unexpected response: code=%d body=%q", recLog.Code, recLog.Body.String())
 	}
 }
 

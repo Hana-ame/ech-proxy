@@ -1,9 +1,9 @@
 // Package cloudflare_ech 封装上游传输隧道：
 //  1. Cloudflare ECH 域前置（Encrypted Client Hello + uTLS Chrome 指纹）
-//  2. SNI 伪装直连（DoH 双栈解析真实 IP + 可配置/伪造 SNI + HTTP/2 与 HTTP/1.1 自适应传输）
-//  3. Direct 明文/标准 TLS 直连（支持 IPv4/IPv6 协议族锁定）
+//  2. SNI 伪装直连（DoH 解析真实 IP + 可配置/伪造 SNI + HTTP/2 与 HTTP/1.1 自适应传输）
+//  3. Direct 明文/标准 TLS 直连（默认 IPv4，支持 dual 双栈或 IPv6 协议族锁定）
 //
-// 本模块仅依赖标准库、netdial、utls 与 x/net/http2。
+// 本模块仅依赖标准库、netdial、logger、utls 与 x/net/http2。
 package cloudflare_ech
 
 import (
@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Hana-ame/ech-proxy/echproxy/logger"
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
@@ -69,7 +70,10 @@ func currentConfig() *runtimeConfig {
 	if c := cfgPtr.Load(); c != nil {
 		return c
 	}
-	c := &runtimeConfig{dohURL: defaultDohURL}
+	c := &runtimeConfig{
+		dohURL: defaultDohURL,
+		ipMode: netdial.DefaultIPMode, // 默认 ipv4 ("v4")
+	}
 	cfgPtr.Store(c)
 	return c
 }
@@ -90,10 +94,10 @@ func SetDoHConfig(host, bootstrapIP string) {
 	cfgPtr.Store(&nc)
 }
 
-// SetIPMode 设置全局默认上游出口 IP 协议族（"v4"、"v6" 或 ""，大小写不敏感）。
+// SetIPMode 设置全局默认上游出口 IP 协议族（默认 "v4"、"v6" 或 "dual"，大小写不敏感）。
 func SetIPMode(mode string) {
 	nc := *currentConfig()
-	nc.ipMode = netdial.NormalizeIPMode(mode)
+	nc.ipMode = netdial.EffectiveIPMode(mode)
 	cfgPtr.Store(&nc)
 
 	clientsMu.Lock()
@@ -106,7 +110,7 @@ func SetIPMode(mode string) {
 	clients = map[string]*Client{}
 }
 
-// GetIPMode 返回当前全局默认出口协议族（"v4"、"v6" 或 ""）。
+// GetIPMode 返回当前全局默认出口协议族（默认 "v4"、"v6" 或 "dual"）。
 func GetIPMode() string {
 	return currentConfig().ipMode
 }
@@ -274,6 +278,7 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 			if mode == "" {
 				mode = currentConfig().ipMode
 			}
+			mode = netdial.EffectiveIPMode(mode)
 			return netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
 				rawConn, err := netdial.DialContextIPMode(ctx, shellDomain, "443", mode, dialTimeout)
 				if err != nil {
@@ -314,7 +319,7 @@ func New() (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newClient(echConfig, ""), nil
+	return newClient(echConfig, netdial.DefaultIPMode), nil
 }
 
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
@@ -329,9 +334,7 @@ func getECHClient(ipMode string) (*Client, error) {
 	if mode == "" {
 		mode = currentConfig().ipMode
 	}
-	if mode == "" {
-		mode = "auto"
-	}
+	mode = netdial.EffectiveIPMode(mode)
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
 	if c, ok := clients[mode]; ok {
@@ -351,7 +354,7 @@ func getECHClient(ipMode string) (*Client, error) {
 	return c, nil
 }
 
-// Do 通过 Cloudflare ECH 隧道发送请求（可选指定 "v4" 或 "v6" 出口协议族）。
+// Do 通过 Cloudflare ECH 隧道发送请求（可选指定 "v4"、"v6" 或 "dual" 出口协议族）。
 func Do(req *http.Request, ipMode ...string) (*http.Response, error) {
 	mode := ""
 	if len(ipMode) > 0 {
@@ -378,7 +381,9 @@ func InitDefault() error {
 	if _, err := getECHClient(""); err != nil {
 		return err
 	}
-	refreshOnce.Do(func() { go refreshLoop() })
+	refreshOnce.Do(func() {
+		logger.SafeGo("ECH-RefreshLoop", refreshLoop)
+	})
 	return nil
 }
 

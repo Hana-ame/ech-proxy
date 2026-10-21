@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"sync"
+
+	"github.com/Hana-ame/ech-proxy/echproxy"
 )
 
 // 托盘右键菜单命令 ID 常量（参考 V2rayN 托盘菜单布局）。
@@ -16,11 +18,9 @@ const (
 	TrayCmdCopyPACURL     uintptr = 1006
 	TrayCmdInstallCA      uintptr = 1007
 	TrayCmdExit           uintptr = 1008
-	TrayCmdFeedbackChat   uintptr = 1009
+	TrayCmdToggleAdScript uintptr = 1009
+	TrayCmdOpenLogs       uintptr = 1010
 )
-
-// feedbackChatURL 是「反馈 / 聊天」托盘菜单项打开的项目聊天/反馈页面地址。
-const feedbackChatURL = "https://chatto.moonchan.xyz"
 
 // ConsoleWindowDriver 抽象控制台窗口显隐控制接口（Windows 下由 GetConsoleWindow + ShowWindow 实现）。
 type ConsoleWindowDriver interface {
@@ -37,14 +37,15 @@ type TrayMenuItem struct {
 	Separator bool
 }
 
-// TrayController 统一管理托盘菜单状态、控制台窗口显隐与系统代理模式切换。
+// TrayController 统一管理托盘菜单状态、控制台窗口显隐、远程广告脚本开关、日志目录打开与系统代理模式切换。
 type TrayController struct {
 	mu              sync.Mutex
 	ListenAddr      string
 	PortalURL       string
-	FeedbackURL     string
 	CAPath          string
+	LogDir          string
 	SysProxy        *SysProxyManager
+	AdScript        *echproxy.AdScriptManager
 	Console         ConsoleWindowDriver
 	OpenURLFn       func(string)
 	CopyClipboardFn func(string) error
@@ -61,7 +62,6 @@ func NewTrayController(listenAddr, portalURL, caPath string, sysProxy *SysProxyM
 	return &TrayController{
 		ListenAddr:      NormalizeLoopbackHostPort(listenAddr),
 		PortalURL:       portalURL,
-		FeedbackURL:     feedbackChatURL,
 		CAPath:          caPath,
 		SysProxy:        sysProxy,
 		Console:         console,
@@ -134,6 +134,7 @@ func (tc *TrayController) MenuItems() []TrayMenuItem {
 	if tc.SysProxy != nil {
 		curMode = tc.SysProxy.Mode()
 	}
+	adEnabled := tc.AdScript != nil && tc.AdScript.Enabled()
 	consoleLabel := "显示 / 隐藏控制台 (双击托盘图标)"
 	return []TrayMenuItem{
 		{ID: TrayCmdToggleConsole, Title: consoleLabel, Checked: consoleVis},
@@ -142,10 +143,11 @@ func (tc *TrayController) MenuItems() []TrayMenuItem {
 		{ID: TrayCmdSysProxyGlobal, Title: "系统代理：全局 HTTP/HTTPS 模式", Checked: curMode == SysProxyGlobal},
 		{ID: TrayCmdSysProxyClear, Title: "系统代理：清除 / 禁用系统代理 (直连)", Checked: curMode == SysProxyOff},
 		{Separator: true},
+		{ID: TrayCmdToggleAdScript, Title: "启用远程去广告与推广脚本 (Ad Script)", Checked: adEnabled},
 		{ID: TrayCmdOpenPortal, Title: "打开 Web 门户导航页 (" + tc.PortalURL + ")"},
 		{ID: TrayCmdCopyPACURL, Title: "复制 PAC 地址 (Copy PAC URL)"},
 		{ID: TrayCmdInstallCA, Title: "一键安装本地 CA 根证书 (Install CA)"},
-		{ID: TrayCmdFeedbackChat, Title: "反馈 / 聊天 (Feedback / Chat)"},
+		{ID: TrayCmdOpenLogs, Title: "打开本地日志目录 (问题排查/上传日志)"},
 		{Separator: true},
 		{ID: TrayCmdExit, Title: "退出程序并清理系统代理 (Exit)"},
 	}
@@ -188,14 +190,25 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 			tc.OnStateChanged()
 		}
 
-	case TrayCmdOpenPortal:
-		if tc.OpenURLFn != nil && tc.PortalURL != "" {
-			go tc.OpenURLFn(tc.PortalURL)
+	case TrayCmdToggleAdScript:
+		if tc.AdScript != nil {
+			next := !tc.AdScript.Enabled()
+			tc.AdScript.SetEnabled(next)
+			if next {
+				echproxy.SafeGo("TrayAdScriptRefresh", func() {
+					_, _ = tc.AdScript.RefreshOnce()
+				})
+			}
+		}
+		if tc.OnStateChanged != nil {
+			tc.OnStateChanged()
 		}
 
-	case TrayCmdFeedbackChat:
-		if tc.OpenURLFn != nil && tc.FeedbackURL != "" {
-			go tc.OpenURLFn(tc.FeedbackURL)
+	case TrayCmdOpenPortal:
+		if tc.OpenURLFn != nil && tc.PortalURL != "" {
+			echproxy.SafeGo("TrayOpenPortal", func() {
+				tc.OpenURLFn(tc.PortalURL)
+			})
 		}
 
 	case TrayCmdCopyPACURL:
@@ -210,13 +223,24 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 
 	case TrayCmdInstallCA:
 		if tc.InstallCAFn != nil && tc.CAPath != "" {
-			go func() {
+			echproxy.SafeGo("TrayInstallCA", func() {
 				if err := tc.InstallCAFn(tc.CAPath); err != nil {
 					log.Printf("[Tray] Install CA failed: %v", err)
 				} else {
 					log.Printf("[Tray] Local CA certificate installed into user Root store: %s", tc.CAPath)
 				}
-			}()
+			})
+		}
+
+	case TrayCmdOpenLogs:
+		target := tc.LogDir
+		if target == "" {
+			target = "http://" + tc.ListenAddr + "/debug/log"
+		}
+		if tc.OpenURLFn != nil {
+			echproxy.SafeGo("TrayOpenLogs", func() {
+				tc.OpenURLFn(target)
+			})
 		}
 
 	case TrayCmdExit:

@@ -32,26 +32,43 @@ func exeNameIs443() bool {
 
 // CLICommand 表示解析后的命令行操作与运行参数。
 type CLICommand struct {
-	Action       string       // "run", "check", "hosts-print", "hosts-apply", "hosts-clean", "ca-status", "ca-export", "ca-install", "pac", "sysproxy-pac", "sysproxy-global", "sysproxy-clear", "sysproxy-status", "version"
-	Mode         string       // "smart" (默认), "local" (443), "portal" (8443), "http"
-	Addr         string
-	FallbackAddr string
-	LocalProxy   bool
-	HTTPMode     bool
-	DataDir      string
-	ConfigURL    string
-	IPMode       string
-	BootstrapIP  string
-	NoBrowser    bool
-	Verbose      bool
-	AllowConnect bool
-	ConnectMode  string
-	HostsFile    string
-	CAExportPath string
-	SysProxy     SysProxyMode // 启动时自动设置的系统代理模式："pac"（smart 模式默认）、"global"、"off"
-	EnableTray   bool         // 是否启用系统托盘（默认开启，支持双击隐藏/显示控制台与右键切换 PAC）
-	HideConsole  bool         // 启动后是否自动隐藏控制台窗口到系统托盘
-	Auth         *echproxy.AuthConfig
+	Action           string // "run", "check", "hosts-print", "hosts-apply", "hosts-clean", "ca-status", "ca-export", "ca-install", "pac", "sysproxy-pac", "sysproxy-global", "sysproxy-clear", "sysproxy-status", "logs-path", "logs-tail", "logs-crash", "logs-clean", "version"
+	Mode             string // "smart" (默认), "local" (443), "portal" (8443), "http"
+	AllMode          bool   // all 模式：无视白名单所有网站都走 ech-proxy（对应 -all / -mode all / ech-proxy all）
+	Addr             string
+	FallbackAddr     string
+	LocalProxy       bool
+	HTTPMode         bool
+	DataDir          string
+	ConfigURL        string
+	IPMode           string // 出口 IP 协议族：默认 "v4" (ipv4 / 4 = ipv4 only)、"dual" (双栈)、"v6" (6 = ipv6 only)
+	BootstrapIP      string
+	NoBrowser        bool
+	Verbose          bool
+	AllowConnect     bool
+	ConnectMode      string
+	HostsFile        string
+	CAExportPath     string
+	SysProxy         SysProxyMode         // 启动时自动设置的系统代理模式："pac"（smart 模式默认）、"global"、"off"
+	EnableTray       bool                 // 是否启用系统托盘（默认开启，支持双击隐藏/显示控制台与右键切换 PAC）
+	HideConsole      bool                 // 启动后是否自动隐藏控制台窗口到系统托盘
+	NoAdScript       bool                 // 是否关闭远程去广告与成人站点推广脚本（-no-ad-script flag）
+	AdScriptURL      string               // 远程脚本 URL 或本地路径（-ad-script-url）
+	WhitelistURL     string               // 远程唯一白名单（黄网域名列表）JSON 地址（-whitelist-url，留空使用默认远程地址，失败 fallback = []）
+	AdScriptInterval time.Duration        // 远程脚本与白名单自动拉取更新周期（-ad-script-interval，默认 30m）
+	LogDir           string               // 本地持久化日志目录（-log-dir，默认 <DataDir>/logs）
+	LogFile          string               // 指定本地日志文件路径（-log-file）
+	NoLogFile        bool                 // 禁用本地日志文件落盘（-no-log-file）
+	Auth             *echproxy.AuthConfig // 访问认证配置指针（避免复制内部 sync.Mutex）
+}
+
+func envBool(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 // parseCLIArgs 解析子命令与命令行标志（统一支持新一代子命令与传统旗舰参数）。
@@ -62,13 +79,18 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	is443 := filenameIs443(progName)
 	action := "run"
 	subMode := ""
+	subAll := false
 
-	// 识别前置子命令（如 ech-proxy check / hosts / ca / pac / sysproxy / local / portal / version）
+	// 识别前置子命令（如 ech-proxy check / hosts / ca / pac / sysproxy / logs / local / portal / all / version）
 	restArgs := args
 	if len(restArgs) > 0 && !strings.HasPrefix(restArgs[0], "-") {
 		switch strings.ToLower(restArgs[0]) {
 		case "run", "serve", "start", "proxy":
 			action = "run"
+			restArgs = restArgs[1:]
+		case "all":
+			action = "run"
+			subAll = true
 			restArgs = restArgs[1:]
 		case "local", "443":
 			action = "run"
@@ -138,6 +160,25 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 					restArgs = restArgs[1:]
 				}
 			}
+		case "logs", "log":
+			action = "logs-path"
+			restArgs = restArgs[1:]
+			if len(restArgs) > 0 && !strings.HasPrefix(restArgs[0], "-") {
+				switch strings.ToLower(restArgs[0]) {
+				case "path", "status", "dir":
+					action = "logs-path"
+					restArgs = restArgs[1:]
+				case "tail", "show", "cat", "print":
+					action = "logs-tail"
+					restArgs = restArgs[1:]
+				case "crash":
+					action = "logs-crash"
+					restArgs = restArgs[1:]
+				case "clean", "clear":
+					action = "logs-clean"
+					restArgs = restArgs[1:]
+				}
+			}
 		}
 	}
 
@@ -147,15 +188,41 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		defaultAddr = "127.0.0.1:443"
 	}
 
+	defaultInterval := echproxy.DefaultAdScriptInterval
+	if envInt := strings.TrimSpace(getenv("ECH_PROXY_AD_SCRIPT_INTERVAL")); envInt != "" {
+		if d, err := time.ParseDuration(envInt); err == nil && d > 0 {
+			defaultInterval = d
+		}
+	}
+
+	// 默认 ipmode = ipv4 ("v4")
+	defaultIPModeEnv := strings.TrimSpace(getenv("IP_MODE"))
+	if defaultIPModeEnv == "" {
+		defaultIPModeEnv = strings.TrimSpace(getenv("ECH_PROXY_IPMODE"))
+	}
+	if defaultIPModeEnv == "" {
+		defaultIPModeEnv = "ipv4"
+	}
+
+	defaultWhitelistEnv := strings.TrimSpace(getenv("ECH_PROXY_WHITELIST_URL"))
+	if defaultWhitelistEnv == "" {
+		defaultWhitelistEnv = strings.TrimSpace(getenv("ECH_PROXY_ADULT_DOMAINS_URL"))
+	}
+
 	fs := flag.NewFlagSet(progName, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 
-	modeFlag := fs.String("mode", subMode, "运行模式：smart（默认，集成自动 PAC/托盘/CONNECT/门户）、local（443 透明反代）、portal（8443 门户）、http（明文）")
+	modeFlag := fs.String("mode", subMode, "运行模式：smart（默认，白名单走 PAC 代理，其他直连）、all（所有网站均走 ech-proxy）、local（443 透明反代）、portal（8443 门户）、http（明文）")
+	allFlag := fs.Bool("all", subAll || envBool(getenv("ECH_PROXY_ALL")), "开启 all 模式：无视白名单，所有网站都通过 ech-proxy 代理")
 	addr := fs.String("addr", defaultAddr, "监听地址（默认 127.0.0.1:8443，443 模式为 127.0.0.1:443）")
 	localProxy := fs.Bool("local", defaultLocal, "启用 443 本地透明反向代理模式（自签名 CA + 按需签发原域名证书 + 自动 SNI/ECH）")
 	dataDir := fs.String("data-dir", getenv("ECH_PROXY_DATA_DIR"), "本地 CA 与叶子证书存储目录（默认：程序所在目录）")
 	configURL := fs.String("config", getenv("ECH_PROXY_CONFIG"), "upstream.json 配置文件路径或 URL（留空使用默认远程地址）")
-	ipMode := fs.String("ip-mode", getenv("IP_MODE"), "锁定上游出口协议族：v4 或 v6（留空由系统自动选择）")
+
+	// ipmode 标志：[default]=ipv4 (4=ipv4 only), dual=双栈, 6=ipv6 only（同时兼容 -ipmode 与 -ip-mode）
+	ipModeFlag := fs.String("ipmode", defaultIPModeEnv, "出口 IP 协议族：[default]=ipv4 (4 = ipv4 only)，dual = 双栈，6 = ipv6 only")
+	ipModeDash := fs.String("ip-mode", "", "出口 IP 协议族（-ipmode 的兼容别名：ipv4 / 4 / v4 / dual / ipv6 / 6 / v6）")
+
 	localIP := fs.String("local-ip", getenv("LOCALIP"), "DoH 引导 IP（可选）")
 	httpMode := fs.Bool("http", false, "以纯 HTTP 明文模式运行（与 -local 互斥）")
 	noBrowser := fs.Bool("no-browser", false, "启动时不自动打开浏览器")
@@ -165,6 +232,19 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	sysProxyFlag := fs.String("sys-proxy", getenv("ECH_PROXY_SYS_PROXY"), "启动时自动配置系统代理模式：pac（默认自动配置 PAC）、global（全局代理）、off（不修改系统代理）")
 	noTray := fs.Bool("no-tray", false, "禁用系统托盘图标")
 	hideConsole := fs.Bool("hide-console", false, "启动后自动隐藏控制台窗口到系统托盘（双击托盘图标可随时恢复显示）")
+
+	// 远程唯一白名单（白名单=黄网=去原有广告+加自己广告+PAC走代理）与远程脚本参数
+	whitelistURL := fs.String("whitelist-url", defaultWhitelistEnv, "远程唯一白名单（黄网域名 JSON 列表）URL 或路径（留空使用默认远程地址，拉取失败 fallback 为空列表 []）")
+	adultDomainsAlias := fs.String("adult-domains-url", "", "-whitelist-url 的兼容别名")
+	noAdScript := fs.Bool("no-ad-script", envBool(getenv("ECH_PROXY_NO_AD_SCRIPT")), "禁用远程去广告与成人站点推广脚本功能")
+	disableScriptAlias := fs.Bool("disable-ad-script", false, "禁用远程去广告与成人站点推广脚本功能（-no-ad-script 的别名）")
+	adScriptURL := fs.String("ad-script-url", getenv("ECH_PROXY_AD_SCRIPT_URL"), "远程广告处理脚本 URL 或本地路径（留空使用默认远程地址并自动拉取最新）")
+	adScriptInterval := fs.Duration("ad-script-interval", defaultInterval, "远程脚本与白名单后台自动更新拉取周期（如 30m、10m）")
+
+	// 本地持久化日志与崩溃日志参数
+	logDir := fs.String("log-dir", getenv("ECH_PROXY_LOG_DIR"), "本地持久化滚动日志与崩溃快照目录（默认 <data-dir>/logs）")
+	logFile := fs.String("log-file", getenv("ECH_PROXY_LOG_FILE"), "指定本地日志文件路径（默认 <log-dir>/ech-proxy.log）")
+	noLogFile := fs.Bool("no-log-file", envBool(getenv("ECH_PROXY_NO_LOG_FILE")), "禁用本地日志文件保存（仅输出至控制台）")
 
 	// 工具与安全标志
 	checkConfig := fs.Bool("check-config", false, "校验 upstream.json 配置文件并退出（0=正常，1=配置错误，2=读取失败）")
@@ -203,8 +283,12 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		*caExport = fs.Arg(0)
 	}
 
+	allMode := *allFlag
 	resolvedMode := strings.ToLower(strings.TrimSpace(*modeFlag))
 	switch resolvedMode {
+	case "all", "global":
+		allMode = true
+		resolvedMode = "smart"
 	case "local", "443":
 		*localProxy = true
 		if *addr == "127.0.0.1:8443" {
@@ -214,7 +298,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		*httpMode = true
 	case "portal", "8443":
 		*localProxy = false
-	case "", "smart", "auto":
+	case "", "smart", "auto", "whitelist":
 		if *localProxy {
 			resolvedMode = "local"
 		} else if *httpMode {
@@ -223,7 +307,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 			resolvedMode = "smart"
 		}
 	default:
-		return CLICommand{}, fmt.Errorf("unknown -mode %q (valid: smart, local, portal, http)", *modeFlag)
+		return CLICommand{}, fmt.Errorf("unknown -mode %q (valid: smart, all, local, portal, http)", *modeFlag)
 	}
 
 	if *localProxy && *httpMode {
@@ -231,6 +315,16 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	}
 	if *localProxy && *addr == "127.0.0.1:8443" && !flagWasPassed(fs, "addr") {
 		*addr = "127.0.0.1:443"
+	}
+
+	// 解析并校验 ipmode（[default]=ipv4 ("v4"), dual = 双栈 ("dual"), 6 = ipv6 only ("v6")）
+	rawIPMode := strings.TrimSpace(*ipModeFlag)
+	if flagWasPassed(fs, "ip-mode") || strings.TrimSpace(*ipModeDash) != "" {
+		rawIPMode = strings.TrimSpace(*ipModeDash)
+	}
+	normalizedIPMode, ipErr := echproxy.ValidateIPMode(rawIPMode)
+	if ipErr != nil {
+		return CLICommand{}, ipErr
 	}
 
 	// 解析启动时的系统代理策略：
@@ -249,31 +343,44 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		sysProxyMode = SysProxyPAC
 	}
 
+	resolvedWhitelistURL := strings.TrimSpace(*whitelistURL)
+	if resolvedWhitelistURL == "" && strings.TrimSpace(*adultDomainsAlias) != "" {
+		resolvedWhitelistURL = strings.TrimSpace(*adultDomainsAlias)
+	}
+
 	fallbackAddr := ""
 	if *localProxy && strings.HasSuffix(*addr, ":443") {
 		fallbackAddr = "127.0.0.1:8443"
 	}
 
 	return CLICommand{
-		Action:       action,
-		Mode:         resolvedMode,
-		Addr:         *addr,
-		FallbackAddr: fallbackAddr,
-		LocalProxy:   *localProxy,
-		HTTPMode:     *httpMode,
-		DataDir:      *dataDir,
-		ConfigURL:    *configURL,
-		IPMode:       *ipMode,
-		BootstrapIP:  *localIP,
-		NoBrowser:    *noBrowser,
-		Verbose:      *verbose,
-		AllowConnect: *allowConnect,
-		ConnectMode:  *connectMode,
-		HostsFile:    *hostsFile,
-		CAExportPath: *caExport,
-		SysProxy:     sysProxyMode,
-		EnableTray:   !*noTray,
-		HideConsole:  *hideConsole,
+		Action:           action,
+		Mode:             resolvedMode,
+		AllMode:          allMode,
+		Addr:             *addr,
+		FallbackAddr:     fallbackAddr,
+		LocalProxy:       *localProxy,
+		HTTPMode:         *httpMode,
+		DataDir:          *dataDir,
+		ConfigURL:        *configURL,
+		IPMode:           normalizedIPMode,
+		BootstrapIP:      *localIP,
+		NoBrowser:        *noBrowser,
+		Verbose:          *verbose,
+		AllowConnect:     *allowConnect,
+		ConnectMode:      *connectMode,
+		HostsFile:        *hostsFile,
+		CAExportPath:     *caExport,
+		SysProxy:         sysProxyMode,
+		EnableTray:       !*noTray,
+		HideConsole:      *hideConsole,
+		NoAdScript:       *noAdScript || *disableScriptAlias,
+		AdScriptURL:      strings.TrimSpace(*adScriptURL),
+		WhitelistURL:     resolvedWhitelistURL,
+		AdScriptInterval: *adScriptInterval,
+		LogDir:           strings.TrimSpace(*logDir),
+		LogFile:          strings.TrimSpace(*logFile),
+		NoLogFile:        *noLogFile,
 		Auth: &echproxy.AuthConfig{
 			Token:    strings.TrimSpace(*token),
 			Username: strings.TrimSpace(*user),
@@ -292,7 +399,21 @@ func flagWasPassed(fs *flag.FlagSet, name string) bool {
 	return found
 }
 
-// runToolAction 执行非长驻服务的 CLI 工具型子命令（check / hosts / ca / pac / sysproxy / version），返回退出码。
+func resolveLogDir(cmd CLICommand) string {
+	if cmd.LogFile != "" {
+		return filepath.Dir(cmd.LogFile)
+	}
+	if cmd.LogDir != "" {
+		return cmd.LogDir
+	}
+	dataDir := cmd.DataDir
+	if dataDir == "" {
+		dataDir, _ = echproxy.DefaultDataDir()
+	}
+	return echproxy.DefaultLogDir(dataDir)
+}
+
+// runToolAction 执行非长驻服务的 CLI 工具型子命令（check / hosts / ca / pac / sysproxy / logs / version），返回退出码。
 func runToolAction(cmd CLICommand, out io.Writer) int {
 	switch cmd.Action {
 	case "version":
@@ -394,11 +515,20 @@ func runToolAction(cmd CLICommand, out io.Writer) int {
 
 	case "pac":
 		cfg, _ := echproxy.LoadConfig(cmd.ConfigURL)
-		fmt.Fprint(out, echproxy.GeneratePAC(cfg, cmd.Addr, false))
+		var wl []string
+		wlURL := cmd.WhitelistURL
+		if wlURL == "" {
+			wlURL = echproxy.DefaultWhitelistURL
+		}
+		if raw, err := echproxy.FetchBytes(wlURL); err == nil {
+			wl, _ = echproxy.ParseDomainListJSON(raw)
+		}
+		fmt.Fprint(out, echproxy.GeneratePAC(cfg, cmd.Addr, cmd.AllMode, wl))
 		return 0
 
 	case "sysproxy-pac":
 		mgr := NewSysProxyManager(cmd.Addr, nil)
+		mgr.SetAllMode(cmd.AllMode)
 		if err := mgr.SetMode(SysProxyPAC); err != nil {
 			fmt.Fprintf(out, "ERROR: %v\n", err)
 			return 1
@@ -428,41 +558,141 @@ func runToolAction(cmd CLICommand, out io.Writer) int {
 		mgr := NewSysProxyManager(cmd.Addr, nil)
 		fmt.Fprintf(out, "%s\n", mgr.StatusText())
 		return 0
+
+	case "logs-path":
+		dir := resolveLogDir(cmd)
+		logFile := cmd.LogFile
+		if logFile == "" {
+			logFile = filepath.Join(dir, "ech-proxy.log")
+		}
+		crashFile := filepath.Join(dir, "crash-latest.log")
+		fmt.Fprintf(out, "Log Dir:    %s\nLog File:   %s\nCrash File: %s\n", dir, logFile, crashFile)
+		return 0
+
+	case "logs-tail":
+		dir := resolveLogDir(cmd)
+		logFile := cmd.LogFile
+		if logFile == "" {
+			logFile = filepath.Join(dir, "ech-proxy.log")
+		}
+		data, err := os.ReadFile(logFile)
+		if err != nil {
+			fmt.Fprintf(out, "ERROR: cannot read log file %s: %v\n", logFile, err)
+			return 1
+		}
+		lines := strings.Split(strings.TrimRight(string(data), "\r\n"), "\n")
+		if len(lines) > 100 {
+			lines = lines[len(lines)-100:]
+		}
+		fmt.Fprintln(out, strings.Join(lines, "\n"))
+		return 0
+
+	case "logs-crash":
+		dir := resolveLogDir(cmd)
+		crashFile := filepath.Join(dir, "crash-latest.log")
+		data, err := os.ReadFile(crashFile)
+		if err != nil {
+			fmt.Fprintf(out, "No crash log found at %s\n", crashFile)
+			return 0
+		}
+		fmt.Fprint(out, string(data))
+		return 0
+
+	case "logs-clean":
+		dir := resolveLogDir(cmd)
+		if err := echproxy.CleanLogs(dir); err != nil {
+			fmt.Fprintf(out, "ERROR: failed to clean logs in %s: %v\n", dir, err)
+			return 1
+		}
+		fmt.Fprintf(out, "Cleaned log files in %s\n", dir)
+		return 0
 	}
 	return -1
 }
 
 func main() {
+	var (
+		logMgr      *echproxy.Logger
+		sysProxyMgr *SysProxyManager
+	)
+	// 最顶层 Panic 闪退守卫：任何未捕获异常均落盘写入 logs/ech-proxy.log 与 logs/crash-latest.log
+	defer echproxy.RecoverAndLog("main", func(_ any, _ []byte) {
+		if sysProxyMgr != nil {
+			sysProxyMgr.CleanupOnExit()
+		}
+		if logMgr != nil {
+			logMgr.Sync()
+			_ = logMgr.Close()
+		}
+		os.Exit(1)
+	})
+
 	progName := "ech-proxy"
 	if len(os.Args) > 0 {
 		progName = os.Args[0]
 	}
 	cmd, err := parseCLIArgs(progName, os.Args[1:], os.Getenv)
 	if err != nil {
-		log.Fatalf("%v", err)
+		// 即使在命令行参数解析阶段报错退出，也自动初始化默认日志器并落盘记录错误与调用栈，防止窗口一闪而过无从排查
+		echproxy.RecordFatalError("CLI-ParseArgs", err)
+		os.Exit(2)
 	}
 
 	if code := runToolAction(cmd, os.Stdout); code >= 0 {
 		os.Exit(code)
 	}
 
+	// 0. 初始化本地持久化滚动日志与全局 Panic 崩溃快照捕获
+	logDir := resolveLogDir(cmd)
+	var logErr error
+	logMgr, logErr = echproxy.InitLogger(echproxy.LoggerOptions{
+		LogDir:      logDir,
+		LogFile:     cmd.LogFile,
+		DisableFile: cmd.NoLogFile,
+		ConsoleOut:  os.Stderr,
+	})
+	if logErr != nil {
+		log.Printf("WARNING: Failed to initialize local file logger (%v), continuing with console output only", logErr)
+	} else {
+		defer logMgr.Close()
+		logMgr.WriteStartupHeader(echproxy.BuildVersionInfo(), os.Args, map[string]string{
+			"Mode":       cmd.Mode,
+			"AllMode":    fmt.Sprintf("%v", cmd.AllMode),
+			"IPMode":     echproxy.FormatIPMode(cmd.IPMode),
+			"ListenAddr": cmd.Addr,
+			"SysProxy":   string(cmd.SysProxy),
+			"AdScript":   fmt.Sprintf("enabled=%v url=%s whitelist_url=%s", !cmd.NoAdScript, cmd.AdScriptURL, cmd.WhitelistURL),
+		})
+	}
+
 	echproxy.Debug = cmd.Verbose
 
 	srv, err := echproxy.NewServer(echproxy.ServerOptions{
-		Addr:         cmd.Addr,
-		FallbackAddr: cmd.FallbackAddr,
-		HTTPMode:     cmd.HTTPMode,
-		ConfigURL:    cmd.ConfigURL,
-		BootstrapIP:  cmd.BootstrapIP,
-		IPMode:       cmd.IPMode,
-		LocalProxy:   cmd.LocalProxy,
-		DataDir:      cmd.DataDir,
-		AllowConnect: cmd.AllowConnect,
-		ConnectMode:  cmd.ConnectMode,
-		Auth:         cmd.Auth,
+		Addr:             cmd.Addr,
+		FallbackAddr:     cmd.FallbackAddr,
+		HTTPMode:         cmd.HTTPMode,
+		ConfigURL:        cmd.ConfigURL,
+		BootstrapIP:      cmd.BootstrapIP,
+		IPMode:           cmd.IPMode,
+		AllMode:          cmd.AllMode,
+		LocalProxy:       cmd.LocalProxy,
+		DataDir:          cmd.DataDir,
+		AllowConnect:     cmd.AllowConnect,
+		ConnectMode:      cmd.ConnectMode,
+		Auth:             cmd.Auth,
+		NoAdScript:       cmd.NoAdScript,
+		AdScriptURL:      cmd.AdScriptURL,
+		WhitelistURL:     cmd.WhitelistURL,
+		AdScriptInterval: cmd.AdScriptInterval,
+		Logger:           logMgr,
 	})
 	if err != nil {
-		log.Fatalf("Proxy server initialization failed: %v", err)
+		echproxy.RecordFatalError("NewServer", err)
+		if logMgr != nil {
+			logMgr.Sync()
+			_ = logMgr.Close()
+		}
+		os.Exit(1)
 	}
 
 	actualListenAddr := fmt.Sprintf("127.0.0.1:%d", srv.Port)
@@ -477,7 +707,8 @@ func main() {
 	}
 
 	// 1. 初始化系统代理管理器（参考 V2rayN，启动时自动为 Windows 配置 PAC，退出时自动清理）
-	sysProxyMgr := NewSysProxyManager(actualListenAddr, nil)
+	sysProxyMgr = NewSysProxyManager(actualListenAddr, nil)
+	sysProxyMgr.SetAllMode(cmd.AllMode)
 	if cmd.SysProxy != SysProxyOff {
 		if err := sysProxyMgr.SetMode(cmd.SysProxy); err != nil {
 			log.Printf("WARNING: Failed to set system proxy (%s): %v", cmd.SysProxy, err)
@@ -488,7 +719,7 @@ func main() {
 	srv.PrintBanner(cmd.BootstrapIP)
 	fmt.Printf("  System Proxy: %s\n", sysProxyMgr.StatusText())
 	if cmd.EnableTray {
-		fmt.Printf("  System Tray: Enabled (double-click tray icon to show/hide console, right-click for PAC/Global menu)\n")
+		fmt.Printf("  System Tray: Enabled (double-click tray icon to show/hide console, right-click for PAC/Global/AdScript/Logs menu)\n")
 	}
 	fmt.Printf("=================\n")
 
@@ -501,6 +732,10 @@ func main() {
 		trayCtrl := NewTrayController(actualListenAddr, portalURL, caPath, sysProxyMgr, nil, func() {
 			stop()
 		})
+		trayCtrl.AdScript = srv.AdScript
+		if logMgr != nil {
+			trayCtrl.LogDir = logMgr.LogDir()
+		}
 		stopTray = startPlatformTray(trayCtrl)
 		if cmd.HideConsole {
 			trayCtrl.SetConsoleVisible(false)
@@ -509,21 +744,31 @@ func main() {
 	defer stopTray()
 
 	if !cmd.NoBrowser && !cmd.LocalProxy {
-		go openBrowser(portalURL)
+		echproxy.SafeGo("OpenBrowser", func() {
+			openBrowser(portalURL)
+		})
 	}
 
-	go func() {
+	echproxy.SafeGo("ShutdownWatcher", func() {
 		<-ctx.Done()
-		log.Printf("Shutting down gracefully (cleaning up system proxy & tray)...")
+		log.Printf("Shutting down gracefully (cleaning up system proxy, tray & flushing logs)...")
 		sysProxyMgr.CleanupOnExit()
 		stopTray()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutCtx)
-	}()
+		if logMgr != nil {
+			logMgr.Sync()
+		}
+	})
 
 	if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("Failed to start server: %v", err)
+		echproxy.RecordFatalError("Server-Serve", err)
+		if logMgr != nil {
+			logMgr.Sync()
+			_ = logMgr.Close()
+		}
+		os.Exit(1)
 	}
 }
 
@@ -538,6 +783,6 @@ func openBrowser(url string) {
 		cmd = exec.Command("xdg-open", url)
 	}
 	if err := cmd.Start(); err == nil {
-		go func() { _ = cmd.Wait() }()
+		echproxy.SafeGo("WaitBrowser", func() { _ = cmd.Wait() })
 	}
 }

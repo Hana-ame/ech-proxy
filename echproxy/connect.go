@@ -21,6 +21,7 @@ import (
 
 	"github.com/Hana-ame/ech-proxy/echproxy/certstore"
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
+	"github.com/Hana-ame/ech-proxy/echproxy/logger"
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 	"golang.org/x/net/http2"
 )
@@ -57,7 +58,7 @@ type authFailWindow struct {
 	windowEnd time.Time
 }
 
-// AuthConfigFromEnv 从环境变量加载认证配置（对齐桌面端与 Android 端 #12）。
+// AuthConfigFromEnv 从环境变量加载认证配置（返回指针以避免复制内部的 sync.Mutex，对齐桌面端与 Android 端 #12）。
 func AuthConfigFromEnv() *AuthConfig {
 	return &AuthConfig{
 		Token:    strings.TrimSpace(os.Getenv("ECH_PROXY_TOKEN")),
@@ -337,6 +338,7 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 			return
 		}
 		go func() {
+			defer logger.RecoverAndLog("CONNECT-MITM", nil)
 			defer release()
 			serveMITMConnect(clientConn, clientBuf, host, opts)
 		}()
@@ -391,6 +393,7 @@ func handleHTTPConnect(w http.ResponseWriter, r *http.Request, opts ConnectOptio
 		idleTimeout = DefaultTunnelIdleTimeout
 	}
 	go func() {
+		defer logger.RecoverAndLog("CONNECT-Relay", nil)
 		defer release()
 		relay(
 			newDeadlineConn(clientConn, idleTimeout),

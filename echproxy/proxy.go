@@ -15,6 +15,7 @@ import (
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
 	"github.com/Hana-ame/ech-proxy/echproxy/cookie"
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
+	"github.com/Hana-ame/ech-proxy/echproxy/logger"
 	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
 	"github.com/gin-gonic/gin"
 )
@@ -52,17 +53,29 @@ func ModeName(mode string) string {
 
 // ProxyHandler 核心反向代理处理器（无鉴权包装，保持向后兼容）。
 func ProxyHandler(upstreams config.UpstreamMap, blockedHosts []string) gin.HandlerFunc {
-	return ProxyHandlerWithAuth(upstreams, blockedHosts, nil)
+	return ProxyHandlerWithOptions(upstreams, blockedHosts, nil, nil)
 }
 
-// ProxyHandlerWithAuth 核心反向代理处理器，统一承载：
-//   - 模式一（PAC / CONNECT MITM 零配置模式）：将浏览器通过 CONNECT 发来的原域名请求解密并经由 ECH/SNI 转发
-//   - 模式二（8443 门户反代模式）：将 *.l.moonchan.xyz 映射至真实上游并执行域名重写、SW 注入与 Cookie 转换
-//   - 模式三（443 本地透明反代模式）：将原域名（如 pixiv.net / *.pixiv.net / i.pximg.net）直接通过 ECH/SNI 隧道转发
+// ProxyHandlerWithAuth 核心反向代理处理器（带鉴权，保持向后兼容）。
 func ProxyHandlerWithAuth(upstreams config.UpstreamMap, blockedHosts []string, auth *AuthConfig) gin.HandlerFunc {
+	return ProxyHandlerWithOptions(upstreams, blockedHosts, auth, nil)
+}
+
+// ProxyHandlerWithOptions 核心反向代理处理器，统一承载：
+//   - 模式一（PAC / CONNECT MITM 零配置模式）：白名单域名（或 all 模式下的全部域名）通过 ECH/SNI 转发；
+//   - 模式二（8443 门户反代模式）：将 *.l.moonchan.xyz 映射至真实上游并执行域名重写、SW 注入与 Cookie 转换；
+//   - 模式三（443 本地透明反代模式）：将原域名直接通过 ECH/SNI 隧道转发；
+//   - 远程脚本注入（AdScript）：白名单 = 黄网（或 HTML 含成人网站广告）= 去掉原有广告 + 加上自己广告。
+func ProxyHandlerWithOptions(upstreams config.UpstreamMap, blockedHosts []string, auth *AuthConfig, adScript *rewrite.AdScriptManager) gin.HandlerFunc {
 	blocked := append([]string(nil), blockedHosts...)
 
 	return func(c *gin.Context) {
+		defer logger.RecoverAndLog("ProxyHandler", func(r any, _ []byte) {
+			if !c.Writer.Written() {
+				c.String(http.StatusInternalServerError, "internal proxy error")
+			}
+		})
+
 		start := time.Now()
 		clientIP := c.ClientIP()
 		host := stripPort(c.Request.Host)
@@ -159,9 +172,16 @@ func ProxyHandlerWithAuth(upstreams config.UpstreamMap, blockedHosts []string, a
 			return
 		}
 
+		// 若对 HTML 页面启用了脚本注入（白名单站点、all 模式或 ServiceWorker），移除上游严格的 CSP 头以确保内联脚本可执行
+		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
+			((adScript != nil && adScript.Enabled() && (adScript.IsWhitelisted(host, uc.Host) || adScript.AllMode())) || uc.SWInject) {
+			c.Writer.Header().Del("Content-Security-Policy")
+			c.Writer.Header().Del("Content-Security-Policy-Report-Only")
+		}
+
 		// 6. 写回响应状态码并传输/重写响应体
 		c.Status(resp.StatusCode)
-		sendResponseBody(c, host, uc, resp, rewriter, port)
+		sendResponseBody(c, host, uc, resp, rewriter, adScript, port)
 	}
 }
 
@@ -269,10 +289,10 @@ func clearHeaders(h http.Header) {
 	}
 }
 
-func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConfig, resp *http.Response, rewriter func([]byte, string) []byte, port string) {
+func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConfig, resp *http.Response, rewriter func([]byte, string) []byte, adScript *rewrite.AdScriptManager, port string) {
 	rc := http.NewResponseController(c.Writer)
 
-	// 文本类且不超过 8MB：解压 -> 重写域名与内容 -> 注入 SW -> 重新压缩并发送
+	// 文本类且不超过 8MB：解压 -> 重写域名与内容 -> 注入远程去广告/推广脚本 -> 注入 SW -> 重新压缩并发送
 	if rewriter != nil && rewrite.IsTextContent(resp.Header.Get("Content-Type")) &&
 		(resp.ContentLength <= 0 || resp.ContentLength <= rewrite.MaxRewriteSize) {
 
@@ -302,14 +322,18 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 
 		plain = rewriter(plain, port)
 
-		if uc.SWInject && config.IsPortalDomain(requestHost) &&
-			strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") &&
-			!bytes.Contains(plain, []byte("serviceWorker")) {
-			reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
-			if idx := bytes.Index(plain, []byte("</head>")); idx >= 0 {
-				plain = append(plain[:idx], append(reg, plain[idx:]...)...)
-			} else {
-				plain = append(plain, reg...)
+		lowerCT := strings.ToLower(resp.Header.Get("Content-Type"))
+		if strings.Contains(lowerCT, "text/html") {
+			if adScript != nil && adScript.Enabled() {
+				plain = adScript.InjectIntoHTMLForHost(plain, requestHost, uc.Host)
+			}
+			if uc.SWInject && config.IsPortalDomain(requestHost) && !bytes.Contains(plain, []byte("serviceWorker")) {
+				reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
+				if idx := bytes.Index(plain, []byte("</head>")); idx >= 0 {
+					plain = append(plain[:idx], append(reg, plain[idx:]...)...)
+				} else {
+					plain = append(plain, reg...)
+				}
 			}
 		}
 

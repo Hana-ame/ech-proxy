@@ -1107,13 +1107,11 @@ func (m *AdScriptManager) InjectIntoHTMLForHost(htmlBody []byte, hosts ...string
 		return cleaned
 	}
 	lower := bytes.ToLower(cleaned)
-	for _, tag := range []string{"</body>", "</head>"} {
-		if idx := bytes.Index(lower, []byte(tag)); idx >= 0 {
-			out := make([]byte, 0, len(cleaned)+len(injected))
-			out = append(out, cleaned[:idx]...)
-			out = append(out, injected...)
-			return append(out, cleaned[idx:]...)
-		}
+	if idx := bytes.Index(lower, []byte("</body>")); idx >= 0 {
+		out := make([]byte, 0, len(cleaned)+len(injected))
+		out = append(out, cleaned[:idx]...)
+		out = append(out, injected...)
+		return append(out, cleaned[idx:]...)
 	}
 	return append(cleaned, injected...)
 }

@@ -76,7 +76,7 @@ type ServerOptions struct {
 	PerPeerMaxTunnels   int        // 单客户端最大并发 CONNECT 隧道数（默认 128）
 	GlobalMaxTunnels    int        // 全局最大并发 CONNECT 隧道数（默认 1024）
 	TunnelIdleTimeout   time.Duration
-	Auth                AuthConfig // 访问认证配置（可选）
+	Auth                *AuthConfig // 访问认证配置（可选）
 }
 
 // Server 表示运行中的 ECH 代理服务器实例。
@@ -214,7 +214,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	engine := NewEngineWithOptions(EngineOptions{
 		Config:    cfg,
 		CertStore: store,
-		Auth:      &auth,
+		Auth:      auth,
 		Limiter:   limiter,
 		Port:      port,
 	})
@@ -233,7 +233,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		IPMode:              opts.IPMode,
 		AllowPrivateTargets: opts.AllowPrivateConnect,
 		IdleTimeout:         opts.TunnelIdleTimeout,
-		Auth:                &auth,
+		Auth:                auth,
 		Limiter:             limiter,
 		CertStore:           store,
 		PortalCert:          portalCert,
@@ -282,7 +282,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		Listener:   ln,
 		Port:       port,
 		IsTLS:      isTLS,
-		Auth:       &auth,
+		Auth:       auth,
 		Limiter:    limiter,
 	}, nil
 }

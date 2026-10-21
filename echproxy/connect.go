@@ -58,8 +58,8 @@ type authFailWindow struct {
 }
 
 // AuthConfigFromEnv 从环境变量加载认证配置（对齐桌面端与 Android 端 #12）。
-func AuthConfigFromEnv() AuthConfig {
-	return AuthConfig{
+func AuthConfigFromEnv() *AuthConfig {
+	return &AuthConfig{
 		Token:    strings.TrimSpace(os.Getenv("ECH_PROXY_TOKEN")),
 		Username: strings.TrimSpace(os.Getenv("ECH_PROXY_USER")),
 		Password: strings.TrimSpace(os.Getenv("ECH_PROXY_PASS")),

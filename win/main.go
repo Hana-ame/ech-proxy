@@ -51,7 +51,7 @@ type CLICommand struct {
 	SysProxy     SysProxyMode // 启动时自动设置的系统代理模式："pac"（smart 模式默认）、"global"、"off"
 	EnableTray   bool         // 是否启用系统托盘（默认开启，支持双击隐藏/显示控制台与右键切换 PAC）
 	HideConsole  bool         // 启动后是否自动隐藏控制台窗口到系统托盘
-	Auth         echproxy.AuthConfig
+	Auth         *echproxy.AuthConfig
 }
 
 // parseCLIArgs 解析子命令与命令行标志（统一支持新一代子命令与传统旗舰参数）。
@@ -274,7 +274,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		SysProxy:     sysProxyMode,
 		EnableTray:   !*noTray,
 		HideConsole:  *hideConsole,
-		Auth: echproxy.AuthConfig{
+		Auth: &echproxy.AuthConfig{
 			Token:    strings.TrimSpace(*token),
 			Username: strings.TrimSpace(*user),
 			Password: strings.TrimSpace(*pass),

@@ -42,12 +42,6 @@ const (
 	// DefaultOnRetryCount 是拉取 on.txt 失败后的重试次数（重试 2 次，即最多尝试 3 次；仍失败直接置 on）。
 	DefaultOnRetryCount = 2
 
-	// DefaultEasyListURL 是 EasyList 网络过滤清单（只取「域名 / 域名+path」子集）。
-	DefaultEasyListURL = "https://easylist.to/easylist/easylist.txt"
-
-	// DefaultAdsAllowlistURL 是 EasyList 拦截的放行清单（ads.txt，一行一个 host/path，必须带 path）。
-	DefaultAdsAllowlistURL = "https://" + netdial.DefaultSiteHost + "/ads.txt"
-
 	// DefaultAdScriptUpdateInterval 是远程配置后台自动检查更新周期（30 分钟）。
 	DefaultAdScriptUpdateInterval = 30 * time.Minute
 
@@ -499,8 +493,6 @@ type AdScriptOptions struct {
 	ScriptURL      string
 	WhitelistURL   string
 	AdultSitesURL  string
-	EasyListURL    string
-	AdsAllowlistURL string
 	BlocklistURL   string
 	OnURL          string
 	OnRetries      int
@@ -518,8 +510,6 @@ type AdScriptManager struct {
 	scriptURL      string
 	whitelistURL   string
 	adultSitesURL  string
-	easylistURL    string
-	adsAllowlistURL string
 	blocklistURL   string
 	onURL          string
 	onRetries      int
@@ -530,10 +520,6 @@ type AdScriptManager struct {
 	whitelistPtr     atomic.Pointer[[]string]
 	whitelistHistory [][]string
 	adultSites       []string
-	easyMatcher      *EasyListMatcher
-	allowRules       []AllowRule
-	allowSource      string
-	blockingEnabled  bool
 
 	scriptBytes []byte
 	versionHash string
@@ -557,14 +543,6 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	adultURL := strings.TrimSpace(opts.AdultSitesURL)
 	if adultURL == "" {
 		adultURL = DefaultAdultSitesURL
-	}
-	easyURL := strings.TrimSpace(opts.EasyListURL)
-	if easyURL == "" {
-		easyURL = DefaultEasyListURL
-	}
-	allowURL := strings.TrimSpace(opts.AdsAllowlistURL)
-	if allowURL == "" {
-		allowURL = DefaultAdsAllowlistURL
 	}
 	blockURL := strings.TrimSpace(opts.BlocklistURL)
 	if blockURL == "" {
@@ -591,8 +569,6 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 		scriptURL:      scriptURL,
 		whitelistURL:   whiteURL,
 		adultSitesURL:  adultURL,
-		easylistURL:    easyURL,
-		adsAllowlistURL: allowURL,
 		blocklistURL:   blockURL,
 		onURL:          onURL,
 		onRetries:      onRetries,
@@ -1108,25 +1084,6 @@ func (m *AdScriptManager) StartAutoUpdate(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	// EasyList 体积较大（~2.5MB）且可能较慢：独立协程刷新，绝不阻塞 ads/pac 的主刷新路径。
-	go func() {
-		defer func() { _ = recover() }()
-		_, _ = m.RefreshAdsAllowlistOnce()
-		_, _ = m.RefreshEasyListOnce()
-		t := time.NewTicker(m.updateInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-m.stopCh:
-				return
-			case <-t.C:
-				_, _ = m.RefreshAdsAllowlistOnce()
-				_, _ = m.RefreshEasyListOnce()
-			}
-		}
-	}()
 	go func() {
 		defer func() { _ = recover() }()
 		_, _ = m.RefreshOnce()
@@ -1265,135 +1222,4 @@ func looksLikeHTMLDocument(b []byte) bool {
 		bytes.Contains(lower, []byte("<!doctype html")) ||
 		bytes.Contains(lower, []byte("<head")) ||
 		bytes.Contains(lower, []byte("<body"))
-}
-
-// EasyListURL 返回 EasyList 网络过滤清单地址。
-func (m *AdScriptManager) EasyListURL() string {
-	if m == nil {
-		return ""
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.easylistURL
-}
-
-// AdsAllowlistURL 返回 ads.js 解析失败时的兜底放行清单地址。
-func (m *AdScriptManager) AdsAllowlistURL() string {
-	if m == nil {
-		return ""
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.adsAllowlistURL
-}
-
-// EasyListRuleCount 返回当前 EasyList 归一后的规则条数。
-func (m *AdScriptManager) EasyListRuleCount() int {
-	if m == nil {
-		return 0
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.easyMatcher.RuleCount()
-}
-
-// AdsAllowRules 返回从 ads.js（或 ads.txt 兜底）解析出的放行项。
-func (m *AdScriptManager) AdsAllowRules() []AllowRule {
-	if m == nil {
-		return nil
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return append([]AllowRule(nil), m.allowRules...)
-}
-
-// AdsAllowSource 返回放行项来源（"ads.js" / "ads.txt" / ""）。
-func (m *AdScriptManager) AdsAllowSource() string {
-	if m == nil {
-		return ""
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.allowSource
-}
-
-// EasyListBlockingEnabled 报告 EasyList 拦截是否可用（放行清单未能解析时自动关闭，避免误杀自有广告）。
-func (m *AdScriptManager) EasyListBlockingEnabled() bool {
-	if m == nil {
-		return false
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.blockingEnabled && m.easyMatcher != nil
-}
-
-// RefreshAdsAllowlistOnce 从当前 ads.js 文本解析放行项；解析不出时回退到 ads.txt。
-// 两者都没有则关闭 EasyList 拦截（blockingEnabled=false），避免把自有广告一起拦掉。
-func (m *AdScriptManager) RefreshAdsAllowlistOnce() ([]AllowRule, error) {
-	if m == nil {
-		return nil, nil
-	}
-	m.mu.RLock()
-	url, fetch := m.adsAllowlistURL, m.fetchFn
-	m.mu.RUnlock()
-
-	var rules []AllowRule
-	src := ""
-	if url != "" && fetch != nil {
-		if raw, err := fetch(url); err == nil {
-			if parsed := ParseAdsAllowlistText(raw); len(parsed) > 0 {
-				rules, src = parsed, "ads.txt"
-			}
-		}
-	}
-	m.mu.Lock()
-	m.allowRules = rules
-	m.allowSource = src
-	m.blockingEnabled = len(rules) > 0
-	m.mu.Unlock()
-	// 抓不到/解析不出 ads.txt 就静默关闭 EasyList 拦截（不告警、不打印、不误放）。
-	return rules, nil
-}
-
-// RefreshEasyListOnce 拉取并解析 EasyList（只取域名/域名+path 子集）；失败时保留上一版。
-func (m *AdScriptManager) RefreshEasyListOnce() (*EasyListMatcher, error) {
-	if m == nil {
-		return nil, nil
-	}
-	m.mu.RLock()
-	url, fetch := m.easylistURL, m.fetchFn
-	m.mu.RUnlock()
-	if url == "" || url == "-" || fetch == nil {
-		return nil, nil
-	}
-	raw, err := fetch(url)
-	if err != nil {
-		// 静默失败：保留上一版 matcher（若有），从未加载成功则保持 nil（不拦截）。
-		return nil, nil
-	}
-	matcher := ParseEasyListNetworkRules(raw)
-	m.mu.Lock()
-	m.easyMatcher = matcher
-	m.mu.Unlock()
-	return matcher, nil
-}
-
-// ShouldBlockEasyList 判断该 host+path 是否应被 EasyList 拦截：
-// 放行项（来自 ads.js / ads.txt）优先；放行清单不可用时一律不拦。
-func (m *AdScriptManager) ShouldBlockEasyList(host, path string) bool {
-	if m == nil {
-		return false
-	}
-	m.mu.RLock()
-	enabled := m.blockingEnabled
-	matcher := m.easyMatcher
-	rules := m.allowRules
-	m.mu.RUnlock()
-	if !enabled || matcher == nil {
-		return false
-	}
-	if Allows(rules, host, path) {
-		return false
-	}
-	return matcher.Match(host, path)
 }

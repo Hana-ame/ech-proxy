@@ -111,14 +111,6 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			return
 		}
 
-		// EasyList 网络过滤子集：命中且不在 ads.js 放行清单内 -> 直接 204，不发起上游请求。
-		// 放行清单由 ads.js 解析得到（当前内置 2 条：slimgather / fussyreturn），保证自有广告不被误杀。
-		if adScript != nil && !adScript.SkipAdBlock() && !config.IsPortalDomain(host) &&
-			adScript.ShouldBlockEasyList(host, c.Request.URL.Path) {
-			c.Status(http.StatusNoContent)
-			return
-		}
-
 		ucForRewrite := uc
 		if ucForRewrite.Wildcard == nil && len(upstreams) > 0 {
 			ucForRewrite.Wildcard = config.InheritWildcard(upstreams, host)

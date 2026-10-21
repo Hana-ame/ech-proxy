@@ -1,3 +1,11 @@
+## v3.4.1
+
+### Fixes & Improvements
+
+- **CI/CD 流水线与平台设计边界对齐 (CI Calibration)**:
+  - 依照架构设计意图（ECH 核心运行模式专门针对 Windows 系统设计，非 Windows 平台无需常驻代理服务），移除 Linux CI 容器中启动后台代理服务与探测的冗余测试步骤，收敛为严格的 CLI 工具链断言（`version`、`check` 校验上游 JSON、`pac` 生成与 `help` 校验）及全架构交叉编译。
+  - 消除 Linux 容器中因冷启动阶段远端 `ads.js` 尚未完成异步拉取而导致的 smoke test 偶发失败，确保发布流水线清洁稳定。
+
 ## v3.4.0
 
 ### Changes & Features

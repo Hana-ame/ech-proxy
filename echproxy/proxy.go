@@ -312,7 +312,8 @@ func consumeForceCertParam(reqURI, upstreamHost string) (string, bool) {
 
 func prepareResponseHeaders(dst, src http.Header, uc config.UpstreamConfig, cookieDomain string, req *http.Request, rewriter func([]byte, string) []byte, port string) {
 	rewrite.CopyHeaders(dst, src)
-	cookie.RewriteSetCookieHeaders(dst, cookieDomain, req.TLS == nil)
+	httpMode := req.TLS == nil && !strings.EqualFold(req.URL.Scheme, "https")
+	cookie.RewriteSetCookieHeaders(dst, cookieDomain, httpMode)
 	rewrite.ApplyHeaderRules(dst, uc.ResponseHeaders, false, nil)
 	if rewriter != nil {
 		rewrite.RewriteRedirectHeaders(dst, rewriter, port)
@@ -373,6 +374,14 @@ func clearHeaders(h http.Header) {
 }
 
 func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConfig, resp *http.Response, rewriter func([]byte, string) []byte, port string, adScript *rewrite.AdScriptManager) {
+	if c.Request.Method == http.MethodHead ||
+		resp.StatusCode == http.StatusNoContent ||
+		resp.StatusCode == http.StatusNotModified ||
+		(resp.StatusCode >= 100 && resp.StatusCode < 200) {
+		c.Writer.WriteHeaderNow()
+		return
+	}
+
 	rc := http.NewResponseController(c.Writer)
 
 	if (rewriter != nil || adScript != nil) && rewrite.IsTextContent(resp.Header.Get("Content-Type")) &&

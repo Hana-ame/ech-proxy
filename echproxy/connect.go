@@ -443,6 +443,7 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 		return
 	}
 
+	tlsState := tlsConn.ConnectionState()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if req.Host == "" {
 			req.Host = targetHost
@@ -451,10 +452,14 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 		if req.URL.Host == "" {
 			req.URL.Host = req.Host
 		}
+		if req.TLS == nil {
+			st := tlsState
+			req.TLS = &st
+		}
 		opts.HTTPHandler.ServeHTTP(w, req)
 	})
 
-	if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+	if tlsState.NegotiatedProtocol == "h2" {
 		(&http2.Server{}).ServeConn(tlsConn, &http2.ServeConnOpts{Handler: handler})
 		return
 	}

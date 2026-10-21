@@ -21,6 +21,7 @@ func TestParseEasyListDeterministicSubset(t *testing.T) {
 ||deny.example.com^$denyallow=ok.example.com
 ##.generic-ad
 example.com##.site-ad
+~example.com##.negated-on-example
 #@#.generic-except
 example.com#@#.site-except
 example.com#?#.proc:has-text(ad)
@@ -63,20 +64,22 @@ example.com#?#.proc:has-text(ad)
 		t.Errorf("csp = %v, want script-src ...", got)
 	}
 
-	// cosmetic：通用 + 域限定，且 #@# 例外生效；procedural 跳过
-	cos := m.CosmeticFor("example.com")
-	joined := strings.Join(cos, ",")
-	if !strings.Contains(joined, ".generic-ad") || !strings.Contains(joined, ".site-ad") {
-		t.Errorf("example.com cosmetic missing selectors: %v", cos)
-	}
-	if strings.Contains(joined, ".generic-except") || strings.Contains(joined, ".site-except") {
-		t.Errorf("cosmetic #@# exception not applied: %v", cos)
-	}
-	if strings.Contains(joined, "has-text") {
-		t.Errorf("procedural rule must be skipped: %v", cos)
+	// cosmetic：通用 + 域限定，且 #@# 例外与 ~domain 排除在主域名及子域名上均生效；procedural 跳过
+	for _, host := range []string{"example.com", "sub.example.com"} {
+		cos := m.CosmeticFor(host)
+		joined := strings.Join(cos, ",")
+		if !strings.Contains(joined, ".generic-ad") || !strings.Contains(joined, ".site-ad") {
+			t.Errorf("%s cosmetic missing selectors: %v", host, cos)
+		}
+		if strings.Contains(joined, ".generic-except") || strings.Contains(joined, ".site-except") || strings.Contains(joined, ".negated-on-example") {
+			t.Errorf("%s cosmetic #@# or ~domain exception not applied: %v", host, cos)
+		}
+		if strings.Contains(joined, "has-text") {
+			t.Errorf("procedural rule must be skipped: %v", cos)
+		}
 	}
 	other := strings.Join(m.CosmeticFor("elsewhere.test"), ",")
-	if !strings.Contains(other, ".generic-ad") || strings.Contains(other, ".site-ad") {
+	if !strings.Contains(other, ".generic-ad") || !strings.Contains(other, ".negated-on-example") || strings.Contains(other, ".site-ad") {
 		t.Errorf("unrelated domain cosmetic wrong: %v", other)
 	}
 	if st := m.CosmeticStyle("example.com"); !strings.Contains(st, "ech-proxy-easylist-style") {
@@ -107,10 +110,13 @@ func TestStripMatchedURLsAndEscaped(t *testing.T) {
 		t.Errorf("unrelated URL must be kept: %s", s)
 	}
 
-	esc := []byte(`<script>(function(){var s=document.createElement('script');s.src="\/\/ads.example.com\/x.js";})()</script>`)
+	esc := []byte(`<script>(function(){var tpl="<\/script>";var s=document.createElement('script');s.src="\/\/ads.example.com\/x.js";})()</script>`)
 	eout, en := m.StripEscapedURLs(esc)
 	if en == 0 || strings.Contains(string(eout), "ads.example.com") {
 		t.Errorf("escaped ad URL not stripped (n=%d): %s", en, string(eout))
+	}
+	if !strings.Contains(string(eout), `<\/script>`) {
+		t.Errorf("StripEscapedURLs must not corrupt unrelated <\\/script> escapes in JS strings: %s", string(eout))
 	}
 }
 

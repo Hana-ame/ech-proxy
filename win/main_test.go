@@ -143,7 +143,7 @@ func TestParseCLIArgsSubcommandsFlagsAndSysProxyDefaults(t *testing.T) {
 }
 
 func TestSysProxyManagerAtomicReplaceAndOldValuePop(t *testing.T) {
-	drv := &noopSysProxyDriver{}
+	drv := &stubSysProxyDriver{}
 	// 预设用户原本已有一个旧的 PAC 地址，验证原子替换与旧值 pop 恢复
 	_ = drv.ApplyPAC("http://corp.example.com/legacy.pac")
 
@@ -190,9 +190,9 @@ func TestSysProxyManagerAtomicReplaceAndOldValuePop(t *testing.T) {
 }
 
 func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
-	drv := &noopSysProxyDriver{}
+	drv := &stubSysProxyDriver{}
 	sysMgr := NewSysProxyManager("127.0.0.1:8443", drv)
-	console := &memoryConsoleDriver{visible: true}
+	console := &stubConsoleDriver{visible: true}
 
 	var openedURL, copiedText, installedCA, uninstalledCA, switchedIPMode string
 	updateChecked := false

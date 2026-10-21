@@ -3,6 +3,7 @@ package echproxy
 import (
 	_ "embed"
 	"html"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -144,7 +145,8 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		adEnabled, adOn, skipAdScript, skipAdBlock := false, true, true, false
 		allMode := opts.AllMode
 		adSource, adVersion := "disabled", ""
-		whitelistCount, blocklistCount := 0, 0
+		whitelistCount, adultSitesCount, blocklistCount, easyListRules := 0, 0, 0, 0
+		easyListLoaded := false
 		if opts.AdScript != nil {
 			adEnabled = opts.AdScript.Enabled()
 			adOn = opts.AdScript.On()
@@ -156,8 +158,11 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			adSource = opts.AdScript.Source()
 			adVersion = opts.AdScript.VersionHash()
 			whitelistCount = len(opts.AdScript.Whitelist())
+			adultSitesCount = len(opts.AdScript.AdultSites())
 			bl := opts.AdScript.Blocklist()
 			blocklistCount = len(bl.Domains) + len(bl.Selectors)
+			easyListLoaded = opts.AdScript.EasyListLoaded()
+			easyListRules = opts.AdScript.EasyListRuleCount()
 		}
 		logFile := ""
 		if opts.Logger != nil {
@@ -167,25 +172,28 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		}
 		upstreams, _ := cfg.Snapshot()
 		c.JSON(http.StatusOK, gin.H{
-			"status":            "ok",
-			"upstreams":         len(upstreams),
-			"ca_path":           caPath,
-			"ca_valid_until":    caValid,
-			"active_tunnels":    activeTunnels,
-			"auth_enabled":      opts.Auth != nil && opts.Auth.Enabled(),
-			"all_mode":          allMode,
-			"ip_mode":           netdial.FormatIPMode(cloudflare_ech.GetIPMode()),
-			"doh_primary":       cloudflare_ech.PrimaryDoHURL(),
-			"doh_secondary":     cloudflare_ech.SecondaryDoHURL(),
-			"ad_script_enabled": adEnabled,
-			"ad_on":             adOn,
-			"skip_ad_script":    skipAdScript,
-			"skip_ad_block":     skipAdBlock,
-			"ad_script_source":  adSource,
-			"ad_script_version": adVersion,
-			"whitelist_count":   whitelistCount,
-			"blocklist_count":   blocklistCount,
-			"log_file":          logFile,
+			"status":              "ok",
+			"upstreams":           len(upstreams),
+			"ca_path":             caPath,
+			"ca_valid_until":      caValid,
+			"active_tunnels":      activeTunnels,
+			"auth_enabled":        opts.Auth != nil && opts.Auth.Enabled(),
+			"all_mode":            allMode,
+			"ip_mode":             netdial.FormatIPMode(cloudflare_ech.GetIPMode()),
+			"doh_primary":         cloudflare_ech.PrimaryDoHURL(),
+			"doh_secondary":       cloudflare_ech.SecondaryDoHURL(),
+			"ad_script_enabled":   adEnabled,
+			"ad_on":               adOn,
+			"skip_ad_script":      skipAdScript,
+			"skip_ad_block":       skipAdBlock,
+			"ad_script_source":    adSource,
+			"ad_script_version":   adVersion,
+			"whitelist_count":     whitelistCount,
+			"adult_sites_count":   adultSitesCount,
+			"blocklist_count":     blocklistCount,
+			"easylist_loaded":     easyListLoaded,
+			"easylist_rule_count": easyListRules,
+			"log_file":            logFile,
 		})
 	})
 
@@ -242,7 +250,7 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 
 func isPortalOrLocalAdminHost(host string) bool {
 	h := netdial.CleanHost(host)
-	return h == indexHost || h == "localhost" || h == "127.0.0.1" || h == "::1"
+	return h == indexHost || h == "localhost" || h == "127.0.0.1" || h == "::1" || net.ParseIP(h) != nil
 }
 
 func corsMiddleware() gin.HandlerFunc {
@@ -289,7 +297,7 @@ func renderUpstreamList(cfg *config.Config, requestHost string) string {
 		}
 	}
 	upstreams, _ := cfg.Snapshot()
-	entries := cfg.UpstreamOrder
+	entries := cfg.OrderSnapshot()
 	if len(entries) == 0 {
 		for k := range upstreams {
 			entries = append(entries, k)

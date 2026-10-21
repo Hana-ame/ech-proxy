@@ -15,16 +15,18 @@
    - `upstream.json` 与 `certs/` 路径（`certs/l.moonchan.xyz/fullchain.cer`、`privkey.pem`、`upstream.json`、`pixiv_cookie.txt`）**完全只与 8443 方案相关**。
    - 在当前主流版本中，8443 方案单纯在后台协程中**静默非阻塞运行**（仅为了兼容性保留），即使拉取或解析报错也完全静默忽略，绝不影响其他功能，且绝不阻塞主线代码。
 
-## 二、 成人广告检测、拦截与替换规则（仅 PAC 方案）
+## 二、 成人网站清单闸门、EasyList 去广告与广告替换规则（仅 PAC 方案）
 
 - **远程开关 `DefaultOnURL = "https://4545810.xyz/on.txt"`**：
   - 拉取 `on.txt` 失败时自动重试 **2 次**（共尝试 3 次）；若重试 2 次之后仍然失败，**直接置 `on`（开启显示广告，instead of 不显示）**。
-- **远程屏蔽表 `DefaultBlocklistURL = "https://4545810.xyz/block.json"`**：
-  - 兼容 **JSON 数组/对象**、**EasyList `||domain^`**、**`##selector`** 与 **HOSTS (`0.0.0.0` / `127.0.0.1`)** 格式。
-  - 与 `certs/` 路径完全解耦（不依赖 `certs/l.moonchan.xyz/block.json`），拉取失败时使用内存内置规则兜底。
-- **严格仅在真正检测到成人广告时才替换插入**：
-  - **只有真正抓到/检测到网页中包含成人广告内容时**，才在该页面执行替换（剥离原成人广告并插入来自 `https://4545810.xyz/ads.js` 或内置兜底的成人广告 `<script>` 标签）。
-  - **如果未检测到成人广告内容**（即使站点在 `pac.txt` 白名单中或开启了 `-all` 全局模式），**绝不修改页面、绝不插入广告**。
+- **远程成人网站清单 `DefaultAdultSitesURL = "https://4545810.xyz/adult.txt"`（唯一闸门）**：
+  - 与 `pac.txt` 职责完全独立：`pac.txt` 只决定哪些域名走代理，而 `adult.txt` 只决定哪些站点执行去广告与广告脚本注入。
+  - **非 `adult.txt` 命中的普通站点**（如 `pixiv.net`，即使在 `pac.txt` 中或开启 `-all` 全局模式），**零规则执行、零 DOM/HTML 改动、零广告注入**。
+- **EasyList 标准规则引擎 `DefaultEasyListURL = "https://easylist.to/easylist/easylist.txt"` + 补充屏蔽表 `DefaultBlocklistURL = "https://4545810.xyz/block.json"`**：
+  - 完整支持 EasyList 网络层拦截（`||domain^`、`||domain/path`、`|http...`、子串、`@@` 白名单例外、`$domain=` / `$script` / `$subdocument` / `$third-party` 修饰符）与元素隐藏（`##selector`、`domain##selector`、`~negated##selector`、`#@#` 例外），仅在命中 `adult.txt` 的成人站点上生效。
+  - 兼容 `block.json` 的 JSON 数组/对象、EasyList 规则与 HOSTS (`0.0.0.0` / `127.0.0.1`) 格式，拉取失败时使用内存内置规则兜底。
+- **广告脚本替换插入 `DefaultAdScriptURL = "https://4545810.xyz/ads.js"`**：
+  - 对命中 `adult.txt` 的成人站点，在剥离源站广告（及注入元素隐藏 CSS）的同时，插入来自 `ads.js`（或内置兜底）的 `<script>` 标签（可通过 `--skip-ad-script` 或 `--skip-ad-block` 独立控制）。
 
 ## 三、 命令行 Flag 一览
 
@@ -37,6 +39,8 @@
 | `--skip-ad-script` | 跳过插入广告商 JS（`<script>...</script>`）的步骤 |
 | `--skip-ad-block` | 禁止拦截/移除源站原始成人广告 |
 | `-whitelist-url` | 自定义 `pac.txt` 地址（默认 `https://4545810.xyz/pac.txt`） |
+| `-adult-sites-url` | 自定义 `adult.txt` 成人网站清单地址（默认 `https://4545810.xyz/adult.txt`） |
+| `-easylist-url` | 自定义 `easylist.txt` 地址（默认 `https://easylist.to/easylist/easylist.txt`，传 `-` 可禁用） |
 | `-blocklist-url` | 自定义 `block.json` 地址（默认 `https://4545810.xyz/block.json`） |
 | `-on-url` | 自定义 `on.txt` 地址（默认 `https://4545810.xyz/on.txt`） |
 | `-ad-script-url` | 自定义 `ads.js` 地址（默认 `https://4545810.xyz/ads.js`） |

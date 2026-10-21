@@ -56,6 +56,8 @@ var (
 	procGlobalAlloc      = modkernel32.NewProc("GlobalAlloc")
 	procGlobalLock       = modkernel32.NewProc("GlobalLock")
 	procGlobalUnlock     = modkernel32.NewProc("GlobalUnlock")
+	procGlobalFree       = modkernel32.NewProc("GlobalFree")
+	procRtlMoveMemory    = modkernel32.NewProc("RtlMoveMemory")
 
 	moduser32            = syscall.NewLazyDLL("user32.dll")
 	procShowWindow       = moduser32.NewProc("ShowWindow")
@@ -480,15 +482,16 @@ func copyToClipboardOnPlatform(text string) error {
 	if hMem == 0 {
 		return err
 	}
-	ptr, _, _ := procGlobalLock.Call(hMem)
+	ptr, _, lerr := procGlobalLock.Call(hMem)
 	if ptr == 0 {
-		return err
+		_, _, _ = procGlobalFree.Call(hMem)
+		return lerr
 	}
-	dst := unsafe.Slice((*uint16)(unsafe.Pointer(ptr)), len(utf16Buf))
-	copy(dst, utf16Buf)
+	_, _, _ = procRtlMoveMemory.Call(ptr, uintptr(unsafe.Pointer(&utf16Buf[0])), sizeBytes)
 	_, _, _ = procGlobalUnlock.Call(hMem)
 
 	if res, _, cerr := procSetClipboardData.Call(cfUnicodeText, hMem); res == 0 {
+		_, _, _ = procGlobalFree.Call(hMem)
 		return cerr
 	}
 	return nil

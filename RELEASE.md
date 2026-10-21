@@ -3,17 +3,17 @@
 ### Changes & Features
 
 - **Unified PAC Proxy Architecture (`127.0.0.1:8443`) & Strict `.443.exe` Isolation** —
-  - By default (`ech-proxy.exe`), the proxy runs strictly as a unified HTTP/HTTPS PAC proxy on `127.0.0.1:8443`, automatically configuring the Windows system PAC (`http://127.0.0.1:8443/proxy.pac?t=<ts>`) without opening `l.moonchan.xyz:8443` on startup (`l.moonchan.xyz` portal remains independently accessible via `ech-proxy portal` or the tray menu).
+  - By default (`ech-proxy.exe`), the proxy runs strictly as a unified HTTP/HTTPS PAC proxy on `127.0.0.1:8443`, automatically configuring the Windows system PAC (`http://127.0.0.1:8443/proxy.pac?t=<ts>`) without opening `l.moonchan.xyz:8443` on startup (`l.moonchan.xyz` portal remains independently accessible via `ech-proxy.8443.exe portal` or the tray menu).
   - When the executable filename does **not** end with `.443.exe` (and `-local` is not explicitly passed), port 443 is never bound and the local 443 transparent proxy code path is strictly not executed.
 - **Seamless HTTP & HTTPS Proxy Handling + 3 GFW-Bypass Transports** —
   - **HTTPS (`CONNECT host:443`)**: Local CA (`CertStore`) dynamically signs leaf certificates with full chain, decrypts HTTP/1.1 & HTTP/2, and routes upstream via **(1) DoH + SNI Camouflage**, **(2) DoH + Cloudflare ECH**, or **(3) DoH + TLS ClientHello Fragment** (`DialFragmentedTLS`), with strict upstream certificate verification (`truedomain.com` hostname, expiration, and trust chain) and one-time token force-access (`?__ech_proxy_force_cert__=<token>`).
   - **Plain HTTP (`http://`) & WebSocket**: Automatically strips `Proxy-*` hop-by-hop headers, upgrades standard port-80 requests to HTTPS via the 3 GFW-bypass modes when supported, and seamlessly falls back to DoH-resolved plain HTTP (`PlainHTTPDo`, preserving request bodies) for HTTP-only origins or custom HTTP ports. Also supports plaintext HTTP inside `CONNECT` tunnels via first-byte sniffing.
-- **Dual-Stack (`--dual`, `-4`, `-6`) & Built-in DoH Failover** —
-  - Defaults to dual-stack (`--dual`), with `-4` (IPv4 only) and `-6` (IPv6 only) flags.
+- **IPv4 Default (`-4`) with Dual-Stack (`-dual`) / IPv6 (`-6`) & Built-in DoH Failover** —
+  - Defaults to IPv4-only (`-4` / `v4`), with `-dual` (dual-stack IPv4 + IPv6) and `-6` (IPv6 only) flags and runtime tray switching.
   - Built-in DoH endpoints: primary `https://4545810.xyz/doh` and secondary `https://1.1.1.1/dns-query` with automatic failover.
-- **Remote PAC Whitelist (`pac.txt`) & Remote Advertiser Script (`ads.js`)** —
+- **Decoupled Remote Lists (`pac.txt`, `adult.txt`, `EasyList`, `block.json`, `on.txt`, `ads.js`)** —
   - Default PAC whitelist fetched from `https://4545810.xyz/pac.txt` (line-delimited domains, fallback to `[]` on failure; `-all` routes all domains through the proxy).
-  - Default advertiser script fetched from `https://4545810.xyz/ads.js` (with built-in fallback), injecting each ad block in its own `<script>...</script>` tag and stripping original site ads (controllable via `--skip-ad-script` and `--skip-ad-block`).
+  - Adult-site gate fetched from `https://4545810.xyz/adult.txt`: only sites matching `adult.txt` undergo EasyList (`https://easylist.to/easylist/easylist.txt`) + `block.json` (`https://4545810.xyz/block.json`) ad stripping/cosmetic hiding and `ads.js` (`https://4545810.xyz/ads.js`) script injection (controllable via `--skip-ad-script` and `--skip-ad-block`). Non-adult sites (`pixiv.net`, etc.) are passed through untouched.
 - **One-Click CA Uninstall & GitHub Releases Auto-Updater (`win/updater.go`)** —
   - Added `ech-proxy ca uninstall` (`-ca-uninstall`) and tray menu item to remove the local CA from Windows User Root store (`certutil -user -delstore Root`) and macOS keychain.
   - Added automatic update checking and background downloading from `https://github.com/Hana-ame/ech-proxy/releases` with SHA-256 verification against `checksums.txt`, staging `.update.new` and applying atomic self-replacement on exit/restart (`ech-proxy update`, tray menu, or `--no-auto-update`).

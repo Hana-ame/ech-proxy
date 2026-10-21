@@ -30,8 +30,11 @@ jobs:
       - name: Install dependencies
         run: go mod download
 
-      - name: Run go vet across all packages
-        run: go vet ./...
+      - name: Run go vet across all packages (Linux & Windows targets)
+        run: |
+          go vet ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...
+          GOOS=windows GOARCH=386   CGO_ENABLED=0 go vet ./...
 
       - name: Validate upstream.json configuration
         run: go run ./win check -config certs/l.moonchan.xyz/upstream.json

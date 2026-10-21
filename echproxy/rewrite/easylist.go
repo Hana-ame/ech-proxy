@@ -14,7 +14,7 @@ import (
 //   - 网络：||domain^、||domain/path、|https://domain/path、/path/*
 //   - 例外：@@、$denyallow
 //   - 选项：$important（等同普通）、$badfilter（丢弃该规则）、$removeparam、$csp
-//   - cosmetic：##selector（通用/域限定）、#@#（cosmetic 例外）
+//   - cosmetic：##selector（通用/域限定/支持 ~domain 域排除）、#@#（cosmetic 例外）
 //
 // 不做（代理缺浏览器上下文，做了只能近似）：
 //   - $third-party / $domain / $script / $image / $xhr / $frame 等请求上下文选项
@@ -106,7 +106,8 @@ func ParseEasyListNetworkRules(raw []byte) *EasyListMatcher {
 			if domains == "" {
 				m.cosmeticExceptGeneric[sel] = true
 			} else {
-				for _, d := range splitEasyDomains(domains) {
+				pos, neg := splitEasyDomainsWithNeg(domains)
+				for _, d := range append(pos, neg...) {
 					if m.cosmeticExceptDomain[d] == nil {
 						m.cosmeticExceptDomain[d] = make(map[string]bool)
 					}
@@ -124,8 +125,19 @@ func ParseEasyListNetworkRules(raw []byte) *EasyListMatcher {
 			if domains == "" {
 				m.cosmeticGeneric = append(m.cosmeticGeneric, sel)
 			} else {
-				for _, d := range splitEasyDomains(domains) {
-					m.cosmeticByDomain[d] = append(m.cosmeticByDomain[d], sel)
+				pos, neg := splitEasyDomainsWithNeg(domains)
+				for _, d := range neg {
+					if m.cosmeticExceptDomain[d] == nil {
+						m.cosmeticExceptDomain[d] = make(map[string]bool)
+					}
+					m.cosmeticExceptDomain[d][sel] = true
+				}
+				if len(pos) == 0 && len(neg) > 0 {
+					m.cosmeticGeneric = append(m.cosmeticGeneric, sel)
+				} else {
+					for _, d := range pos {
+						m.cosmeticByDomain[d] = append(m.cosmeticByDomain[d], sel)
+					}
 				}
 			}
 			m.ruleCount++
@@ -238,16 +250,23 @@ func parseEasyOptions(opts string) (keep bool, removeParams []string, csp string
 	return true, removeParams, csp, denyAllow
 }
 
-func splitEasyDomains(s string) []string {
-	var out []string
+func splitEasyDomainsWithNeg(s string) (pos []string, neg []string) {
 	for _, d := range strings.Split(s, ",") {
 		d = strings.ToLower(strings.TrimSpace(d))
-		d = strings.TrimPrefix(d, "~")
-		if d = NormalizeEasyHost(d); d != "" {
-			out = append(out, d)
+		if d == "" {
+			continue
+		}
+		if strings.HasPrefix(d, "~") {
+			if norm := NormalizeEasyHost(strings.TrimPrefix(d, "~")); norm != "" {
+				neg = append(neg, norm)
+			}
+			continue
+		}
+		if norm := NormalizeEasyHost(d); norm != "" {
+			pos = append(pos, norm)
 		}
 	}
-	return out
+	return pos, neg
 }
 
 func appendEasyUnique(list []string, v string) []string {
@@ -349,20 +368,28 @@ func (m *EasyListMatcher) CSPFor(host string) []string {
 	return out
 }
 
-// CosmeticFor 返回该 host 生效的 cosmetic 选择器（通用 + 域限定 − #@# 例外）。
+// CosmeticFor 返回该 host 生效的 cosmetic 选择器（通用 + 域限定 − #@# / ~domain 例外）。
 func (m *EasyListMatcher) CosmeticFor(host string) []string {
 	if m == nil {
 		return nil
 	}
 	host = strings.ToLower(strings.TrimSpace(host))
+	suffixes := easyHostSuffixes(host)
 	var out []string
 	seen := make(map[string]bool)
-	exceptDomain := m.cosmeticExceptDomain[host]
-	add := func(sel string) {
-		if sel == "" || seen[sel] || m.cosmeticExceptGeneric[sel] {
-			return
+	isExcepted := func(sel string) bool {
+		if m.cosmeticExceptGeneric[sel] {
+			return true
 		}
-		if exceptDomain != nil && exceptDomain[sel] {
+		for _, suf := range suffixes {
+			if ex := m.cosmeticExceptDomain[suf]; ex != nil && ex[sel] {
+				return true
+			}
+		}
+		return false
+	}
+	add := func(sel string) {
+		if sel == "" || seen[sel] || isExcepted(sel) {
 			return
 		}
 		seen[sel] = true
@@ -371,7 +398,7 @@ func (m *EasyListMatcher) CosmeticFor(host string) []string {
 	for _, sel := range m.cosmeticGeneric {
 		add(sel)
 	}
-	for _, suf := range easyHostSuffixes(host) {
+	for _, suf := range suffixes {
 		for _, sel := range m.cosmeticByDomain[suf] {
 			add(sel)
 		}
@@ -428,15 +455,43 @@ func (m *EasyListMatcher) StripMatchedURLs(body []byte) ([]byte, int) {
 	return out, len(hits)
 }
 
-// StripEscapedURLs 处理 JS 字符串里被转义的 URL（\/\/host\/path）。
+// StripEscapedURLs 处理 JS 字符串里被转义的 URL（\/\/host\/path），仅剥离命中的转义广告 URL，保留其余 `<\/script>` 与正则转义。
 func (m *EasyListMatcher) StripEscapedURLs(body []byte) ([]byte, int) {
 	if m == nil || len(body) == 0 || !bytes.Contains(body, []byte(`\/\/`)) {
 		return body, 0
 	}
 	unescaped := bytes.ReplaceAll(body, []byte(`\/`), []byte("/"))
-	stripped, n := m.StripMatchedURLs(unescaped)
-	if n == 0 {
+	found := make(map[string]bool)
+	var hits []string
+	for _, mt := range htmlURLScanRE.FindAllSubmatch(unescaped, -1) {
+		host := strings.ToLower(string(mt[1]))
+		path := ""
+		if len(mt) > 2 {
+			path = string(mt[2])
+		}
+		if host == "" || m.allowHostOnly[host] || !m.ShouldBlock(host, path) {
+			continue
+		}
+		lit := string(mt[0])
+		if lit != "" && !found[lit] {
+			found[lit] = true
+			hits = append(hits, lit)
+		}
+		if len(hits) >= 512 {
+			break
+		}
+	}
+	if len(hits) == 0 {
 		return body, 0
 	}
-	return stripped, n
+	out := body
+	for _, h := range hits {
+		escH := strings.ReplaceAll(h, "/", `\/`)
+		out = stripOneBlockedURL(out, []byte(escH))
+		if i := strings.Index(h, "://"); i >= 0 {
+			escProtoRel := `\/\/` + strings.ReplaceAll(h[i+3:], "/", `\/`)
+			out = stripOneBlockedURL(out, []byte(escProtoRel))
+		}
+	}
+	return out, len(hits)
 }

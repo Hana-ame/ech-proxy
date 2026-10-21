@@ -181,6 +181,15 @@ func (c *Config) Snapshot() (UpstreamMap, []string) {
 	return c.Upstreams, c.BlockedHosts
 }
 
+func (c *Config) OrderSnapshot() []string {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]string(nil), c.UpstreamOrder...)
+}
+
 func Load(source string) (*Config, error) {
 	defaultSource := source == ""
 	if defaultSource {
@@ -351,7 +360,7 @@ func mergeLegacyHeaders(headers map[string]HeaderRule, referer, origin, xsite st
 
 func compileHeaderRules(rules map[string]HeaderRule) {
 	for k, r := range rules {
-		if len(r.Replace) >= 2 && r.Replace[0] != "" {
+		if len(r.Replace) >= 2 && r.Replace[0] != "" && r.CompiledReplace == nil {
 			r.CompiledReplace, _ = regexp.Compile(r.Replace[0])
 			rules[k] = r
 		}
@@ -364,7 +373,7 @@ func CompileBodyReplace(rules []BodyReplaceRule) {
 
 func compileBodyReplace(rules []BodyReplaceRule) {
 	for i := range rules {
-		if rules[i].Old != "" {
+		if rules[i].Old != "" && rules[i].Compiled == nil {
 			rules[i].Compiled, _ = regexp.Compile(rules[i].Old)
 		}
 	}

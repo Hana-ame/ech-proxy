@@ -116,15 +116,16 @@ func BuildEntryRewriterForHost(requestHost string, uc config.UpstreamConfig, blo
 		}
 	}
 	domainRewriter := buildDomainRewriter(rules)
-	config.CompileBodyReplace(uc.BodyReplace)
+	bodyReplace := append([]config.BodyReplaceRule(nil), uc.BodyReplace...)
+	config.CompileBodyReplace(bodyReplace)
 
 	return func(body []byte, port string) []byte {
 		body = stripBlockedURLs(body, blocked)
 		if len(rules) > 0 {
 			body = domainRewriter(body, port)
 		}
-		if len(uc.BodyReplace) > 0 {
-			body = applyBodyReplace(body, uc.BodyReplace)
+		if len(bodyReplace) > 0 {
+			body = applyBodyReplace(body, bodyReplace)
 		}
 		return body
 	}

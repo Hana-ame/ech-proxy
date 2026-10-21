@@ -39,7 +39,7 @@ func exeNameIs443() bool {
 func FlagOverviewText() string {
 	return `=== ech-proxy 命令行 Flag 一览 ===
   三种运行方案（高内聚、完全解耦）:
-    ech-proxy.exe       [默认主流 PAC 方案] 本地 CA MITM + DoH/SNI/ECH/Fragment + pac.txt + on.txt + block.json + ads.js（默认 8443，自适应任意端口；8443 方案在后台静默兼容运行）
+    ech-proxy.exe       [默认主流 PAC 方案] 本地 CA MITM + DoH/SNI/ECH/Fragment + pac.txt + adult.txt + EasyList + on.txt + block.json + ads.js（默认 8443，自适应任意端口；8443 方案在后台静默兼容运行）
     .*.443.exe          [443 方案] 只与 listen 443 有关，仅监听 443 端口（本地 CA + SNI/ECH），其余功能一律不运行
     *.8443.exe          [8443 方案] 公网真实证书门户反代（加载 certs/l.moonchan.xyz/ 与 upstream.json，静默非阻塞兼容）
 
@@ -49,9 +49,15 @@ func FlagOverviewText() string {
     -dual               双端出口 (IPv4 + IPv6 双栈)
     -all                开启全局模式（无视 pac.txt 白名单，所有网站均通过 ech-proxy 代理）
 
-  广告处理控制 Flag（仅 PAC 方案生效，且仅在真正检测到成人广告时才替换插入，托盘中隐藏）:
+  广告处理控制 Flag（仅 PAC 方案生效，仅对命中 adult.txt 成人清单的站点执行去广告与替换注入，托盘中隐藏）:
     --skip-ad-script    跳过插入广告商 JS (<script>...</script>) 的步骤
     --skip-ad-block     禁止拦截/移除源站原始成人广告
+    -whitelist-url      自定义 pac.txt 代理白名单地址（默认 https://4545810.xyz/pac.txt）
+    -adult-sites-url    自定义 adult.txt 成人站点清单地址（默认 https://4545810.xyz/adult.txt）
+    -easylist-url       自定义 EasyList 规则地址（默认 https://easylist.to/easylist/easylist.txt，传 - 可禁用）
+    -blocklist-url      自定义 block.json 补充屏蔽表地址（默认 https://4545810.xyz/block.json）
+    -on-url             自定义 on.txt 远程开关地址（默认 https://4545810.xyz/on.txt）
+    -ad-script-url      自定义 ads.js 广告脚本地址（默认 https://4545810.xyz/ads.js）
 
   CA 证书与自动更新子命令 / Flag:
     ca install          一键安装本地 CA 根证书 (-ca-install)

@@ -554,3 +554,65 @@ func TestPlainHTTPAndHTTPSProxyRoutingAndFallback(t *testing.T) {
 		t.Errorf("POST / on proxied host failed: code=%d body=%q", rec3.Code, rec3.Body.String())
 	}
 }
+
+func TestHeadAndNoContentResponsesPreserveHeaders(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	orig := roundTripFn
+	defer func() { roundTripFn = orig }()
+
+	adMgr := NewAdScriptManager(AdScriptOptions{
+		Enabled:  true,
+		CacheDir: t.TempDir(),
+	})
+	adMgr.SetAdultSites([]string{"e-hentai.org"})
+
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		if req.Method == http.MethodHead {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type":   []string{"text/html; charset=utf-8"},
+					"Content-Length": []string{"98765"},
+				},
+				Body: io.NopCloser(strings.NewReader("")),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Header: http.Header{
+				"Content-Type": []string{"text/html; charset=utf-8"},
+			},
+			Body: io.NopCloser(strings.NewReader("")),
+		}, nil
+	}
+
+	engine := NewEngineWithOptions(EngineOptions{
+		Config:   &config.Config{},
+		AdScript: adMgr,
+	})
+
+	recHead := httptest.NewRecorder()
+	reqHead := httptest.NewRequest(http.MethodHead, "https://e-hentai.org/index.html", nil)
+	reqHead.Host = "e-hentai.org"
+	engine.ServeHTTP(recHead, reqHead)
+	if recHead.Code != http.StatusOK {
+		t.Fatalf("HEAD status = %d, want 200", recHead.Code)
+	}
+	if gotCL := recHead.Header().Get("Content-Length"); gotCL != "98765" {
+		t.Errorf("HEAD Content-Length clobbered: got %q, want 98765", gotCL)
+	}
+	if recHead.Body.Len() != 0 {
+		t.Errorf("HEAD response must not have body bytes, got %d", recHead.Body.Len())
+	}
+
+	rec204 := httptest.NewRecorder()
+	req204 := httptest.NewRequest(http.MethodGet, "https://e-hentai.org/ping", nil)
+	req204.Host = "e-hentai.org"
+	engine.ServeHTTP(rec204, req204)
+	if rec204.Code != http.StatusNoContent {
+		t.Fatalf("204 status = %d, want 204", rec204.Code)
+	}
+	if rec204.Body.Len() != 0 {
+		t.Errorf("204 response must not have injected body, got %q", rec204.Body.String())
+	}
+}

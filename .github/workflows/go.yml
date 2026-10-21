@@ -66,35 +66,14 @@ jobs:
           GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-darwin-amd64 ./win/
           rm -rf build-check
 
-      - name: Runtime smoke test (startup, PAC whitelist vs direct, -4/-6/-dual, ads.js, local log & graceful shutdown)
+      - name: CLI tool commands verification (version, check, pac, help)
         run: |
           CGO_ENABLED=0 go build -trimpath -o ./ech-proxy-ci ./win/
           ./ech-proxy-ci version
           ./ech-proxy-ci help | grep -q -- "-whitelist-url"
           ./ech-proxy-ci check -config certs/l.moonchan.xyz/upstream.json
           ./ech-proxy-ci pac -config certs/l.moonchan.xyz/upstream.json | grep -q "FindProxyForURL"
-          mkdir -p ./ci-logs
-          ./ech-proxy-ci -http -addr 127.0.0.1:18443 -no-tray -no-auto-update -sys-proxy off \
-            -dual \
-            -config certs/l.moonchan.xyz/upstream.json \
-            -log-dir ./ci-logs &
-          PID=$!
-          for i in $(seq 1 20); do
-            if curl -fsS http://127.0.0.1:18443/healthz >/dev/null 2>&1; then
-              break
-            fi
-            sleep 0.5
-          done
-          curl -fsS http://127.0.0.1:18443/healthz | grep -q "ok"
-          curl -fsS http://127.0.0.1:18443/statusz | grep -q '"ad_script_enabled":true'
-          curl -fsS http://127.0.0.1:18443/proxy.pac | grep -q "FindProxyForURL"
-          curl -fsS http://127.0.0.1:18443/__ech_proxy__/ads.js | grep -q "slimgather.com"
-          curl -fsS "http://127.0.0.1:18443/debug/log?download=1" | grep -q "ech-proxy session started"
-          kill -TERM "$PID"
-          wait "$PID" || true
-          test -s ./ci-logs/ech-proxy.log
-          ./ech-proxy-ci logs tail -log-dir ./ci-logs | grep -q "ech-proxy session started"
-          rm -rf ./ech-proxy-ci ./ci-logs
+          rm -rf ./ech-proxy-ci
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4

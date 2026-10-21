@@ -1,3 +1,18 @@
+## v3.2.0
+
+### Changes & Features
+
+- **New upstream transport — Mode 3: TLS ClientHello fragmentation** (`echproxy/ech/fragment.go`) — For origins not hosted on Cloudflare (no ECH available) that strictly verify TLS SNI (rejecting SNI-camouflage's fake SNI): a single-packet plaintext ClientHello gets RST/dropped by GFW DPI. Mode 3 resolves the real origin IP via DoH, then splits the first TLS handshake record (ClientHello) into many tiny TLS-record fragments written with `TCP_NODELAY`, breaking the plaintext-SNI DPI signature. After the handshake, the returned cert is validated with the same `validateUpstreamCert` (hostname vs the real domain, time validity, chain trust).
+  - Upstream config `mode: "fragment"` (aliases `"bypass"` / `"gfw"`); `echproxy/config/config.go:normalizeMode` and `echproxy/config/validate.go:validModes` updated; auto-passthrough (unlisted hosts) now probes SNI/ECH/Fragment.
+- **Warning-page code refactored** out of `proxy.go` into `echproxy/certwarn.go` (`serveCertWarningPage` / `buildCertWarningHTML` / `forceAccessURL`). Behavior unchanged: distinct 过期 / 不一致 / 不可信 pages + one-time force-access token.
+- **Windows tray & system-proxy 32/64-bit correctness** — `win/tray_windows.go`: `NOTIFYICONDATAW` now uses the complete struct (incl. `winGUID`) for Windows 7~11 32/64-bit; `win/sysproxy_windows.go`: `INTERNET_PER_CONN_OPTIONW` `Value` union is pointer-width aware (386 = 4 bytes, amd64 = 8).
+- Snapshot also updates README and config docs.
+
+### Notes
+
+- Carries over all v3.0.0–v3.1.1 work (logger startup-truncate, upstream cert validation incl. chain/trust, force-access one-time token + rate limit, goreleaser/release asset-collision fix).
+- Verified: `go vet ./...` OK, `go build ./...` OK, `go test ./... -race` 11/11 PASS.
+
 ## v3.1.1
 
 ### Changes & Features

@@ -191,7 +191,7 @@ curl -s -o /dev/null -w '%{http_code}\n' https://4545810.xyz/adult.txt
 
 ### 8.4 文档与发布
 11. `README.md` / `RELEASE.md` 未更新 `adult.txt`、EasyList、`ads.txt` 状态与「certs 只归 8443」等新事实。
-12. 未打新 tag；`RELEASE.md` 最新仍是 `v3.3.0`，本批改动没有版本条目。
+12. 已发布 `v3.3.1`（见 `RELEASE.md` 顶部条目）；说明书对应 `4b962b6` 之后的代码。
 13. EasyList 规则索引无条数上限/内存监控（下载上限 32MB）。
 
 ---

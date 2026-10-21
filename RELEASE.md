@@ -1,3 +1,15 @@
+## v3.3.1
+
+### Pre-Release Fixes (hardening pass)
+
+- **HTML escaping safety in ad stripping (`StripEscapedURLs`)** — Previously the whole HTML body was unescaped (`\/` → `/`) and returned unchanged only when nothing matched; any single matched escaped ad URL therefore converted every `<\/script>` into a literal `<\/script>`-breaking `</script>` and corrupted regex literals such as `/foo\/bar/`. Now only matched ad-URL literals are located on the unescaped copy and removed from the original body, preserving all other `\/` escapes.
+- **EasyList negated domains & `#@#` exceptions** — `~example.com##.ad` (negated cosmetic domain) is no longer recorded as a positive cosmetic target for `example.com`; it is treated as a generic selector plus a domain exception. `#@#` exceptions are now matched over the full suffix chain, so `sub.example.com` honours an exception declared for `example.com`.
+- **Data races removed** — `config.ReplaceFrom` writing `UpstreamOrder` while the portal read it unlocked (8443 silent-compat loader) is fixed by a locked `OrderSnapshot()`; `BuildEntryRewriterForHost` no longer rewrites `Compiled`/`CompiledReplace` into the shared `BodyReplace` backing array on every request (compile-once, only when nil). `go test -race` is clean under concurrent requests.
+- **CONNECT/MITM TLS state & HEAD/204 body handling** — The `closeNotifyConn` wrapper hides `*tls.Conn` from `http.Server`, leaving `req.TLS == nil`; this stripped `; Secure` from HTTPS `Set-Cookie` headers (breaking `SameSite=None; Secure` sessions). `req.TLS` is now restored from `tlsConn.ConnectionState()` in the handler. `HEAD`, `204` and `304` responses are no longer rewritten or re-injected, and the upstream `Content-Length` is preserved.
+- **Windows `go vet` & clipboard** — `copyToClipboardOnPlatform` no longer converts `uintptr` to `unsafe.Pointer` (uses `kernel32!RtlMoveMemory`) and frees `hMem` with `GlobalFree` on failure. CI now runs `go vet` for `windows/amd64` and `windows/386` (previously Linux only) and verifies all 12 Flutter FFI exports (`ECHInit`, `GetProxyPort`, `IsEchReady` were previously unchecked).
+- **Docs & observability** — CLI help, `README.md` and `RELEASE.md` now describe the `adult.txt` gate + EasyList engine and the IPv4 (`-4`) default (previously they still described HTML auto-detection and a dual-stack default). `/statusz` gained `adult_sites_url`, `adult_sites_count`, `easylist_url`, `easylist_loaded` and `easylist_rule_count`.
+- **Notes** — `ads.txt` is no longer read by the proxy (EasyList allow rules and post-strip injection make it redundant); the file can be removed from the web root. Added `docs/adblock-manual.md` (Chinese operating manual).
+
 ## v3.3.0
 
 ### Changes & Features

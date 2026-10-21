@@ -39,7 +39,7 @@ func exeNameIs443() bool {
 func FlagOverviewText() string {
 	return `=== ech-proxy 命令行 Flag 一览 ===
   三种运行方案（高内聚、完全解耦）:
-    ech-proxy.exe       [默认主流 PAC 方案] 本地 CA MITM + DoH/SNI/ECH/Fragment + pac.txt + adult.txt + EasyList + on.txt + block.json + ads.js（默认 8443，自适应任意端口；8443 方案在后台静默兼容运行）
+    ech-proxy.exe       [默认主流 PAC 方案] 本地 CA MITM + DoH/SNI/ECH/Fragment + pac.txt（默认 8443，自适应任意端口；8443 方案在后台静默兼容运行）
     .*.443.exe          [443 方案] 只与 listen 443 有关，仅监听 443 端口（本地 CA + SNI/ECH），其余功能一律不运行
     *.8443.exe          [8443 方案] 公网真实证书门户反代（加载 certs/l.moonchan.xyz/ 与 upstream.json，静默非阻塞兼容）
 
@@ -49,15 +49,8 @@ func FlagOverviewText() string {
     -dual               双端出口 (IPv4 + IPv6 双栈)
     -all                开启全局模式（无视 pac.txt 白名单，所有网站均通过 ech-proxy 代理）
 
-  广告处理控制 Flag（仅 PAC 方案生效，仅对命中 adult.txt 成人清单的站点执行去广告与替换注入，托盘中隐藏）:
-    --skip-ad-script    跳过插入广告商 JS (<script>...</script>) 的步骤
-    --skip-ad-block     禁止拦截/移除源站原始成人广告
+  远程配置 Flag:
     -whitelist-url      自定义 pac.txt 代理白名单地址（默认 https://4545810.xyz/pac.txt）
-    -adult-sites-url    自定义 adult.txt 成人站点清单地址（默认 https://4545810.xyz/adult.txt）
-    -easylist-url       自定义 EasyList 规则地址（默认 https://easylist.to/easylist/easylist.txt，传 - 可禁用）
-    -blocklist-url      自定义 block.json 补充屏蔽表地址（默认 https://4545810.xyz/block.json）
-    -on-url             自定义 on.txt 远程开关地址（默认 https://4545810.xyz/on.txt）
-    -ad-script-url      自定义 ads.js 广告脚本地址（默认 https://4545810.xyz/ads.js）
 
   CA 证书与自动更新子命令 / Flag:
     ca install          一键安装本地 CA 根证书 (-ca-install)
@@ -247,8 +240,8 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	flag6 := fs.Bool("6", false, "强制 v6 出口")
 	flagDual := fs.Bool("dual", false, "双端出口")
 	allFlag := fs.Bool("all", subAll || envBool(getenv("ECH_PROXY_ALL")), "全局模式")
-	skipAdScript := fs.Bool("skip-ad-script", envBool(getenv("ECH_PROXY_SKIP_AD_SCRIPT")) || envBool(getenv("ECH_PROXY_NO_AD_SCRIPT")), "跳过插入广告 JS")
-	skipAdBlock := fs.Bool("skip-ad-block", envBool(getenv("ECH_PROXY_SKIP_AD_BLOCK")), "禁止拦截源站广告")
+	skipAdScript := fs.Bool("skip-ad-script", envBool(getenv("ECH_PROXY_SKIP_AD_SCRIPT")) || envBool(getenv("ECH_PROXY_NO_AD_SCRIPT")), "跳过脚本注入步骤")
+	skipAdBlock := fs.Bool("skip-ad-block", envBool(getenv("ECH_PROXY_SKIP_AD_BLOCK")), "跳过内容过滤步骤")
 
 	modeFlag := fs.String("mode", subMode, "运行模式")
 	addr := fs.String("addr", defaultAddr, "监听地址")
@@ -265,14 +258,14 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	noTray := fs.Bool("no-tray", false, "禁用托盘")
 	hideConsole := fs.Bool("hide-console", false, "隐藏控制台")
 	whitelistURL := fs.String("whitelist-url", defaultWhitelistEnv, "pac.txt 地址")
-	adultSitesURL := fs.String("adult-sites-url", getenv("ECH_PROXY_ADULT_SITES_URL"), "adult.txt 成人网站清单地址（决定去广告/注入广告）")
-	easyListURL := fs.String("easylist-url", getenv("ECH_PROXY_EASYLIST_URL"), "EasyList 地址（置为 - 可禁用；仅作用于 adult.txt 命中站点）")
+	adultSitesURL := fs.String("adult-sites-url", getenv("ECH_PROXY_ADULT_SITES_URL"), "自定义站点清单地址")
+	easyListURL := fs.String("easylist-url", getenv("ECH_PROXY_EASYLIST_URL"), "自定义规则清单地址（置为 - 可禁用）")
 	adultDomainsAlias := fs.String("adult-domains-url", "", "pac.txt 别名")
-	blocklistURL := fs.String("blocklist-url", getenv("ECH_PROXY_BLOCKLIST_URL"), "block.json 地址")
-	onURL := fs.String("on-url", getenv("ECH_PROXY_ON_URL"), "on.txt 地址")
+	blocklistURL := fs.String("blocklist-url", getenv("ECH_PROXY_BLOCKLIST_URL"), "自定义补充规则地址")
+	onURL := fs.String("on-url", getenv("ECH_PROXY_ON_URL"), "自定义远程开关地址")
 	noAdScriptAlias := fs.Bool("no-ad-script", false, "--skip-ad-script 别名")
 	disableScriptAlias := fs.Bool("disable-ad-script", false, "--skip-ad-script 别名")
-	adScriptURL := fs.String("ad-script-url", getenv("ECH_PROXY_AD_SCRIPT_URL"), "ads.js 地址")
+	adScriptURL := fs.String("ad-script-url", getenv("ECH_PROXY_AD_SCRIPT_URL"), "自定义脚本地址")
 	adScriptInterval := fs.Duration("ad-script-interval", defaultInterval, "自动更新间隔")
 	updateNow := fs.Bool("update", false, "立即更新")
 	checkUpdateAlias := fs.Bool("check-update", false, "立即更新")

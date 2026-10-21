@@ -71,7 +71,7 @@ jobs:
         run: |
           CGO_ENABLED=0 go build -trimpath -o ./ech-proxy-ci ./win/
           ./ech-proxy-ci version
-          ./ech-proxy-ci help | grep -q -- "--skip-ad-script"
+          ./ech-proxy-ci help | grep -q -- "-whitelist-url"
           ./ech-proxy-ci check -config certs/l.moonchan.xyz/upstream.json
           ./ech-proxy-ci pac -config certs/l.moonchan.xyz/upstream.json | grep -q "FindProxyForURL"
           mkdir -p ./ci-logs

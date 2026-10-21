@@ -409,8 +409,14 @@ sha256:fcb8f707ccc5317a7813036ede4e89a5f5bff3bfc1ae74f9ae9046d39a3e95ca
 func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
 	var out bytes.Buffer
 	code := runToolAction(CLICommand{Action: "help"}, &out)
-	if code != 0 || !strings.Contains(out.String(), "--skip-ad-script") || !strings.Contains(out.String(), "--skip-ad-block") || !strings.Contains(out.String(), "-dual") {
+	if code != 0 || !strings.Contains(out.String(), "-dual") || !strings.Contains(out.String(), "-whitelist-url") {
 		t.Errorf("help action returned code=%d, out=%q", code, out.String())
+	}
+	// 公开帮助文本中不得暴露任何广告相关字样（故意隐藏）：flag 仍可用，但不再对外描述。
+	for _, forbidden := range []string{"广告", "ad-script", "skip-ad", "adult.txt", "EasyList", "easylist", "block.json", "on.txt", "ads.js"} {
+		if strings.Contains(out.String(), forbidden) {
+			t.Errorf("help output must not expose %q, out=%q", forbidden, out.String())
+		}
 	}
 
 	out.Reset()

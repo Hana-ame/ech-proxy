@@ -2,13 +2,10 @@
 
 ### Pre-Release Fixes (hardening pass)
 
-- **HTML escaping safety in ad stripping (`StripEscapedURLs`)** — Previously the whole HTML body was unescaped (`\/` → `/`) and returned unchanged only when nothing matched; any single matched escaped ad URL therefore converted every `<\/script>` into a literal `<\/script>`-breaking `</script>` and corrupted regex literals such as `/foo\/bar/`. Now only matched ad-URL literals are located on the unescaped copy and removed from the original body, preserving all other `\/` escapes.
-- **EasyList negated domains & `#@#` exceptions** — `~example.com##.ad` (negated cosmetic domain) is no longer recorded as a positive cosmetic target for `example.com`; it is treated as a generic selector plus a domain exception. `#@#` exceptions are now matched over the full suffix chain, so `sub.example.com` honours an exception declared for `example.com`.
 - **Data races removed** — `config.ReplaceFrom` writing `UpstreamOrder` while the portal read it unlocked (8443 silent-compat loader) is fixed by a locked `OrderSnapshot()`; `BuildEntryRewriterForHost` no longer rewrites `Compiled`/`CompiledReplace` into the shared `BodyReplace` backing array on every request (compile-once, only when nil). `go test -race` is clean under concurrent requests.
 - **CONNECT/MITM TLS state & HEAD/204 body handling** — The `closeNotifyConn` wrapper hides `*tls.Conn` from `http.Server`, leaving `req.TLS == nil`; this stripped `; Secure` from HTTPS `Set-Cookie` headers (breaking `SameSite=None; Secure` sessions). `req.TLS` is now restored from `tlsConn.ConnectionState()` in the handler. `HEAD`, `204` and `304` responses are no longer rewritten or re-injected, and the upstream `Content-Length` is preserved.
 - **Windows `go vet` & clipboard** — `copyToClipboardOnPlatform` no longer converts `uintptr` to `unsafe.Pointer` (uses `kernel32!RtlMoveMemory`) and frees `hMem` with `GlobalFree` on failure. CI now runs `go vet` for `windows/amd64` and `windows/386` (previously Linux only) and verifies all 12 Flutter FFI exports (`ECHInit`, `GetProxyPort`, `IsEchReady` were previously unchecked).
-- **Docs & observability** — CLI help, `README.md` and `RELEASE.md` now describe the `adult.txt` gate + EasyList engine and the IPv4 (`-4`) default (previously they still described HTML auto-detection and a dual-stack default). `/statusz` gained `adult_sites_url`, `adult_sites_count`, `easylist_url`, `easylist_loaded` and `easylist_rule_count`.
-- **Notes** — `ads.txt` is no longer read by the proxy (EasyList allow rules and post-strip injection make it redundant); the file can be removed from the web root. Added `docs/adblock-manual.md` (Chinese operating manual).
+- **Docs & observability** — CLI help and `README.md` now describe the IPv4 (`-4`) default (previously a dual-stack default).
 
 ## v3.3.0
 
@@ -23,9 +20,8 @@
 - **IPv4 Default (`-4`) with Dual-Stack (`-dual`) / IPv6 (`-6`) & Built-in DoH Failover** —
   - Defaults to IPv4-only (`-4` / `v4`), with `-dual` (dual-stack IPv4 + IPv6) and `-6` (IPv6 only) flags and runtime tray switching.
   - Built-in DoH endpoints: primary `https://4545810.xyz/doh` and secondary `https://1.1.1.1/dns-query` with automatic failover.
-- **Decoupled Remote Lists (`pac.txt`, `adult.txt`, `EasyList`, `block.json`, `on.txt`, `ads.js`)** —
+- **Decoupled Remote PAC Whitelist (`pac.txt`)** —
   - Default PAC whitelist fetched from `https://4545810.xyz/pac.txt` (line-delimited domains, fallback to `[]` on failure; `-all` routes all domains through the proxy).
-  - Adult-site gate fetched from `https://4545810.xyz/adult.txt`: only sites matching `adult.txt` undergo EasyList (`https://easylist.to/easylist/easylist.txt`) + `block.json` (`https://4545810.xyz/block.json`) ad stripping/cosmetic hiding and `ads.js` (`https://4545810.xyz/ads.js`) script injection (controllable via `--skip-ad-script` and `--skip-ad-block`). Non-adult sites (`pixiv.net`, etc.) are passed through untouched.
 - **One-Click CA Uninstall & GitHub Releases Auto-Updater (`win/updater.go`)** —
   - Added `ech-proxy ca uninstall` (`-ca-uninstall`) and tray menu item to remove the local CA from Windows User Root store (`certutil -user -delstore Root`) and macOS keychain.
   - Added automatic update checking and background downloading from `https://github.com/Hana-ame/ech-proxy/releases` with SHA-256 verification against `checksums.txt`, staging `.update.new` and applying atomic self-replacement on exit/restart (`ech-proxy update`, tray menu, or `--no-auto-update`).

@@ -112,3 +112,41 @@ func TestCrashAndFatalErrorWriteLogFiles(t *testing.T) {
 		t.Errorf("ech-proxy.log missing fatal error report:\n%s", string(mainLogBytes))
 	}
 }
+
+// TestStartupClearsExistingLogFile verifies that initializing a new Manager on
+// a directory already holding a previous session's ech-proxy.log truncates the
+// file on open instead of appending to it.
+// 用户要求：每次启动时不再 append，而是直接清空文件。
+func TestStartupClearsExistingLogFile(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, logFileName)
+
+	// Seed a previous session's log file with stale content that must not survive restart.
+	stale := []byte("OLD SESSION LOG LINE THAT MUST NOT SURVIVE RESTART\n")
+	if err := os.WriteFile(logPath, stale, 0o644); err != nil {
+		t.Fatalf("seed previous log: %v", err)
+	}
+
+	mgr, err := NewManager(Options{LogDir: dir})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer mgr.Close()
+
+	marker := []byte("FRESH STARTUP MARKER\n")
+	if _, err := mgr.Write(marker); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	mgr.Sync()
+
+	got, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if strings.Contains(string(got), "OLD SESSION LOG LINE THAT MUST NOT SURVIVE RESTART") {
+		t.Errorf("startup should have cleared the previous log, but stale content remains: %s", got)
+	}
+	if !strings.Contains(string(got), "FRESH STARTUP MARKER") {
+		t.Errorf("fresh startup marker missing from cleared log: %s", got)
+	}
+}

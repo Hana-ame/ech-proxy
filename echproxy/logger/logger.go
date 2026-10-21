@@ -148,7 +148,7 @@ func NewManager(opts Options) (*Manager, error) {
 
 		m.logDir = logDir
 		m.logFilePath = logFile
-		if err := m.openFileLocked(); err != nil {
+		if err := m.openFileLocked(true); err != nil { // 启动时清空已有日志文件
 			return nil, err
 		}
 	}
@@ -189,11 +189,21 @@ func canWriteDir(dir string) bool {
 	return os.Remove(name) == nil
 }
 
-func (m *Manager) openFileLocked() error {
+func (m *Manager) openFileLocked(truncate bool) error {
 	if m.disableFile || m.logFilePath == "" {
 		return nil
 	}
-	f, err := os.OpenFile(m.logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	// 始终保留 O_APPEND 写入：该 fd 同时被 debug.SetCrashOutput 绑定给 Go 运行时崩溃输出，
+	// 并发写入时只有 append 能保证不互相覆盖/错位。
+	// truncate=true 时附加 O_TRUNC：每次启动清空已有日志文件，不再跨会话累积 append（用户要求：
+	// 每次启动时不再 append，而是直接清空文件）。
+	// rotateLocked 走 truncate=false：活跃文件刚被 rename 成备份、路径已不存在，O_CREATE 新建空文件；
+	// 即使 rename 失败也以 append 方式保留现有内容，绝不丢日志。
+	flags := os.O_CREATE | os.O_WRONLY | os.O_APPEND
+	if truncate {
+		flags |= os.O_TRUNC
+	}
+	f, err := os.OpenFile(m.logFilePath, flags, 0o644)
 	if err != nil {
 		return fmt.Errorf("open log file %s: %w", m.logFilePath, err)
 	}
@@ -255,7 +265,7 @@ func (m *Manager) rotateLocked() error {
 
 	_ = os.Rename(m.logFilePath, backupPath)
 	m.pruneOldBackupsLocked()
-	return m.openFileLocked()
+	return m.openFileLocked(false) // 滚动后新建空文件，不清空
 }
 
 func (m *Manager) pruneOldBackupsLocked() {

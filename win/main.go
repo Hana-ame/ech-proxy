@@ -96,7 +96,6 @@ type CLICommand struct {
 	AdultSitesURL    string
 	EasyListURL      string
 	BlocklistURL     string
-	OnURL            string
 	AdScriptInterval time.Duration
 	NoAutoUpdate     bool
 	LogDir           string
@@ -262,7 +261,6 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	easyListURL := fs.String("easylist-url", getenv("ECH_PROXY_EASYLIST_URL"), "自定义规则清单地址（置为 - 可禁用）")
 	adultDomainsAlias := fs.String("adult-domains-url", "", "pac.txt 别名")
 	blocklistURL := fs.String("blocklist-url", getenv("ECH_PROXY_BLOCKLIST_URL"), "自定义补充规则地址")
-	onURL := fs.String("on-url", getenv("ECH_PROXY_ON_URL"), "自定义远程开关地址")
 	noAdScriptAlias := fs.Bool("no-ad-script", false, "--skip-ad-script 别名")
 	disableScriptAlias := fs.Bool("disable-ad-script", false, "--skip-ad-script 别名")
 	adScriptURL := fs.String("ad-script-url", getenv("ECH_PROXY_AD_SCRIPT_URL"), "自定义脚本地址")
@@ -455,7 +453,6 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		AdultSitesURL:    strings.TrimSpace(*adultSitesURL),
 		EasyListURL:      strings.TrimSpace(*easyListURL),
 		BlocklistURL:     strings.TrimSpace(*blocklistURL),
-		OnURL:            strings.TrimSpace(*onURL),
 		AdScriptInterval: *adScriptInterval,
 		NoAutoUpdate:     noAutoUpd,
 		LogDir:           strings.TrimSpace(*logDir),
@@ -773,7 +770,6 @@ func main() {
 		AdultSitesURL:    cmd.AdultSitesURL,
 		EasyListURL:      cmd.EasyListURL,
 		BlocklistURL:     cmd.BlocklistURL,
-		OnURL:            cmd.OnURL,
 		AdScriptInterval: cmd.AdScriptInterval,
 		Logger:           logMgr,
 	})

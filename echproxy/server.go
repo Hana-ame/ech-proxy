@@ -1,5 +1,5 @@
 // Package echproxy 以高内聚、低耦合的工程化架构组装三种完全解耦的运行方案，最大化复用底层核心模块（netdial, ech, certstore, rewrite, cookie, logger）：
-//  1. PAC 方案（默认主线 mainstream）：默认监听 8443（端口占用或指定其他端口亦全功能无感运行），复用本地自签 CA (certstore, 存于 <dataDir>/ca/) + DoH/SNI/ECH/Fragment + 证书核对 (ech) + CONNECT MITM (connect)，独享 pac.txt、on.txt、block.json 与 ads.js (rewrite.AdScriptManager)，与 upstream.json 及 certs/ 路径完全解耦；
+//  1. PAC 方案（默认主线 mainstream）：默认监听 8443（端口占用或指定其他端口亦全功能无感运行），复用本地自签 CA (certstore, 存于 <dataDir>/ca/) + DoH/SNI/ECH/Fragment + 证书核对 (ech) + CONNECT MITM (connect)，独享 pac.txt、block.json 与 ads.js (rewrite.AdScriptManager)，与 upstream.json 及 certs/ 路径完全解耦；
 //  2. 443 方案（仅当文件名匹配 .*.443.exe 时开启）：只和 listen 443 有关，仅监听 443 端口，复用本地自签 CA (certstore) + DoH/SNI/ECH/Fragment + 证书核对 (ech)，其余模块一律不运行；
 //  3. 8443 方案（真实公网证书下发的门户代理）：仅与 upstream.json 及 certs/l.moonchan.xyz/ 路径有关，在后台静默非阻塞运行以保持兼容性，即使报错也不影响任何其他功能且绝不阻塞其他代码。
 package echproxy
@@ -73,7 +73,6 @@ var (
 	ParseDomainList         = rewrite.ParseDomainList
 	ParseDomainListJSON     = rewrite.ParseDomainListJSON
 	ParseBlocklist          = rewrite.ParseBlocklist
-	ParseOnSwitch           = rewrite.ParseOnSwitch
 	BuildAdScriptTags       = rewrite.BuildAdScriptTags
 	SplitAdScriptBlocks     = rewrite.SplitAdScriptBlocks
 	MatchDomainInList       = rewrite.MatchDomainInList
@@ -83,8 +82,6 @@ var (
 	DefaultAdultSitesURL    = rewrite.DefaultAdultSitesURL
 	DefaultEasyListURL      = rewrite.DefaultEasyListURL
 	DefaultBlocklistURL     = rewrite.DefaultBlocklistURL
-	DefaultOnURL            = rewrite.DefaultOnURL
-	DefaultOnRetryCount     = rewrite.DefaultOnRetryCount
 	DefaultAdScriptInterval = rewrite.DefaultAdScriptUpdateInterval
 	DefaultPrimaryDoHURL    = cloudflare_ech.DefaultPrimaryDoHURL
 	DefaultSecondaryDoHURL  = cloudflare_ech.DefaultSecondaryDoHURL
@@ -135,8 +132,6 @@ type ServerOptions struct {
 	AdultSitesURL       string
 	EasyListURL         string
 	BlocklistURL        string
-	OnURL               string
-	OnRetries           int
 	AdScriptInterval    time.Duration
 	Logger              *logger.Manager
 }
@@ -307,7 +302,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		}, nil
 	}
 
-	// 5. PAC 主线方案：启动独有的 pac.txt、on.txt、block.json 与 ads.js 管理器（与 upstream.json 及 certs/ 完全解耦）
+	// 5. PAC 主线方案：启动独有的 pac.txt、block.json 与 ads.js 管理器（与 upstream.json 及 certs/ 完全解耦）
 	var adScript *rewrite.AdScriptManager
 	if !opts.PortalMode {
 		skipAdScript := opts.NoAdScript || opts.SkipAdScript
@@ -321,8 +316,6 @@ func NewServer(opts ServerOptions) (*Server, error) {
 			AdultSitesURL:  strings.TrimSpace(opts.AdultSitesURL),
 			EasyListURL:    strings.TrimSpace(opts.EasyListURL),
 			BlocklistURL:   strings.TrimSpace(opts.BlocklistURL),
-			OnURL:          strings.TrimSpace(opts.OnURL),
-			OnRetries:      opts.OnRetries,
 			UpdateInterval: opts.AdScriptInterval,
 			CacheDir:       cacheDir,
 		})
@@ -661,7 +654,7 @@ func (s *Server) PrintBanner(localIP string) {
 	case s.Options.PortalMode:
 		fmt.Printf("  Scheme: 8443 Real-Cert Portal Proxy (Silent Compatibility / Mobile App)\n")
 	default:
-		fmt.Printf("  Scheme: PAC HTTPS MITM Proxy [Mainstream] (Local CA + DoH/SNI/ECH/Fragment + pac.txt + on.txt + block.json + ads.js)\n")
+		fmt.Printf("  Scheme: PAC HTTPS MITM Proxy [Mainstream] (Local CA + DoH/SNI/ECH/Fragment + pac.txt + block.json + ads.js)\n")
 	}
 	fmt.Printf("  Listening: %s\n", s.Options.Addr)
 	if !s.Options.LocalProxy && !s.Options.PortalMode {

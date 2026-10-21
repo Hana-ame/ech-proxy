@@ -132,10 +132,13 @@ func TestAdultScopedEasyListInjection(t *testing.T) {
 			case "https://e/adult.txt":
 				return []byte("adult.example.com\n"), nil
 			default:
-				return []byte(BuiltInAdScript), nil
+				return []byte("// remote ads.js\nconsole.log('remote ad');"), nil
 			}
 		},
 	})
+	if _, err := mgr.RefreshOnce(); err != nil {
+		t.Fatalf("RefreshOnce: %v", err)
+	}
 	if err := mgr.RefreshEasyListOnce(); err != nil {
 		t.Fatalf("RefreshEasyListOnce: %v", err)
 	}
@@ -156,7 +159,7 @@ func TestAdultScopedEasyListInjection(t *testing.T) {
 	if !strings.Contains(out, "ech-proxy-easylist-style") || !strings.Contains(out, ".ad-slot") {
 		t.Errorf("adult site: EasyList cosmetic style should be injected: %s", out)
 	}
-	if !strings.Contains(out, "slimgather.com") {
+	if !strings.Contains(out, "remote ad") {
 		t.Errorf("adult site: own ad script should be injected: %s", out)
 	}
 

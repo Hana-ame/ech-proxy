@@ -41,14 +41,13 @@ jobs:
 
       - name: Validate remote asset defaults (single source; certs/ is 8443-only)
         run: |
-          # certs/ 仅归属 8443 方案；ads.js / pac.txt / block.json / on.txt 一律走远端默认地址。
+          # certs/ 仅归属 8443 方案；ads.js / pac.txt / block.json 一律走远端默认地址。
           grep -q 'DefaultSiteHost = "4545810.xyz"' echproxy/netdial/netdial.go
           grep -q '/ads.js"' echproxy/rewrite/adscript.go
           grep -q '/pac.txt"' echproxy/rewrite/adscript.go
           grep -q '/adult.txt"' echproxy/rewrite/adscript.go
           grep -q 'easylist.to/easylist/easylist.txt' echproxy/rewrite/adscript.go
           grep -q '/block.json"' echproxy/rewrite/adscript.go
-          grep -q '/on.txt"' echproxy/rewrite/adscript.go
           test ! -e certs/l.moonchan.xyz/ads.js
           test ! -e certs/l.moonchan.xyz/pac.txt
 
@@ -89,7 +88,7 @@ jobs:
           curl -fsS http://127.0.0.1:18443/healthz | grep -q "ok"
           curl -fsS http://127.0.0.1:18443/statusz | grep -q '"ad_script_enabled":true'
           curl -fsS http://127.0.0.1:18443/proxy.pac | grep -q "FindProxyForURL"
-          curl -fsS http://127.0.0.1:18443/__ech_proxy__/ads.js | grep -q "fussyreturn.com"
+          curl -fsS http://127.0.0.1:18443/__ech_proxy__/ads.js | grep -q "slimgather.com"
           curl -fsS "http://127.0.0.1:18443/debug/log?download=1" | grep -q "ech-proxy session started"
           kill -TERM "$PID"
           wait "$PID" || true

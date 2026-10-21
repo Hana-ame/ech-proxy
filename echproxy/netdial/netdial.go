@@ -25,7 +25,7 @@ const (
 	RetryBackoff  = 1500 * time.Millisecond
 	DefaultIPMode = "v4"
 
-	// DefaultSiteHost 是项目自有服务域名（DoH / ads.js / pac.txt / block.json / on.txt 共用）的
+	// DefaultSiteHost 是项目自有服务域名（DoH / ads.js / pac.txt / block.json 共用）的
 	// **唯一 true source**。其它包必须引用它派生，不得再各自硬编码该域名。
 	DefaultSiteHost = "4545810.xyz"
 )

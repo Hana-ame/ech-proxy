@@ -141,6 +141,8 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 		AllMode:  false,
 		CacheDir: t.TempDir(),
 	})
+	testRemoteScript := []byte("// remote ads.js\n(function(){ console.log('remote ad inserted'); })();")
+	adMgr.SetScript(testRemoteScript, "remote")
 	adMgr.SetWhitelist([]string{"e-hentai.org", "missav.com", "pixiv.net"})
 	// 成人网站清单（adult.txt）是去广告/注入的唯一闸门；pixiv.net 不在其中。
 	adMgr.SetAdultSites([]string{"e-hentai.org", "missav.com"})
@@ -204,7 +206,7 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	reqClean := httptest.NewRequest(http.MethodGet, "https://pixiv.net/", nil)
 	reqClean.Host = "pixiv.net"
 	engine.ServeHTTP(recClean, reqClean)
-	if strings.Contains(recClean.Body.String(), "slimgather.com") || strings.Contains(recClean.Body.String(), "ech-proxy-ad-script") {
+	if strings.Contains(recClean.Body.String(), "remote ad inserted") || strings.Contains(recClean.Body.String(), "ech-proxy-ad-script") {
 		t.Errorf("whitelisted site WITHOUT adult ads must NOT have ads injected: %s", recClean.Body.String())
 	}
 
@@ -214,8 +216,8 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	req.Host = "e-hentai.org"
 	engine.ServeHTTP(rec, req)
 	bodyStr := rec.Body.String()
-	if !strings.Contains(bodyStr, "slimgather.com") || !strings.Contains(bodyStr, "fussyreturn.com") || !strings.Contains(bodyStr, "<script>\n(function(augj){") {
-		t.Errorf("expected injected <script> tags for slimgather.com and fussyreturn.com in HTML response, got: %s", bodyStr)
+	if !strings.Contains(bodyStr, "remote ad inserted") || !strings.Contains(bodyStr, "<script>\n// remote ads.js") {
+		t.Errorf("expected injected <script> tag for remote ads.js in HTML response, got: %s", bodyStr)
 	}
 	if strings.Contains(bodyStr, "syndication.exoclick.com") {
 		t.Errorf("expected exoclick ad URL to be stripped from HTML")
@@ -226,7 +228,7 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	req2 := httptest.NewRequest(http.MethodGet, "https://e-hentai.org/", nil)
 	req2.Host = "e-hentai.org"
 	engine.ServeHTTP(rec2, req2)
-	if strings.Contains(rec2.Body.String(), "slimgather.com") {
+	if strings.Contains(rec2.Body.String(), "remote ad inserted") {
 		t.Errorf("expected no advertiser script when --skip-ad-script is enabled")
 	}
 	if strings.Contains(rec2.Body.String(), "syndication.exoclick.com") {
@@ -242,7 +244,7 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	if !strings.Contains(rec3.Body.String(), "syndication.exoclick.com") {
 		t.Errorf("expected original exoclick ad to be preserved when --skip-ad-block is enabled")
 	}
-	if !strings.Contains(rec3.Body.String(), "slimgather.com") {
+	if !strings.Contains(rec3.Body.String(), "remote ad inserted") {
 		t.Errorf("expected advertiser <script> still injected when only --skip-ad-block is set")
 	}
 	adMgr.SetSkipAdBlock(false)
@@ -251,7 +253,7 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	reqScript := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/__ech_proxy__/ads.js", nil)
 	reqScript.Host = "127.0.0.1:8443"
 	engine.ServeHTTP(recScript, reqScript)
-	if recScript.Code != http.StatusOK || !strings.Contains(recScript.Body.String(), "fussyreturn.com") {
+	if recScript.Code != http.StatusOK || !strings.Contains(recScript.Body.String(), "remote ad inserted") {
 		t.Errorf("/__ech_proxy__/ads.js unexpected response: code=%d body=%q", recScript.Code, recScript.Body.String())
 	}
 

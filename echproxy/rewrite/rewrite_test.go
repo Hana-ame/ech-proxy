@@ -71,58 +71,7 @@ func TestOriginalDomainVsPortalDomainRewriteIsolation(t *testing.T) {
 	}
 }
 
-// TestOnTxtRetryTwiceThenForceOn 验证：
-// 1. 默认 on.txt 地址为 https://4545810.xyz/on.txt；
-// 2. 对 on.txt 重试 2 次之后（共尝试 3 次），若仍然失败，直接置 on（true，开启显示广告，instead of 不显示）；
-// 3. 若在第 2 次重试时成功返回 "off" / "0"，则按实际返回值置为 false；若返回 "on" / "1"，置为 true。
-func TestOnTxtRetryTwiceThenForceOn(t *testing.T) {
-	var attempts atomic.Int32
-	mgrFailAll := NewAdScriptManager(AdScriptOptions{
-		Enabled:   true,
-		OnRetries: 2,
-		FetchFn: func(url string) ([]byte, error) {
-			if url == DefaultOnURL {
-				attempts.Add(1)
-				return nil, errors.New("connection timeout")
-			}
-			return nil, errors.New("not found")
-		},
-	})
-	if mgrFailAll.OnURL() != "https://4545810.xyz/on.txt" {
-		t.Fatalf("default OnURL = %q, want https://4545810.xyz/on.txt", mgrFailAll.OnURL())
-	}
 
-	// 先手动置为 false，验证重试 2 次失败后被强制置回 on (true)
-	mgrFailAll.SetOn(false)
-	onVal, err := mgrFailAll.RefreshOnOnce()
-	if err == nil {
-		t.Errorf("expected error when all 3 attempts to on.txt fail")
-	}
-	if got := attempts.Load(); got != 3 {
-		t.Errorf("on.txt fetch attempts = %d, want 3 (1 initial + 2 retries)", got)
-	}
-	if !onVal || !mgrFailAll.On() || !mgrFailAll.Enabled() {
-		t.Errorf("after 2 retries fail, on.txt must be forced to on (true), got onVal=%v On()=%v Enabled()=%v", onVal, mgrFailAll.On(), mgrFailAll.Enabled())
-	}
-
-	// 验证前 2 次失败、第 3 次（第 2 次重试）成功返回 "off" 时，正确识别为 false
-	var retrySuccessAttempts atomic.Int32
-	mgrRetryOff := NewAdScriptManager(AdScriptOptions{
-		Enabled:   true,
-		OnRetries: 2,
-		FetchFn: func(url string) ([]byte, error) {
-			n := retrySuccessAttempts.Add(1)
-			if n <= 2 {
-				return nil, errors.New("temporary error")
-			}
-			return []byte("off\n"), nil
-		},
-	})
-	onVal2, err2 := mgrRetryOff.RefreshOnOnce()
-	if err2 != nil || onVal2 || mgrRetryOff.On() {
-		t.Errorf("expected off (false) when retry #2 succeeds with 'off', got onVal=%v err=%v", onVal2, err2)
-	}
-}
 
 // TestBlocklistJSONEasyListHostsAndDecoupledFromCerts 验证：
 // 1. DefaultBlocklistURL = "https://4545810.xyz/block.json"；
@@ -202,6 +151,7 @@ func TestBlocklistJSONEasyListHostsAndDecoupledFromCerts(t *testing.T) {
 // 1. 只有真正检测到成人广告的时候才执行替换插入自己的广告；如果没有检测到成人广告（即使站点在 pac.txt 白名单中或开启了 -all），绝不能插入自己的广告；
 // 2. PAC 白名单支持原子替换（SwapWhitelist）与旧值弹出恢复（PopWhitelist）。
 func TestOnlyInjectOnAdultSitesListAndPACWhitelistAtomicPop(t *testing.T) {
+	testRemoteScript := []byte("// ad-remote\n(function(){ console.log('remote ad inserted'); })();")
 	mgr := NewAdScriptManager(AdScriptOptions{
 		Enabled:       true,
 		AllMode:       true,
@@ -213,12 +163,10 @@ func TestOnlyInjectOnAdultSitesListAndPACWhitelistAtomicPop(t *testing.T) {
 				return []byte("// pac.txt\ne-hentai.org\n*.dlsite.com\niwara.tv\n"), nil
 			case "https://4545810.xyz/adult.txt":
 				return []byte("// adult.txt\ne-hentai.org\nmissav.com\n"), nil
-			case "https://4545810.xyz/on.txt":
-				return []byte("on\n"), nil
 			case "https://4545810.xyz/block.json":
 				return []byte(`["||custom-adult-net.example^", "##.custom-ero-slot"]`), nil
 			default:
-				return []byte(BuiltInAdScript), nil
+				return testRemoteScript, nil
 			}
 		},
 	})
@@ -255,7 +203,7 @@ func TestOnlyInjectOnAdultSitesListAndPACWhitelistAtomicPop(t *testing.T) {
 	// 场景 A：不在成人清单中的站点（即便 HTML 含成人广告）-> 绝不注入、原样返回
 	adultAdHTML := []byte(`<!DOCTYPE html><html><head><title>Video</title><script src="https://syndication.exoclick.com/ads.js"></script></head><body><div class="exo-native-widget"></div></body></html>`)
 	outA := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "not-in-adult-list.example.com"))
-	if strings.Contains(outA, "slimgather.com") || strings.Contains(outA, "ech-proxy-ad-script") {
+	if strings.Contains(outA, "remote ad inserted") || strings.Contains(outA, "ech-proxy-ad-script") {
 		t.Errorf("host NOT in adult.txt must NOT have ads injected, got: %s", outA)
 	}
 	if outA != string(adultAdHTML) {
@@ -264,7 +212,7 @@ func TestOnlyInjectOnAdultSitesListAndPACWhitelistAtomicPop(t *testing.T) {
 
 	// 场景 B：成人清单站点（e-hentai.org）-> 剥离原广告 + 注入自有广告 + block.json selector
 	outInjected := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "e-hentai.org"))
-	if !strings.Contains(outInjected, "slimgather.com") || !strings.Contains(outInjected, "fussyreturn.com") || !strings.Contains(outInjected, "<script>\n(function(augj){") {
+	if !strings.Contains(outInjected, "remote ad inserted") || !strings.Contains(outInjected, "<script>\n// ad-remote") {
 		t.Errorf("adult-listed host must have advertiser <script> tags injected, got: %s", outInjected)
 	}
 	if strings.Contains(outInjected, "syndication.exoclick.com/ads.js") {
@@ -277,14 +225,14 @@ func TestOnlyInjectOnAdultSitesListAndPACWhitelistAtomicPop(t *testing.T) {
 	// 场景 B2：成人清单站点 + 干净 HTML（无成人广告）-> 仍按手动清单注入（不再依赖 HTML 检测）
 	cleanHTML := []byte(`<!DOCTYPE html><html><head><title>Gallery</title></head><body><p>Clean gallery page</p></body></html>`)
 	outClean := string(mgr.InjectIntoHTMLForHost(cleanHTML, "e-hentai.org"))
-	if !strings.Contains(outClean, "slimgather.com") || !strings.Contains(outClean, "ech-proxy-ad-script") {
+	if !strings.Contains(outClean, "remote ad inserted") || !strings.Contains(outClean, "ech-proxy-ad-script") {
 		t.Errorf("adult-listed host with clean HTML should still inject (manual list), got: %s", outClean)
 	}
 
 	// 场景 C：--skip-ad-script：跳过插入广告商 JS，但仍拦截源站成人广告
 	mgr.SetSkipAdScript(true)
 	onlyBlocked := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "e-hentai.org"))
-	if strings.Contains(onlyBlocked, "slimgather.com") || strings.Contains(onlyBlocked, "fussyreturn.com") {
+	if strings.Contains(onlyBlocked, "remote ad inserted") {
 		t.Errorf("--skip-ad-script should not insert advertiser <script> tags, got: %s", onlyBlocked)
 	}
 	if strings.Contains(onlyBlocked, "syndication.exoclick.com/ads.js") {
@@ -298,7 +246,7 @@ func TestOnlyInjectOnAdultSitesListAndPACWhitelistAtomicPop(t *testing.T) {
 	if !strings.Contains(onlyInjected, "syndication.exoclick.com/ads.js") {
 		t.Errorf("--skip-ad-block must NOT strip original ads, got: %s", onlyInjected)
 	}
-	if !strings.Contains(onlyInjected, "slimgather.com") || !strings.Contains(onlyInjected, "fussyreturn.com") {
+	if !strings.Contains(onlyInjected, "remote ad inserted") {
 		t.Errorf("--skip-ad-block (without --skip-ad-script) should still inject advertiser <script> tags, got: %s", onlyInjected)
 	}
 	mgr.SetSkipAdBlock(false)
@@ -349,9 +297,6 @@ func TestAdScriptManagerAutoUpdateAndDisableFlag(t *testing.T) {
 		case "/pac.txt":
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			_, _ = w.Write([]byte("// pac.txt\nadult.example.com\n"))
-		case "/on.txt":
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			_, _ = w.Write([]byte("on\n"))
 		case "/block.json":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`["||exoclick.com^"]`))
@@ -368,8 +313,9 @@ func TestAdScriptManagerAutoUpdateAndDisableFlag(t *testing.T) {
 		Enabled:        true,
 		ScriptURL:      srv.URL + "/ads.js",
 		WhitelistURL:   srv.URL + "/pac.txt",
+		AdultSitesURL:  srv.URL + "/adult.txt",
+		EasyListURL:    "-",
 		BlocklistURL:   srv.URL + "/block.json",
-		OnURL:          srv.URL + "/on.txt",
 		UpdateInterval: 25 * time.Millisecond,
 		CacheDir:       cacheDir,
 		FetchFn: func(u string) ([]byte, error) {

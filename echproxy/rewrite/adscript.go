@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	// DefaultAdScriptURL 是 PAC 方案专属的远程广告商脚本（ads.js）默认地址（失败自动使用内置 fallback）。
+	// DefaultAdScriptURL 是 PAC 方案专属的远程广告脚本（ads.js）默认地址。
 	DefaultAdScriptURL = "https://" + netdial.DefaultSiteHost + "/ads.js"
 
 	// DefaultWhitelistURL 是 PAC 方案专属的远程白名单（pac.txt，一行一个 domain）默认地址（失败 fallback = []）。
@@ -38,13 +38,6 @@ const (
 	//   - 兼容 JSON 数组/对象、EasyList ||domain^、##selector、HOSTS 格式；
 	//   - 与 certs/ 路径完全解耦（certs/ 完全只与 8443 方案相关），拉取失败使用内存内置规则兜底。
 	DefaultBlocklistURL = "https://" + netdial.DefaultSiteHost + "/block.json"
-
-	// DefaultOnURL 是 PAC 方案专属的远程广告开关（on.txt）默认地址：
-	//   - 对 on.txt 重试 2 次之后若仍失败，直接置 on（即开启显示广告，instead of 不显示）。
-	DefaultOnURL = "https://" + netdial.DefaultSiteHost + "/on.txt"
-
-	// DefaultOnRetryCount 是拉取 on.txt 失败后的重试次数（重试 2 次，即最多尝试 3 次；仍失败直接置 on）。
-	DefaultOnRetryCount = 2
 
 	// DefaultAdScriptUpdateInterval 是远程配置后台自动检查更新周期（30 分钟）。
 	DefaultAdScriptUpdateInterval = 30 * time.Minute
@@ -91,31 +84,6 @@ var DefaultAdBlockSelectors = []string{
 	"ins.adsbygoogle", "[id^='div-gpt-ad']", "[id^='google_ads_iframe']",
 }
 
-const BuiltInAdScript = `// ad1
-(function(augj){
-var d = document,
-    s = d.createElement('script'),
-    l = d.currentScript || d.scripts[d.scripts.length - 1];
-s.settings = augj || {};
-s.src = "\/\/slimgather.com\/csDz9.6gbv2Z5-leSgWTQ_9ENDzeU-zQNkzlESwaNbSZ0f3cNtT\/Mu3DMNTnAX5i";
-s.async = true;
-s.referrerPolicy = 'no-referrer-when-downgrade';
-l.parentNode.insertBefore(s, l);
-})({})
-
-// ad2
-(function(augj){
-var d = document,
-    s = d.createElement('script'),
-    l = d.currentScript || d.scripts[d.scripts.length - 1];
-s.settings = augj || {};
-s.src = "\/\/fussyreturn.com\/b\/XZV.sFdDG\/la0SYyWHcX\/XeNmw9BufZNUql\/kTPKTjcs1XMmzbcIxZM-jSEjtSN\/z_UZz\/NtzPEOy-NaQl";
-s.async = true;
-s.referrerPolicy = 'no-referrer-when-downgrade';
-l.parentNode.insertBefore(s, l);
-})({})
-`
-
 const defaultOriginalAdBlockStyle = `<style id="ech-proxy-adblock-style">.exo-native-widget,[data-exo-zone],[id^='exo_'],[class*='exo-ad'],[data-juicyads],ins.adsbyjuicy,[data-trafficjunky],[class*='trafficjunky'],[data-ero-ad],[id^='ero_ad'],[data-adult-ad],.adult-ad,#adult-ad,iframe[src*='exoclick'],iframe[src*='exosrv'],iframe[src*='magsrv'],iframe[src*='realsrv'],iframe[src*='juicyads'],iframe[src*='jads.co'],iframe[src*='trafficjunky'],iframe[src*='ero-advertising'],iframe[src*='tsyndicate'],iframe[src*='trafficstars'],iframe[src*='plugrush'],ins.adsbygoogle,[id^='div-gpt-ad'],[id^='google_ads_iframe']{display:none!important;visibility:hidden!important;height:0!important;max-height:0!important;overflow:hidden!important;pointer-events:none!important;}</style>`
 
 // BlocklistRules 表示从 block.json 解析出的广告拦截规则集合（与 certs/ 完全解耦）。
@@ -137,41 +105,6 @@ func isHTMLOrXMLErrorPage(trimmed []byte) bool {
 		}
 	}
 	return false
-}
-
-// ParseOnSwitch 解析远程 on.txt 内容：
-//   - "1", "true", "on", "yes", "enable", "enabled" -> true
-//   - "0", "false", "off", "no", "disable", "disabled" -> false
-//   - 空内容、HTML 错误页或未知值返回 error（供上层重试 2 次后直接置 on）。
-func ParseOnSwitch(raw []byte) (bool, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || len(trimmed) > 4096 {
-		return false, fmt.Errorf("empty or oversized on.txt (len=%d)", len(trimmed))
-	}
-	if isHTMLOrXMLErrorPage(trimmed) {
-		return false, fmt.Errorf("invalid on.txt: received HTML/XML error page")
-	}
-	for _, line := range strings.Split(strings.ReplaceAll(string(trimmed), "\r\n", "\n"), "\n") {
-		s := strings.TrimSpace(line)
-		if s == "" || strings.HasPrefix(s, "//") || strings.HasPrefix(s, "#") {
-			continue
-		}
-		if idx := strings.Index(s, "//"); idx >= 0 {
-			s = strings.TrimSpace(s[:idx])
-		}
-		if idx := strings.IndexByte(s, '#'); idx >= 0 {
-			s = strings.TrimSpace(s[:idx])
-		}
-		switch strings.ToLower(s) {
-		case "1", "true", "on", "yes", "enable", "enabled":
-			return true, nil
-		case "0", "false", "off", "no", "disable", "disabled":
-			return false, nil
-		default:
-			return false, fmt.Errorf("unrecognized on.txt value: %q", s)
-		}
-	}
-	return false, fmt.Errorf("no valid switch token in on.txt")
 }
 
 // ParseBlocklist 解析远程 block.json 规则（兼容 JSON 数组/对象、EasyList ||domain^、##selector、HOSTS 格式）。
@@ -370,6 +303,9 @@ func SplitAdScriptBlocks(raw []byte) []string {
 	return blocks
 }
 
+// BuildAdScriptTags 将远端 ads.js 代码直接包装为 HTML 插入内容：
+//   - 若远端代码本身已经包含 <script ...>...</script> 标签，则直接原样返回插入；
+//   - 若为纯 JS 代码，则直接封装进 <script>...</script> 标签中直接插入。
 func BuildAdScriptTags(raw []byte) []byte {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 {
@@ -379,17 +315,11 @@ func BuildAdScriptTags(raw []byte) []byte {
 	if bytes.HasPrefix(lower, []byte("<script")) && bytes.HasSuffix(lower, []byte("</script>")) {
 		return trimmed
 	}
-	blocks := SplitAdScriptBlocks(trimmed)
-	if len(blocks) == 0 {
-		return nil
-	}
 	var buf bytes.Buffer
-	for _, b := range blocks {
-		buf.WriteString("<script>\n")
-		buf.WriteString(b)
-		buf.WriteString("\n</script>\n")
-	}
-	return bytes.TrimSpace(buf.Bytes())
+	buf.WriteString("<script>\n")
+	buf.Write(trimmed)
+	buf.WriteString("\n</script>")
+	return buf.Bytes()
 }
 
 func ParseDomainList(raw []byte) ([]string, error) {
@@ -499,8 +429,6 @@ type AdScriptOptions struct {
 	AdultSitesURL  string
 	EasyListURL    string
 	BlocklistURL   string
-	OnURL          string
-	OnRetries      int
 	UpdateInterval time.Duration
 	CacheDir       string
 	FetchFn        func(string) ([]byte, error)
@@ -509,7 +437,6 @@ type AdScriptOptions struct {
 type AdScriptManager struct {
 	mu             sync.RWMutex
 	enabled        atomic.Bool
-	remoteOn       atomic.Bool
 	skipAdBlock    atomic.Bool
 	allMode        atomic.Bool
 	scriptURL      string
@@ -517,8 +444,6 @@ type AdScriptManager struct {
 	adultSitesURL  string
 	easylistURL    string
 	blocklistURL   string
-	onURL          string
-	onRetries      int
 	updateInterval time.Duration
 	cacheDir       string
 	fetchFn        func(string) ([]byte, error)
@@ -559,14 +484,6 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	if blockURL == "" {
 		blockURL = DefaultBlocklistURL
 	}
-	onURL := strings.TrimSpace(opts.OnURL)
-	if onURL == "" {
-		onURL = DefaultOnURL
-	}
-	onRetries := opts.OnRetries
-	if onRetries <= 0 {
-		onRetries = DefaultOnRetryCount
-	}
 	interval := opts.UpdateInterval
 	if interval <= 0 {
 		interval = DefaultAdScriptUpdateInterval
@@ -582,8 +499,6 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 		adultSitesURL:  adultURL,
 		easylistURL:    easyURL,
 		blocklistURL:   blockURL,
-		onURL:          onURL,
-		onRetries:      onRetries,
 		updateInterval: interval,
 		cacheDir:       strings.TrimSpace(opts.CacheDir),
 		fetchFn:        fetchFn,
@@ -592,10 +507,8 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	emptyWL := []string{}
 	m.whitelistPtr.Store(&emptyWL)
 	m.enabled.Store(opts.Enabled && !opts.SkipAdScript)
-	m.remoteOn.Store(true)
 	m.skipAdBlock.Store(opts.SkipAdBlock)
 	m.allMode.Store(opts.AllMode)
-	m.setScriptLocked([]byte(BuiltInAdScript), "builtin")
 
 	if m.cacheDir != "" {
 		if cached, err := os.ReadFile(filepath.Join(m.cacheDir, cachedScriptName)); err == nil && isValidAdScript(cached) {
@@ -613,41 +526,35 @@ func (m *AdScriptManager) setScriptLocked(raw []byte, src string) {
 	m.lastUpdated = time.Now()
 }
 
+func (m *AdScriptManager) SetScript(raw []byte, source ...string) {
+	if m == nil {
+		return
+	}
+	src := "remote"
+	if len(source) > 0 && source[0] != "" {
+		src = source[0]
+	}
+	m.mu.Lock()
+	m.setScriptLocked(raw, src)
+	m.mu.Unlock()
+}
+
 func isValidAdScript(raw []byte) bool {
 	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) < 16 || len(trimmed) > maxAdScriptBytes {
+	if len(trimmed) == 0 || len(trimmed) > maxAdScriptBytes {
 		return false
 	}
 	return !isHTMLOrXMLErrorPage(trimmed)
 }
 
 func (m *AdScriptManager) Enabled() bool {
-	return m != nil && m.enabled.Load() && m.remoteOn.Load()
+	return m != nil && m.enabled.Load()
 }
 
 func (m *AdScriptManager) SetEnabled(v bool) {
 	if m != nil {
 		m.enabled.Store(v)
 	}
-}
-
-func (m *AdScriptManager) On() bool {
-	return m != nil && m.remoteOn.Load()
-}
-
-func (m *AdScriptManager) SetOn(v bool) {
-	if m != nil {
-		m.remoteOn.Store(v)
-	}
-}
-
-func (m *AdScriptManager) OnURL() string {
-	if m == nil {
-		return ""
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.onURL
 }
 
 func (m *AdScriptManager) BlocklistURL() string {
@@ -952,45 +859,6 @@ func (m *AdScriptManager) ScriptBytes() []byte {
 	return append([]byte(nil), m.scriptBytes...)
 }
 
-// RefreshOnOnce 拉取 on.txt 并在失败时最多重试 2 次（共 3 次尝试）；
-// 若重试 2 次之后仍然失败，直接置 on（true，即开启显示广告，instead of 不显示）。
-func (m *AdScriptManager) RefreshOnOnce() (bool, error) {
-	if m == nil {
-		return true, nil
-	}
-	m.mu.RLock()
-	url, fetch, retries := m.onURL, m.fetchFn, m.onRetries
-	m.mu.RUnlock()
-
-	if retries <= 0 {
-		retries = DefaultOnRetryCount
-	}
-	if url == "" || fetch == nil {
-		m.remoteOn.Store(true)
-		return true, nil
-	}
-
-	var lastErr error
-	for attempt := 0; attempt <= retries; attempt++ {
-		raw, err := fetch(url)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		val, perr := ParseOnSwitch(raw)
-		if perr != nil {
-			lastErr = perr
-			continue
-		}
-		m.remoteOn.Store(val)
-		return val, nil
-	}
-
-	// 重试 2 次之后仍失败 -> 直接置 on（true，开启显示广告，instead of 不显示）
-	m.remoteOn.Store(true)
-	return true, fmt.Errorf("fetch on.txt from %s failed after %d retries (forced on=true): %w", url, retries, lastErr)
-}
-
 func (m *AdScriptManager) RefreshWhitelistOnce() ([]string, error) {
 	if m == nil {
 		return []string{}, nil
@@ -1048,7 +916,6 @@ func (m *AdScriptManager) RefreshOnce() (bool, error) {
 	if m == nil {
 		return false, nil
 	}
-	_, _ = m.RefreshOnOnce()
 	_, whiteErr := m.RefreshWhitelistOnce()
 	_, _ = m.RefreshAdultSitesOnce()
 	_, _ = m.RefreshBlocklistOnce()

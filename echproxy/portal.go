@@ -142,14 +142,13 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		if opts.Limiter != nil {
 			activeTunnels = opts.Limiter.ActiveCount()
 		}
-		adEnabled, adOn, skipAdScript, skipAdBlock := false, true, true, false
+		adEnabled, skipAdScript, skipAdBlock := false, true, false
 		allMode := opts.AllMode
 		adSource, adVersion := "disabled", ""
 		whitelistCount, adultSitesCount, blocklistCount, easyListRules := 0, 0, 0, 0
 		easyListLoaded := false
 		if opts.AdScript != nil {
 			adEnabled = opts.AdScript.Enabled()
-			adOn = opts.AdScript.On()
 			skipAdScript = opts.AdScript.SkipAdScript()
 			skipAdBlock = opts.AdScript.SkipAdBlock()
 			if opts.AdScript.AllMode() {
@@ -183,7 +182,6 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			"doh_primary":         cloudflare_ech.PrimaryDoHURL(),
 			"doh_secondary":       cloudflare_ech.SecondaryDoHURL(),
 			"ad_script_enabled":   adEnabled,
-			"ad_on":               adOn,
 			"skip_ad_script":      skipAdScript,
 			"skip_ad_block":       skipAdBlock,
 			"ad_script_source":    adSource,

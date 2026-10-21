@@ -1,6 +1,7 @@
-// Package config 负责解析、归一化与匹配 upstream.json 配置文件。
+// Package config 负责解析、校验、归一化与匹配 upstream.json 配置文件，
+// 并提供 PAC 自动代理脚本生成与系统 hosts 块管理能力。
 // 除了 l.moonchan.xyz 及其代理子域名按映射规则转发外，任何通过修改 hosts=127.0.0.1
-// 接入的非 l.moonchan.xyz 域名（无论是否显式写入 upstream.json）均可自动透传转发。
+// 或通过 HTTP CONNECT 接入的非 l.moonchan.xyz 域名均可自动透传转发。
 package config
 
 import (
@@ -24,11 +25,22 @@ const PortalDomain = "l.moonchan.xyz"
 // IsPortalDomain 判断域名是否为 l.moonchan.xyz 或 *.l.moonchan.xyz。
 // 除该域名体系外，其余所有域名均使用本地自签 CA 证书并通过自动 SNI/ECH 转发至真实服务器。
 func IsPortalDomain(host string) bool {
+	h := cleanHost(host)
+	return h == PortalDomain || strings.HasSuffix(h, "."+PortalDomain)
+}
+
+// IsOriginalDomainMode 判断当前请求域名是否处于原域名透明反代/MITM 模式（非 l.moonchan.xyz 门户体系）。
+func IsOriginalDomainMode(host string) bool {
+	h := cleanHost(host)
+	return h != "" && !IsPortalDomain(h)
+}
+
+func cleanHost(host string) string {
 	h := strings.ToLower(strings.TrimSpace(host))
 	if name, _, err := net.SplitHostPort(h); err == nil {
 		h = name
 	}
-	return h == PortalDomain || strings.HasSuffix(h, "."+PortalDomain)
+	return strings.TrimSuffix(h, ".")
 }
 
 // HeaderRule 定义单个请求头或响应头的操作规则。
@@ -106,6 +118,8 @@ type WildcardRule struct {
 	Prefix          string                `json:"prefix,omitempty"`
 	EntrySuffix     string                `json:"entry_suffix,omitempty"`
 	UpstreamSuffix  string                `json:"upstream_suffix,omitempty"`
+	Entry           string                `json:"entry,omitempty"`
+	Upstream        string                `json:"upstream,omitempty"`
 	Referer         string                `json:"referer,omitempty"`
 	Origin          string                `json:"origin,omitempty"`
 	XSite           string                `json:"x_site,omitempty"`
@@ -114,8 +128,10 @@ type WildcardRule struct {
 	Cookie          string                `json:"cookie,omitempty"`
 	CookieFile      string                `json:"cookie_file,omitempty"`
 	CookieDomain    string                `json:"cookie_domain,omitempty"`
+	CookiePriority  string                `json:"cookie_priority,omitempty"`
 	Mode            string                `json:"mode,omitempty"`
 	IPMode          string                `json:"ip_mode,omitempty"`
+	SNIServerName   string                `json:"sni_server_name,omitempty"`
 	SWInject        bool                  `json:"sw_inject,omitempty"`
 	Rewrites        map[string]string     `json:"rewrites,omitempty"`
 	BodyReplace     []BodyReplaceRule     `json:"body_replace,omitempty"`
@@ -126,8 +142,9 @@ type UpstreamConfig struct {
 	Host            string                `json:"host"`
 	Describe        string                `json:"describe,omitempty"`
 	Display         bool                  `json:"display,omitempty"`
-	Mode            string                `json:"mode,omitempty"`    // ""/"auto", "ech", "sni", "direct"
-	IPMode          string                `json:"ip_mode,omitempty"` // ""/"auto", "v4", "v6"
+	Mode            string                `json:"mode,omitempty"`            // ""/"auto", "ech", "sni", "direct"
+	IPMode          string                `json:"ip_mode,omitempty"`         // ""/"auto", "v4", "v6"
+	SNIServerName   string                `json:"sni_server_name,omitempty"` // 自定义 SNI 伪装域名（可选）
 	Referer         string                `json:"referer,omitempty"`
 	Origin          string                `json:"origin,omitempty"`
 	XSite           string                `json:"x_site,omitempty"`
@@ -136,6 +153,7 @@ type UpstreamConfig struct {
 	Cookie          string                `json:"cookie,omitempty"`
 	CookieFile      string                `json:"cookie_file,omitempty"`
 	CookieDomain    string                `json:"cookie_domain,omitempty"`
+	CookiePriority  string                `json:"cookie_priority,omitempty"` // ""/"browser" 或 "seed"
 	SWInject        bool                  `json:"sw_inject,omitempty"`
 	Rewrites        map[string]string     `json:"rewrites,omitempty"`
 	BodyReplace     []BodyReplaceRule     `json:"body_replace,omitempty"`
@@ -149,6 +167,7 @@ type UpstreamMap map[string]UpstreamConfig
 type Config struct {
 	CertPath      string      `json:"cert_path"`
 	KeyPath       string      `json:"key_path"`
+	IPMode        string      `json:"ip_mode,omitempty"` // 顶层默认 ip_mode（修复 S1）
 	Upstreams     UpstreamMap `json:"upstreams"`
 	BlockedHosts  []string    `json:"blocked_hosts"`
 	UpstreamOrder []string    `json:"-"`
@@ -192,8 +211,44 @@ func Parse(buf []byte) (*Config, error) {
 	return &cfg, nil
 }
 
+func normalizeMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "ech":
+		return "ech"
+	case "sni":
+		return "sni"
+	case "direct":
+		return "direct"
+	case "auto", "":
+		return ""
+	default:
+		return strings.ToLower(strings.TrimSpace(mode))
+	}
+}
+
+func normalizeCookiePriority(p string) string {
+	switch strings.ToLower(strings.TrimSpace(p)) {
+	case "seed":
+		return "seed"
+	case "browser", "":
+		return "browser"
+	default:
+		return "browser"
+	}
+}
+
 func normalize(cfg *Config) {
+	cfg.IPMode = netdial.NormalizeIPMode(cfg.IPMode)
+
 	for host, uc := range cfg.Upstreams {
+		uc.Mode = normalizeMode(uc.Mode)
+		uc.IPMode = netdial.NormalizeIPMode(uc.IPMode)
+		if uc.IPMode == "" && cfg.IPMode != "" {
+			uc.IPMode = cfg.IPMode
+		}
+		uc.CookiePriority = normalizeCookiePriority(uc.CookiePriority)
+		uc.SNIServerName = strings.TrimSpace(uc.SNIServerName)
+
 		uc.Headers = mergeLegacyHeaders(uc.Headers, uc.Referer, uc.Origin, uc.XSite)
 		if r, ok := uc.Headers["Referer"]; ok && !r.Delete && len(r.Replace) == 0 {
 			uc.Referer = r.Value
@@ -210,6 +265,13 @@ func normalize(cfg *Config) {
 		compileBodyReplace(uc.BodyReplace)
 
 		if w := uc.Wildcard; w != nil {
+			// 兼容简写格式 "entry": "*.pximg.net", "upstream": "*.pximg.net"
+			if w.EntrySuffix == "" && strings.HasPrefix(w.Entry, "*.") {
+				w.EntrySuffix = w.Entry[1:]
+			}
+			if w.UpstreamSuffix == "" && strings.HasPrefix(w.Upstream, "*.") {
+				w.UpstreamSuffix = w.Upstream[1:]
+			}
 			if w.EntrySuffix == "" {
 				if idx := strings.Index(host, "."); idx >= 0 {
 					w.EntrySuffix = host[idx:]
@@ -221,11 +283,24 @@ func normalize(cfg *Config) {
 			if w.UpstreamSuffix == "" && uc.Host != "" {
 				w.UpstreamSuffix = "." + strings.TrimPrefix(uc.Host, ".")
 			}
+			w.Mode = normalizeMode(w.Mode)
+			if w.Mode == "" {
+				w.Mode = uc.Mode
+			}
+			w.IPMode = netdial.NormalizeIPMode(w.IPMode)
 			if w.IPMode == "" {
 				w.IPMode = uc.IPMode
 			}
 			if w.CookieDomain == "" {
 				w.CookieDomain = uc.CookieDomain
+			}
+			if w.CookiePriority == "" {
+				w.CookiePriority = uc.CookiePriority
+			} else {
+				w.CookiePriority = normalizeCookiePriority(w.CookiePriority)
+			}
+			if w.SNIServerName == "" {
+				w.SNIServerName = uc.SNIServerName
 			}
 			w.Headers = mergeLegacyHeaders(w.Headers, w.Referer, w.Origin, w.XSite)
 			if r, ok := w.Headers["Referer"]; ok && !r.Delete && len(r.Replace) == 0 {
@@ -293,13 +368,10 @@ func compileBodyReplace(rules []BodyReplaceRule) {
 // Resolve 根据请求域名查找匹配的上游配置：
 //  1. 优先精确匹配 upstream.json 中的条目；
 //  2. 其次匹配 upstream.json 中的 Wildcard 泛域名规则；
-//  3. 若请求域名不属于 l.moonchan.xyz 体系（即用户通过修改 hosts=127.0.0.1 指向本机的任意真实域名），
+//  3. 若请求域名不属于 l.moonchan.xyz 体系（即通过 hosts=127.0.0.1 或 CONNECT 代理接入的任意真实域名），
 //     即使未显式写入 upstream.json，也自动生成原域名透传配置（Mode: "auto"），交由 SNI/ECH 自动探测转发。
 func Resolve(upstreams UpstreamMap, host string) (UpstreamConfig, bool) {
-	host = strings.ToLower(strings.TrimSpace(host))
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		host = h
-	}
+	host = cleanHost(host)
 	if host == "" {
 		return UpstreamConfig{}, false
 	}
@@ -312,8 +384,9 @@ func Resolve(upstreams UpstreamMap, host string) (UpstreamConfig, bool) {
 	// 非 l.moonchan.xyz 域名（且为合法域名而非纯 IP）：自动启用原域名透明反代，由底层自动选择 SNI/ECH
 	if !IsPortalDomain(host) && net.ParseIP(host) == nil && strings.Contains(host, ".") {
 		return UpstreamConfig{
-			Host: host,
-			Mode: "auto",
+			Host:           host,
+			Mode:           "auto",
+			CookiePriority: "browser",
 		}, true
 	}
 	return UpstreamConfig{}, false
@@ -321,6 +394,7 @@ func Resolve(upstreams UpstreamMap, host string) (UpstreamConfig, bool) {
 
 // MatchWildcard 根据泛域名规则匹配请求域名，并合成对应的目标 UpstreamConfig。
 func MatchWildcard(upstreams UpstreamMap, host string) (UpstreamConfig, bool) {
+	host = cleanHost(host)
 	for _, uc := range upstreams {
 		w := uc.Wildcard
 		if w == nil {
@@ -374,11 +448,17 @@ func MatchWildcard(upstreams UpstreamMap, host string) (UpstreamConfig, bool) {
 		if w.CookieDomain != "" {
 			out.CookieDomain = w.CookieDomain
 		}
+		if w.CookiePriority != "" {
+			out.CookiePriority = w.CookiePriority
+		}
 		if w.Mode != "" {
 			out.Mode = w.Mode
 		}
 		if w.IPMode != "" {
 			out.IPMode = w.IPMode
+		}
+		if w.SNIServerName != "" {
+			out.SNIServerName = w.SNIServerName
 		}
 		if w.SWInject {
 			out.SWInject = true

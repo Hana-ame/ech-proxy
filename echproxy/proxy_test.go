@@ -1,6 +1,7 @@
 package echproxy
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -9,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
@@ -20,9 +22,9 @@ import (
 )
 
 // TestIssue17And26_UpstreamJSONAndPximgRouting 验证：
-// 1. certs/l.moonchan.xyz/upstream.json 语法与结构完整合法 (#26)；
+// 1. certs/l.moonchan.xyz/upstream.json 语法与结构完整合法 (#26)，且通过严格静态校验 ValidateConfig (#8)；
 // 2. 包含 pixiv.net、pximg.net、i.pximg.net、s.pximg.net 路由且携带防盗链 Referer (#17)；
-// 3. 任何未写入 upstream.json 的非 l.moonchan.xyz 域名（修改 hosts=127.0.0.1 后）均可自动透传转发。
+// 3. 任何未写入 upstream.json 的非 l.moonchan.xyz 域名（修改 hosts=127.0.0.1 或通过 CONNECT 后）均可自动透传转发。
 func TestIssue17And26_UpstreamJSONAndPximgRouting(t *testing.T) {
 	buf, err := os.ReadFile("../certs/l.moonchan.xyz/upstream.json")
 	if err != nil {
@@ -31,13 +33,17 @@ func TestIssue17And26_UpstreamJSONAndPximgRouting(t *testing.T) {
 	if err := json.Unmarshal(buf, &map[string]any{}); err != nil {
 		t.Fatalf("upstream.json invalid JSON: %v", err)
 	}
+	issues, verr := ValidateConfig(buf)
+	if verr != nil || ConfigHasErrors(issues) {
+		t.Fatalf("ValidateConfig failed: err=%v issues=%s", verr, FormatConfigIssues(issues))
+	}
 	cfg, err := ParseConfig(buf)
 	if err != nil {
 		t.Fatalf("ParseConfig failed: %v", err)
 	}
 
 	// 验证 Pixiv 主站与子域
-	for _, host := range []string{"pixiv.net", "www.pixiv.net", "account.pixiv.net", "accounts.pixiv.net"} {
+	for _, host := range []string{"pixiv.net", "www.pixiv.net", "account.pixiv.net", "accounts.pixiv.net", "api.sec.pixiv.net"} {
 		uc, ok := config.Resolve(cfg.Upstreams, host)
 		if !ok || uc.Host != host || uc.IPMode != "v4" {
 			t.Errorf("Pixiv host %s resolve mismatch: host=%q ip_mode=%q ok=%v", host, uc.Host, uc.IPMode, ok)
@@ -95,9 +101,45 @@ func TestIssue28_BlockArbitraryFileReadAndControlPlane(t *testing.T) {
 	}
 }
 
+// TestLargeChunkedTextResponseNotTruncated 验证超过 8MB (MaxRewriteSize) 的 Chunked 文本响应不会被截断。
+func TestLargeChunkedTextResponseNotTruncated(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	largeSize := rewrite.MaxRewriteSize + 512*1024 // 8.5 MB
+	payload := bytes.Repeat([]byte("A"), largeSize)
+
+	orig := roundTripFn
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			ContentLength: -1, // 模拟未知长度的 Chunked 响应
+			Header:        http.Header{"Content-Type": []string{"application/javascript"}},
+			Body:          io.NopCloser(bytes.NewReader(payload)),
+		}, nil
+	}
+	defer func() { roundTripFn = orig }()
+
+	cfg := &config.Config{
+		Upstreams: config.UpstreamMap{
+			"test.l.moonchan.xyz": {Host: "test.example.com"},
+		},
+	}
+	engine := NewEngine(cfg)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://test.l.moonchan.xyz:8443/bundle.js", nil)
+	req.Host = "test.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.Len() != largeSize {
+		t.Errorf("large chunked body truncated: got %d bytes, want %d bytes", rec.Body.Len(), largeSize)
+	}
+}
+
 // TestIssue21AndAutoTransparentReverseProxy 验证：
-// 1. 除 l.moonchan.xyz 体系外，所有域名均由本地自签名 CA 动态签发证书，且下发完整证书链与 SKID/AKID (#21)；
-// 2. l.moonchan.xyz 及 *.l.moonchan.xyz 保持使用門户证书；
+// 1. 除 l.moonchan.xyz 体系外，所有域名（含多级子域 api.sec.pixiv.net 与双后缀域名 www.dlsite.co.jp）均由本地自签名 CA 动态签发证书，且下发完整证书链与 SKID/AKID (#21)；
+// 2. 同一监听端口同时支持 HTTPS 访问与明文 HTTP (/proxy.pac, /ca.pem, /statusz) 自动分流；
 // 3. 请求通过自动 SNI/ECH 隧道转发至真实上游。
 func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 	gin.SetMode(gin.TestMode)
@@ -135,15 +177,28 @@ func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 		t.Fatalf("listen: %v", err)
 	}
 	defer ln.Close()
-	port := ln.Addr().(*net.TCPAddr).Port
+	port := uint16(ln.Addr().(*net.TCPAddr).Port)
 
+	engine := NewEngineWithOptions(EngineOptions{
+		Config:    cfg,
+		CertStore: store,
+		Port:      port,
+	})
 	tlsCfg := store.TLSConfig(nil)
-	httpSrv := &http.Server{
-		Handler:   NewEngine(cfg),
-		TLSConfig: tlsCfg,
+	srv := &Server{
+		Config:    cfg,
+		CertStore: store,
+		Engine:    engine,
+		HTTPServer: &http.Server{
+			Handler:   engine,
+			TLSConfig: tlsCfg,
+		},
+		Listener: ln,
+		Port:     port,
+		IsTLS:    true,
 	}
-	go httpSrv.Serve(tls.NewListener(ln, tlsCfg))
-	defer httpSrv.Close()
+	go srv.Serve()
+	defer srv.Close()
 
 	caPEM, err := os.ReadFile(store.CAPath())
 	if err != nil {
@@ -154,8 +209,19 @@ func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 		t.Fatal("append CA cert failed")
 	}
 
-	// 测试 www.pixiv.net、i.pximg.net、s.pximg.net 以及未列入 upstream.json 的任意域名
-	for _, sni := range []string{"www.pixiv.net", "i.pximg.net", "s.pximg.net", "custom.site.example"} {
+	// 1. 验证同一端口的明文 HTTP 自助端点 (/proxy.pac, /ca.pem, /statusz)
+	plainResp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/proxy.pac", port))
+	if err != nil {
+		t.Fatalf("GET plain /proxy.pac on dual-mode port failed: %v", err)
+	}
+	pacBody, _ := io.ReadAll(plainResp.Body)
+	plainResp.Body.Close()
+	if !strings.Contains(string(pacBody), "FindProxyForURL") {
+		t.Errorf("unexpected /proxy.pac body: %q", string(pacBody))
+	}
+
+	// 2. 测试 www.pixiv.net、api.sec.pixiv.net、i.pximg.net、s.pximg.net、www.dlsite.co.jp 以及未列入 upstream.json 的任意域名
+	for _, sni := range []string{"www.pixiv.net", "api.sec.pixiv.net", "i.pximg.net", "s.pximg.net", "www.dlsite.co.jp", "custom.site.example"} {
 		client := &http.Client{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {

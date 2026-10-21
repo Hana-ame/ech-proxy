@@ -21,6 +21,7 @@ var (
 	proxyMu     sync.Mutex
 	proxyServer *echproxy.Server
 	echReady    bool
+	proxyGen    uint64
 
 	logMu       sync.RWMutex
 	logBuffer   []string
@@ -54,7 +55,8 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	}()
 
 	proxyMu.Lock()
-	defer proxyMu.Unlock()
+	proxyGen++
+	myGen := proxyGen
 
 	logMu.Lock()
 	logBuffer = nil
@@ -67,12 +69,16 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 	}
 	echReady = false
 	echproxy.Debug = true
+	proxyMu.Unlock()
 
-	// 对齐桌面端环境变量：支持 LOCALIP, IP_MODE, ECH_PROXY_CONFIG, ECH_PROXY_DATA_DIR (#27)
+	// 对齐桌面端全部环境变量：LOCALIP, IP_MODE, ECH_PROXY_CONFIG, ECH_PROXY_DATA_DIR,
+	// ECH_PROXY_TOKEN, ECH_PROXY_USER, ECH_PROXY_PASS (#12, #27)
 	bootstrap := strings.TrimSpace(C.GoString(bootstrapIP))
 	if bootstrap == "" {
 		bootstrap = os.Getenv("LOCALIP")
 	}
+	allowConnect := os.Getenv("ECH_PROXY_ALLOW_CONNECT") == "1"
+
 	srv, err := echproxy.NewServer(echproxy.ServerOptions{
 		Addr:            "127.0.0.1:8443",
 		AllowRandomPort: true,
@@ -80,13 +86,25 @@ func StartProxy(bootstrapIP *C.char) uint16 {
 		BootstrapIP:     bootstrap,
 		IPMode:          os.Getenv("IP_MODE"),
 		DataDir:         os.Getenv("ECH_PROXY_DATA_DIR"),
+		AllowConnect:    allowConnect,
+		DisableConnect:  !allowConnect,
+		Auth:            echproxy.AuthConfigFromEnv(),
 	})
 	if err != nil {
 		log.Printf("Server init failed: %v", err)
 		return 0
 	}
 
+	proxyMu.Lock()
+	defer proxyMu.Unlock()
+	if proxyGen != myGen {
+		_ = srv.Close()
+		log.Printf("StartProxy aborted: stopped during initialization")
+		return 0
+	}
+
 	if err := srv.ServeAsync(); err != nil {
+		_ = srv.Close()
 		log.Printf("Serve failed: %v", err)
 		return 0
 	}
@@ -107,6 +125,7 @@ func StopProxy() {
 
 	proxyMu.Lock()
 	defer proxyMu.Unlock()
+	proxyGen++
 	if proxyServer != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -178,6 +197,9 @@ func GetLogs() *C.char {
 
 //export FreeCString
 func FreeCString(s *C.char) {
+	if s == nil {
+		return
+	}
 	C.free(unsafe.Pointer(s))
 }
 

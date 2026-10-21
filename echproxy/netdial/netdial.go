@@ -1,5 +1,6 @@
 // Package netdial 提供基础网络拨号、公共 DNS 解析、IPv4/IPv6 协议族绑定、
-// Cloudflare IP 识别、远程/本地文件拉取与通用重试工具。本模块不依赖项目内任何其他包。
+// Cloudflare IP 识别、内网/保留地址识别（SSRF 防护）、远程/本地文件拉取与通用重试工具。
+// 本模块处于架构最底层，不依赖项目内任何其他包。
 package netdial
 
 import (
@@ -17,9 +18,15 @@ import (
 )
 
 const (
-	OpTimeout     = 5 * time.Minute
+	// DialTimeout 是单次 TCP 连接建立超时时间（避免单个不可达 IP 阻塞数分钟）。
+	DialTimeout = 10 * time.Second
+	// DoHTimeout 是单次 DoH / DNS 查询超时时间。
+	DoHTimeout = 10 * time.Second
+	// OpTimeout 是流式传输或大文件拉取的整体操作超时上限。
+	OpTimeout = 5 * time.Minute
+
 	RetryAttempts = 3
-	RetryBackoff  = 2 * time.Second
+	RetryBackoff  = 1500 * time.Millisecond
 )
 
 var dnsServers = []string{
@@ -49,6 +56,35 @@ var cloudflareNets = func() []*net.IPNet {
 	return nets
 }()
 
+// 保留与特殊用途网段（CGNAT、基准测试、链路本地、云元数据等），用于 CONNECT 隧道 SSRF 拦截。
+var reservedCIDRs = []string{
+	"0.0.0.0/8",
+	"100.64.0.0/10",
+	"127.0.0.0/8",
+	"169.254.0.0/16",
+	"192.0.0.0/24",
+	"192.0.2.0/24",
+	"198.18.0.0/15",
+	"198.51.100.0/24",
+	"203.0.113.0/24",
+	"224.0.0.0/4",
+	"240.0.0.0/4",
+	"::1/128",
+	"fc00::/7",
+	"fe80::/10",
+	"ff00::/8",
+}
+
+var reservedNets = func() []*net.IPNet {
+	var nets []*net.IPNet
+	for _, c := range reservedCIDRs {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			nets = append(nets, n)
+		}
+	}
+	return nets
+}()
+
 // IsCloudflareIP 判断给定 IP 是否属于 Cloudflare 边缘节点网段。
 func IsCloudflareIP(ip net.IP) bool {
 	if ip == nil {
@@ -60,6 +96,35 @@ func IsCloudflareIP(ip net.IP) bool {
 		}
 	}
 	return false
+}
+
+// IsPrivateOrReservedIP 判断 IP 是否属于环回、内网、链路本地（如 169.254.169.254）或保留地址。
+func IsPrivateOrReservedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	for _, n := range reservedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeIPMode 将出口协议族归一化为 "v4"、"v6" 或 ""（代表自动选择）。
+func NormalizeIPMode(mode string) string {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "v4", "ipv4", "4":
+		return "v4"
+	case "v6", "ipv6", "6":
+		return "v6"
+	default:
+		return ""
+	}
 }
 
 var (
@@ -76,7 +141,7 @@ func getResolver() *net.Resolver {
 		resolver = &net.Resolver{
 			PreferGo: true,
 			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				d := net.Dialer{Timeout: OpTimeout}
+				d := net.Dialer{Timeout: DoHTimeout}
 				var lastErr error
 				for _, dns := range dnsServers {
 					conn, err := d.DialContext(ctx, network, dns)
@@ -116,37 +181,99 @@ func getRootPool() *x509.CertPool {
 // Dialer 返回绑定了公共 DNS 的拨号器（兼容 Android/Termux 等无 /etc/resolv.conf 的环境）。
 func Dialer() *net.Dialer {
 	return &net.Dialer{
-		Timeout:   OpTimeout,
+		Timeout:   DialTimeout,
 		KeepAlive: 30 * time.Second,
 		Resolver:  getResolver(),
 	}
 }
 
-// ResolvePreferredIP 按指定的协议族（"v4" 或 "v6"）解析域名并返回首个匹配的 IP。
-func ResolvePreferredIP(ctx context.Context, host, mode string) (string, error) {
-	ips, err := getResolver().LookupIPAddr(ctx, host)
+// FilterIPsByMode 按指定的协议族（"v4"、"v6" 或 ""/"auto"）过滤 IP 列表。
+func FilterIPsByMode(ips []net.IP, mode string) []string {
+	norm := NormalizeIPMode(mode)
+	var out []string
+	seen := make(map[string]bool, len(ips))
+	for _, ip := range ips {
+		if ip == nil {
+			continue
+		}
+		isV4 := ip.To4() != nil
+		if norm == "v4" && !isV4 {
+			continue
+		}
+		if norm == "v6" && (isV4 || ip.To16() == nil) {
+			continue
+		}
+		s := ip.String()
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// ResolveIPs 按指定的协议族（"v4"、"v6" 或 ""/"auto"）解析域名并返回所有匹配的 IP。
+func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
+	if ip := net.ParseIP(host); ip != nil {
+		filtered := FilterIPsByMode([]net.IP{ip}, mode)
+		if len(filtered) == 0 {
+			return nil, fmt.Errorf("IP %s does not match ip_mode %q", host, mode)
+		}
+		return filtered, nil
+	}
+	addrs, err := getResolver().LookupIPAddr(ctx, host)
 	if err != nil {
-		return "", fmt.Errorf("resolve %s: %w", host, err)
+		return nil, fmt.Errorf("resolve %s: %w", host, err)
 	}
-	for _, addr := range ips {
-		if mode == "v4" && addr.IP.To4() != nil {
-			return addr.IP.String(), nil
-		}
-		if mode == "v6" && addr.IP.To4() == nil && addr.IP.To16() != nil {
-			return addr.IP.String(), nil
-		}
+	ips := make([]net.IP, 0, len(addrs))
+	for _, a := range addrs {
+		ips = append(ips, a.IP)
 	}
-	return "", fmt.Errorf("no %s address for %s", mode, host)
+	filtered := FilterIPsByMode(ips, mode)
+	if len(filtered) == 0 {
+		if norm := NormalizeIPMode(mode); norm != "" {
+			return nil, fmt.Errorf("no %s address for %s", norm, host)
+		}
+		return nil, fmt.Errorf("no IP address for %s", host)
+	}
+	return filtered, nil
+}
+
+// ResolvePreferredIP 按指定的协议族（"v4"、"v6" 或 ""/"auto"）解析域名并返回首个匹配的 IP。
+func ResolvePreferredIP(ctx context.Context, host, mode string) (string, error) {
+	ips, err := ResolveIPs(ctx, host, mode)
+	if err != nil {
+		return "", err
+	}
+	return ips[0], nil
 }
 
 // DialContextIPMode 根据 ipMode（"v4"、"v6" 或 ""/"auto"）向目标 host:port 发起 TCP 连接。
 func DialContextIPMode(ctx context.Context, host, port, mode string, timeout time.Duration) (net.Conn, error) {
-	if mode == "v4" || mode == "v6" {
-		ip, err := ResolvePreferredIP(ctx, host, mode)
+	if timeout <= 0 {
+		timeout = DialTimeout
+	}
+	norm := NormalizeIPMode(mode)
+	if norm == "v4" || norm == "v6" {
+		ips, err := ResolveIPs(ctx, host, norm)
 		if err != nil {
 			return nil, err
 		}
-		return (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
+		network := "tcp"
+		if norm == "v4" {
+			network = "tcp4"
+		} else {
+			network = "tcp6"
+		}
+		var lastErr error
+		for _, ip := range ips {
+			conn, err := (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ip, port))
+			if err == nil {
+				return conn, nil
+			}
+			lastErr = err
+		}
+		return nil, lastErr
 	}
 	return (&net.Dialer{
 		Timeout:   timeout,
@@ -162,7 +289,7 @@ func Transport() *http.Transport {
 			DialContext:       Dialer().DialContext,
 			TLSClientConfig:   &tls.Config{RootCAs: getRootPool()},
 			MaxIdleConns:      100,
-			IdleConnTimeout:   OpTimeout,
+			IdleConnTimeout:   90 * time.Second,
 			ForceAttemptHTTP2: true,
 		}
 	})
@@ -171,7 +298,8 @@ func Transport() *http.Transport {
 
 // TransportWithIPMode 返回锁定出口 IP 协议族（"v4" 或 "v6"）的 HTTP Transport。
 func TransportWithIPMode(mode string) *http.Transport {
-	if mode != "v4" && mode != "v6" {
+	norm := NormalizeIPMode(mode)
+	if norm != "v4" && norm != "v6" {
 		return Transport()
 	}
 	return &http.Transport{
@@ -180,11 +308,11 @@ func TransportWithIPMode(mode string) *http.Transport {
 			if err != nil {
 				return nil, err
 			}
-			return DialContextIPMode(ctx, host, port, mode, OpTimeout)
+			return DialContextIPMode(ctx, host, port, norm, DialTimeout)
 		},
 		TLSClientConfig:   &tls.Config{RootCAs: getRootPool()},
 		MaxIdleConns:      100,
-		IdleConnTimeout:   OpTimeout,
+		IdleConnTimeout:   90 * time.Second,
 		ForceAttemptHTTP2: true,
 	}
 }
@@ -240,6 +368,9 @@ func FetchBytes(rawURL string) ([]byte, error) {
 func Retry[T any](ctx context.Context, attempts int, backoff time.Duration, fn func() (T, error)) (T, error) {
 	var zero T
 	var last error
+	if attempts <= 0 {
+		attempts = 1
+	}
 	for i := 0; i < attempts; i++ {
 		if err := ctx.Err(); err != nil {
 			return zero, err

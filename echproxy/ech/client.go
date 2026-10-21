@@ -1,6 +1,6 @@
 // Package cloudflare_ech 封装上游传输隧道：
 //  1. Cloudflare ECH 域前置（Encrypted Client Hello + uTLS Chrome 指纹）
-//  2. SNI 伪装直连（DoH 解析真实 IP + 伪造 SNI + HTTP/2 传输）
+//  2. SNI 伪装直连（DoH 双栈解析真实 IP + 可配置/伪造 SNI + HTTP/2 与 HTTP/1.1 自适应传输）
 //  3. Direct 明文/标准 TLS 直连（支持 IPv4/IPv6 协议族锁定）
 //
 // 本模块仅依赖标准库、netdial、utls 与 x/net/http2。
@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,8 +29,8 @@ import (
 const (
 	shellDomain   = "cloudflare-ech.com"
 	defaultDohURL = "https://moonchan.xyz/doh"
-	dialTimeout   = netdial.OpTimeout
-	dohTimeout    = netdial.OpTimeout
+	dialTimeout   = netdial.DialTimeout
+	dohTimeout    = netdial.DoHTimeout
 	minTTL        = 60
 	maxTTL        = 24 * 3600
 )
@@ -91,14 +90,10 @@ func SetDoHConfig(host, bootstrapIP string) {
 	cfgPtr.Store(&nc)
 }
 
-// SetIPMode 设置全局默认上游出口 IP 协议族（"v4"、"v6" 或 ""）。
+// SetIPMode 设置全局默认上游出口 IP 协议族（"v4"、"v6" 或 ""，大小写不敏感）。
 func SetIPMode(mode string) {
 	nc := *currentConfig()
-	if mode == "v4" || mode == "v6" {
-		nc.ipMode = mode
-	} else {
-		nc.ipMode = ""
-	}
+	nc.ipMode = netdial.NormalizeIPMode(mode)
 	cfgPtr.Store(&nc)
 
 	clientsMu.Lock()
@@ -109,6 +104,11 @@ func SetIPMode(mode string) {
 		}
 	}
 	clients = map[string]*Client{}
+}
+
+// GetIPMode 返回当前全局默认出口协议族（"v4"、"v6" 或 ""）。
+func GetIPMode() string {
+	return currentConfig().ipMode
 }
 
 // CheckDualStack 检查 moonchan.xyz 是否发布 A / AAAA 记录。
@@ -270,8 +270,8 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				MinVersion:                     tls.VersionTLS13,
 				NextProtos:                     []string{"h2", "http/1.1"},
 			}
-			mode := ipMode
-			if mode == "" || mode == "auto" {
+			mode := netdial.NormalizeIPMode(ipMode)
+			if mode == "" {
 				mode = currentConfig().ipMode
 			}
 			return netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
@@ -325,11 +325,11 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 }
 
 func getECHClient(ipMode string) (*Client, error) {
-	mode := strings.ToLower(strings.TrimSpace(ipMode))
-	if mode == "" || mode == "auto" {
+	mode := netdial.NormalizeIPMode(ipMode)
+	if mode == "" {
 		mode = currentConfig().ipMode
 	}
-	if mode != "v4" && mode != "v6" {
+	if mode == "" {
 		mode = "auto"
 	}
 	clientsMu.Lock()

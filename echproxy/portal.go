@@ -2,11 +2,13 @@ package echproxy
 
 import (
 	_ "embed"
+	"encoding/json"
 	"html"
 	"net"
 	"net/http"
 	"strings"
 
+	"github.com/Hana-ame/ech-proxy/echproxy/certstore"
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
 	"github.com/Hana-ame/ech-proxy/echproxy/cookie"
 	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
@@ -21,8 +23,23 @@ const (
 	defaultPort = "8443"
 )
 
-// NewEngine 构建并配置 Gin 路由引擎，同时服务 8443 门户模式与 443 本地透明反代模式。
+// EngineOptions 定义创建路由引擎时的可选扩展组件（本地 CA、CONNECT 限流器、认证策略等）。
+type EngineOptions struct {
+	Config    *config.Config
+	CertStore *certstore.Store
+	Auth      *AuthConfig
+	Limiter   *TunnelLimiter
+	Port      uint16
+}
+
+// NewEngine 构建并配置 Gin 路由引擎，同时服务 8443 门户模式、443 本地透明反代模式及 PAC/CA 自助下载端点。
 func NewEngine(cfg *config.Config) *gin.Engine {
+	return NewEngineWithOptions(EngineOptions{Config: cfg})
+}
+
+// NewEngineWithOptions 使用完整配置项构建 Gin 路由引擎。
+func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
+	cfg := opts.Config
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
@@ -31,15 +48,103 @@ func NewEngine(cfg *config.Config) *gin.Engine {
 	r.Use(gin.Recovery(), corsMiddleware())
 
 	seedCookiesFromConfig(cfg)
-	proxyHandler := ProxyHandler(cfg.Upstreams, cfg.BlockedHosts)
+	proxyHandler := ProxyHandlerWithAuth(cfg.Upstreams, cfg.BlockedHosts, opts.Auth)
 
 	r.GET("/healthz", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
 
+	// 运行时状态诊断端点
+	r.GET("/statusz", func(c *gin.Context) {
+		host := stripPort(c.Request.Host)
+		if !isPortalOrLocalAdminHost(host) {
+			proxyHandler(c)
+			return
+		}
+		caPath := ""
+		caValid := ""
+		if opts.CertStore != nil {
+			caPath = opts.CertStore.CAPath()
+			if !opts.CertStore.CAValidUntil().IsZero() {
+				caValid = opts.CertStore.CAValidUntil().Format("2006-01-02")
+			}
+		}
+		activeTunnels := 0
+		if opts.Limiter != nil {
+			activeTunnels = opts.Limiter.ActiveCount()
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"status":         "ok",
+			"upstreams":      len(cfg.Upstreams),
+			"ca_path":        caPath,
+			"ca_valid_until": caValid,
+			"active_tunnels": activeTunnels,
+			"auth_enabled":   opts.Auth != nil && opts.Auth.Enabled(),
+		})
+	})
+
+	// 一键下载本地 CA 根证书（方便浏览器、移动端直接点击安装信任）
+	caDownloadHandler := func(c *gin.Context) {
+		host := stripPort(c.Request.Host)
+		if !isPortalOrLocalAdminHost(host) {
+			proxyHandler(c)
+			return
+		}
+		if opts.CertStore == nil {
+			c.String(http.StatusNotFound, "local CA store is not initialized")
+			return
+		}
+		pemBytes, err := opts.CertStore.CAPEM()
+		if err != nil {
+			c.String(http.StatusInternalServerError, "export CA: %v", err)
+			return
+		}
+		c.Header("Content-Type", "application/x-x509-ca-cert")
+		c.Header("Content-Disposition", `attachment; filename="ech-proxy-ca.crt"`)
+		c.Data(http.StatusOK, "application/x-x509-ca-cert", pemBytes)
+	}
+	r.GET("/ca.pem", caDownloadHandler)
+	r.GET("/ca.crt", caDownloadHandler)
+
+	// 自动代理配置脚本（PAC）：让用户无需修改 hosts、无需管理员 443 权限即可按需代理所有目标站点
+	r.GET("/proxy.pac", func(c *gin.Context) {
+		host := stripPort(c.Request.Host)
+		if !isPortalOrLocalAdminHost(host) {
+			proxyHandler(c)
+			return
+		}
+		proxyAddr := c.Request.Host
+		if !strings.Contains(proxyAddr, ":") {
+			p := defaultPort
+			if opts.Port > 0 {
+				p = jsonNumber(int(opts.Port))
+			}
+			proxyAddr = "127.0.0.1:" + p
+		} else {
+			_, p, _ := net.SplitHostPort(proxyAddr)
+			proxyAddr = "127.0.0.1:" + p
+		}
+		global := c.Query("mode") == "all" || c.Query("global") == "1"
+		pac := config.GeneratePAC(cfg, proxyAddr, global)
+		c.Header("Content-Type", "application/x-ns-proxy-autoconfig; charset=utf-8")
+		c.String(http.StatusOK, pac)
+	})
+
+	// 自动生成完整的 hosts 配置片段（供偏爱 443 透明反代模式的用户直接复制）
+	r.GET("/hosts.txt", func(c *gin.Context) {
+		host := stripPort(c.Request.Host)
+		if !isPortalOrLocalAdminHost(host) {
+			proxyHandler(c)
+			return
+		}
+		ip := c.DefaultQuery("ip", "127.0.0.1")
+		c.Header("Content-Type", "text/plain; charset=utf-8")
+		c.String(http.StatusOK, config.GenerateHostsBlock(cfg, ip))
+	})
+
 	r.GET("/", func(c *gin.Context) {
 		host := stripPort(c.Request.Host)
-		if host == indexHost {
+		if isPortalOrLocalAdminHost(host) {
 			servePortal(c, cfg)
 			return
 		}
@@ -52,6 +157,16 @@ func NewEngine(cfg *config.Config) *gin.Engine {
 
 	r.NoRoute(proxyHandler)
 	return r
+}
+
+func isPortalOrLocalAdminHost(host string) bool {
+	h := strings.ToLower(strings.TrimSpace(host))
+	return h == indexHost || h == "localhost" || h == "127.0.0.1" || h == "::1"
+}
+
+func jsonNumber(n int) string {
+	b, _ := json.Marshal(n)
+	return string(b)
 }
 
 func corsMiddleware() gin.HandlerFunc {
@@ -90,7 +205,11 @@ func renderUpstreamList(cfg *config.Config, requestHost string) string {
 	var sb strings.Builder
 	port := ":" + defaultPort
 	if _, p, err := net.SplitHostPort(requestHost); err == nil {
-		port = ":" + p
+		if p == "443" || p == "80" {
+			port = ""
+		} else {
+			port = ":" + p
+		}
 	}
 	entries := cfg.UpstreamOrder
 	if len(entries) == 0 {
@@ -115,8 +234,11 @@ func renderUpstreamList(cfg *config.Config, requestHost string) string {
 		if desc == "" {
 			desc = "Access " + uc.Host + " via ECH Proxy"
 		}
-		badge := strings.ToUpper(entry[:1])
-		sb.WriteString(`<div class="card"><a class="item" href="https://` + html.EscapeString(entry) + port + `/">`)
+		badge := "E"
+		if len(entry) > 0 {
+			badge = strings.ToUpper(entry[:1])
+		}
+		sb.WriteString(`<div class="card" data-entry="` + html.EscapeString(strings.ToLower(entry+" "+uc.Host+" "+desc)) + `"><a class="item" href="https://` + html.EscapeString(entry) + port + `/">`)
 		sb.WriteString(`<div class="badge" style="background:` + color + `">` + html.EscapeString(badge) + `</div>`)
 		sb.WriteString(`<div class="info"><div class="entry">` + html.EscapeString(entry) + `</div>`)
 		sb.WriteString(`<div class="desc">` + html.EscapeString(desc) + `</div>`)

@@ -142,6 +142,8 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 		CacheDir: t.TempDir(),
 	})
 	adMgr.SetWhitelist([]string{"e-hentai.org", "missav.com", "pixiv.net"})
+	// 成人网站清单（adult.txt）是去广告/注入的唯一闸门；pixiv.net 不在其中。
+	adMgr.SetAdultSites([]string{"e-hentai.org", "missav.com"})
 
 	adultHTML := `<!DOCTYPE html><html><head><title>Gallery</title><script src="https://syndication.exoclick.com/ads.js"></script></head><body><div class="ad-banner">Ad</div></body></html>`
 	cleanHTML := `<!DOCTYPE html><html><head><title>Pixiv Art</title></head><body><div class="artwork">No adult ads here</div></body></html>`
@@ -197,7 +199,7 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	}
 	adMgr.SetAllMode(false)
 
-	// 1. 虽在白名单中但未检测到成人广告的页面（pixiv.net） -> 绝不插入广告！
+	// 1. 不在成人清单中的站点（pixiv.net，即便被 pac.txt 白名单收录） -> 绝不插入广告！
 	recClean := httptest.NewRecorder()
 	reqClean := httptest.NewRequest(http.MethodGet, "https://pixiv.net/", nil)
 	reqClean.Host = "pixiv.net"
@@ -206,7 +208,7 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 		t.Errorf("whitelisted site WITHOUT adult ads must NOT have ads injected: %s", recClean.Body.String())
 	}
 
-	// 2. 真正检测到成人广告的页面（e-hentai.org 含 exoclick） -> 替换并插入自己的成人广告
+	// 2. 成人清单站点（e-hentai.org 含 exoclick） -> 替换并插入自己的成人广告
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "https://e-hentai.org/", nil)
 	req.Host = "e-hentai.org"

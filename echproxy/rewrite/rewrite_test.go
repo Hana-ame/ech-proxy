@@ -201,15 +201,18 @@ func TestBlocklistJSONEasyListHostsAndDecoupledFromCerts(t *testing.T) {
 // TestOnlyInjectWhenAdultAdsActuallyDetectedAndPACWhitelistAtomicPop 验证：
 // 1. 只有真正检测到成人广告的时候才执行替换插入自己的广告；如果没有检测到成人广告（即使站点在 pac.txt 白名单中或开启了 -all），绝不能插入自己的广告；
 // 2. PAC 白名单支持原子替换（SwapWhitelist）与旧值弹出恢复（PopWhitelist）。
-func TestOnlyInjectWhenAdultAdsActuallyDetectedAndPACWhitelistAtomicPop(t *testing.T) {
+func TestOnlyInjectOnAdultSitesListAndPACWhitelistAtomicPop(t *testing.T) {
 	mgr := NewAdScriptManager(AdScriptOptions{
-		Enabled:      true,
-		AllMode:      true,
-		WhitelistURL: "https://4545810.xyz/pac.txt",
+		Enabled:       true,
+		AllMode:       true,
+		WhitelistURL:  "https://4545810.xyz/pac.txt",
+		AdultSitesURL: "https://4545810.xyz/adult.txt",
 		FetchFn: func(u string) ([]byte, error) {
 			switch u {
 			case "https://4545810.xyz/pac.txt":
 				return []byte("// pac.txt\ne-hentai.org\n*.dlsite.com\niwara.tv\n"), nil
+			case "https://4545810.xyz/adult.txt":
+				return []byte("// adult.txt\ne-hentai.org\nmissav.com\n"), nil
 			case "https://4545810.xyz/on.txt":
 				return []byte("on\n"), nil
 			case "https://4545810.xyz/block.json":
@@ -223,6 +226,22 @@ func TestOnlyInjectWhenAdultAdsActuallyDetectedAndPACWhitelistAtomicPop(t *testi
 		t.Fatalf("RefreshOnce failed: %v", err)
 	}
 
+	// 成人网站清单（adult.txt，与 pac.txt 并列的第二个文件）才是注入闸门
+	if !mgr.IsAdultSite("e-hentai.org") || !mgr.IsAdultSite("www.missav.com") || mgr.IsAdultSite("github.com") {
+		t.Fatalf("IsAdultSite mismatch: e-hentai=%v missav=%v github=%v",
+			mgr.IsAdultSite("e-hentai.org"), mgr.IsAdultSite("www.missav.com"), mgr.IsAdultSite("github.com"))
+	}
+
+	// 成人清单的原子替换与旧值弹出
+	oldAdult := mgr.SwapAdultSites([]string{"only.example.com"})
+	if len(oldAdult) != 2 || !mgr.IsAdultSite("only.example.com") || mgr.IsAdultSite("e-hentai.org") {
+		t.Fatalf("SwapAdultSites failed: old=%v cur=%v", oldAdult, mgr.AdultSites())
+	}
+	mgr.SetAdultSites(oldAdult)
+	if !mgr.IsAdultSite("e-hentai.org") || mgr.IsAdultSite("only.example.com") {
+		t.Fatalf("SetAdultSites restore failed: %v", mgr.AdultSites())
+	}
+
 	// 验证 PAC 原子替换与旧值 pop
 	oldWL := mgr.SwapWhitelist([]string{"new-domain.example.com"})
 	if len(oldWL) != 3 || !mgr.IsWhitelisted("new-domain.example.com") || mgr.IsWhitelisted("e-hentai.org") {
@@ -233,30 +252,36 @@ func TestOnlyInjectWhenAdultAdsActuallyDetectedAndPACWhitelistAtomicPop(t *testi
 		t.Fatalf("PopWhitelist failed: ok=%v popped=%v cur=%v", ok, poppedWL, mgr.Whitelist())
 	}
 
-	// 场景 A：站点在 pac.txt 白名单中（e-hentai.org）且开启了 -all，但页面只有普通内容或普通 Google 广告（无成人广告） -> 绝不能插入广告！
-	cleanHTML := []byte(`<!DOCTYPE html><html><head><title>Gallery</title><script src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js"></script></head><body><p>Clean gallery page without adult ads</p></body></html>`)
-	outClean := string(mgr.InjectIntoHTMLForHost(cleanHTML, "e-hentai.org"))
-	if strings.Contains(outClean, "slimgather.com") || strings.Contains(outClean, "fussyreturn.com") || strings.Contains(outClean, "ech-proxy-ad-script") {
-		t.Errorf("page WITHOUT adult ads on whitelisted host must NOT have ads injected, got: %s", outClean)
+	// 场景 A：不在成人清单中的站点（即便 HTML 含成人广告）-> 绝不注入、原样返回
+	adultAdHTML := []byte(`<!DOCTYPE html><html><head><title>Video</title><script src="https://syndication.exoclick.com/ads.js"></script></head><body><div class="exo-native-widget"></div></body></html>`)
+	outA := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "not-in-adult-list.example.com"))
+	if strings.Contains(outA, "slimgather.com") || strings.Contains(outA, "ech-proxy-ad-script") {
+		t.Errorf("host NOT in adult.txt must NOT have ads injected, got: %s", outA)
 	}
-	if outClean != string(cleanHTML) {
-		t.Errorf("page WITHOUT adult ads must remain untouched, got: %s", outClean)
+	if outA != string(adultAdHTML) {
+		t.Errorf("host NOT in adult.txt must remain untouched, got: %s", outA)
 	}
 
-	// 场景 B：真正抓到成人广告内容（如 ExoClick 或 block.json 中的成人广告域名） -> 执行替换并插入自己的成人广告
-	adultAdHTML := []byte(`<!DOCTYPE html><html><head><title>Video</title><script src="https://syndication.exoclick.com/ads.js"></script></head><body><div class="exo-native-widget"></div></body></html>`)
+	// 场景 B：成人清单站点（e-hentai.org）-> 剥离原广告 + 注入自有广告 + block.json selector
 	outInjected := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "e-hentai.org"))
 	if !strings.Contains(outInjected, "slimgather.com") || !strings.Contains(outInjected, "fussyreturn.com") || !strings.Contains(outInjected, "<script>\n(function(augj){") {
-		t.Errorf("page WITH genuine adult ads must have advertiser <script> tags injected, got: %s", outInjected)
+		t.Errorf("adult-listed host must have advertiser <script> tags injected, got: %s", outInjected)
 	}
 	if strings.Contains(outInjected, "syndication.exoclick.com/ads.js") {
-		t.Errorf("page WITH genuine adult ads should strip original adult ad URL, got: %s", outInjected)
+		t.Errorf("adult-listed host should strip original adult ad URL, got: %s", outInjected)
 	}
 	if !strings.Contains(outInjected, ".custom-ero-slot") {
 		t.Errorf("injected style should include selector from block.json, got: %s", outInjected)
 	}
 
-	// 场景 C：测试 --skip-ad-script：检测到成人广告时，跳过插入广告商 JS，但仍拦截源站成人广告
+	// 场景 B2：成人清单站点 + 干净 HTML（无成人广告）-> 仍按手动清单注入（不再依赖 HTML 检测）
+	cleanHTML := []byte(`<!DOCTYPE html><html><head><title>Gallery</title></head><body><p>Clean gallery page</p></body></html>`)
+	outClean := string(mgr.InjectIntoHTMLForHost(cleanHTML, "e-hentai.org"))
+	if !strings.Contains(outClean, "slimgather.com") || !strings.Contains(outClean, "ech-proxy-ad-script") {
+		t.Errorf("adult-listed host with clean HTML should still inject (manual list), got: %s", outClean)
+	}
+
+	// 场景 C：--skip-ad-script：跳过插入广告商 JS，但仍拦截源站成人广告
 	mgr.SetSkipAdScript(true)
 	onlyBlocked := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "e-hentai.org"))
 	if strings.Contains(onlyBlocked, "slimgather.com") || strings.Contains(onlyBlocked, "fussyreturn.com") {
@@ -267,7 +292,7 @@ func TestOnlyInjectWhenAdultAdsActuallyDetectedAndPACWhitelistAtomicPop(t *testi
 	}
 	mgr.SetSkipAdScript(false)
 
-	// 场景 D：测试 --skip-ad-block：检测到成人广告时，禁止 block 源站原始广告，但仍插入广告商 JS
+	// 场景 D：--skip-ad-block：禁止 block 源站原始广告，但仍插入广告商 JS
 	mgr.SetSkipAdBlock(true)
 	onlyInjected := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "e-hentai.org"))
 	if !strings.Contains(onlyInjected, "syndication.exoclick.com/ads.js") {

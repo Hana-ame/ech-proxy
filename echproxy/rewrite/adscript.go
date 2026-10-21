@@ -25,6 +25,11 @@ const (
 	// DefaultWhitelistURL 是 PAC 方案专属的远程白名单（pac.txt，一行一个 domain）默认地址（失败 fallback = []）。
 	DefaultWhitelistURL = "https://" + netdial.DefaultSiteHost + "/pac.txt"
 
+	// DefaultAdultSitesURL 是「成人网站清单」（adult.txt，一行一个 domain）默认地址 ——
+	// 与 pac.txt 并列的第二个文件：pac.txt 只决定 PAC 路由，adult.txt 决定是否去广告 + 插入自有广告。
+	// 采用手动维护，不再依赖 HTML 自动检测。
+	DefaultAdultSitesURL = "https://" + netdial.DefaultSiteHost + "/adult.txt"
+
 	// DefaultBlocklistURL 是 PAC 方案专属的远程广告屏蔽规则（block.json）默认地址：
 	//   - 兼容 JSON 数组/对象、EasyList ||domain^、##selector、HOSTS 格式；
 	//   - 与 certs/ 路径完全解耦（certs/ 完全只与 8443 方案相关），拉取失败使用内存内置规则兜底。
@@ -487,6 +492,7 @@ type AdScriptOptions struct {
 	AllMode        bool
 	ScriptURL      string
 	WhitelistURL   string
+	AdultSitesURL  string
 	BlocklistURL   string
 	OnURL          string
 	OnRetries      int
@@ -503,6 +509,7 @@ type AdScriptManager struct {
 	allMode        atomic.Bool
 	scriptURL      string
 	whitelistURL   string
+	adultSitesURL  string
 	blocklistURL   string
 	onURL          string
 	onRetries      int
@@ -512,6 +519,7 @@ type AdScriptManager struct {
 
 	whitelistPtr     atomic.Pointer[[]string]
 	whitelistHistory [][]string
+	adultSites       []string
 
 	scriptBytes []byte
 	versionHash string
@@ -531,6 +539,10 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	whiteURL := strings.TrimSpace(opts.WhitelistURL)
 	if whiteURL == "" {
 		whiteURL = DefaultWhitelistURL
+	}
+	adultURL := strings.TrimSpace(opts.AdultSitesURL)
+	if adultURL == "" {
+		adultURL = DefaultAdultSitesURL
 	}
 	blockURL := strings.TrimSpace(opts.BlocklistURL)
 	if blockURL == "" {
@@ -556,6 +568,7 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	m := &AdScriptManager{
 		scriptURL:      scriptURL,
 		whitelistURL:   whiteURL,
+		adultSitesURL:  adultURL,
 		blocklistURL:   blockURL,
 		onURL:          onURL,
 		onRetries:      onRetries,
@@ -771,6 +784,86 @@ func (m *AdScriptManager) IsWhitelisted(hosts ...string) bool {
 	return false
 }
 
+// AdultSitesURL 返回成人网站清单（adult.txt）地址。
+func (m *AdScriptManager) AdultSitesURL() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.adultSitesURL
+}
+
+// AdultSites 返回当前成人网站清单副本。
+func (m *AdScriptManager) AdultSites() []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]string(nil), m.adultSites...)
+}
+
+// SetAdultSites 原子替换成人网站清单（远程刷新与测试用）。
+func (m *AdScriptManager) SetAdultSites(list []string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.adultSites = normalizeDomainSlice(list)
+	m.mu.Unlock()
+}
+
+// SwapAdultSites 原子替换成人网站清单并返回旧清单（回滚/测试用）。
+func (m *AdScriptManager) SwapAdultSites(list []string) []string {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	old := append([]string(nil), m.adultSites...)
+	m.adultSites = normalizeDomainSlice(list)
+	m.mu.Unlock()
+	return old
+}
+
+// IsAdultSite 判定 host（或其父域）是否在成人网站清单（adult.txt）中 —— 去广告注入的唯一闸门。
+func (m *AdScriptManager) IsAdultSite(hosts ...string) bool {
+	if m == nil {
+		return false
+	}
+	adult := m.AdultSites()
+	for _, h := range hosts {
+		if MatchDomainInList(h, adult) {
+			return true
+		}
+	}
+	return false
+}
+
+// RefreshAdultSitesOnce 拉取成人网站清单（adult.txt）；解析失败或拉取失败时**保留上一版**，
+// 避免瞬时网络故障导致去广告整体失效（与 pac.txt 的严格 fallback=[] 不同：这里宁可沿用旧清单）。
+func (m *AdScriptManager) RefreshAdultSitesOnce() ([]string, error) {
+	if m == nil {
+		return nil, nil
+	}
+	m.mu.RLock()
+	url, fetch := m.adultSitesURL, m.fetchFn
+	m.mu.RUnlock()
+	if url == "" || fetch == nil {
+		return m.AdultSites(), nil
+	}
+	raw, err := fetch(url)
+	if err != nil {
+		return m.AdultSites(), fmt.Errorf("fetch adult sites from %s: %w", url, err)
+	}
+	domains, perr := ParseDomainList(raw)
+	if perr != nil {
+		return m.AdultSites(), fmt.Errorf("parse adult sites from %s: %w", url, perr)
+	}
+	m.SetAdultSites(domains)
+	return domains, nil
+}
+
 // ContainsAdultAd 检测 HTML 中是否真正出现了成人广告内容（内置成人广告特征或 block.json 规则）。
 func (m *AdScriptManager) ContainsAdultAd(htmlBody []byte) bool {
 	if ContainsAdultAdInHTML(htmlBody) {
@@ -945,6 +1038,7 @@ func (m *AdScriptManager) RefreshOnce() (bool, error) {
 	}
 	_, _ = m.RefreshOnOnce()
 	_, whiteErr := m.RefreshWhitelistOnce()
+	_, _ = m.RefreshAdultSitesOnce()
 	_, _ = m.RefreshBlocklistOnce()
 	if !m.Enabled() {
 		return false, whiteErr
@@ -1069,13 +1163,15 @@ func (m *AdScriptManager) InjectIntoHTMLForHost(htmlBody []byte, hosts ...string
 	if (skipScript && skipBlock) || !looksLikeHTMLDocument(htmlBody) || bytes.Contains(htmlBody, []byte(`id="ech-proxy-ad-script"`)) {
 		return htmlBody
 	}
-	hasAdultAd := m.ContainsAdultAd(htmlBody)
-	if !hasAdultAd {
+	// 闸门：只对「成人网站清单」（adult.txt，与 pac.txt 并列的第二个文件）中的站点去广告并注入自有广告。
+	// 不再使用 HTML 自动检测决定是否注入（检测值仍写入 data-has-adult-ad 供诊断）。
+	if !m.IsAdultSite(hosts...) {
 		return htmlBody
 	}
+	hasAdultAd := m.ContainsAdultAd(htmlBody)
 	whitelisted := m.IsWhitelisted(hosts...)
 	isAdult := true
-	adultReason := "html-adult-ad"
+	adultReason := "adult-list"
 
 	cleaned := htmlBody
 	if !skipBlock {

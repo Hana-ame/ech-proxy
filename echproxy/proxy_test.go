@@ -17,6 +17,7 @@ import (
 
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
 	"github.com/Hana-ame/ech-proxy/echproxy/cookie"
+	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
 	"github.com/Hana-ame/ech-proxy/echproxy/logger"
 	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
 	"github.com/gin-gonic/gin"
@@ -363,5 +364,92 @@ func TestIssue21AndAutoTransparentReverseProxy(t *testing.T) {
 		if resp.TLS == nil || len(resp.TLS.PeerCertificates) < 2 {
 			t.Errorf("%s expected full certificate chain (>=2 certs), got %d", sni, len(resp.TLS.PeerCertificates))
 		}
+	}
+}
+
+// TestCertWarningPage 验证上游证书校验失败时渲染区分「过期 / 不一致」的 HTML 警告页，
+// 且页面含「强行访问」按钮（?__ech_proxy_force_cert__=1）。两类提示不得混用文案。
+func TestCertWarningPage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	orig := roundTripFn
+	defer func() { roundTripFn = orig }()
+
+	cfg := &config.Config{
+		Upstreams: config.UpstreamMap{
+			"t.l.moonchan.xyz": {Host: "truedomain.com"},
+		},
+	}
+	engine := NewEngine(cfg)
+
+	// 1. 过期 -> 502 + text/html 警告页，含「已过期」与「强行访问」按钮
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		return nil, fmt.Errorf("dial upstream: %w", cloudflare_ech.ErrCertExpired)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path", nil)
+	req.Host = "t.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("expired: status=%d, want 502", rec.Code)
+	}
+	if ct := rec.Result().Header.Get("Content-Type"); !strings.Contains(ct, "text/html") {
+		t.Fatalf("expired: content-type=%q, want text/html", ct)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "已过期") {
+		t.Errorf("expired page missing 「已过期」 text: %s", body)
+	}
+	if !strings.Contains(body, "强行访问") || !strings.Contains(body, forceCertQueryParam) {
+		t.Errorf("expired page missing force-access button (%s): %s", forceCertQueryParam, body)
+	}
+	if strings.Contains(body, "不一致") {
+		t.Errorf("expired page must NOT contain 「不一致」 text: %s", body)
+	}
+
+	// 2. 不一致 -> 502 + text/html 警告页，含「不一致」与「强行访问」按钮
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		return nil, fmt.Errorf("dial upstream: %w", cloudflare_ech.ErrCertMismatch)
+	}
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path", nil)
+	req2.Host = "t.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec2, req2)
+	body2 := rec2.Body.String()
+	if !strings.Contains(body2, "不一致") {
+		t.Errorf("mismatch page missing 「不一致」 text: %s", body2)
+	}
+	if !strings.Contains(body2, "强行访问") || !strings.Contains(body2, forceCertQueryParam) {
+		t.Errorf("mismatch page missing force-access button: %s", body2)
+	}
+	if strings.Contains(body2, "已过期") {
+		t.Errorf("mismatch page must NOT contain 「已过期」 text: %s", body2)
+	}
+
+	// 3. 强行访问覆盖：无参时上游返回证书错误 -> 警告页；带 ?__ech_proxy_force_cert__=1 -> 跳过校验直接放行上游
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		if !cloudflare_ech.AllowBadCert(req.Context()) {
+			return nil, fmt.Errorf("dial upstream: %w", cloudflare_ech.ErrCertMismatch)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/plain; charset=utf-8"}},
+			Body:       io.NopCloser(strings.NewReader("forced-ok")),
+		}, nil
+	}
+	// 3a. 无参 -> 警告页（不一致）
+	rec3a := httptest.NewRecorder()
+	req3a := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path", nil)
+	req3a.Host = "t.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec3a, req3a)
+	if rec3a.Code != http.StatusBadGateway || !strings.Contains(rec3a.Body.String(), "不一致") {
+		t.Fatalf("no force param: want 502+不一致 page, got status=%d body=%q", rec3a.Code, rec3a.Body.String())
+	}
+	// 3b. 带参 -> 跳过校验，直接放行上游
+	rec3b := httptest.NewRecorder()
+	req3b := httptest.NewRequest(http.MethodGet, "https://t.l.moonchan.xyz:8443/path?"+forceCertQueryParam+"=1", nil)
+	req3b.Host = "t.l.moonchan.xyz:8443"
+	engine.ServeHTTP(rec3b, req3b)
+	if rec3b.Code != http.StatusOK || rec3b.Body.String() != "forced-ok" {
+		t.Fatalf("force-access should bypass cert check and serve upstream, got status=%d body=%q", rec3b.Code, rec3b.Body.String())
 	}
 }

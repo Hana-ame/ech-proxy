@@ -3,6 +3,8 @@ package echproxy
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -32,6 +34,10 @@ func debugLogf(format string, args ...any) {
 const (
 	writeTimeout        = 30 * time.Minute
 	maxSelfRedirectHops = 3
+
+	// forceCertQueryParam 是证书警告页「强行访问」按钮的覆盖参数名。
+	// 命中 ?__ech_proxy_force_cert__=1 时跳过上游证书校验继续连接（用户在看到过期/不一致警告后明确选择继续）。
+	forceCertQueryParam = "__ech_proxy_force_cert__"
 )
 
 // roundTripFn 供单元测试注入自定义传输层使用，生产环境默认调用 cloudflare_ech.RoundTrip。
@@ -123,6 +129,11 @@ func ProxyHandlerWithOptions(upstreams config.UpstreamMap, blockedHosts []string
 		// 3. 通过 ECH / SNI / Direct 隧道发送请求
 		resp, err := roundTripFn(outReq, uc.Mode, uc.IPMode)
 		if err != nil {
+			// 上游证书校验失败（过期/不一致）：渲染区分类型的 HTML 警告页（含强行访问按钮），替代 502
+			if kind, certHost, detail, ok := cloudflare_ech.ClassifyCertError(err); ok {
+				serveCertWarningPage(c, kind, certHost, detail, host, uc.Host)
+				return
+			}
 			log.Printf("[%s] Upstream request failed (%s): %v", clientIP, uc.Host, err)
 			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
 			c.String(http.StatusBadGateway, "upstream: %v", err)
@@ -198,7 +209,20 @@ func buildUpstreamRequest(c *gin.Context, uc config.UpstreamConfig) (*http.Reque
 		reqURI = "/" + reqURI
 	}
 
+	// 「强行访问」覆盖：用户在证书警告页点击继续后，请求带 ?__ech_proxy_force_cert__=1。
+	// 注入跳过上游证书校验的标记，并从发往上游的 URI 中剥离该参数（不外泄给上游）。
+	forceAllowCert := c.Query(forceCertQueryParam) == "1"
 	reqCtx := cloudflare_ech.WithSNIServerName(c.Request.Context(), uc.SNIServerName)
+	if forceAllowCert {
+		reqCtx = cloudflare_ech.WithAllowBadCert(reqCtx)
+		if u, perr := url.Parse(reqURI); perr == nil {
+			q := u.Query()
+			q.Del(forceCertQueryParam)
+			u.RawQuery = q.Encode()
+			reqURI = u.RequestURI()
+		}
+	}
+
 	outReq, err := http.NewRequestWithContext(reqCtx, c.Request.Method, "https://"+uc.Host+reqURI, c.Request.Body)
 	if err != nil {
 		return nil, err
@@ -376,4 +400,114 @@ func extractPort(hostport string) string {
 		return p
 	}
 	return ""
+}
+
+// serveCertWarningPage 在上游证书校验失败（过期/不一致）时向客户端渲染区分类型的 HTML 警告页。
+// MITM/反代通道此时客户端 TLS 已建立（覆盖证书），客户端无法自行判断上游真实证书，故由代理代为提示。
+// 警告页含「强行访问」按钮：点击后以 ?__ech_proxy_force_cert__=1 重新请求并跳过校验。
+func serveCertWarningPage(c *gin.Context, kind, certHost, detail, requestHost, upstreamHost string) {
+	rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+	forceURL := forceAccessURL(c.Request.URL, c.Request.Host)
+	htmlBody := buildCertWarningHTML(kind, certHost, detail, requestHost, upstreamHost, forceURL)
+	c.Header("Content-Type", "text/html; charset=utf-8")
+	c.Header("Cache-Control", "no-store")
+	c.Writer.WriteHeader(http.StatusBadGateway) // 502 + HTML 警告体（浏览器渲染警告页而非裸 502）
+	_, _ = c.Writer.Write([]byte(htmlBody))
+}
+
+// forceAccessURL 构造「强行访问」目标：原请求 URL 追加 ?__ech_proxy_force_cert__=1。
+// 不修改传入的 *url.URL。
+func forceAccessURL(u *url.URL, requestHost string) string {
+	var clone url.URL
+	if u != nil {
+		clone = *u // 拷贝结构体值，避免改动原始 c.Request.URL
+	}
+	q := clone.Query()
+	q.Set(forceCertQueryParam, "1")
+	clone.RawQuery = q.Encode()
+	scheme := clone.Scheme
+	if scheme == "" {
+		scheme = "https"
+	}
+	host := requestHost
+	if host == "" {
+		host = clone.Host
+	}
+	return scheme + "://" + host + clone.RequestURI()
+}
+
+const certWarningHTMLTemplate = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#1a1d23;color:#e6e6e6;font-family:-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;line-height:1.6}
+.wrap{max-width:720px;margin:0 auto;padding:48px 24px}
+h1{font-size:22px;margin:0 0 18px}
+.box{background:#262b33;border:1px solid #3a3f4a;border-radius:10px;padding:20px 22px;margin:14px 0}
+.box.warn{border-color:#d97706}
+.box.danger{border-color:#dc2626}
+code{background:#11141a;padding:2px 6px;border-radius:4px;color:#5ce1e6;font-size:13px}
+.detail{background:#11141a;border-radius:6px;padding:12px 14px;font-family:ui-monospace,Consolas,monospace;font-size:12px;color:#9aa0a6;word-break:break-all;white-space:pre-wrap;margin-top:14px}
+.btns{margin-top:22px;display:flex;gap:12px;flex-wrap:wrap}
+a.btn{display:inline-block;padding:11px 20px;border-radius:6px;text-decoration:none;font-weight:600;font-size:14px}
+a.force{background:#dc2626;color:#fff}
+a.force:hover{background:#b91c1c}
+a.back{background:#3a3f4a;color:#e6e6e6}
+.muted{color:#6b7280;font-size:12px;margin-top:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>{{HEADLINE}}</h1>
+<div class="box {{CLASS}}">
+{{EXPLAIN}}
+<div class="detail">{{DETAIL}}</div>
+</div>
+<div class="box">
+<p style="margin:0 0 8px"><strong>为什么会看到这个页面？</strong></p>
+<p style="margin:0;color:#9aa0a6;line-height:1.6">ech-proxy 在 MITM 模式下用本地 CA 覆盖了客户端证书，你的浏览器无法自行判断上游真实证书。代理代为校验了上游 <code>{{UPSTREAM}}</code> 返回的证书并发现了上述问题。</p>
+</div>
+<div class="btns">
+<a class="btn force" href="{{FORCE_URL}}">强行访问（不安全）</a>
+<a class="btn back" href="/">返回门户</a>
+</div>
+<p class="muted">强行访问将跳过证书校验继续连接上游，存在中间人风险，请仅在你确信安全时使用。</p>
+</div>
+</body>
+</html>`
+
+// buildCertWarningHTML 渲染区分「过期」与「不一致」的证书警告页。
+func buildCertWarningHTML(kind, certHost, detail, requestHost, upstreamHost, forceURL string) string {
+	var title, headline, class, explain string
+	switch kind {
+	case "expired":
+		title = "上游证书已过期 - ech-proxy"
+		headline = "⚠ 上游证书已过期或尚未生效"
+		class = "warn"
+		explain = fmt.Sprintf("代理连接上游 <code>%s</code> 时，其返回的证书时间有效性校验未通过。可能站点证书已过期，或服务器/本机时间有误。", html.EscapeString(upstreamHost))
+	case "mismatch":
+		title = "上游证书不一致 - ech-proxy"
+		headline = "⚠ 上游证书与请求域名不一致"
+		class = "danger"
+		explain = fmt.Sprintf("代理连接上游 <code>%s</code> 时，其返回的证书未覆盖真实请求域名 <code>%s</code>。这可能意味着遭遇了中间人攻击，或连接到了错误的服务器。", html.EscapeString(upstreamHost), html.EscapeString(certHost))
+	default:
+		title = "上游证书校验失败 - ech-proxy"
+		headline = "⚠ 上游证书校验失败"
+		class = "warn"
+		explain = fmt.Sprintf("代理连接上游 <code>%s</code> 时证书校验未通过。", html.EscapeString(upstreamHost))
+	}
+	out := certWarningHTMLTemplate
+	repl := func(k, v string) { out = strings.ReplaceAll(out, k, v) }
+	repl("{{TITLE}}", html.EscapeString(title))
+	repl("{{HEADLINE}}", html.EscapeString(headline))
+	repl("{{CLASS}}", class)
+	repl("{{EXPLAIN}}", explain) // explain 已用 html.EscapeString 转义其内部片段，整体为受信片段
+	repl("{{DETAIL}}", html.EscapeString(detail))
+	repl("{{UPSTREAM}}", html.EscapeString(upstreamHost))
+	repl("{{FORCE_URL}}", html.EscapeString(forceURL))
+	return out
 }

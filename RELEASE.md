@@ -1,3 +1,21 @@
+## v3.0.0
+
+### Changes & Features
+
+- **Upstream certificate validation in the SNI-camouflage path (MITM cert-override gap)** — Because ech-proxy in MITM mode presents its own locally-trusted CA leaf to the client, the client can no longer see or judge the *real* upstream certificate. The proxy now validates the upstream cert itself on the SNI-front dial (`ech/sni.go:dialUTLS`), **right after the TLS handshake**, without touching the disguise:
+  - Reads the peer certificate the server returns, then checks **(1) time validity** (`NotBefore`/`NotAfter`) and **(2) hostname coverage of the *real* requested domain** (`leaf.VerifyHostname(realDomain)`).
+  - The fake SNI (`cloudflare-ech.com` by default) and `InsecureSkipVerify` are **kept intact** — verification is against the real domain, never against the disguised SNI (the sent fake domain and the returned cert's domain are necessarily different, so SNI-matching is semantically wrong here). Disguise is not sacrificed.
+  - Two **distinctly-worded** HTML warning pages (HTTP 502 + `text/html`):
+    - **Expired / not yet valid** → 「上游证书已过期或尚未生效」(amber).
+    - **Hostname mismatch** (cert not valid for the requested domain — possible MITM or wrong server) → 「上游证书与请求域名不一致」(red).
+  - **「强行访问」(Force Access) button** on each warning page. Clicking re-requests the same URL with `?__ech_proxy_force_cert__=1`; the proxy injects a `WithAllowBadCert` context flag (stripping the param before it reaches upstream), so the cert check is skipped and the upstream is served — an explicit user opt-in, like a browser's "proceed anyway".
+  - `RoundTrip`'s auto fallback chain (ECH ↔ SNI ↔ direct) now **propagates cert errors immediately** instead of masking them behind a fallback attempt, so the warning page always surfaces.
+- **Tests** — `ech/certcheck_test.go` covers expired / not-yet-valid / mismatch / valid / wildcard / force-bypass / no-cert / time-first-precedence / classify-non-cert-error. `proxy_test.go:TestCertWarningPage` asserts the distinct expired vs mismatch pages render with the force-access button and that `?__ech_proxy_force_cert__=1` bypasses the check end-to-end.
+
+### Notes
+
+- Only the SNI-camouflage path performs this manual check this release (it is the one that previously used `InsecureSkipVerify:true`). The ECH (`ech/client.go:newTransport`) and plain-Direct (`netdial`) paths already verify normally and were left unchanged. Chain/trust-root verification is not added (only hostname + time, per the two failure categories); self-signed-but-correct-hostname is a known gap to be addressed in a follow-up if needed.
+
 ## v2.2.0
 
 ### Changes & Features

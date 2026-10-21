@@ -148,6 +148,10 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	if resp != nil {
 		resp.Body.Close()
 	}
+	// 上游证书校验失败（过期/不一致）：立即上抛走警告页，绝不切换备选模式掩盖
+	if IsCertError(err) {
+		return nil, err
+	}
 	clearCachedRoute(host)
 
 	// 首选模式失败：自动无感切换另一模式
@@ -155,11 +159,17 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	if primary == "sni" {
 		secondary = "ech"
 	}
-	if resp2, err2 := doSingleMode(req, secondary, normIPMode); err2 == nil && !isCloudflareRouteRejection(resp2, secondary) {
+	resp2, err2 := doSingleMode(req, secondary, normIPMode)
+	if err2 == nil && !isCloudflareRouteRejection(resp2, secondary) {
 		setCachedRoute(host, secondary)
 		return resp2, nil
-	} else if resp2 != nil {
+	}
+	if resp2 != nil {
 		resp2.Body.Close()
+	}
+	// 备选模式同样可能命中证书校验失败：立即上抛走警告页
+	if IsCertError(err2) {
+		return nil, err2
 	}
 
 	// 兜底尝试标准直连
@@ -313,7 +323,7 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 	return ips, nil
 }
 
-func dialUTLS(ctx context.Context, ip, sniName string, nextProtos []string) (*utls.UConn, error) {
+func dialUTLS(ctx context.Context, ip, sniName, host string, nextProtos []string) (*utls.UConn, error) {
 	rawConn, err := (&net.Dialer{
 		Timeout:   dialTimeout,
 		KeepAlive: 30 * time.Second,
@@ -322,19 +332,26 @@ func dialUTLS(ctx context.Context, ip, sniName string, nextProtos []string) (*ut
 		return nil, err
 	}
 	uConn := utls.UClient(rawConn, &utls.Config{
-		ServerName:         sniName,
-		InsecureSkipVerify: true,
+		ServerName:         sniName, // 伪装 SNI（假域名），保持不变
+		InsecureSkipVerify: true,   // 不由 utls 做主机名校验（假 SNI 与证书域名必然不同），改由下方手动校验
 		NextProtos:         nextProtos,
 	}, utls.HelloChrome_120)
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		rawConn.Close()
 		return nil, err
 	}
+	// MITM 覆盖证书后客户端看不到上游真实证书，故由代理代为校验「返回的证书」：
+	// 时间有效性 + 是否覆盖真实请求域名 host（不比对假 SNI）。失败则中断并返回证书错误。
+	// 伪装（假 SNI + InsecureSkipVerify）保持不变。ctx 命中 WithAllowBadCert 时跳过（强行访问）。
+	if cerr := validateUpstreamCert(ctx, host, uConn.ConnectionState().PeerCertificates); cerr != nil {
+		rawConn.Close()
+		return nil, cerr
+	}
 	return uConn, nil
 }
 
-func getSNIH2Transport(ip, sniName string) *http2.Transport {
-	key := ip + "|" + sniName
+func getSNIH2Transport(ip, sniName, host string) *http2.Transport {
+	key := ip + "|" + sniName + "|" + host
 	sniTransMu.Lock()
 	defer sniTransMu.Unlock()
 	if t, ok := sniH2Trans[key]; ok {
@@ -343,7 +360,7 @@ func getSNIH2Transport(ip, sniName string) *http2.Transport {
 	t := &http2.Transport{
 		AllowHTTP: false,
 		DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
-			uConn, err := dialUTLS(ctx, ip, sniName, []string{"h2", "http/1.1"})
+			uConn, err := dialUTLS(ctx, ip, sniName, host, []string{"h2", "http/1.1"})
 			if err != nil {
 				return nil, err
 			}
@@ -365,8 +382,8 @@ func getSNIH2Transport(ip, sniName string) *http2.Transport {
 	return t
 }
 
-func getSNIH1Client(ip, sniName string) *http.Client {
-	key := ip + "|" + sniName
+func getSNIH1Client(ip, sniName, host string) *http.Client {
+	key := ip + "|" + sniName + "|" + host
 	sniTransMu.Lock()
 	defer sniTransMu.Unlock()
 	if c, ok := sniH1Clients[key]; ok {
@@ -374,7 +391,7 @@ func getSNIH1Client(ip, sniName string) *http.Client {
 	}
 	tr := &http.Transport{
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dialUTLS(ctx, ip, sniName, []string{"http/1.1"})
+			return dialUTLS(ctx, ip, sniName, host, []string{"http/1.1"})
 		},
 		MaxIdleConns:    32,
 		IdleConnTimeout: 90 * time.Second,
@@ -428,13 +445,13 @@ func SNIFrontDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 
 	var lastErr error
 	for _, ip := range ips {
-		resp, err := getSNIH2Transport(ip, sniName).RoundTrip(req)
+		resp, err := getSNIH2Transport(ip, sniName, host).RoundTrip(req)
 		if err == nil {
 			return resp, nil
 		}
 		// 若源站仅支持 HTTP/1.1，自动回退至 uTLS HTTP/1.1 传输
 		if strings.Contains(err.Error(), "not h2") {
-			if resp1, err1 := getSNIH1Client(ip, sniName).Do(req); err1 == nil {
+			if resp1, err1 := getSNIH1Client(ip, sniName, host).Do(req); err1 == nil {
 				return resp1, nil
 			} else {
 				err = err1

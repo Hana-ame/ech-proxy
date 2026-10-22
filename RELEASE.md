@@ -1,3 +1,14 @@
+## v3.5.20
+
+### Fixes & Improvements
+
+- **彻底根治 DoH 自解析协程爆炸风暴（Goroutine Fork-Bomb）与相互递归 4~5GB 内存耗尽**:
+  - **DoH 自解析重入守卫**：在 `netdial` 中新增 `WithInsideDoH` / `IsInsideDoH` 上下文标记与 `isSelfDoHHost` 短路机制，处于 DoH 请求内部拨号或解析 DoH 自身域名时直接走 IP 直连的 Bootstrap DoH（`1.1.1.1` / `1.0.0.1`），彻底阻断无限递归派生数十万协程导致的内存暴涨；
+  - **切断 ResolveHostIPsByMode 与 ResolveIPs 双向递归环路**：兜底调用严格直接走 `ResolveViaBootstrapDoH`，切断相互调用环路；同时过滤 DoH 返回的 `127.0.0.1` / `0.0.0.0` 污染地址防代理自连死循环；
+  - **Singleflight 并发合并与受限淘汰缓存**：在域名解析、ECH 配置获取与 Bootstrap DoH 中全面接入 Singleflight 并发请求合并（冷启动数十并发合并为 1 次请求）与容量/TTL 淘汰，复用长连接；
+  - **根治 `http.Transport.Clone()` 泄漏与连接池膨胀**：`PlainHTTPDo` 直接复用共享传输客户端，`doDohRequest` 按目标池化复用 Transport；
+  - **大响应体流式复用与并发下载限流**：`proxy` 与 `CONNECT` 隧道统一通过 32KB 缓冲池复用，规则重写增加快速跳过零拷贝，二进制更新下载并发度限制为 2。
+
 ## v3.5.19
 
 ### Fixes & Improvements

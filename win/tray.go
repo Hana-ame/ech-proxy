@@ -9,7 +9,7 @@ import (
 	"github.com/Hana-ame/ech-proxy/echproxy"
 )
 
-const DefaultFeedbackURL = "https://chatto.moonchan.xyz"
+const DefaultFeedbackURL = "https://chatto.4545810.xyz"
 
 const (
 	TrayCmdToggleConsole uintptr = 1001

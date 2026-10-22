@@ -231,8 +231,8 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 	if strings.Contains(rec2.Body.String(), "remote ad inserted") {
 		t.Errorf("expected no advertiser script when --skip-ad-script is enabled")
 	}
-	if strings.Contains(rec2.Body.String(), "syndication.exoclick.com") {
-		t.Errorf("expected original exoclick ad still stripped when only --skip-ad-script is set")
+	if !strings.Contains(rec2.Body.String(), "syndication.exoclick.com") {
+		t.Errorf("expected original HTML preserved and streamed directly when --skip-ad-script is set")
 	}
 	adMgr.SetSkipAdScript(false)
 
@@ -618,3 +618,47 @@ func TestHeadAndNoContentResponsesPreserveHeaders(t *testing.T) {
 		t.Errorf("204 response must not have injected body, got %q", rec204.Body.String())
 	}
 }
+
+// TestDirectStreamWhenNoRewriteRequired 验证 v3.5.0：
+// 无 adblock 需求或无需改写的请求（如 pixiv.net 的 HTML/JSON/JS/CSS，非成人站点内容），
+// 一律直接流式传输给客户端，不经过内存全部读入 (io.ReadAll) 再写。
+func TestDirectStreamWhenNoRewriteRequired(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	orig := roundTripFn
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		// 模拟一个大文本响应，带有 Content-Type: text/html
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"text/html; charset=utf-8"},
+			},
+			Body: io.NopCloser(strings.NewReader("<html><body>Normal Page Content</body></html>")),
+		}, nil
+	}
+	defer func() { roundTripFn = orig }()
+
+	adMgr := NewAdScriptManager(AdScriptOptions{
+		Enabled: true,
+	})
+	// e-hentai.org 是成人站点，pixiv.net 不是
+	adMgr.SetAdultSites([]string{"e-hentai.org"})
+
+	engine := NewEngineWithOptions(EngineOptions{
+		Config:   &config.Config{},
+		AdScript: adMgr,
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://www.pixiv.net/", nil)
+	req.Host = "www.pixiv.net"
+	engine.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("pixiv.net status = %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != "<html><body>Normal Page Content</body></html>" {
+		t.Fatalf("pixiv.net body altered: got %q", rec.Body.String())
+	}
+}
+

@@ -229,7 +229,7 @@ func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 	}
 	joined := strings.Join(titles, " | ")
 	for _, mustHave := range []string{
-		"反馈 (https://chatto.moonchan.xyz)",
+		"反馈 (https://chatto.4545810.xyz)",
 		"强制 v4 出口",
 		"强制 v6 出口",
 		"双端出口",
@@ -282,8 +282,8 @@ func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 	if !gotUpdateChecked {
 		t.Errorf("TrayCmdCheckUpdate did not invoke CheckUpdateFn")
 	}
-	if gotOpenedURL != "https://chatto.moonchan.xyz" {
-		t.Errorf("TrayCmdOpenFeedback opened %q, want https://chatto.moonchan.xyz", gotOpenedURL)
+	if gotOpenedURL != "https://chatto.4545810.xyz" {
+		t.Errorf("TrayCmdOpenFeedback opened %q, want https://chatto.4545810.xyz", gotOpenedURL)
 	}
 
 	tc.HandleCommand(TrayCmdToggleConsole)

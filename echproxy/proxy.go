@@ -364,6 +364,40 @@ func clearHeaders(h http.Header) {
 	}
 }
 
+func needsBodyRewrite(c *gin.Context, requestHost string, uc config.UpstreamConfig, resp *http.Response, rewriter func([]byte, string) []byte, adScript *rewrite.AdScriptManager) bool {
+	if c.Request.Method == http.MethodHead ||
+		resp.StatusCode == http.StatusNoContent ||
+		resp.StatusCode == http.StatusNotModified ||
+		(resp.StatusCode >= 100 && resp.StatusCode < 200) {
+		return false
+	}
+	if resp.ContentLength > rewrite.MaxRewriteSize {
+		return false
+	}
+
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	isHTML := strings.Contains(contentType, "text/html")
+
+	// 1. 显式配置了重写器（如 8443 门户模式下的 URL 映射）且为文本
+	if rewriter != nil && rewrite.IsTextContent(contentType) {
+		return true
+	}
+
+	// 2. 门户域下的 ServiceWorker 注册脚本注入
+	if isHTML && uc.SWInject && config.IsPortalDomain(requestHost) {
+		return true
+	}
+
+	// 3. 广告脚本注入：仅当为 text/html、命中 adult.txt 成人站点、启用了脚本注入且脚本内容非空时才拦截重写
+	if isHTML && adScript != nil && !adScript.SkipAdScript() && len(adScript.ScriptBytes()) > 0 {
+		if adScript.IsAdultSite(requestHost, uc.Host) {
+			return true
+		}
+	}
+
+	return false
+}
+
 func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConfig, resp *http.Response, rewriter func([]byte, string) []byte, port string, adScript *rewrite.AdScriptManager) {
 	if c.Request.Method == http.MethodHead ||
 		resp.StatusCode == http.StatusNoContent ||
@@ -375,67 +409,66 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 
 	rc := http.NewResponseController(c.Writer)
 
-	if (rewriter != nil || adScript != nil) && rewrite.IsTextContent(resp.Header.Get("Content-Type")) &&
-		(resp.ContentLength <= 0 || resp.ContentLength <= rewrite.MaxRewriteSize) {
-
-		body, err := io.ReadAll(io.LimitReader(resp.Body, rewrite.MaxRewriteSize+1))
-		if err != nil || len(body) > rewrite.MaxRewriteSize {
-			if len(body) > 0 {
-				_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
-				if _, werr := c.Writer.Write(body); werr != nil {
-					return
-				}
-			}
-			if err == nil {
-				streamRemainingBody(c, rc, resp.Body)
-			}
-			return
-		}
-
-		origEnc := resp.Header.Get("Content-Encoding")
-		plain, derr := rewrite.DecompressBody(body, origEnc)
-		if derr != nil {
-			c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
-			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
-			_, _ = c.Writer.Write(body)
-			return
-		}
-
-		if rewriter != nil {
-			plain = rewriter(plain, port)
-		}
-
-		isHTML := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html")
-		if isHTML && adScript != nil && (!adScript.SkipAdScript() || !adScript.SkipAdBlock()) {
-			beforeLen := len(plain)
-			plain = adScript.InjectIntoHTMLForHost(plain, requestHost, uc.Host)
-			if len(plain) != beforeLen {
-				c.Writer.Header().Del("Content-Security-Policy")
-				c.Writer.Header().Del("Content-Security-Policy-Report-Only")
-			}
-		}
-
-		if isHTML && uc.SWInject && config.IsPortalDomain(requestHost) && !bytes.Contains(plain, []byte("serviceWorker")) {
-			reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
-			if idx := bytes.Index(plain, []byte("</head>")); idx >= 0 {
-				plain = append(plain[:idx], append(reg, plain[idx:]...)...)
-			} else {
-				plain = append(plain, reg...)
-			}
-		}
-
-		c.Writer.Header().Del("Content-Encoding")
-		if compressed, enc := rewrite.CompressBody(plain, origEnc, c.Request.Header.Get("Accept-Encoding")); enc != "" {
-			plain = compressed
-			c.Writer.Header().Set("Content-Encoding", enc)
-		}
-		c.Writer.Header().Set("Content-Length", strconv.Itoa(len(plain)))
-		_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
-		_, _ = c.Writer.Write(plain)
+	// 没有 adblock 需求且无需改写的请求，一律直接流式传输给客户端，不经过内存全部读入再写
+	if !needsBodyRewrite(c, requestHost, uc, resp, rewriter, adScript) {
+		streamRemainingBody(c, rc, resp.Body)
 		return
 	}
 
-	streamRemainingBody(c, rc, resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, rewrite.MaxRewriteSize+1))
+	if err != nil || len(body) > rewrite.MaxRewriteSize {
+		if len(body) > 0 {
+			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+			if _, werr := c.Writer.Write(body); werr != nil {
+				return
+			}
+		}
+		if err == nil {
+			streamRemainingBody(c, rc, resp.Body)
+		}
+		return
+	}
+
+	origEnc := resp.Header.Get("Content-Encoding")
+	plain, derr := rewrite.DecompressBody(body, origEnc)
+	if derr != nil {
+		c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+		_, _ = c.Writer.Write(body)
+		return
+	}
+
+	if rewriter != nil {
+		plain = rewriter(plain, port)
+	}
+
+	isHTML := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html")
+	if isHTML && adScript != nil && !adScript.SkipAdScript() {
+		beforeLen := len(plain)
+		plain = adScript.InjectIntoHTMLForHost(plain, requestHost, uc.Host)
+		if len(plain) != beforeLen {
+			c.Writer.Header().Del("Content-Security-Policy")
+			c.Writer.Header().Del("Content-Security-Policy-Report-Only")
+		}
+	}
+
+	if isHTML && uc.SWInject && config.IsPortalDomain(requestHost) && !bytes.Contains(plain, []byte("serviceWorker")) {
+		reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
+		if idx := bytes.Index(plain, []byte("</head>")); idx >= 0 {
+			plain = append(plain[:idx], append(reg, plain[idx:]...)...)
+		} else {
+			plain = append(plain, reg...)
+		}
+	}
+
+	c.Writer.Header().Del("Content-Encoding")
+	if compressed, enc := rewrite.CompressBody(plain, origEnc, c.Request.Header.Get("Accept-Encoding")); enc != "" {
+		plain = compressed
+		c.Writer.Header().Set("Content-Encoding", enc)
+	}
+	c.Writer.Header().Set("Content-Length", strconv.Itoa(len(plain)))
+	_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+	_, _ = c.Writer.Write(plain)
 }
 
 func streamRemainingBody(c *gin.Context, rc *http.ResponseController, body io.Reader) {

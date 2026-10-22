@@ -1,3 +1,13 @@
+## v3.5.0
+
+### Changes & Features
+
+- **全链路直接流式传输 (Full-Pipeline Direct Streaming)**:
+  - 移除了由于 AdBlock 需求而导致的响应体全量读入内存缓存机制 (`io.ReadAll`)。
+  - 所有无需改写的请求（普通站点如 Pixiv 的 HTML、API JSON、JavaScript、CSS、图片、音视频等），一律直接流式分块实时写出给客户端，首包即达（TTFB 趋近直连），彻底消除内存等待延迟。
+- **官方讨论区链接更新 (Feedback URL Update)**:
+  - 托盘右键菜单中的反馈链接与文档更新为 `https://chatto.4545810.xyz`。
+
 ## v3.4.3
 
 ### Fixes & Improvements

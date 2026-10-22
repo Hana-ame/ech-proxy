@@ -34,6 +34,10 @@ on:
       - ".github/workflows/ech-proxy-flutter-ffi.yml"
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   ffi-contract:
     runs-on: ubuntu-latest

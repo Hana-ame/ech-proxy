@@ -15,6 +15,10 @@ on:
       - ".gitignore"
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-and-verify:
     runs-on: ubuntu-latest
@@ -30,11 +34,17 @@ jobs:
       - name: Install dependencies
         run: go mod download
 
-      - name: Run go vet across all packages (Linux & Windows targets)
+      - name: Run go vet across all packages (Linux & Windows targets in parallel)
         run: |
-          go vet ./...
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...
-          GOOS=windows GOARCH=386   CGO_ENABLED=0 go vet ./...
+          go vet ./... &
+          PID1=$!
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./... &
+          PID2=$!
+          GOOS=windows GOARCH=386   CGO_ENABLED=0 go vet ./... &
+          PID3=$!
+          wait $PID1
+          wait $PID2
+          wait $PID3
 
       - name: Validate upstream.json configuration
         run: go run ./win check -config certs/l.moonchan.xyz/upstream.json

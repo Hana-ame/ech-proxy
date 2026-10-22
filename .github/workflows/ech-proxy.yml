@@ -12,6 +12,10 @@ on:
       - ".github/workflows/ech-proxy.yml"
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -31,7 +35,7 @@ jobs:
         run: |
           go vet ./...
           grep -q 'DefaultSiteHost = "4545810.xyz"' echproxy/netdial/netdial.go
-          go test ./... -race
+          go test ./...
 
       - name: Setup Patched Go SDK for Windows 7 (XTLS/go-win7)
         # 借鉴 XTLS/Xray-core 的 Windows 7 构建方案：

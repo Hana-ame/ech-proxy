@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,7 @@ const (
 	maxDomainJSONBytes   = 1 << 20
 	maxWhitelistHistory  = 16
 	cachedScriptName     = "ads.js"
+	cachedWhitelistName  = "pac.txt"
 )
 
 var DefaultAdNetworkBlockedURLs = []string{
@@ -425,8 +427,9 @@ type AdScriptOptions struct {
 	AdultSitesURL  string
 	BlocklistURL   string
 	UpdateInterval time.Duration
-	CacheDir       string
-	FetchFn        func(string) ([]byte, error)
+	CacheDir           string
+	FetchFn            func(string) ([]byte, error)
+	OnWhitelistUpdated func([]string)
 }
 
 type AdScriptManager struct {
@@ -441,6 +444,8 @@ type AdScriptManager struct {
 	updateInterval time.Duration
 	cacheDir       string
 	fetchFn        func(string) ([]byte, error)
+
+	onWhitelistUpdated func([]string)
 
 	whitelistPtr     atomic.Pointer[[]string]
 	whitelistHistory [][]string
@@ -498,12 +503,27 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	m.skipAdBlock.Store(opts.SkipAdBlock)
 	m.allMode.Store(opts.AllMode)
 
+	m.onWhitelistUpdated = opts.OnWhitelistUpdated
+
 	if m.cacheDir != "" {
 		if cached, err := os.ReadFile(filepath.Join(m.cacheDir, cachedScriptName)); err == nil && isValidAdScript(cached) {
 			m.setScriptLocked(cached, "cache")
 		}
+		if cachedWL, err := os.ReadFile(filepath.Join(m.cacheDir, cachedWhitelistName)); err == nil {
+			if domains, perr := ParseDomainList(cachedWL); perr == nil && len(domains) > 0 {
+				m.SwapWhitelist(domains)
+			}
+		}
 	}
 	return m
+}
+
+func (m *AdScriptManager) SetOnWhitelistUpdated(fn func([]string)) {
+	if m != nil {
+		m.mu.Lock()
+		m.onWhitelistUpdated = fn
+		m.mu.Unlock()
+	}
 }
 
 func (m *AdScriptManager) setScriptLocked(raw []byte, src string) {
@@ -870,25 +890,46 @@ func (m *AdScriptManager) RefreshWhitelistOnce() ([]string, error) {
 		return []string{}, nil
 	}
 	m.mu.RLock()
-	url, fetch := m.whitelistURL, m.fetchFn
+	url, fetch, cacheDir := m.whitelistURL, m.fetchFn, m.cacheDir
 	m.mu.RUnlock()
 
 	if url == "" || fetch == nil {
-		m.SwapWhitelist(nil)
-		return []string{}, nil
+		return m.Whitelist(), nil
 	}
 	raw, err := fetch(url)
 	if err != nil {
-		m.SwapWhitelist(nil)
-		return []string{}, fmt.Errorf("fetch pac whitelist from %s: %w", url, err)
+		log.Printf("[AdScript] Failed to fetch pac whitelist from %s: %v (retaining previous whitelist)", url, err)
+		return m.Whitelist(), fmt.Errorf("fetch pac whitelist from %s: %w", url, err)
 	}
 	domains, perr := ParseDomainList(raw)
 	if perr != nil {
-		m.SwapWhitelist(nil)
-		return []string{}, fmt.Errorf("parse pac whitelist from %s: %w", url, perr)
+		log.Printf("[AdScript] Failed to parse pac whitelist from %s: %v (retaining previous whitelist)", url, perr)
+		return m.Whitelist(), fmt.Errorf("parse pac whitelist from %s: %w", url, perr)
 	}
-	m.SwapWhitelist(domains)
+	prev := m.SwapWhitelist(domains)
+	if cacheDir != "" && len(raw) > 0 {
+		_ = os.MkdirAll(cacheDir, 0o755)
+		_ = os.WriteFile(filepath.Join(cacheDir, cachedWhitelistName), raw, 0o644)
+	}
+	m.mu.RLock()
+	cb := m.onWhitelistUpdated
+	m.mu.RUnlock()
+	if cb != nil && (len(prev) == 0 || !slicesEqual(prev, domains)) {
+		cb(domains)
+	}
 	return append([]string(nil), domains...), nil
+}
+
+func slicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // RefreshBlocklistOnce 拉取远程 block.json（完全与 certs/ 解耦，失败回退至内存内置规则）。

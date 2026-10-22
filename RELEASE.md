@@ -1,3 +1,15 @@
+## v3.5.21
+
+### Fixes & Improvements
+
+- **彻底修复 Bootstrap DoH 单点死锁、PAC 启动竞态与连接超时重试放大**:
+  - **Bootstrap DoH 多路兜底与自解析竞速**：在 `resolveViaBootstrapDoH` 中保留 1.1.1.1 / 1.0.0.1 的同时，集成 223.5.5.5 / 223.6.6.6（阿里云 DoH）与 1.12.12.12（DNSPod DoH）作为兜底节点；在解析首选 DoH 节点自身（4545810.xyz）时并发全路竞速，彻底打破国内网络下 1.1.1.1:443 丢包导致的全局 DNS 死锁；
+  - **PAC 本地落盘缓存与变更系统通知**：`AdScriptManager` 成功拉取 `pac.txt` 后持久化缓存至本地 `cache/pac.txt`，启动时同步读取本地缓存秒级就绪；拉取失败时保留上一次有效白名单；`RefreshWhitelistOnce` 首次拉取成功或规则更新时触发回调调用 `sysProxyMgr.SetMode(SysProxyPAC)` 刷新 `?t=` 时间戳通知 Windows 与浏览器重新加载最新 PAC；`/proxy.pac` 响应头加入 `Cache-Control: no-store, no-cache, must-revalidate`；
+  - **调整启动顺序**：先以 `ServeAsync()` 启动后台服务并开始监听处理，再通知系统设置 PAC 模式，杜绝启动初期返回空规则竞态；
+  - **优化智能路由探测与 Cloudflare 403 规避**：对 Cloudflare 节点优先采用原生 ECH 隧道直通，避免 TLS 记录分片触发 Cloudflare WAF 403 挑战与国内 Anycast 黑洞超时；`isCloudflareRouteRejection` 统一拦截所有模式下的 403 challenge 与 5xx 响应；
+  - **dialUTLSWithWrapper 超时快速跳过**：仅当遭遇 TLS 协议层拒绝（如 `tls:`、`handshake failure` 等）时才对同 IP 降级尝试 TCP 分段与 Firefox 指纹；若首次拨号即为 TCP 连接/握手超时，立即跳过该 IP，彻底消除单个死 IP 串行 3 次重试累计 30 秒的延迟放大；
+  - **更新器 GitHub 镜像全面注入 TLS 分片**：更新镜像候选列表引入高速可用节点（`gh-proxy.com`、`ghfast.top`、`gh.llkk.cc`、`ghproxy.imciel.com`），并对所有镜像请求统一应用 ClientHello TLS 分片，杜绝 GFW 针对镜像域名 SNI 的审查阻断；识别 `.443` 文件名准确匹配对应更新资产。
+
 ## v3.5.20
 
 ### Fixes & Improvements

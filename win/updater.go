@@ -205,6 +205,12 @@ func (u *Updater) AssetName() string {
 	if u == nil {
 		return ReleaseAssetNameForPlatform(runtime.GOOS, runtime.GOARCH)
 	}
+	if u.exePath != "" {
+		base := strings.ToLower(filepath.Base(u.exePath))
+		if strings.Contains(base, ".443") {
+			return "ech-proxy.443.exe"
+		}
+	}
 	return ReleaseAssetNameForPlatform(u.goos, u.goarch)
 }
 

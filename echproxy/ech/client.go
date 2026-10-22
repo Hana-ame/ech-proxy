@@ -250,8 +250,11 @@ func QueryDoH(ctx context.Context, name string, qtype int) (*http.Response, erro
 	// 当查询的目标域名恰好是首选 DoH 节点自身域名（如 4545810.xyz）且未配置引导 IP 时，
 	// 优先直接查询次选 IP DoH（https://1.1.1.1/dns-query），避免先连接自身域名才能解析自身域名的循环依赖。
 	if isSelfDoHHost(name, cfg) && cfg.fallbackURL != "" && cfg.fallbackURL != cfg.dohURL {
+		ctxSec, cancelSec := context.WithTimeout(ctx, 2*time.Second)
 		secondaryURL := fmt.Sprintf("%s?name=%s&type=%d", cfg.fallbackURL, url.QueryEscape(name), qtype)
-		if resp2, err2 := doDohRequest(ctx, secondaryURL, "", cfg.ipMode); err2 == nil && resp2 != nil && resp2.StatusCode == http.StatusOK {
+		resp2, err2 := doDohRequest(ctxSec, secondaryURL, "", cfg.ipMode)
+		cancelSec()
+		if err2 == nil && resp2 != nil && resp2.StatusCode == http.StatusOK {
 			return resp2, nil
 		} else if resp2 != nil && resp2.Body != nil {
 			_ = resp2.Body.Close()

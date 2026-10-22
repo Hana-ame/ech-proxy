@@ -278,17 +278,17 @@ func getBootstrapClient(bIP string) *http.Client {
 			if port == "" {
 				port = "443"
 			}
-			return (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(bIP, port))
+			return (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(bIP, port))
 		},
 		MaxIdleConns:          8,
 		MaxIdleConnsPerHost:   4,
 		MaxConnsPerHost:       16,
 		IdleConnTimeout:       30 * time.Second,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ResponseHeaderTimeout: 6 * time.Second,
+		TLSHandshakeTimeout:   3 * time.Second,
+		ResponseHeaderTimeout: 3500 * time.Millisecond,
 		ForceAttemptHTTP2:     true,
 	}
-	c := &http.Client{Transport: tr, Timeout: 6 * time.Second}
+	c := &http.Client{Transport: tr, Timeout: 4 * time.Second}
 	bootstrapClients[bIP] = c
 	return c
 }
@@ -354,6 +354,53 @@ type dohJSONResponse struct {
 	Answer []dohJSONAnswer `json:"Answer"`
 }
 
+type bootstrapEndpoint struct {
+	ip         string
+	urlPattern string
+}
+
+var primaryBootstrapEndpoints = []bootstrapEndpoint{
+	{ip: "1.1.1.1", urlPattern: "https://%s/dns-query?name=%s&type=%d"},
+	{ip: "1.0.0.1", urlPattern: "https://%s/dns-query?name=%s&type=%d"},
+}
+
+var fallbackBootstrapEndpoints = []bootstrapEndpoint{
+	{ip: "223.5.5.5", urlPattern: "https://%s/resolve?name=%s&type=%d"},
+	{ip: "223.6.6.6", urlPattern: "https://%s/resolve?name=%s&type=%d"},
+	{ip: "1.12.12.12", urlPattern: "https://%s/dns-query?name=%s&type=%d"},
+}
+
+func queryBootstrapEndpoint(ctx context.Context, ep bootstrapEndpoint, host string, qt int) ([]net.IP, error) {
+	reqURL := fmt.Sprintf(ep.urlPattern, ep.ip, url.QueryEscape(host), qt)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/dns-json")
+	client := getBootstrapClient(ep.ip)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var d dohJSONResponse
+	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		return nil, err
+	}
+	var ips []net.IP
+	for _, ans := range d.Answer {
+		if ans.Type == qt {
+			if parsed := net.ParseIP(ans.Data); parsed != nil && !parsed.IsLoopback() && !parsed.IsUnspecified() {
+				ips = append(ips, parsed)
+			}
+		}
+	}
+	return ips, nil
+}
+
 // ResolveViaBootstrapDoH 仅通过 HTTPS（端口 443）向 IP 直连 DoH 端点查询，绝不发起任何 UDP/TCP 53 端口连接，
 // 且絕不回调上层 DoHResolver，内置内存缓存与 Singleflight 并发合并。
 func ResolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, error) {
@@ -409,37 +456,65 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 		qtypes = []int{1, 28}
 	}
 
-	bootstrapIPs := []string{"1.1.1.1", "1.0.0.1"}
+	cleanHost := CleanHost(host)
+	isSelfDoH := strings.EqualFold(cleanHost, "4545810.xyz") || strings.HasSuffix(cleanHost, ".4545810.xyz")
+
 	var ips []net.IP
 
 	for _, qt := range qtypes {
-		for _, bIP := range bootstrapIPs {
-			reqURL := fmt.Sprintf("https://%s/dns-query?name=%s&type=%d", bIP, url.QueryEscape(host), qt)
-			req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-			if err != nil {
-				continue
+		if isSelfDoH {
+			// 解析首选 DoH 节点自身（4545810.xyz）时，并发竞速 Cloudflare、阿里云与 DNSPod 引导端点，杜绝单点死锁
+			allEPs := append(append([]bootstrapEndpoint(nil), primaryBootstrapEndpoints...), fallbackBootstrapEndpoints...)
+			resCh := make(chan []net.IP, len(allEPs))
+			raceCtx, raceCancel := context.WithCancel(ctx)
+			for _, ep := range allEPs {
+				targetEP := ep
+				go func() {
+					res, err := queryBootstrapEndpoint(raceCtx, targetEP, host, qt)
+					if err == nil && len(res) > 0 {
+						select {
+						case resCh <- res:
+							raceCancel()
+						case <-raceCtx.Done():
+						}
+					} else {
+						select {
+						case resCh <- nil:
+						case <-raceCtx.Done():
+						}
+					}
+				}()
 			}
-			req.Header.Set("Accept", "application/dns-json")
-			client := getBootstrapClient(bIP)
-			resp, err := client.Do(req)
-			if err != nil || resp.StatusCode != http.StatusOK {
-				if resp != nil && resp.Body != nil {
-					_ = resp.Body.Close()
+			var won []net.IP
+			for i := 0; i < len(allEPs); i++ {
+				r := <-resCh
+				if len(r) > 0 && len(won) == 0 {
+					won = r
 				}
-				continue
 			}
-			var d dohJSONResponse
-			_ = json.NewDecoder(resp.Body).Decode(&d)
-			_ = resp.Body.Close()
-			for _, ans := range d.Answer {
-				if ans.Type == qt {
-					if parsed := net.ParseIP(ans.Data); parsed != nil && !parsed.IsLoopback() && !parsed.IsUnspecified() {
-						ips = append(ips, parsed)
+			raceCancel()
+			if len(won) > 0 {
+				ips = append(ips, won...)
+			}
+		} else {
+			// 普通域名：优先 1.1.1.1 / 1.0.0.1，若超时或受阻则立即回退至阿里云与 DNSPod 兜底引导节点
+			var found bool
+			for _, ep := range primaryBootstrapEndpoints {
+				res, err := queryBootstrapEndpoint(ctx, ep, host, qt)
+				if err == nil && len(res) > 0 {
+					ips = append(ips, res...)
+					found = true
+					break
+				}
+			}
+			if !found {
+				for _, ep := range fallbackBootstrapEndpoints {
+					res, err := queryBootstrapEndpoint(ctx, ep, host, qt)
+					if err == nil && len(res) > 0 {
+						ips = append(ips, res...)
+						break
 					}
 				}
-			}
-			if len(ips) > 0 {
-				break
 			}
 		}
 	}
@@ -628,13 +703,10 @@ type gitHubProxyTransport struct {
 
 func (g *gitHubProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req != nil && req.URL != nil {
-		host := req.URL.Hostname()
-		if strings.Contains(host, "github.com") || strings.Contains(host, "githubusercontent.com") {
-			if GitHubRoundTripper != nil {
-				resp, err := GitHubRoundTripper(req)
-				if err == nil && resp != nil {
-					return resp, nil
-				}
+		if GitHubRoundTripper != nil {
+			resp, err := GitHubRoundTripper(req)
+			if err == nil && resp != nil {
+				return resp, nil
 			}
 		}
 	}
@@ -669,9 +741,8 @@ func FetchBytes(rawURL string) ([]byte, error) {
 			rawURL,
 			"https://gh-proxy.com/" + rawURL,
 			"https://ghfast.top/" + rawURL,
-			"https://ghproxy.net/" + rawURL,
-			"https://ghproxy.cn/" + rawURL,
-			"https://github.moeyy.xyz/" + rawURL,
+			"https://gh.llkk.cc/" + rawURL,
+			"https://ghproxy.imciel.com/" + rawURL,
 		}
 
 		isBinary := strings.HasSuffix(rawURL, ".exe") || strings.HasSuffix(rawURL, ".zip") ||

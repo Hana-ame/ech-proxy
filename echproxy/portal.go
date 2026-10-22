@@ -224,6 +224,7 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		}
 		pac := config.GeneratePAC(nil, proxyAddr, global, wl)
 		c.Header("Content-Type", "application/x-ns-proxy-autoconfig; charset=utf-8")
+		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
 		c.String(http.StatusOK, pac)
 	})
 

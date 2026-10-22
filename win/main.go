@@ -820,10 +820,27 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	serverErrCh := make(chan error, 1)
+	echproxy.SafeGo("ServerRun", func() {
+		if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
+			serverErrCh <- err
+		}
+	})
+
 	// 在 .*.443.exe 下（cmd.LocalProxy == true），只有 443 方案开启，系统代理、更新器、托盘等一律不运行
 	if !cmd.LocalProxy {
 		sysProxyMgr = NewSysProxyManager(actualListenAddr, nil)
 		sysProxyMgr.SetAllMode(cmd.AllMode)
+		if srv.AdScript != nil {
+			srv.AdScript.SetOnWhitelistUpdated(func(domains []string) {
+				if sysProxyMgr != nil && sysProxyMgr.Mode() == SysProxyPAC {
+					log.Printf("[PAC] Whitelist updated (%d domains), refreshing system proxy PAC URL...", len(domains))
+					if err := sysProxyMgr.SetMode(SysProxyPAC); err != nil {
+						log.Printf("WARNING: Failed to refresh system proxy PAC: %v", err)
+					}
+				}
+			})
+		}
 		if cmd.SysProxy != SysProxyOff {
 			if err := sysProxyMgr.SetMode(cmd.SysProxy); err != nil {
 				log.Printf("WARNING: Failed to set system proxy (%s): %v", cmd.SysProxy, err)
@@ -883,8 +900,8 @@ func main() {
 		echproxy.SafeGo("OpenBrowser", func() { openBrowser(portalURL) })
 	}
 
-	echproxy.SafeGo("ShutdownWatcher", func() {
-		<-ctx.Done()
+	select {
+	case <-ctx.Done():
 		log.Printf("[Shutdown] Signal received, dumping memory statistics before shutdown...")
 		echproxy.DumpMemory("Shutdown", srv, logMgr)
 		if sysProxyMgr != nil {
@@ -900,9 +917,7 @@ func main() {
 		if logMgr != nil {
 			logMgr.Sync()
 		}
-	})
-
-	if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
+	case err := <-serverErrCh:
 		echproxy.RecordFatalError("Serve", err)
 		echproxy.DumpMemory("ServeError", srv, logMgr)
 		if sysProxyMgr != nil {

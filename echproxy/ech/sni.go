@@ -440,7 +440,11 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 			if cached, ok := getCachedRoute(host); ok {
 				return doSingleMode(req, cached, normIPMode)
 			}
-			return doSingleMode(req, "fragment", normIPMode)
+			detected, _ := DetectTransportModeWithStatus(req.Context(), host, normIPMode)
+			if detected == "" {
+				detected = "fragment"
+			}
+			return doSingleMode(req, detected, normIPMode)
 		case <-req.Context().Done():
 			return nil, req.Context().Err()
 		}
@@ -456,24 +460,39 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		}()
 	}
 
-	// 3. 智能路由探测：优先尝试单连接 TLS 记录分片（fragment），绝不盲目并发连接打满系统套接字
-	respFrag, errFrag := FragmentDo(req, normIPMode)
-	if errFrag == nil && !isCloudflareRouteRejection(respFrag, "fragment") && respFrag.StatusCode < 500 {
-		setCachedRoute(host, "fragment")
-		return respFrag, nil
-	}
-	if respFrag != nil {
-		respFrag.Body.Close()
-	}
-	if IsCertError(errFrag) {
-		return nil, errFrag
+	// 3. 智能路由探测：优先尝试根据节点特征识别出的首选传输模式（Cloudflare 节点首选 ech，自定伪装 SNI 首选 sni，普通节点首选 fragment）
+	detected, confident := DetectTransportModeWithStatus(req.Context(), host, normIPMode)
+	primaryMode := detected
+	if primaryMode == "" {
+		primaryMode = "fragment"
 	}
 
-	// 4. 若分片不通，再按站点类型降级（Cloudflare 竞速 ECH 与 SNI，非 Cloudflare 单独尝试 SNI）
-	if detected, confident := DetectTransportModeWithStatus(req.Context(), host, normIPMode); confident && detected != "ech" {
-		return raceModes(req, []string{"sni"}, normIPMode, host)
+	respPri, errPri := doSingleMode(req, primaryMode, normIPMode)
+	if errPri == nil && !isCloudflareRouteRejection(respPri, primaryMode) && respPri.StatusCode < 500 {
+		setCachedRoute(host, primaryMode)
+		return respPri, nil
 	}
-	return raceModes(req, []string{"ech", "sni"}, normIPMode, host)
+	if respPri != nil {
+		respPri.Body.Close()
+	}
+	if IsCertError(errPri) {
+		return nil, errPri
+	}
+
+	// 4. 若首选模式不通或遭遇阻断，再按站点类型降级备用通道竞速
+	var fallbackModes []string
+	if primaryMode == "ech" {
+		fallbackModes = []string{"fragment", "sni"}
+	} else if primaryMode == "sni" {
+		fallbackModes = []string{"fragment"}
+	} else {
+		if confident && detected != "ech" {
+			fallbackModes = []string{"sni"}
+		} else {
+			fallbackModes = []string{"ech", "sni"}
+		}
+	}
+	return raceModes(req, fallbackModes, normIPMode, host)
 }
 
 func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
@@ -524,10 +543,7 @@ func doSingleMode(req *http.Request, mode, ipMode string) (*http.Response, error
 	}
 }
 
-func isCloudflareRouteRejection(resp *http.Response, mode string) bool {
-	if mode != "ech" && mode != "" {
-		return false
-	}
+func isCloudflareRouteRejection(resp *http.Response, _ ...string) bool {
 	if resp == nil {
 		return true
 	}
@@ -730,24 +746,45 @@ func dialUTLSOnce(ctx context.Context, ip, sniName, verifyHost string, nextProto
 	return uConn, nil
 }
 
+func isTLSRetryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "timeout") || strings.Contains(msg, "deadline exceeded") {
+		return false
+	}
+	return strings.Contains(msg, "tls:") ||
+		strings.Contains(msg, "handshake failure") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "reset") ||
+		strings.Contains(msg, "connection refused")
+}
+
 // dialUTLSWithWrapper 统一的 uTLS 拨号与上游证书校验封装（供 SNI 伪装与 Fragment 分片模式共同复用）：
 //   - 在 Fragment 模式下，若双记录 TLS 分片握手被源站（如 DDoS-Guard / nyaa.si）以 tls: handshake failure 拒绝，
 //     自动无感降级至「纯 TCP 层分段 + Chrome_120」以及「纯 TCP 层分段 + Firefox_120（不含实验性 Kyber 扩展）」，
 //     确保既能绕过 GFW SNI 检测，又能 100% 兼容各类严苛源站 TLS 栈。
+//   - 若首次拨号就是 TCP 连接/握手超时，立即跳过该 IP，杜绝同一个死 IP 串行重试 3 次（10s x 3 = 30s）。
 func dialUTLSWithWrapper(ctx context.Context, ip, sniName, verifyHost string, nextProtos []string, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
 	uConn, err := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloChrome_120, wrapConn)
 	if err == nil || IsCertError(err) || ctx.Err() != nil {
 		return uConn, err
 	}
-	if wrapConn != nil {
+	if wrapConn != nil && isTLSRetryableError(err) {
 		tcpWrap := func(c net.Conn) net.Conn {
 			return newTCPFragmentConn(c, 32)
 		}
 		if uConn2, err2 := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloChrome_120, tcpWrap); err2 == nil || IsCertError(err2) {
 			return uConn2, err2
-		}
-		if uConn3, err3 := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloFirefox_120, tcpWrap); err3 == nil || IsCertError(err3) {
-			return uConn3, err3
+		} else if isTLSRetryableError(err2) {
+			if uConn3, err3 := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloFirefox_120, tcpWrap); err3 == nil || IsCertError(err3) {
+				return uConn3, err3
+			}
 		}
 	}
 	return nil, err

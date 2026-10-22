@@ -54,7 +54,14 @@ func (e *CertError) Unwrap() error { return e.err }
 
 // IsCertError 判断 err 是否为上游证书校验失败（过期 / 不一致 / 不可信）。
 func IsCertError(err error) bool {
-	return errors.Is(err, ErrCertExpired) || errors.Is(err, ErrCertMismatch) || errors.Is(err, ErrCertUntrusted)
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrCertExpired) || errors.Is(err, ErrCertMismatch) || errors.Is(err, ErrCertUntrusted) {
+		return true
+	}
+	_, _, _, ok := ClassifyCertError(err)
+	return ok
 }
 
 // ClassifyCertError 从（可能被 http2/url 包装的）错误中判定证书校验失败类型。

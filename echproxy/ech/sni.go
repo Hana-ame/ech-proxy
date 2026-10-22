@@ -407,7 +407,9 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		if IsCertError(err) {
 			return nil, err
 		}
-		clearCachedRoute(host)
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			clearCachedRoute(host)
+		}
 	}
 
 	// 2. 抑制并发风暴（Singleflight / In-Flight 去重）：
@@ -421,6 +423,7 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 			if cached, ok := getCachedRoute(host); ok {
 				return doSingleMode(req, cached, normIPMode)
 			}
+			return doSingleMode(req, "fragment", normIPMode)
 		case <-req.Context().Done():
 			return nil, req.Context().Err()
 		}
@@ -436,15 +439,24 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		}()
 	}
 
-	// 3. 先基于 DoH 解析出的真实 IP 判定是否为 Cloudflare 站点：
-	//    - 非 Cloudflare 站点（如 nyaa.si 走 DDoS-Guard、i.pximg.net 走 Fastly）绝不能向 cloudflare-ech.com 发 ECH 请求，
-	//      否则 Cloudflare 边缘必定返回 tls: handshake failure；直接竞速 fragment 与 sni。
-	if detected, confident := DetectTransportModeWithStatus(req.Context(), host, normIPMode); confident && detected != "ech" {
-		return raceModes(req, []string{"fragment", "sni"}, normIPMode, host)
+	// 3. 智能路由探测：优先尝试单连接 TLS 记录分片（fragment），绝不盲目并发连接打满系统套接字
+	respFrag, errFrag := FragmentDo(req, normIPMode)
+	if errFrag == nil && !isCloudflareRouteRejection(respFrag, "fragment") && respFrag.StatusCode < 500 {
+		setCachedRoute(host, "fragment")
+		return respFrag, nil
+	}
+	if respFrag != nil {
+		respFrag.Body.Close()
+	}
+	if IsCertError(errFrag) {
+		return nil, errFrag
 	}
 
-	// 4. Cloudflare 节点或未决节点：并发竞速三种方案（ECH、TLS 分片、SNI 伪装），选出最快成功返回的方案！
-	return raceModes(req, []string{"ech", "fragment", "sni"}, normIPMode, host)
+	// 4. 若分片不通，再按站点类型降级（Cloudflare 竞速 ECH 与 SNI，非 Cloudflare 单独尝试 SNI）
+	if detected, confident := DetectTransportModeWithStatus(req.Context(), host, normIPMode); confident && detected != "ech" {
+		return raceModes(req, []string{"sni"}, normIPMode, host)
+	}
+	return raceModes(req, []string{"ech", "sni"}, normIPMode, host)
 }
 
 func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
@@ -802,12 +814,14 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 			}
 		}
 		lastErr = err
-		utlsTransMu.Lock()
-		if old, ok := utlsH2Trans[cacheKey]; ok {
-			old.CloseIdleConnections()
-			delete(utlsH2Trans, cacheKey)
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && (err == nil || !strings.Contains(err.Error(), "canceled")) {
+			utlsTransMu.Lock()
+			if old, ok := utlsH2Trans[cacheKey]; ok {
+				old.CloseIdleConnections()
+				delete(utlsH2Trans, cacheKey)
+			}
+			utlsTransMu.Unlock()
 		}
-		utlsTransMu.Unlock()
 	}
 	ipCacheMu.Lock()
 	delete(ipCache, host+"|"+normMode)

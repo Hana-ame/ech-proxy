@@ -456,7 +456,8 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		}()
 	}
 
-	// 3. 智能路由探测：优先尝试单连接 TLS 记录分片（fragment），绝不盲目并发连接打满系统套接字
+	// 3. 智能路由探测：三路机制依次尝试，绝不半途放弃（Fragment 分片 -> SNI 伪装 -> ECH / 并发竞速）
+	// 第 1 步：优先尝试单连接 TLS/TCP 记录分片（fragment）
 	respFrag, errFrag := FragmentDo(req, normIPMode)
 	if errFrag == nil && !isCloudflareRouteRejection(respFrag, "fragment") && respFrag.StatusCode < 500 {
 		setCachedRoute(host, "fragment")
@@ -469,16 +470,37 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		return nil, errFrag
 	}
 
-	// 4. 若分片不通，再按站点类型降级备用通道竞速
-	if detected, confident := DetectTransportModeWithStatus(req.Context(), host, normIPMode); confident && detected != "ech" {
-		if HasCustomSNIServerName(req.Context()) {
-			return raceModes(req, []string{"sni"}, normIPMode, host)
-		}
-		// 非 Cloudflare 节点且未显式指定自定义伪装 SNI 时，绝不可向源站发送随机公共伪装 SNI（如 cdnjs.cloudflare.com），
-		// 否则源站（如 DDoS-Guard / Nginx 等）必然回传默认或自签名证书，导致触发误报的「连接不安全 / 证书不匹配」告警。
-		return nil, errFrag
+	// 第 2 步：若分片失败，立即尝试 SNI 伪装（如 apple.com / microsoft.com）
+	respSNI, errSNI := SNIFrontDo(req, normIPMode)
+	if errSNI == nil && !isCloudflareRouteRejection(respSNI, "sni") && respSNI.StatusCode < 500 {
+		setCachedRoute(host, "sni")
+		return respSNI, nil
 	}
-	return raceModes(req, []string{"sni", "ech"}, normIPMode, host)
+	if respSNI != nil {
+		respSNI.Body.Close()
+	}
+	if IsCertError(errSNI) && !HasCustomSNIServerName(req.Context()) {
+		// 伪装 SNI 触发证书不匹配且未显式指定自定义 SNI，继续尝试 ECH 或并发竞速
+	}
+
+	// 第 3 步：尝试 ECH 或多路竞速兜底
+	detected, _ := DetectTransportModeWithStatus(req.Context(), host, normIPMode)
+	modesToRace := []string{"sni", "ech"}
+	if detected == "ech" {
+		modesToRace = []string{"ech", "sni"}
+	}
+	respRace, errRace := raceModes(req, modesToRace, normIPMode, host)
+	if errRace == nil && respRace != nil {
+		return respRace, nil
+	}
+	if respRace != nil {
+		respRace.Body.Close()
+	}
+
+	if errFrag != nil {
+		return nil, fmt.Errorf("all transport modes failed for %s: fragment: %v, sni: %v, race: %v", host, errFrag, errSNI, errRace)
+	}
+	return nil, errRace
 }
 
 func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
@@ -808,9 +830,7 @@ func getUTLSH2Transport(cacheKey string, dialFn func(ctx context.Context, nextPr
 	}
 	t := &http2.Transport{
 		AllowHTTP:       false,
-		IdleConnTimeout: 15 * time.Second,
-		PingTimeout:     5 * time.Second,
-		ReadIdleTimeout: 10 * time.Second,
+		IdleConnTimeout: 90 * time.Second,
 		DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
 			uConn, err := dialFn(ctx, []string{"h2", "http/1.1"})
 			if err != nil {
@@ -844,10 +864,10 @@ func getUTLSH1Client(cacheKey string, dialFn func(ctx context.Context, nextProto
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return dialFn(ctx, []string{"http/1.1"})
 		},
-		MaxIdleConns:        16,
-		MaxIdleConnsPerHost: 4,
-		MaxConnsPerHost:     16,
-		IdleConnTimeout:     15 * time.Second,
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 32,
+		MaxConnsPerHost:     64,
+		IdleConnTimeout:     90 * time.Second,
 	}
 	c := &http.Client{
 		Transport:     tr,
@@ -888,6 +908,9 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 
 	var lastErr error
 	for _, ip := range ips {
+		if req.Context() != nil && req.Context().Err() != nil {
+			return nil, req.Context().Err()
+		}
 		cacheKey := tag + "|" + ip + "|" + effectiveSNI + "|" + host
 		dialFn := func(ctx context.Context, nextProtos []string) (*utls.UConn, error) {
 			return dialUTLSWithWrapper(ctx, ip, effectiveSNI, host, nextProtos, wrapConn)
@@ -899,6 +922,11 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 		if IsCertError(err) {
 			return nil, err
 		}
+		if errors.Is(err, context.Canceled) || (req.Context() != nil && errors.Is(req.Context().Err(), context.Canceled)) {
+			// 客户端主动取消（如浏览器切页或滑动离开可视区缩略图），绝不是底层连接/IP 失败！
+			// 绝对不可因此清理 utlsH2Trans 连接池，更绝对不可清空 ipCache，避免导致其他并发下载 Pixiv 图片的连接被连带腰斩！
+			return nil, err
+		}
 		if strings.Contains(err.Error(), "not h2") {
 			if resp1, err1 := getUTLSH1Client(cacheKey, dialFn).Do(req); err1 == nil {
 				return resp1, nil
@@ -906,11 +934,14 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 				if IsCertError(err1) {
 					return nil, err1
 				}
+				if errors.Is(err1, context.Canceled) || (req.Context() != nil && errors.Is(req.Context().Err(), context.Canceled)) {
+					return nil, err1
+				}
 				err = err1
 			}
 		}
 		lastErr = err
-		if err != nil {
+		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			utlsTransMu.Lock()
 			if old, ok := utlsH2Trans[cacheKey]; ok {
 				old.CloseIdleConnections()
@@ -925,9 +956,11 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 			utlsTransMu.Unlock()
 		}
 	}
-	ipCacheMu.Lock()
-	delete(ipCache, host+"|"+normMode)
-	ipCacheMu.Unlock()
+	if lastErr != nil && !errors.Is(lastErr, context.Canceled) {
+		ipCacheMu.Lock()
+		delete(ipCache, host+"|"+normMode)
+		ipCacheMu.Unlock()
+	}
 	return nil, fmt.Errorf("all IPs failed for %s: %w", host, lastErr)
 }
 

@@ -1,3 +1,19 @@
+## v3.5.26
+
+### Fixes & Improvements
+
+- **彻底修复 Pixiv 图片加载一段时间后停止加载的问题（客户端请求取消误杀 H2 连接池与 IP 缓存）**:
+  - **根因分析**：用户在 Pixiv 滚动浏览瀑布流时，浏览器会频繁因视图移动而主动取消部分离屏缩略图请求（`context.Canceled`）。在 `roundTripUTLS` 中，该正常取消信号被误当成底层传输网络错误处理，触发了 `delete(utlsH2Trans, cacheKey)` 销毁整个 H2 多路复用连接池，并调用 `delete(ipCache, host+"|"+normMode)` 清空 IP 缓存；导致同一 TCP 管道上所有正在并发传输的其余大图全部被断流腰斩，且后续请求遭遇 DoH 拥塞与重解析超时，表现为“图片加载一段时间后全部停止”；
+  - **修复连接池与缓存保护**：在 `roundTripUTLS` 中显式拦截 `errors.Is(err, context.Canceled)` 与 `req.Context().Err()`，绝不因客户端切页/取消而淘汰连接池，更不删除有效 IP 缓存；遇到取消请求时立即退出，不再使用已取消上下文串行遍历剩余 IP；
+  - **移除过激的 H2 ReadIdleTimeout 杀连接机制**：移除 `http2.Transport` 中 `ReadIdleTimeout: 10s` 与 `PingTimeout: 5s` 限制（用户停顿查看大图超过 10 秒即被反代或本地 Ping 失败强行断开）；将空闲连接保活时间放宽至 90 秒，并将 H1 连接池并发上限从 16 提升至 64，彻底保障 Pixiv 图片长期持续稳定加载。
+- **三路穿透机制全链路闭环降级（Fragment 分片 -> SNI 伪装 -> ECH 全覆盖，绝不半途放弃）**:
+  - **根因分析**：此前在智能路由 `RoundTrip` 中，针对非 Cloudflare 站点（如 `nyaa.si` 等），一旦首选 `FragmentDo` 失败，代码因担心证书不匹配而直接硬编码 `return nil, errFrag` 退出，彻底阻断了后续 SNI 伪装通道；
+  - **修复**：全链路打通三级平滑降级——`FragmentDo`（单连接分段）失败后立即无感尝试 `SNIFrontDo`（使用 `ConsistentDefaultSNIForHost` 轮换 Apple / Microsoft 等顶级高信誉伪装域名），若仍失败再尝试 `Do`（ECH 隧道）或并发竞速，三个方法依次尝试，绝不半途放弃。
+- **分片引擎升级为 TCP 报文级分片（`newTCPFragmentConn`）**:
+  - 将 `FragmentDo` 底层由旧版的拆分 2 条 TLS Record 彻底重构为 TCP 报文段分片（保持单条完整 TLS 记录头结构）；既能将 TCP 载荷中的 SNI 明文打碎绕过 GFW DPI 审查，又能 100% 兼容 DDoS-Guard、Cloudflare 等各类严苛反代。
+- **新增上游本地代理（v2ray 10809 / Clash 7890）自动无感逃逸托底机制**:
+  - 在 `ProxyHandlerWithConfig` 中增加直连失败自动托底逻辑。当直连分片遭遇 GFW 临时 IP 封锁或丢包超时时，自动捕获 Windows 既有的本地代理现场（如 v2rayN `127.0.0.1:10809`），在毫秒级内透明向本地上游代理重试请求，绝对杜绝浏览器掉入 PAC 的 `DIRECT` 导致 20 秒超时黑洞（`ERR_CONNECTION_TIMED_OUT`）。
+
 ## v3.5.25
 
 ### Fixes & Improvements

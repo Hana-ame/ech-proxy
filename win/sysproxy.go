@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,9 +37,12 @@ func NormalizeSysProxyMode(raw string) (SysProxyMode, error) {
 
 type SysProxyState struct {
 	Mode          SysProxyMode
+	ProxyEnable   bool
 	ProxyServer   string
 	ProxyBypass   string
+	AutoDetect    bool
 	AutoConfigURL string
+	RawFlags      uint32
 }
 
 type SysProxyDriver interface {
@@ -46,9 +50,10 @@ type SysProxyDriver interface {
 	ApplyGlobal(proxyHostPort, bypass string) error
 	Clear() error
 	Query() (SysProxyState, error)
+	Restore(state SysProxyState) error
 }
 
-func BuildPACURL(listenAddr string, global bool, ts int64) string {
+func BuildPACURL(listenAddr string, global bool, ts int64, fallback string) string {
 	hostPort := NormalizeLoopbackHostPort(listenAddr)
 	var u strings.Builder
 	u.WriteString("http://")
@@ -57,6 +62,10 @@ func BuildPACURL(listenAddr string, global bool, ts int64) string {
 	sep := "?"
 	if global {
 		u.WriteString("?mode=all")
+		sep = "&"
+	}
+	if strings.TrimSpace(fallback) != "" {
+		u.WriteString(fmt.Sprintf("%sfallback=%s", sep, url.QueryEscape(strings.TrimSpace(fallback))))
 		sep = "&"
 	}
 	if ts > 0 {
@@ -69,28 +78,48 @@ func NormalizeLoopbackHostPort(listenAddr string) string {
 	return echproxy.NormalizeLoopbackHostPort(listenAddr, "127.0.0.1:8443")
 }
 
-// SysProxyManager 负责系统代理的原子替换与旧值栈（pop）恢复。
+func isSelfProxy(st SysProxyState, listenAddr string) bool {
+	hostPort := NormalizeLoopbackHostPort(listenAddr)
+	if strings.Contains(st.ProxyServer, hostPort) {
+		return true
+	}
+	if strings.Contains(st.AutoConfigURL, hostPort) || strings.Contains(st.AutoConfigURL, "/proxy.pac") {
+		return true
+	}
+	return false
+}
+
+// SysProxyManager 负责系统代理的管理、现场捕获与无损恢复。
 type SysProxyManager struct {
-	mu         sync.Mutex
-	listenAddr string
-	allMode    atomic.Bool
-	mode       SysProxyMode
-	modified   bool
-	prevStates []SysProxyState
-	driver     SysProxyDriver
-	nowUnix    func() int64
+	mu            sync.Mutex
+	listenAddr    string
+	allMode       atomic.Bool
+	mode          SysProxyMode
+	modified      bool
+	hasOriginal   bool
+	originalState SysProxyState
+	prevStates    []SysProxyState
+	driver        SysProxyDriver
+	nowUnix       func() int64
 }
 
 func NewSysProxyManager(listenAddr string, driver SysProxyDriver) *SysProxyManager {
 	if driver == nil {
 		driver = newPlatformSysProxyDriver()
 	}
-	return &SysProxyManager{
+	mgr := &SysProxyManager{
 		listenAddr: NormalizeLoopbackHostPort(listenAddr),
 		mode:       SysProxyOff,
 		driver:     driver,
 		nowUnix:    func() int64 { return time.Now().Unix() },
 	}
+	if initSt, err := driver.Query(); err == nil {
+		if !isSelfProxy(initSt, mgr.listenAddr) {
+			mgr.originalState = initSt
+			mgr.hasOriginal = true
+		}
+	}
+	return mgr
 }
 
 func (m *SysProxyManager) AllMode() bool {
@@ -114,9 +143,8 @@ func (m *SysProxyManager) Mode() SysProxyMode {
 
 func (m *SysProxyManager) PACURL() string {
 	m.mu.Lock()
-	addr := m.listenAddr
-	m.mu.Unlock()
-	return BuildPACURL(addr, m.allMode.Load(), 0)
+	defer m.mu.Unlock()
+	return BuildPACURL(m.listenAddr, m.allMode.Load(), 0, m.getFallbackLocked())
 }
 
 func (m *SysProxyManager) SetListenAddr(addr string) {
@@ -134,12 +162,39 @@ func (m *SysProxyManager) HistoryDepth() int {
 	return len(m.prevStates)
 }
 
+func (m *SysProxyManager) OriginalState() (SysProxyState, bool) {
+	if m == nil {
+		return SysProxyState{Mode: SysProxyOff}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.originalState, m.hasOriginal
+}
+
+func (m *SysProxyManager) captureOriginalLocked(current SysProxyState) {
+	if !m.hasOriginal && !isSelfProxy(current, m.listenAddr) {
+		m.originalState = current
+		m.hasOriginal = true
+	}
+}
+
+func (m *SysProxyManager) getFallbackLocked() string {
+	if m.hasOriginal && m.originalState.ProxyEnable && strings.TrimSpace(m.originalState.ProxyServer) != "" {
+		if !isSelfProxy(m.originalState, m.listenAddr) {
+			return m.originalState.ProxyServer
+		}
+	}
+	return ""
+}
+
 // ReplacePAC 原子替换系统 PAC 地址，并将替换前的系统代理旧值压入栈中返回。
 func (m *SysProxyManager) ReplacePAC(pacURL string) (SysProxyState, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	prev, _ := m.driver.Query()
+	m.captureOriginalLocked(prev)
+
 	if err := m.driver.ApplyPAC(pacURL); err != nil {
 		return prev, fmt.Errorf("apply system PAC (%s): %w", pacURL, err)
 	}
@@ -156,46 +211,29 @@ func (m *SysProxyManager) Pop() (SysProxyState, bool, error) {
 	defer m.mu.Unlock()
 
 	if len(m.prevStates) == 0 {
+		if m.hasOriginal {
+			err := m.driver.Restore(m.originalState)
+			m.mode = normalizeRestoredMode(m.originalState.Mode)
+			m.modified = false
+			return m.originalState, true, err
+		}
 		return SysProxyState{Mode: SysProxyOff}, false, nil
 	}
 	idx := len(m.prevStates) - 1
 	old := m.prevStates[idx]
 	m.prevStates = m.prevStates[:idx]
 
-	err := m.restoreStateLocked(old)
+	err := m.driver.Restore(old)
 	m.mode = normalizeRestoredMode(old.Mode)
 	m.modified = len(m.prevStates) > 0
 	return old, true, err
 }
 
-// normalizeRestoredMode 把驱动返回的空 mode（未设置状态）归一为 off ——
-// 某些驱动（含测试用 noop 驱动）初始状态 Mode 为空，弹出恢复后应视为“无代理”。
 func normalizeRestoredMode(mode SysProxyMode) SysProxyMode {
 	if mode == "" {
 		return SysProxyOff
 	}
 	return mode
-}
-
-func (m *SysProxyManager) restoreStateLocked(st SysProxyState) error {
-	switch st.Mode {
-	case SysProxyPAC:
-		if strings.TrimSpace(st.AutoConfigURL) != "" {
-			return m.driver.ApplyPAC(st.AutoConfigURL)
-		}
-		return m.driver.Clear()
-	case SysProxyGlobal:
-		if strings.TrimSpace(st.ProxyServer) != "" {
-			bypass := st.ProxyBypass
-			if bypass == "" {
-				bypass = DefaultProxyBypass
-			}
-			return m.driver.ApplyGlobal(st.ProxyServer, bypass)
-		}
-		return m.driver.Clear()
-	default:
-		return m.driver.Clear()
-	}
 }
 
 func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
@@ -205,7 +243,10 @@ func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
 	switch mode {
 	case SysProxyPAC:
 		prev, _ := m.driver.Query()
-		pacURL := BuildPACURL(m.listenAddr, m.allMode.Load(), m.nowUnix())
+		m.captureOriginalLocked(prev)
+
+		fallback := m.getFallbackLocked()
+		pacURL := BuildPACURL(m.listenAddr, m.allMode.Load(), m.nowUnix(), fallback)
 		if err := m.driver.ApplyPAC(pacURL); err != nil {
 			return fmt.Errorf("apply system PAC (%s): %w", pacURL, err)
 		}
@@ -217,6 +258,8 @@ func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
 
 	case SysProxyGlobal:
 		prev, _ := m.driver.Query()
+		m.captureOriginalLocked(prev)
+
 		if err := m.driver.ApplyGlobal(m.listenAddr, DefaultProxyBypass); err != nil {
 			return fmt.Errorf("apply global system proxy (%s): %w", m.listenAddr, err)
 		}
@@ -227,13 +270,20 @@ func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
 		return nil
 
 	case SysProxyOff:
-		if err := m.driver.Clear(); err != nil {
-			return fmt.Errorf("clear system proxy: %w", err)
+		if m.hasOriginal {
+			if err := m.driver.Restore(m.originalState); err != nil {
+				return fmt.Errorf("restore original system proxy: %w", err)
+			}
+			log.Printf("[SysProxy] Windows/OS system proxy restored to original state (mode=%s, proxyEnable=%v, server=%s, bypass=%s, pac=%s, autoDetect=%v)",
+				m.originalState.Mode, m.originalState.ProxyEnable, m.originalState.ProxyServer, m.originalState.ProxyBypass, m.originalState.AutoConfigURL, m.originalState.AutoDetect)
+		} else {
+			if err := m.driver.Clear(); err != nil {
+				return fmt.Errorf("clear system proxy: %w", err)
+			}
+			log.Printf("[SysProxy] Windows/OS system proxy cleared (Direct mode)")
 		}
-		m.prevStates = nil
 		m.mode = SysProxyOff
 		m.modified = false
-		log.Printf("[SysProxy] Windows/OS system proxy cleared (Direct mode)")
 		return nil
 
 	default:
@@ -248,16 +298,18 @@ func (m *SysProxyManager) CleanupOnExit() {
 		return
 	}
 	var target SysProxyState
-	if len(m.prevStates) > 0 {
+	if m.hasOriginal {
+		target = m.originalState
+	} else if len(m.prevStates) > 0 {
 		target = m.prevStates[0]
-		m.prevStates = nil
 	} else {
 		target = SysProxyState{Mode: SysProxyOff}
 	}
-	if err := m.restoreStateLocked(target); err != nil {
+	if err := m.driver.Restore(target); err != nil {
 		log.Printf("[SysProxy] WARNING: failed to restore system proxy on exit: %v", err)
 	} else {
-		log.Printf("[SysProxy] System proxy popped and restored on exit (mode=%s)", target.Mode)
+		log.Printf("[SysProxy] System proxy restored to original state on exit (mode=%s, proxyEnable=%v, server=%s, pac=%s, autoDetect=%v)",
+			target.Mode, target.ProxyEnable, target.ProxyServer, target.AutoConfigURL, target.AutoDetect)
 	}
 	m.mode = normalizeRestoredMode(target.Mode)
 	m.modified = false
@@ -274,6 +326,9 @@ func (m *SysProxyManager) StatusText() string {
 	case SysProxyGlobal:
 		return fmt.Sprintf("Mode: Global Proxy (ProxyServer=%s, Bypass=%s)", st.ProxyServer, st.ProxyBypass)
 	default:
+		if st.AutoDetect {
+			return "Mode: Auto-Detect (WPAD)"
+		}
 		return "Mode: Off (Direct)"
 	}
 }

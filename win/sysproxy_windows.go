@@ -33,6 +33,7 @@ const (
 	proxyTypeDirect       = 0x00000001
 	proxyTypeProxy        = 0x00000002
 	proxyTypeAutoProxyURL = 0x00000004
+	proxyTypeAutoDetect   = 0x00000008
 
 	// ptrSize 在 32 位 Windows (GOARCH=386) 下为 4，在 64 位 Windows (GOARCH=amd64) 下为 8。
 	ptrSize = unsafe.Sizeof(uintptr(0))
@@ -79,7 +80,9 @@ func (d *windowsSysProxyDriver) ApplyPAC(pacURL string) error {
 	if err := writeInternetSettingsReg(false, "", "", pacURL); err != nil {
 		return err
 	}
-	_ = applyWinINetPerConn(proxyTypeDirect|proxyTypeAutoProxyURL, "", "", pacURL)
+	flags := uint32(proxyTypeDirect | proxyTypeAutoProxyURL)
+	updateDefaultConnectionSettings(flags)
+	_ = applyWinINetPerConn(flags, "", "", pacURL)
 	notifyWinINetRefresh()
 	return nil
 }
@@ -89,7 +92,9 @@ func (d *windowsSysProxyDriver) ApplyGlobal(proxyHostPort, bypass string) error 
 	if err := writeInternetSettingsReg(true, proxyHostPort, bypass, ""); err != nil {
 		return err
 	}
-	_ = applyWinINetPerConn(proxyTypeDirect|proxyTypeProxy, proxyHostPort, bypass, "")
+	flags := uint32(proxyTypeDirect | proxyTypeProxy)
+	updateDefaultConnectionSettings(flags)
+	_ = applyWinINetPerConn(flags, proxyHostPort, bypass, "")
 	notifyWinINetRefresh()
 	return nil
 }
@@ -99,12 +104,82 @@ func (d *windowsSysProxyDriver) Clear() error {
 	if err := writeInternetSettingsReg(false, "", "", ""); err != nil {
 		return err
 	}
-	_ = applyWinINetPerConn(proxyTypeDirect, "", "", "")
+	flags := uint32(proxyTypeDirect)
+	updateDefaultConnectionSettings(flags)
+	_ = applyWinINetPerConn(flags, "", "", "")
 	notifyWinINetRefresh()
 	return nil
 }
 
-// Query 读取当前 Windows 注册表中的系统代理状态。
+// Restore 将 Windows 系统代理还原为指定状态（无损恢复全局代理、自动代理、PAC 及原始标志位）。
+func (d *windowsSysProxyDriver) Restore(st SysProxyState) error {
+	k, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsRegPath, registry.SET_VALUE)
+	if err != nil {
+		return fmt.Errorf("open registry %s: %w", internetSettingsRegPath, err)
+	}
+	defer k.Close()
+
+	var enableVal uint32
+	if st.ProxyEnable {
+		enableVal = 1
+	}
+	_ = k.SetDWordValue("ProxyEnable", enableVal)
+
+	if st.ProxyServer != "" {
+		_ = k.SetStringValue("ProxyServer", st.ProxyServer)
+	} else {
+		_ = k.DeleteValue("ProxyServer")
+	}
+
+	if st.ProxyBypass != "" {
+		_ = k.SetStringValue("ProxyOverride", st.ProxyBypass)
+	} else {
+		_ = k.DeleteValue("ProxyOverride")
+	}
+
+	if strings.TrimSpace(st.AutoConfigURL) != "" {
+		_ = k.SetStringValue("AutoConfigURL", st.AutoConfigURL)
+	} else {
+		_ = k.DeleteValue("AutoConfigURL")
+	}
+
+	var autoDetectVal uint32
+	if st.AutoDetect {
+		autoDetectVal = 1
+	}
+	_ = k.SetDWordValue("AutoDetect", autoDetectVal)
+
+	// 计算 WinINet Flags
+	flags := uint32(proxyTypeDirect)
+	if st.ProxyEnable && strings.TrimSpace(st.ProxyServer) != "" {
+		flags |= proxyTypeProxy
+	}
+	if strings.TrimSpace(st.AutoConfigURL) != "" {
+		flags |= proxyTypeAutoProxyURL
+	}
+	if st.AutoDetect {
+		flags |= proxyTypeAutoDetect
+	}
+	if st.RawFlags != 0 {
+		flags |= (st.RawFlags & ^uint32(proxyTypeProxy|proxyTypeAutoProxyURL|proxyTypeAutoDetect))
+		if st.AutoDetect {
+			flags |= proxyTypeAutoDetect
+		}
+		if st.ProxyEnable && strings.TrimSpace(st.ProxyServer) != "" {
+			flags |= proxyTypeProxy
+		}
+		if strings.TrimSpace(st.AutoConfigURL) != "" {
+			flags |= proxyTypeAutoProxyURL
+		}
+	}
+
+	updateDefaultConnectionSettings(flags)
+	_ = applyWinINetPerConn(flags, st.ProxyServer, st.ProxyBypass, st.AutoConfigURL)
+	notifyWinINetRefresh()
+	return nil
+}
+
+// Query 读取当前 Windows 注册表中的系统代理状态（包含全局代理、自动代理与 PAC 设置）。
 func (d *windowsSysProxyDriver) Query() (SysProxyState, error) {
 	k, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsRegPath, registry.QUERY_VALUE)
 	if err != nil {
@@ -116,19 +191,73 @@ func (d *windowsSysProxyDriver) Query() (SysProxyState, error) {
 	proxyEnable, _, _ := k.GetIntegerValue("ProxyEnable")
 	proxyServer, _, _ := k.GetStringValue("ProxyServer")
 	proxyOverride, _, _ := k.GetStringValue("ProxyOverride")
+	autoDetectReg, _, _ := k.GetIntegerValue("AutoDetect")
+
+	var rawFlags uint32
+	var hasRawFlags bool
+	if connKey, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsRegPath+`\Connections`, registry.QUERY_VALUE); err == nil {
+		if buf, _, err := connKey.GetBinaryValue("DefaultConnectionSettings"); err == nil && len(buf) > 8 {
+			rawFlags = uint32(buf[8])
+			hasRawFlags = true
+		}
+		connKey.Close()
+	}
+
+	autoDetect := autoDetectReg != 0
+	proxyEnabled := proxyEnable != 0
+	hasPAC := strings.TrimSpace(autoURL) != ""
+
+	if hasRawFlags {
+		if rawFlags&proxyTypeAutoDetect != 0 {
+			autoDetect = true
+		}
+		if rawFlags&proxyTypeProxy != 0 {
+			proxyEnabled = true
+		}
+		if rawFlags&proxyTypeAutoProxyURL != 0 {
+			hasPAC = true
+		}
+	} else {
+		rawFlags = proxyTypeDirect
+		if proxyEnabled {
+			rawFlags |= proxyTypeProxy
+		}
+		if hasPAC {
+			rawFlags |= proxyTypeAutoProxyURL
+		}
+		if autoDetect {
+			rawFlags |= proxyTypeAutoDetect
+		}
+	}
 
 	st := SysProxyState{
 		Mode:          SysProxyOff,
+		ProxyEnable:   proxyEnabled,
 		ProxyServer:   proxyServer,
 		ProxyBypass:   proxyOverride,
+		AutoDetect:    autoDetect,
 		AutoConfigURL: autoURL,
+		RawFlags:      rawFlags,
 	}
-	if strings.TrimSpace(autoURL) != "" {
+
+	if hasPAC && strings.TrimSpace(autoURL) != "" {
 		st.Mode = SysProxyPAC
-	} else if proxyEnable != 0 && strings.TrimSpace(proxyServer) != "" {
+	} else if proxyEnabled && strings.TrimSpace(proxyServer) != "" {
 		st.Mode = SysProxyGlobal
 	}
 	return st, nil
+}
+
+func updateDefaultConnectionSettings(flags uint32) {
+	if connKey, err := registry.OpenKey(registry.CURRENT_USER, internetSettingsRegPath+`\Connections`, registry.SET_VALUE|registry.QUERY_VALUE); err == nil {
+		for _, valName := range []string{"DefaultConnectionSettings", "SavedLegacySettings"} {
+			if buf, _, err := connKey.GetBinaryValue(valName); err == nil && len(buf) > 8 {
+				buf[8] = byte(flags)
+				_ = connKey.SetBinaryValue(valName, buf)
+			}
+		}
+		connKey.Close()
+	}
 }
 
 func writeInternetSettingsReg(enableProxy bool, proxyServer, proxyBypass, autoConfigURL string) error {

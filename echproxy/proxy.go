@@ -2,6 +2,7 @@ package echproxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"log"
@@ -226,6 +227,13 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 		}
 
 		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+				(c.Request.Context().Err() != nil && (errors.Is(c.Request.Context().Err(), context.Canceled) || errors.Is(c.Request.Context().Err(), context.DeadlineExceeded))) ||
+				strings.Contains(strings.ToLower(err.Error()), "context canceled") {
+				// 客户端主动断开/取消请求（如浏览器切页、图片预取取消或滚动离开可视区），属于正常客户端生命周期，无需向日志刷屏假报警
+				debugLogf("[%s] Client canceled request (%s): %v", clientIP, uc.Host, err)
+				return
+			}
 			log.Printf("[%s] Upstream request failed (%s): %v", clientIP, uc.Host, err)
 			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
 			if renderCertWarningIfMatch(c, uc.Host, err) {

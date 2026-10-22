@@ -189,6 +189,102 @@ func TestSysProxyManagerAtomicReplaceAndOldValuePop(t *testing.T) {
 	}
 }
 
+// TestSysProxyRestoreOriginalSceneOnDirectAndExit 验证：
+// 1. 本地运行 v2ray（全局代理 127.0.0.1:10809、自动代理 autoDetect、或 PAC）时启动 ech-proxy：
+//    - PAC URL 自动挂载 fallback=127.0.0.1:10809 参数，实现白名单走 ech-proxy，非白名单走 v2ray 无缝共存；
+// 2. 从 PAC 模式切换为「直连模式 (SysProxyOff)」时，现场必须完整无损还原（包含全局代理、自动代理、PAC 三项）；
+// 3. 再次切回 PAC 模式后退出进程（CleanupOnExit），现场再次无损还原，绝不破坏原有 v2ray 设置；
+// 4. 若启动前系统代理残留的是 ech-proxy 自身（如前次异常崩溃残留的 127.0.0.1:8443/proxy.pac），安全识别为自身地址，切直连时还原为纯净 Direct 模式。
+func TestSysProxyRestoreOriginalSceneOnDirectAndExit(t *testing.T) {
+	// --- 测试场景 1: 本地运行 v2ray 全局代理 + 自动检测 ---
+	drv1 := &stubSysProxyDriver{}
+	origV2RayState := SysProxyState{
+		Mode:          SysProxyGlobal,
+		ProxyEnable:   true,
+		ProxyServer:   "127.0.0.1:10809",
+		ProxyBypass:   DefaultProxyBypass,
+		AutoDetect:    true,
+		AutoConfigURL: "",
+		RawFlags:      0x0B, // Direct(1) + Proxy(2) + AutoDetect(8)
+	}
+	_ = drv1.Restore(origV2RayState)
+
+	mgr1 := NewSysProxyManager("127.0.0.1:8443", drv1)
+	mgr1.nowUnix = func() int64 { return 1700000000 }
+
+	// 验证捕获到的现场
+	orig, hasOrig := mgr1.OriginalState()
+	if !hasOrig || !orig.ProxyEnable || orig.ProxyServer != "127.0.0.1:10809" || !orig.AutoDetect {
+		t.Fatalf("OriginalState not properly captured: %+v, has=%v", orig, hasOrig)
+	}
+
+	// 1. 切换为 PAC 模式：应挂载 fallback 参数指向 v2ray
+	if err := mgr1.SetMode(SysProxyPAC); err != nil {
+		t.Fatalf("SetMode(PAC): %v", err)
+	}
+	curSt, _ := drv1.Query()
+	wantPACWithFallback := "http://127.0.0.1:8443/proxy.pac?fallback=127.0.0.1%3A10809&t=1700000000"
+	if curSt.AutoConfigURL != wantPACWithFallback {
+		t.Errorf("PAC URL got %q, want %q with fallback", curSt.AutoConfigURL, wantPACWithFallback)
+	}
+
+	// 2. 模拟白名单后台更新：再次调用 SetMode(SysProxyPAC) 不得覆盖 originalState
+	if err := mgr1.SetMode(SysProxyPAC); err != nil {
+		t.Fatalf("refresh SetMode(PAC): %v", err)
+	}
+	origAfterRefresh, _ := mgr1.OriginalState()
+	if origAfterRefresh.ProxyServer != "127.0.0.1:10809" || !origAfterRefresh.ProxyEnable {
+		t.Fatalf("originalState poisoned by second SetMode call: %+v", origAfterRefresh)
+	}
+
+	// 3. PAC模式 -> 直连模式：现场完整无损还原（全局代理 127.0.0.1:10809 + 自动代理 AutoDetect）
+	if err := mgr1.SetMode(SysProxyOff); err != nil {
+		t.Fatalf("SetMode(Off): %v", err)
+	}
+	restoredSt, _ := drv1.Query()
+	if !restoredSt.ProxyEnable || restoredSt.ProxyServer != "127.0.0.1:10809" || !restoredSt.AutoDetect {
+		t.Errorf("after SetMode(Off), expected restored v2ray scene, got %+v", restoredSt)
+	}
+
+	// 4. 再次切回 PAC 模式，并模拟退出（CleanupOnExit）
+	if err := mgr1.SetMode(SysProxyPAC); err != nil {
+		t.Fatalf("SetMode(PAC) again: %v", err)
+	}
+	mgr1.CleanupOnExit()
+	exitSt, _ := drv1.Query()
+	if !exitSt.ProxyEnable || exitSt.ProxyServer != "127.0.0.1:10809" || !exitSt.AutoDetect {
+		t.Errorf("after CleanupOnExit, expected restored v2ray scene, got %+v", exitSt)
+	}
+
+	// --- 测试场景 2: 本地运行 v2ray PAC 模式 ---
+	drv2 := &stubSysProxyDriver{}
+	_ = drv2.ApplyPAC("http://127.0.0.1:10808/pac")
+	mgr2 := NewSysProxyManager("127.0.0.1:8443", drv2)
+	mgr2.nowUnix = func() int64 { return 1700000000 }
+	_ = mgr2.SetMode(SysProxyPAC)
+	// 切直连 -> 现场还原为 v2ray PAC
+	_ = mgr2.SetMode(SysProxyOff)
+	st2, _ := drv2.Query()
+	if st2.AutoConfigURL != "http://127.0.0.1:10808/pac" {
+		t.Errorf("PAC->Off want restored v2ray pac, got %q", st2.AutoConfigURL)
+	}
+
+	// --- 测试场景 3: 启动前残留自身 PAC 崩溃地址防自死锁 ---
+	drv3 := &stubSysProxyDriver{}
+	_ = drv3.ApplyPAC("http://127.0.0.1:8443/proxy.pac?t=123")
+	mgr3 := NewSysProxyManager("127.0.0.1:8443", drv3)
+	// 识别为自身地址，hasOriginal 应为 false，不会死循环 fallback
+	if _, ok := mgr3.OriginalState(); ok {
+		t.Error("expected self PAC not recorded as valid original proxy")
+	}
+	_ = mgr3.SetMode(SysProxyOff)
+	st3, _ := drv3.Query()
+	if st3.Mode != SysProxyOff || st3.AutoConfigURL != "" {
+		t.Errorf("clearing self residual proxy want clean Off, got %+v", st3)
+	}
+}
+
+
 func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 	drv := &stubSysProxyDriver{}
 	sysMgr := NewSysProxyManager("127.0.0.1:8443", drv)

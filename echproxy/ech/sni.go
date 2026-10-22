@@ -471,7 +471,12 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 
 	// 4. 若分片不通，再按站点类型降级备用通道竞速
 	if detected, confident := DetectTransportModeWithStatus(req.Context(), host, normIPMode); confident && detected != "ech" {
-		return raceModes(req, []string{"sni"}, normIPMode, host)
+		if HasCustomSNIServerName(req.Context()) {
+			return raceModes(req, []string{"sni"}, normIPMode, host)
+		}
+		// 非 Cloudflare 节点且未显式指定自定义伪装 SNI 时，绝不可向源站发送随机公共伪装 SNI（如 cdnjs.cloudflare.com），
+		// 否则源站（如 DDoS-Guard / Nginx 等）必然回传默认或自签名证书，导致触发误报的「连接不安全 / 证书不匹配」告警。
+		return nil, errFrag
 	}
 	return raceModes(req, []string{"sni", "ech"}, normIPMode, host)
 }
@@ -614,27 +619,39 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 
 	// Singleflight 并发合并：同一 (host, normMode) 在缓存未命中时只发起一次 DoH 解析，
 	// 防止冷启动或页面并发加载数十个子资源时触发重复的 DoH 连接风暴。
+	// 注意：单次解析必须使用独立的后台 Context (带 10s 超时)，绝不可直接绑定单个客户端请求的 Context！
+	// 否则若首个客户端因页面跳转或取消加载而 context canceled，会导致后台 DoH 递归中断，
+	// 进而让所有并发等待中的其他客户端全部收到 "no v4 record" 级联失败并污染缓存。
 	ipFlightMu.Lock()
-	if call, inFlight := ipFlights[cacheKey]; inFlight {
-		ipFlightMu.Unlock()
-		select {
-		case <-call.done:
-			return call.ips, call.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	call, inFlight := ipFlights[cacheKey]
+	if !inFlight {
+		call = &ipFlightCall{done: make(chan struct{})}
+		ipFlights[cacheKey] = call
+		go func() {
+			defer func() {
+				ipFlightMu.Lock()
+				delete(ipFlights, cacheKey)
+				close(call.done)
+				ipFlightMu.Unlock()
+			}()
+
+			resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer resolveCancel()
+
+			call.ips, call.err = doResolveHostIPs(resolveCtx, host, normMode, cacheKey)
+		}()
 	}
-	call := &ipFlightCall{done: make(chan struct{})}
-	ipFlights[cacheKey] = call
 	ipFlightMu.Unlock()
 
-	defer func() {
-		ipFlightMu.Lock()
-		delete(ipFlights, cacheKey)
-		close(call.done)
-		ipFlightMu.Unlock()
-	}()
+	select {
+	case <-call.done:
+		return call.ips, call.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
+func doResolveHostIPs(ctx context.Context, host, normMode, cacheKey string) ([]string, error) {
 	qtypes := []int{1}
 	switch normMode {
 	case "v6":
@@ -689,16 +706,13 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 			ips = fallbackIPs
 		} else {
 			if normMode != "dual" {
-				call.err = fmt.Errorf("no %s record for %s", normMode, host)
-				return nil, call.err
+				return nil, fmt.Errorf("no %s record for %s", normMode, host)
 			}
-			call.err = fmt.Errorf("no A/AAAA record for %s", host)
-			return nil, call.err
+			return nil, fmt.Errorf("no A/AAAA record for %s", host)
 		}
 	}
 
 	storeIPCache(cacheKey, ips, ttl)
-	call.ips = ips
 	return ips, nil
 }
 
@@ -749,6 +763,9 @@ func isTLSRetryableError(err error) bool {
 		strings.Contains(msg, "handshake failure") ||
 		strings.Contains(msg, "unexpected eof") ||
 		strings.Contains(msg, "reset") ||
+		strings.Contains(msg, "forcibly closed") ||
+		strings.Contains(msg, "closed by the remote host") ||
+		strings.Contains(msg, "broken pipe") ||
 		strings.Contains(msg, "connection refused")
 }
 

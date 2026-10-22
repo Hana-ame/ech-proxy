@@ -429,26 +429,35 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 	bootstrapCacheMu.Unlock()
 
 	bootstrapFlightMu.Lock()
-	if call, inFlight := bootstrapFlights[cacheKey]; inFlight {
-		bootstrapFlightMu.Unlock()
-		select {
-		case <-call.done:
-			return call.ips, call.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	call, inFlight := bootstrapFlights[cacheKey]
+	if !inFlight {
+		call = &bootstrapFlightCall{done: make(chan struct{})}
+		bootstrapFlights[cacheKey] = call
+		go func() {
+			defer func() {
+				bootstrapFlightMu.Lock()
+				delete(bootstrapFlights, cacheKey)
+				close(call.done)
+				bootstrapFlightMu.Unlock()
+			}()
+
+			resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer resolveCancel()
+
+			call.ips, call.err = doResolveViaBootstrapDoH(resolveCtx, host, norm, cacheKey)
+		}()
 	}
-	call := &bootstrapFlightCall{done: make(chan struct{})}
-	bootstrapFlights[cacheKey] = call
 	bootstrapFlightMu.Unlock()
 
-	defer func() {
-		bootstrapFlightMu.Lock()
-		delete(bootstrapFlights, cacheKey)
-		close(call.done)
-		bootstrapFlightMu.Unlock()
-	}()
+	select {
+	case <-call.done:
+		return call.ips, call.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
+func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) ([]string, error) {
 	qtypes := []int{1}
 	if norm == "v6" {
 		qtypes = []int{28}
@@ -497,8 +506,7 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 
 	filtered := FilterIPsByMode(ips, norm)
 	if len(filtered) == 0 {
-		call.err = fmt.Errorf("DoH resolve %s (%s) failed", host, norm)
-		return nil, call.err
+		return nil, fmt.Errorf("DoH resolve %s (%s) failed", host, norm)
 	}
 
 	bootstrapCacheMu.Lock()
@@ -522,7 +530,6 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 	}
 	bootstrapCacheMu.Unlock()
 
-	call.ips = filtered
 	return filtered, nil
 }
 

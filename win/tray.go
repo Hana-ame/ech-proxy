@@ -219,11 +219,18 @@ func (tc *TrayController) MenuItems() []TrayMenuItem {
 		}
 	}
 
+	clearTitle := "系统代理：清除 / 禁用系统代理 (直连)"
+	if tc.SysProxy != nil {
+		if orig, ok := tc.SysProxy.OriginalState(); ok && (orig.Mode != SysProxyOff || orig.AutoDetect) {
+			clearTitle = "系统代理：直连模式 (还原原有代理/自动检测)"
+		}
+	}
+
 	return []TrayMenuItem{
 		{ID: TrayCmdToggleConsole, Title: "显示 / 隐藏控制台 (双击托盘图标)", Checked: consoleVis},
 		{Separator: true},
 		{ID: TrayCmdSysProxyPAC, Title: "系统代理：自动配置 PAC 模式 (推荐)", Checked: curMode == SysProxyPAC},
-		{ID: TrayCmdSysProxyClear, Title: "系统代理：清除 / 禁用系统代理 (直连)", Checked: curMode == SysProxyOff},
+		{ID: TrayCmdSysProxyClear, Title: clearTitle, Checked: curMode == SysProxyOff},
 		{Separator: true},
 		{ID: TrayCmdIPModeV4, Title: "强制 v4 出口", Checked: curIPMode == "v4"},
 		{ID: TrayCmdIPModeV6, Title: "强制 v6 出口", Checked: curIPMode == "v6"},
@@ -330,11 +337,12 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 			echproxy.SafeGo("TrayOpenFeedback", func() { tc.OpenURLFn(feedbackURL) })
 		}
 	case TrayCmdCopyPACURL:
-		allMode := false
+		pacURL := ""
 		if tc.SysProxy != nil {
-			allMode = tc.SysProxy.AllMode()
+			pacURL = tc.SysProxy.PACURL()
+		} else {
+			pacURL = BuildPACURL(tc.ListenAddr, false, 0, "")
 		}
-		pacURL := BuildPACURL(tc.ListenAddr, allMode, 0)
 		if tc.CopyClipboardFn != nil {
 			if err := tc.CopyClipboardFn(pacURL); err != nil {
 				log.Printf("[Tray] Copy PAC URL failed (%v), PAC URL is: %s", err, pacURL)

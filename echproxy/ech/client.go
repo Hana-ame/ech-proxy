@@ -349,28 +349,37 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 	cacheMu.Unlock()
 
 	echFlightMu.Lock()
-	if call, inFlight := echFlights[domain]; inFlight {
-		echFlightMu.Unlock()
-		select {
-		case <-call.done:
-			return call.cfg, call.err
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	call, inFlight := echFlights[domain]
+	if !inFlight {
+		call = &echFlightCall{done: make(chan struct{})}
+		echFlights[domain] = call
+		go func() {
+			defer func() {
+				echFlightMu.Lock()
+				delete(echFlights, domain)
+				close(call.done)
+				echFlightMu.Unlock()
+			}()
+
+			resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer resolveCancel()
+
+			call.cfg, call.err = doFetchECHConfig(resolveCtx, domain)
+		}()
 	}
-	call := &echFlightCall{done: make(chan struct{})}
-	echFlights[domain] = call
 	echFlightMu.Unlock()
 
-	defer func() {
-		echFlightMu.Lock()
-		delete(echFlights, domain)
-		close(call.done)
-		echFlightMu.Unlock()
-	}()
+	select {
+	case <-call.done:
+		return call.cfg, call.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
+func doFetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 	dohURL := currentConfig().dohURL
-	cfgBytes, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() ([]byte, error) {
+	return netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() ([]byte, error) {
 		resp, err := QueryDoH(ctx, domain, 65)
 		if err != nil {
 			return nil, err
@@ -429,8 +438,6 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("no ECH config found for %s", domain)
 	})
-	call.cfg, call.err = cfgBytes, err
-	return cfgBytes, err
 }
 
 func parseSVCBWire(wire []byte) ([]byte, error) {

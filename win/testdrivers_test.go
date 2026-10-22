@@ -43,6 +43,13 @@ func (d *stubSysProxyDriver) Query() (SysProxyState, error) {
 	return d.state, nil
 }
 
+func (d *stubSysProxyDriver) Restore(state SysProxyState) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.state = state
+	return nil
+}
+
 type stubConsoleDriver struct {
 	mu      sync.Mutex
 	visible bool

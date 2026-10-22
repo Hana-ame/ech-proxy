@@ -55,6 +55,13 @@ func (d *noopSysProxyDriver) Query() (SysProxyState, error) {
 	return d.state, nil
 }
 
+func (d *noopSysProxyDriver) Restore(state SysProxyState) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.state = state
+	return nil
+}
+
 func installCAOnPlatform(caPath string) error {
 	switch runtime.GOOS {
 	case "darwin":

@@ -137,6 +137,39 @@ func TestFetchBytesLocalAndRetry(t *testing.T) {
 	}
 }
 
+func TestGitHubFetchCandidatesOrder(t *testing.T) {
+	const raw = "https://github.com/Hana-ame/ech-proxy/releases/latest/download/checksums.txt"
+	got := gitHubFetchCandidates(raw)
+	want := []string{
+		"https://gh-proxy.com/" + raw,
+		"https://ghfast.top/" + raw,
+		"https://gh.llkk.cc/" + raw,
+		"https://ghproxy.imciel.com/" + raw,
+		raw,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("gitHubFetchCandidates returned %d candidates, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("candidate[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	// 硬性契约：直连必须排最后。国内网络直连 github.com:443 在 TCP 层即被阻断，
+	// 若直连排在前面，二进制下载（并发度 3）的槽位会被挂死的直连候选占满，
+	// 唯一可用镜像被饿死，更新下载必然整体超时失败。
+	if got[len(got)-1] != raw {
+		t.Errorf("direct GitHub URL must be the LAST candidate, got %q", got[len(got)-1])
+	}
+	// 所有镜像候选必须排在直连之前。
+	directIdx := len(got) - 1
+	for i, c := range got {
+		if i < directIdx && c == raw {
+			t.Errorf("mirror candidate[%d] equals the direct URL", i)
+		}
+	}
+}
+
 func TestWithInsideDoHPreventsDoHResolverRecursion(t *testing.T) {
 	origResolver := DoHResolver
 	defer func() { DoHResolver = origResolver }()

@@ -692,6 +692,26 @@ func (g *gitHubProxyTransport) RoundTrip(req *http.Request) (*http.Response, err
 	return http.DefaultTransport.RoundTrip(req)
 }
 
+// gitHubFetchCandidates 返回 GitHub 资源的竞速候选列表，顺序即优先级。
+//
+// 国内加速镜像一律排在直连之前：实证（2026-10-22，Windows/国内网络，
+// 见 RELEASE.md v3.5.24 与 updtest 诊断 exe）直连 github.com:443 在 TCP 层
+// 即被阻断（i/o timeout），而镜像可达。直连保留在末位——海外用户没有
+// 镜像时它仍是唯一通路，且排在最后不会给国内用户增加任何等待。
+//
+// 该顺序是硬性契约：二进制下载的并发度只有 3，一旦某个"挂死但排前面"的
+// 候选占住槽位 90s，唯一可用镜像就会被饿死（总超时先到）。TestGitHubFetchCandidatesOrder
+// 锁定此顺序，回归即红。
+func gitHubFetchCandidates(rawURL string) []string {
+	return []string{
+		"https://gh-proxy.com/" + rawURL,
+		"https://ghfast.top/" + rawURL,
+		"https://gh.llkk.cc/" + rawURL,
+		"https://ghproxy.imciel.com/" + rawURL,
+		rawURL,
+	}
+}
+
 func FetchBytes(rawURL string) ([]byte, error) {
 	if strings.HasPrefix(rawURL, "file://") {
 		return os.ReadFile(strings.TrimPrefix(rawURL, "file://"))
@@ -706,20 +726,14 @@ func FetchBytes(rawURL string) ([]byte, error) {
 		Transport: TransportWithIPMode(DefaultIPMode),
 	}
 
-	// 针对 GitHub 资源，国内直连经常被 GFW 阻断或 DNS 污染，并发竞速直连（FragmentDo 绕过 GFW）与国内加速镜像源
+	// 针对 GitHub 资源，国内直连经常被 GFW 阻断或 DNS 污染，并发竞速国内加速镜像源与直连（FragmentDo 绕过 GFW）
 	if strings.Contains(rawURL, "github.com") || strings.Contains(rawURL, "githubusercontent.com") {
 		type fetchResult struct {
 			target string
 			data   []byte
 			err    error
 		}
-		candidates := []string{
-			rawURL,
-			"https://gh-proxy.com/" + rawURL,
-			"https://ghfast.top/" + rawURL,
-			"https://gh.llkk.cc/" + rawURL,
-			"https://ghproxy.imciel.com/" + rawURL,
-		}
+		candidates := gitHubFetchCandidates(rawURL)
 
 		isBinary := strings.HasSuffix(rawURL, ".exe") || strings.HasSuffix(rawURL, ".zip") ||
 			strings.HasSuffix(rawURL, ".tar.gz") || strings.HasSuffix(rawURL, ".bin")
@@ -729,10 +743,13 @@ func FetchBytes(rawURL string) ([]byte, error) {
 		maxConcurrent := len(candidates)
 		if isBinary {
 			candTimeout = 90 * time.Second
-			overallTimeout = 150 * time.Second
+			overallTimeout = 180 * time.Second
 			maxReadBytes = 64 << 20
-			// 二进制大文件限制并发下载数为 2，避免 6 个镜像同时在内存缓冲数十 MB 的可执行文件
-			maxConcurrent = 2
+			// 二进制大文件限制并发下载数，避免多个镜像同时在内存缓冲数十 MB 的可执行文件。
+			// 必须 >= 3：实证（2026-10-22，Windows/国内网络）4 个镜像中只有 ghproxy.imciel.com
+			// 能真正完成下载，若只放行 2 路，排在前面的挂死候选各占槽 90s，唯一可用镜像
+			// 永远抢不到槽，总超时先到——更新下载 100% 失败（见 RELEASE.md v3.5.24）。
+			maxConcurrent = 3
 		}
 
 		sem := make(chan struct{}, maxConcurrent)

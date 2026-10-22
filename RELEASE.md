@@ -1,3 +1,12 @@
+## v3.5.15
+
+### Fixes & Improvements
+
+- **彻底修复国内直连 GitHub 检查更新卡死 5 分钟的问题**:
+  - **TLS 分片免翻墙绕过 GFW**：在 `netdial.FetchBytes` 中将直连 GitHub（含 `github.com` 及重定向资产源 `objects.githubusercontent.com`）注入 `GitHubRoundTripper`，利用 DoH 解析真实 IP + TLS ClientHello 分片（`FragmentDo`）彻底绕过 GFW 对 GitHub SNI 的黑洞丢包与重置。
+  - **Transport 握手超时兜底**：在底层 `TransportWithIPMode` 中显式设置 `TLSHandshakeTimeout: 10s`、`ResponseHeaderTimeout: 30s`，杜绝未设握手超时导致 GFW 丢包时 Go 原生标准库死等 5 分钟（`OpTimeout`）的严重缺陷。
+  - **多源智能竞速与独立超时**：并发竞速直连分片与 4 大国内高速镜像源（`gh-proxy.com`、`ghfast.top`、`ghproxy.net`、`ghproxy.cn`），单源超时 15 秒（二进制下载 90 秒），首个成功结果立即返回并取消其他请求，秒级完成版本检测与更新包下载。
+
 ## v3.5.6
 
 ### Fixes & Improvements

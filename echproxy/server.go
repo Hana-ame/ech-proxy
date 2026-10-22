@@ -100,6 +100,12 @@ var (
 	CleanLogs               = logger.CleanLogs
 )
 
+func init() {
+	netdial.GitHubRoundTripper = func(req *http.Request) (*http.Response, error) {
+		return cloudflare_ech.RoundTrip(req, "fragment", "")
+	}
+}
+
 const (
 	// DoH 主机名统一引用 ech 包（源自 netdial.DefaultSiteHost）的唯一 true source。
 	defaultListenAddr = "127.0.0.1:8443"

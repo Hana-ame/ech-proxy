@@ -203,6 +203,9 @@ func FormatIPMode(mode string) string {
 var (
 	DoHResolver func(ctx context.Context, host, mode string) ([]string, error)
 
+	// GitHubRoundTripper 提供免翻墙绕过 GFW DPI 访问 GitHub 的 RoundTripper（由上层 echproxy 模块注入 FragmentDo）
+	GitHubRoundTripper func(req *http.Request) (*http.Response, error)
+
 	rootPoolOnce sync.Once
 	rootPool     *x509.CertPool
 
@@ -407,11 +410,14 @@ func TransportWithIPMode(mode string) *http.Transport {
 			}
 			return DialContextIPMode(ctx, host, port, norm, DialTimeout)
 		},
-		TLSClientConfig:   &tls.Config{RootCAs: getRootPool()},
-		MaxIdleConns:        64,
-		MaxIdleConnsPerHost: 8,
-		IdleConnTimeout:     15 * time.Second,
-		ForceAttemptHTTP2:   true,
+		TLSClientConfig:       &tls.Config{RootCAs: getRootPool()},
+		MaxIdleConns:          64,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       15 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ForceAttemptHTTP2:     true,
 	}
 	ipTransports[norm] = tr
 	return tr
@@ -471,6 +477,28 @@ func ClientWithIPMode(mode string, timeout time.Duration) *http.Client {
 	}
 }
 
+type gitHubProxyTransport struct {
+	base http.RoundTripper
+}
+
+func (g *gitHubProxyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req != nil && req.URL != nil {
+		host := req.URL.Hostname()
+		if strings.Contains(host, "github.com") || strings.Contains(host, "githubusercontent.com") {
+			if GitHubRoundTripper != nil {
+				resp, err := GitHubRoundTripper(req)
+				if err == nil && resp != nil {
+					return resp, nil
+				}
+			}
+		}
+	}
+	if g.base != nil {
+		return g.base.RoundTrip(req)
+	}
+	return http.DefaultTransport.RoundTrip(req)
+}
+
 func FetchBytes(rawURL string) ([]byte, error) {
 	if strings.HasPrefix(rawURL, "file://") {
 		return os.ReadFile(strings.TrimPrefix(rawURL, "file://"))
@@ -485,55 +513,88 @@ func FetchBytes(rawURL string) ([]byte, error) {
 		Transport: TransportWithIPMode(DefaultIPMode),
 	}
 
-	// 针对 GitHub 资源，国内直连经常被 GFW 阻断或 DNS 污染，并发竞速直连与国内加速镜像源
+	// 针对 GitHub 资源，国内直连经常被 GFW 阻断或 DNS 污染，并发竞速直连（FragmentDo 绕过 GFW）与国内加速镜像源
 	if strings.Contains(rawURL, "github.com") || strings.Contains(rawURL, "githubusercontent.com") {
 		type fetchResult struct {
-			data []byte
-			err  error
+			target string
+			data   []byte
+			err    error
 		}
 		candidates := []string{
 			rawURL,
 			"https://gh-proxy.com/" + rawURL,
+			"https://ghfast.top/" + rawURL,
 			"https://ghproxy.net/" + rawURL,
+			"https://ghproxy.cn/" + rawURL,
 		}
+
+		isBinary := strings.HasSuffix(rawURL, ".exe") || strings.HasSuffix(rawURL, ".zip") ||
+			strings.HasSuffix(rawURL, ".tar.gz") || strings.HasSuffix(rawURL, ".bin")
+		candTimeout := 15 * time.Second
+		overallTimeout := 25 * time.Second
+		if isBinary {
+			candTimeout = 90 * time.Second
+			overallTimeout = 120 * time.Second
+		}
+
 		ch := make(chan fetchResult, len(candidates))
-		raceCtx, raceCancel := context.WithCancel(context.Background())
+		raceCtx, raceCancel := context.WithTimeout(context.Background(), overallTimeout)
 		defer raceCancel()
+
+		ghClient := &http.Client{
+			Transport: &gitHubProxyTransport{
+				base: TransportWithIPMode(DefaultIPMode),
+			},
+		}
 
 		for _, cand := range candidates {
 			go func(target string) {
-				req, err := http.NewRequestWithContext(raceCtx, http.MethodGet, target, nil)
+				cCtx, cCancel := context.WithTimeout(raceCtx, candTimeout)
+				defer cCancel()
+
+				req, err := http.NewRequestWithContext(cCtx, http.MethodGet, target, nil)
 				if err != nil {
-					ch <- fetchResult{nil, err}
+					ch <- fetchResult{target: target, err: err}
 					return
 				}
-				resp, err := client.Do(req)
+				req.Header.Set("User-Agent", "ech-proxy-updater")
+				resp, err := ghClient.Do(req)
 				if err != nil {
-					ch <- fetchResult{nil, err}
+					ch <- fetchResult{target: target, err: err}
 					return
 				}
 				defer resp.Body.Close()
 				if resp.StatusCode != http.StatusOK {
-					ch <- fetchResult{nil, fmt.Errorf("unexpected status: %s", resp.Status)}
+					ch <- fetchResult{target: target, err: fmt.Errorf("unexpected status: %s", resp.Status)}
 					return
 				}
 				b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 				if err == nil && len(b) > 0 {
-					ch <- fetchResult{b, nil}
-					raceCancel()
+					ch <- fetchResult{target: target, data: b, err: nil}
 				} else {
-					ch <- fetchResult{nil, err}
+					if err == nil {
+						err = fmt.Errorf("empty body from %s", target)
+					}
+					ch <- fetchResult{target: target, err: err}
 				}
 			}(cand)
 		}
 
 		var lastErr error
 		for i := 0; i < len(candidates); i++ {
-			res := <-ch
-			if res.err == nil && len(res.data) > 0 {
-				return res.data, nil
+			select {
+			case res := <-ch:
+				if res.err == nil && len(res.data) > 0 {
+					raceCancel()
+					return res.data, nil
+				}
+				lastErr = res.err
+			case <-raceCtx.Done():
+				if lastErr == nil {
+					lastErr = raceCtx.Err()
+				}
+				return nil, fmt.Errorf("fetch %s timed out after %v: %w", rawURL, overallTimeout, lastErr)
 			}
-			lastErr = res.err
 		}
 		return nil, lastErr
 	}

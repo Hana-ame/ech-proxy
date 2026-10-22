@@ -1,3 +1,11 @@
+## v3.5.5
+
+### Changes & Features
+
+- **SNI 伪装默认域名轮换（高信誉主流服务白名单，绝不留空）**:
+  - 移除了假 SNI 留空的逻辑，配置默认伪装 SNI 轮询列表（`apple.com`、`icloud.com`、`msa.apple.com`、`microsoft.com`、`azure.microsoft.com` 与 `*.windowsupdate.com` 合法子域名）。
+  - 在未显式指定自定义 SNI 时，按 Round-Robin 线程安全轮换上述不受干扰的大型主流服务域名，避免单域名流量特征与空 SNI 导致的握手异常。
+
 ## v3.5.1
 
 ### Changes & Features

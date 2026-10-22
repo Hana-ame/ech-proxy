@@ -32,8 +32,13 @@ func TestSetIPModeNormalizesAndSNIServerNameContext(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if got := SNIServerNameFromContext(ctx); got != "" {
-		t.Errorf("default SNIServerName = %q, want empty", got)
+	gotDefault := SNIServerNameFromContext(ctx)
+	if gotDefault == "" {
+		t.Errorf("default SNIServerName should not be empty, got %q", gotDefault)
+	}
+	gotNext := SNIServerNameFromContext(ctx)
+	if gotNext == "" || gotNext == gotDefault {
+		t.Errorf("next SNIServerName should rotate to different domain, got %q (prev: %q)", gotNext, gotDefault)
 	}
 	ctxCustom := WithSNIServerName(ctx, "custom.sni.example")
 	if got := SNIServerNameFromContext(ctxCustom); got != "custom.sni.example" {
@@ -42,6 +47,39 @@ func TestSetIPModeNormalizesAndSNIServerNameContext(t *testing.T) {
 	ctxNone := WithSNIServerName(ctx, "none")
 	if got := SNIServerNameFromContext(ctxNone); got != "" {
 		t.Errorf("none SNIServerName = %q, want empty", got)
+	}
+	if HasCustomSNIServerName(ctx) {
+		t.Errorf("HasCustomSNIServerName(ctx) = true, want false")
+	}
+	if !HasCustomSNIServerName(ctxCustom) {
+		t.Errorf("HasCustomSNIServerName(ctxCustom) = false, want true")
+	}
+	if HasCustomSNIServerName(ctxNone) {
+		t.Errorf("HasCustomSNIServerName(ctxNone) = true, want false")
+	}
+}
+
+func TestDefaultSNIDomainsRotation(t *testing.T) {
+	seen := make(map[string]bool)
+	hasWildcardResolved := false
+	for i := 0; i < len(DefaultSNIDomains)*2; i++ {
+		sni := NextDefaultSNIServerName()
+		if sni == "" {
+			t.Fatalf("NextDefaultSNIServerName() returned empty string at index %d", i)
+		}
+		if strings.Contains(sni, "*") {
+			t.Fatalf("NextDefaultSNIServerName() returned unexpanded wildcard: %q", sni)
+		}
+		if strings.HasSuffix(sni, ".windowsupdate.com") {
+			hasWildcardResolved = true
+		}
+		seen[sni] = true
+	}
+	if len(seen) < 5 {
+		t.Errorf("expected diverse rotated domains, only got %d unique: %v", len(seen), seen)
+	}
+	if !hasWildcardResolved {
+		t.Errorf("expected *.windowsupdate.com to be resolved into valid subdomains")
 	}
 }
 

@@ -85,6 +85,8 @@ var (
 	DefaultPrimaryDoHURL    = cloudflare_ech.DefaultPrimaryDoHURL
 	DefaultSecondaryDoHURL  = cloudflare_ech.DefaultSecondaryDoHURL
 	DefaultDoHHost          = cloudflare_ech.DefaultDoHHost
+	DefaultSNIDomains       = cloudflare_ech.DefaultSNIDomains
+	NextDefaultSNIServerName = cloudflare_ech.NextDefaultSNIServerName
 	SetGlobalIPMode         = cloudflare_ech.SetIPMode
 	GetGlobalIPMode         = cloudflare_ech.GetIPMode
 	InitLogger              = logger.Init

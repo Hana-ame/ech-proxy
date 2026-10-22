@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
@@ -24,6 +25,46 @@ const (
 	maxSNICacheEntries = 256
 )
 
+var (
+	defaultSNIIndex         uint64
+	windowsUpdateSubdomains = []string{
+		"update",
+		"download",
+		"www",
+		"ctldl",
+		"tsfe",
+		"msdl",
+	}
+	windowsUpdateIndex uint64
+
+	// DefaultSNIDomains 是一组在国内完全不受影响、属于全球大型主流云与基础服务（Apple、Microsoft、Windows Update 等）的高信誉域名。
+	// 当未指定自定义伪装 SNI 时，按轮询（Round-Robin）顺序轮换使用这些域名作为 TLS ClientHello 的伪装 ServerName，绝不留空。
+	DefaultSNIDomains = []string{
+		"apple.com",
+		"icloud.com",
+		"msa.apple.com",
+		"microsoft.com",
+		"azure.microsoft.com",
+		"*.windowsupdate.com",
+	}
+)
+
+// NextDefaultSNIServerName 线程安全地按轮询（Round-Robin）顺序返回下一个默认伪装 SNI 域名。
+// 针对通配符规则（如 *.windowsupdate.com），自动转换为合法的常见子域名（如 update.windowsupdate.com, download.windowsupdate.com 等）。
+func NextDefaultSNIServerName() string {
+	if len(DefaultSNIDomains) == 0 {
+		return "microsoft.com"
+	}
+	idx := atomic.AddUint64(&defaultSNIIndex, 1) - 1
+	d := DefaultSNIDomains[idx%uint64(len(DefaultSNIDomains))]
+	if strings.HasPrefix(d, "*.") {
+		subIdx := atomic.AddUint64(&windowsUpdateIndex, 1) - 1
+		sub := windowsUpdateSubdomains[subIdx%uint64(len(windowsUpdateSubdomains))]
+		return sub + d[1:]
+	}
+	return d
+}
+
 type sniServerNameKey struct{}
 
 func WithSNIServerName(ctx context.Context, serverName string) context.Context {
@@ -33,14 +74,30 @@ func WithSNIServerName(ctx context.Context, serverName string) context.Context {
 	return context.WithValue(ctx, sniServerNameKey{}, strings.TrimSpace(serverName))
 }
 
-func SNIServerNameFromContext(ctx context.Context) string {
-	if v, ok := ctx.Value(sniServerNameKey{}).(string); ok && v != "" {
-		if strings.EqualFold(v, "none") {
-			return ""
-		}
-		return v
+// HasCustomSNIServerName 检查当前 Context 中是否显式注入了自定义的伪装 SNI（且非 "none"）。
+func HasCustomSNIServerName(ctx context.Context) bool {
+	if ctx == nil {
+		return false
 	}
-	return ""
+	if v, ok := ctx.Value(sniServerNameKey{}).(string); ok && v != "" {
+		return !strings.EqualFold(v, "none")
+	}
+	return false
+}
+
+// SNIServerNameFromContext 从 Context 中获取 SNI 伪装域名。
+// 若未显式指定自定义 SNI，则自动从大型服务不受影响的白名单域名中轮换选取一个，绝不留空。
+// 若显式指定为 "none"，则明确返回空字符串以发送无 SNI 扩展的握手。
+func SNIServerNameFromContext(ctx context.Context) string {
+	if ctx != nil {
+		if v, ok := ctx.Value(sniServerNameKey{}).(string); ok && v != "" {
+			if strings.EqualFold(v, "none") {
+				return ""
+			}
+			return v
+		}
+	}
+	return NextDefaultSNIServerName()
 }
 
 type routeEntry struct {
@@ -93,7 +150,7 @@ func DetectTransportModeWithStatus(ctx context.Context, host, ipMode string) (mo
 			}
 		}
 		// 非 Cloudflare 节点：若配置了显式自定义伪装 SNI 则首选 sni，否则首选 fragment（TLS 记录分片绕过 GFW）
-		if customSNI := SNIServerNameFromContext(ctx); customSNI != "" {
+		if HasCustomSNIServerName(ctx) {
 			return "sni", true
 		}
 		return "fragment", true
@@ -558,8 +615,12 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 		return nil, err
 	}
 	effectiveSNI := sniName
-	if effectiveSNI == "" && tag == "frag" {
-		effectiveSNI = host
+	if effectiveSNI == "" {
+		if tag == "frag" {
+			effectiveSNI = host
+		} else if tag == "sni" {
+			effectiveSNI = NextDefaultSNIServerName()
+		}
 	}
 
 	var lastErr error

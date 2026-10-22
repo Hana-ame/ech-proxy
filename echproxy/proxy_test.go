@@ -684,13 +684,14 @@ func TestPrevent304BlankPageAndZeroByteCachePollution(t *testing.T) {
 
 	engine := NewEngine(&config.Config{})
 
-	// 1. HTML document navigation must strip If-None-Match and strip upstream ETag from response
+	// 1. Force refresh (Cache-Control: no-cache) must strip If-None-Match; normal request preserves ETag
 	attempts = 0
 	recDoc := httptest.NewRecorder()
 	reqDoc := httptest.NewRequest(http.MethodGet, "https://nyaa.si/", nil)
 	reqDoc.Host = "nyaa.si"
 	reqDoc.Header.Set("Accept", "text/html,application/xhtml+xml")
 	reqDoc.Header.Set("Sec-Fetch-Dest", "document")
+	reqDoc.Header.Set("Cache-Control", "no-cache")
 	reqDoc.Header.Set("If-None-Match", `"stale-empty-etag"`)
 	reqDoc.Header.Set("Origin", "https://nyaa.si")
 	engine.ServeHTTP(recDoc, reqDoc)
@@ -699,10 +700,10 @@ func TestPrevent304BlankPageAndZeroByteCachePollution(t *testing.T) {
 		t.Fatalf("document navigation got status=%d body=%q", recDoc.Code, recDoc.Body.String())
 	}
 	if lastSawIfNoneMatch != "" {
-		t.Errorf("expected If-None-Match stripped on HTML navigation, upstream saw %q", lastSawIfNoneMatch)
+		t.Errorf("expected If-None-Match stripped on force-refresh, upstream saw %q", lastSawIfNoneMatch)
 	}
-	if gotETag := recDoc.Header().Get("ETag"); gotETag != "" {
-		t.Errorf("expected ETag stripped on HTML response, got %q", gotETag)
+	if gotETag := recDoc.Header().Get("ETag"); gotETag != `"v1"` {
+		t.Errorf("expected ETag preserved on untouched passthrough HTML response, got %q", gotETag)
 	}
 	if gotVary := recDoc.Header().Get("Vary"); !strings.Contains(gotVary, "Accept-Encoding") || !strings.Contains(gotVary, "Origin") {
 		t.Errorf("expected Vary to preserve Accept-Encoding and append Origin, got %q", gotVary)

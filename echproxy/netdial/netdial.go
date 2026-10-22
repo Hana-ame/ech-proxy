@@ -298,9 +298,11 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 					_, port, _ := net.SplitHostPort(addr)
 					return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(bIP, port))
 				},
+				DisableKeepAlives: true,
 			}
 			client := &http.Client{Transport: tr, Timeout: 6 * time.Second}
 			resp, err := client.Do(req)
+			tr.CloseIdleConnections()
 			if err != nil || resp.StatusCode != http.StatusOK {
 				if resp != nil && resp.Body != nil {
 					_ = resp.Body.Close()
@@ -406,9 +408,10 @@ func TransportWithIPMode(mode string) *http.Transport {
 			return DialContextIPMode(ctx, host, port, norm, DialTimeout)
 		},
 		TLSClientConfig:   &tls.Config{RootCAs: getRootPool()},
-		MaxIdleConns:      100,
-		IdleConnTimeout:   90 * time.Second,
-		ForceAttemptHTTP2: true,
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     15 * time.Second,
+		ForceAttemptHTTP2:   true,
 	}
 	ipTransports[norm] = tr
 	return tr
@@ -447,9 +450,10 @@ func TransportWithIPModeAndCertCheck(mode string, certCheck func(host string, pe
 			}
 			return tlsConn, nil
 		},
-		MaxIdleConns:      100,
-		IdleConnTimeout:   90 * time.Second,
-		ForceAttemptHTTP2: true,
+		MaxIdleConns:        64,
+		MaxIdleConnsPerHost: 8,
+		IdleConnTimeout:     15 * time.Second,
+		ForceAttemptHTTP2:   true,
 	}
 }
 

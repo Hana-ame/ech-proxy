@@ -31,7 +31,7 @@ import (
 const (
 	DefaultPerPeerMaxTunnels = 128
 	DefaultGlobalMaxTunnels  = 1024
-	DefaultTunnelIdleTimeout = 10 * time.Minute
+	DefaultTunnelIdleTimeout = 60 * time.Second
 	authFailureWindow        = 5 * time.Minute
 	maxAuthFailures          = 10
 
@@ -418,7 +418,7 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 			}
 			opts.HTTPHandler.ServeHTTP(w, req)
 		})
-		srv := &http.Server{Handler: plainHandler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second}
+		srv := &http.Server{Handler: plainHandler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 15 * time.Second}
 		_ = srv.Serve(newSingleConnListener(peekedConn))
 		return
 	}
@@ -460,10 +460,14 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 	})
 
 	if tlsState.NegotiatedProtocol == "h2" {
-		(&http2.Server{}).ServeConn(tlsConn, &http2.ServeConnOpts{Handler: handler})
+		h2Srv := &http2.Server{
+			IdleTimeout:          15 * time.Second,
+			MaxConcurrentStreams: 64,
+		}
+		h2Srv.ServeConn(tlsConn, &http2.ServeConnOpts{Handler: handler})
 		return
 	}
-	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 15 * time.Second, IdleTimeout: 90 * time.Second}
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 15 * time.Second}
 	_ = srv.Serve(newSingleConnListener(tlsConn))
 }
 

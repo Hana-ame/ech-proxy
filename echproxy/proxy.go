@@ -67,6 +67,16 @@ func isDocumentNavigation(req *http.Request) bool {
 	return strings.Contains(accept, "text/html") || strings.Contains(accept, "application/xhtml+xml")
 }
 
+// isClientForceRefresh 判断客户端请求是否显式指示忽略/绕过本地缓存（如 Ctrl+F5 强制刷新）。
+func isClientForceRefresh(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	cc := strings.ToLower(req.Header.Get("Cache-Control"))
+	pragma := strings.ToLower(req.Header.Get("Pragma"))
+	return strings.Contains(cc, "no-cache") || strings.Contains(pragma, "no-cache") || strings.Contains(cc, "max-age=0")
+}
+
 // hasConditionalHeaders 判断客户端原始请求是否携带了条件缓存校验头。
 func hasConditionalHeaders(h http.Header) bool {
 	return h.Get("If-None-Match") != "" ||
@@ -240,10 +250,10 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, effectiveRewriter, port)
 		}
 
-		// 防御「孤儿 304」与文档导航 304 白屏：
-		// 若上游返回 304 Not Modified，但浏览器并未发送条件请求头（浏览器本地根本无缓存）或属于 HTML 导航请求，
+		// 防御「孤儿 304」白屏：
+		// 若上游返回 304 Not Modified，但浏览器并未发送任何条件请求头（浏览器本地根本无缓存导致页面全白），
 		// 自动剥离条件请求头并附加 Cache-Control: no-cache 向上游重拉一次完整的 200 OK 响应。
-		if resp.StatusCode == http.StatusNotModified && (!hasConditionalHeaders(c.Request.Header) || isDocumentNavigation(c.Request)) {
+		if resp.StatusCode == http.StatusNotModified && !hasConditionalHeaders(c.Request.Header) {
 			if retryReq, rerr := buildUpstreamRequestWithScheme(c, uc, targetScheme, reqPort); rerr == nil {
 				stripConditionalHeaders(retryReq.Header)
 				retryReq.Header.Set("Cache-Control", "no-cache")
@@ -309,9 +319,9 @@ func buildUpstreamRequestWithScheme(c *gin.Context, uc config.UpstreamConfig, sc
 	outReq.Header.Del("Proxy-Authenticate")
 	outReq.Header.Del("Proxy-Authorization")
 
-	// 对 HTML 页面主文档导航请求主动剥离条件缓存头（If-None-Match / If-Modified-Since），
-	// 确保主文档永远返回完整正文，杜绝因浏览器残缺缓存收到 304 导致整页白屏。
-	if isDocumentNavigation(c.Request) {
+	// 仅当客户端主动发起强制刷新（Cache-Control: no-cache / Pragma: no-cache）时，剥离条件缓存头；
+	// 正常浏览导航保留 If-None-Match / If-Modified-Since，允许毫秒级 304 命中浏览器本地缓存，大幅提升浏览速度。
+	if isClientForceRefresh(c.Request) {
 		stripConditionalHeaders(outReq.Header)
 	}
 
@@ -369,12 +379,9 @@ func prepareResponseHeaders(dst, src http.Header, uc config.UpstreamConfig, cook
 		rewrite.RewriteRedirectHeaders(dst, rewriter, port)
 	}
 	ct := strings.ToLower(src.Get("Content-Type"))
-	if strings.Contains(ct, "text/html") || (rewriter != nil && rewrite.IsTextContent(ct)) {
+	if rewriter != nil && rewrite.IsTextContent(ct) {
 		dst.Del("ETag")
 		dst.Del("Last-Modified")
-		if strings.Contains(ct, "text/html") {
-			dst.Set("Cache-Control", "no-cache, must-revalidate")
-		}
 	}
 	rewrite.ApplyCORSHeaders(dst, req)
 }
@@ -494,7 +501,7 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 			}
 		}
 		if err != nil {
-			panic(http.ErrAbortHandler)
+			return
 		}
 		streamRemainingBodyAfterPrefix(c, rc, resp.Body)
 		return
@@ -564,9 +571,6 @@ func streamRemainingBody(c *gin.Context, rc *http.ResponseController, resp *http
 		}
 	}
 	if rerr != nil {
-		if !errors.Is(rerr, io.EOF) {
-			panic(http.ErrAbortHandler)
-		}
 		return
 	}
 	streamRemainingBodyAfterPrefix(c, rc, resp.Body)
@@ -586,9 +590,6 @@ func streamRemainingBodyAfterPrefix(c *gin.Context, rc *http.ResponseController,
 			}
 		}
 		if rerr != nil {
-			if !errors.Is(rerr, io.EOF) {
-				panic(http.ErrAbortHandler)
-			}
 			break
 		}
 	}

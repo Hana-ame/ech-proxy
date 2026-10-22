@@ -341,7 +341,10 @@ func parseSVCBWire(wire []byte) ([]byte, error) {
 
 func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 	return &http2.Transport{
-		AllowHTTP: false,
+		AllowHTTP:       false,
+		IdleConnTimeout: 15 * time.Second,
+		PingTimeout:     5 * time.Second,
+		ReadIdleTimeout: 10 * time.Second,
 		DialTLSContext: func(ctx context.Context, _, addr string, _ *tls.Config) (net.Conn, error) {
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {

@@ -65,6 +65,26 @@ func NextDefaultSNIServerName() string {
 	return d
 }
 
+// ConsistentDefaultSNIForHost 基于访问的目标主机名计算稳定的伪装 SNI 域名。
+// 针对同一主机名始终返回同一个伪装域名，使 HTTP/2 传输通道与 TCP 连接池能够高效复用，杜绝频繁切换导致连接池膨胀与端口耗尽。
+func ConsistentDefaultSNIForHost(host string) string {
+	if len(DefaultSNIDomains) == 0 {
+		return "microsoft.com"
+	}
+	clean := netdial.CleanHost(host)
+	var h uint64 = 14695981039346656037
+	for i := 0; i < len(clean); i++ {
+		h ^= uint64(clean[i])
+		h *= 1099511628211
+	}
+	d := DefaultSNIDomains[h%uint64(len(DefaultSNIDomains))]
+	if strings.HasPrefix(d, "*.") {
+		sub := windowsUpdateSubdomains[(h>>8)%uint64(len(windowsUpdateSubdomains))]
+		return sub + d[1:]
+	}
+	return d
+}
+
 type sniServerNameKey struct{}
 
 func WithSNIServerName(ctx context.Context, serverName string) context.Context {
@@ -105,9 +125,15 @@ type routeEntry struct {
 	expiry time.Time
 }
 
+type routeFlightCall struct {
+	done chan struct{}
+}
+
 var (
-	routeMu sync.RWMutex
-	routes  = map[string]routeEntry{}
+	routeMu       sync.RWMutex
+	routes        = map[string]routeEntry{}
+	routeFlightMu sync.Mutex
+	routeFlights  = map[string]*routeFlightCall{}
 )
 
 func getCachedRoute(host string) (string, bool) {
@@ -384,14 +410,40 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		clearCachedRoute(host)
 	}
 
-	// 2. 先基于 DoH 解析出的真实 IP 判定是否为 Cloudflare 站点：
+	// 2. 抑制并发风暴（Singleflight / In-Flight 去重）：
+	//    若当前主机名正处于竞速探测中，等待首条探测完成并写入缓存，直接复用获胜模式，避免几十个并发请求同时打满套接字与内存。
+	routeFlightMu.Lock()
+	call, inFlight := routeFlights[host]
+	if inFlight {
+		routeFlightMu.Unlock()
+		select {
+		case <-call.done:
+			if cached, ok := getCachedRoute(host); ok {
+				return doSingleMode(req, cached, normIPMode)
+			}
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+	} else {
+		call = &routeFlightCall{done: make(chan struct{})}
+		routeFlights[host] = call
+		routeFlightMu.Unlock()
+		defer func() {
+			routeFlightMu.Lock()
+			delete(routeFlights, host)
+			close(call.done)
+			routeFlightMu.Unlock()
+		}()
+	}
+
+	// 3. 先基于 DoH 解析出的真实 IP 判定是否为 Cloudflare 站点：
 	//    - 非 Cloudflare 站点（如 nyaa.si 走 DDoS-Guard、i.pximg.net 走 Fastly）绝不能向 cloudflare-ech.com 发 ECH 请求，
 	//      否则 Cloudflare 边缘必定返回 tls: handshake failure；直接竞速 fragment 与 sni。
 	if detected, confident := DetectTransportModeWithStatus(req.Context(), host, normIPMode); confident && detected != "ech" {
 		return raceModes(req, []string{"fragment", "sni"}, normIPMode, host)
 	}
 
-	// 3. Cloudflare 节点或未决节点：并发竞速三种方案（ECH、TLS 分片、SNI 伪装），选出最快成功返回的方案！
+	// 4. Cloudflare 节点或未决节点：并发竞速三种方案（ECH、TLS 分片、SNI 伪装），选出最快成功返回的方案！
 	return raceModes(req, []string{"ech", "fragment", "sni"}, normIPMode, host)
 }
 
@@ -418,6 +470,7 @@ func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 	}
 
 	tr := netdial.TransportWithIPMode(normMode).Clone()
+	defer tr.CloseIdleConnections()
 	tr.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return netdial.DialContextIPMode(ctx, dialTarget, port, normMode, dialTimeout)
 	}
@@ -429,16 +482,28 @@ func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 	return c.Do(req)
 }
 
+var (
+	directClientMu sync.Mutex
+	directClients  = map[string]*http.Client{}
+)
+
 func directDo(req *http.Request, ipMode string) (*http.Response, error) {
-	tr := netdial.TransportWithIPModeAndCertCheck(ipMode, func(host string, peerCerts []*x509.Certificate) error {
-		return validateUpstreamCert(req.Context(), host, peerCerts)
-	})
-	c := &http.Client{
-		Transport:     tr,
-		Timeout:       netdial.OpTimeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	normMode := resolveEffectiveIPMode(ipMode)
+	directClientMu.Lock()
+	client, ok := directClients[normMode]
+	if !ok {
+		tr := netdial.TransportWithIPModeAndCertCheck(normMode, func(host string, peerCerts []*x509.Certificate) error {
+			return validateUpstreamCert(context.Background(), host, peerCerts)
+		})
+		client = &http.Client{
+			Transport:     tr,
+			Timeout:       netdial.OpTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		}
+		directClients[normMode] = client
 	}
-	return c.Do(req)
+	directClientMu.Unlock()
+	return client.Do(req)
 }
 
 func doSingleMode(req *http.Request, mode, ipMode string) (*http.Response, error) {
@@ -458,9 +523,16 @@ func isCloudflareRouteRejection(resp *http.Response, mode string) bool {
 	if mode != "ech" && mode != "" {
 		return false
 	}
+	if resp == nil {
+		return true
+	}
 	switch resp.StatusCode {
 	case 521, 522, 523, 525, 530, 421:
 		return true
+	case 403:
+		if strings.EqualFold(resp.Header.Get("cf-mitigated"), "challenge") {
+			return true
+		}
 	}
 	return false
 }
@@ -630,7 +702,10 @@ func getUTLSH2Transport(cacheKey string, dialFn func(ctx context.Context, nextPr
 		return t
 	}
 	t := &http2.Transport{
-		AllowHTTP: false,
+		AllowHTTP:       false,
+		IdleConnTimeout: 15 * time.Second,
+		PingTimeout:     5 * time.Second,
+		ReadIdleTimeout: 10 * time.Second,
 		DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
 			uConn, err := dialFn(ctx, []string{"h2", "http/1.1"})
 			if err != nil {
@@ -664,8 +739,9 @@ func getUTLSH1Client(cacheKey string, dialFn func(ctx context.Context, nextProto
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return dialFn(ctx, []string{"http/1.1"})
 		},
-		MaxIdleConns:    32,
-		IdleConnTimeout: 90 * time.Second,
+		MaxIdleConns:        16,
+		MaxIdleConnsPerHost: 4,
+		IdleConnTimeout:     15 * time.Second,
 	}
 	c := &http.Client{
 		Transport:     tr,
@@ -698,7 +774,7 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 		if tag == "frag" {
 			effectiveSNI = host
 		} else if tag == "sni" {
-			effectiveSNI = NextDefaultSNIServerName()
+			effectiveSNI = ConsistentDefaultSNIForHost(host)
 		}
 	}
 

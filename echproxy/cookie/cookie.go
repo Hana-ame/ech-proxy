@@ -146,6 +146,20 @@ func (j *Jar) SaveClientCookies(host string, req *http.Request) {
 	}
 }
 
+// parseSetCookie 使用 Go 1.0+ 兼容的 (&http.Response{Header: ...}).Cookies() 解析单条 Set-Cookie，
+// 避免依赖 Go 1.23+ 才引入的 http.ParseSetCookie，确保在 Go 1.20 / 1.21.4 及 go-win7 工具链下均可编译。
+func parseSetCookie(raw string) (*http.Cookie, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, false
+	}
+	cookies := (&http.Response{Header: http.Header{"Set-Cookie": {raw}}}).Cookies()
+	if len(cookies) == 0 || cookies[0] == nil {
+		return nil, false
+	}
+	return cookies[0], true
+}
+
 // SaveResponseCookies 将上游响应的 Set-Cookie 存入 Jar；
 // 若上游下发了过期/登出指令（Max-Age <= 0、Expires 已过期或值为 "deleted"），则主动从 Jar 中清除该 Cookie。
 func (j *Jar) SaveResponseCookies(host string, resp *http.Response) {
@@ -160,8 +174,8 @@ func (j *Jar) SaveResponseCookies(host string, resp *http.Response) {
 	defer j.mu.Unlock()
 	now := time.Now()
 	for _, s := range scs {
-		c, err := http.ParseSetCookie(s)
-		if err != nil {
+		c, ok := parseSetCookie(s)
+		if !ok {
 			continue
 		}
 		if c.MaxAge > 0 && c.Expires.IsZero() {

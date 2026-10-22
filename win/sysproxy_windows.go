@@ -43,6 +43,16 @@ var (
 	procInternetSetOption = modwininet.NewProc("InternetSetOptionW")
 )
 
+func safeCallProc(p *syscall.LazyProc, a ...uintptr) (uintptr, uintptr, error) {
+	if p == nil {
+		return 0, 0, syscall.EINVAL
+	}
+	if err := p.Find(); err != nil {
+		return 0, 0, err
+	}
+	return p.Call(a...)
+}
+
 // internetPerConnOption 对应 Win32 <wininet.h> INTERNET_PER_CONN_OPTIONW 结构体。
 type internetPerConnOption struct {
 	dwOption uint32
@@ -174,7 +184,8 @@ func applyWinINetPerConn(flags uint32, proxyServer, proxyBypass, autoConfigURL s
 		pOptions:      uintptr(unsafe.Pointer(&opts[0])),
 	}
 
-	r1, _, err := procInternetSetOption.Call(
+	r1, _, err := safeCallProc(
+		procInternetSetOption,
 		0,
 		internetOptionPerConnectionOption,
 		uintptr(unsafe.Pointer(&list)),
@@ -187,8 +198,8 @@ func applyWinINetPerConn(flags uint32, proxyServer, proxyBypass, autoConfigURL s
 }
 
 func notifyWinINetRefresh() {
-	_, _, _ = procInternetSetOption.Call(0, internetOptionSettingsChanged, 0, 0)
-	_, _, _ = procInternetSetOption.Call(0, internetOptionRefresh, 0, 0)
+	_, _, _ = safeCallProc(procInternetSetOption, 0, internetOptionSettingsChanged, 0, 0)
+	_, _, _ = safeCallProc(procInternetSetOption, 0, internetOptionRefresh, 0, 0)
 }
 
 // installCAOnPlatform 在 Windows 7~11 (32/64) 下调用 certutil 将本地 CA 导入受信任的根证书颁发机构。

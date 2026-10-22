@@ -479,3 +479,22 @@ func TestRunToolActionsCheckHostsCAAndLogs(t *testing.T) {
 		t.Errorf("logs-clean failed: code=%d out=%q", code, out.String())
 	}
 }
+
+func TestDanglingModeFlagAndShortIPFlagCompatibility(t *testing.T) {
+	noEnv := func(string) string { return "" }
+
+	// 用户实际输入: .\ech.443.exe -mode -ip 4
+	cmd, err := parseCLIArgs(`D:\pixiv\ech.443.exe`, []string{"-mode", "-ip", "4"}, noEnv)
+	if err != nil {
+		t.Fatalf("parseCLIArgs(ech.443.exe -mode -ip 4) failed: %v", err)
+	}
+	if !cmd.LocalProxy || cmd.Addr != "127.0.0.1:443" || cmd.IPMode != "v4" {
+		t.Errorf("unexpected parsed command for ech.443.exe -mode -ip 4: %+v", cmd)
+	}
+
+	// 验证 -ip 6 与 -mode -4 在普通二进制下也能正常容错解析
+	cmd6, err := parseCLIArgs("ech-proxy.exe", []string{"-mode", "-ip", "6"}, noEnv)
+	if err != nil || cmd6.IPMode != "v6" || cmd6.Mode != "smart" {
+		t.Errorf("parseCLIArgs(ech-proxy.exe -mode -ip 6) = %+v, %v", cmd6, err)
+	}
+}

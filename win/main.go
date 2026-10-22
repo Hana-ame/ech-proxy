@@ -112,6 +112,25 @@ func envBool(raw string) bool {
 	}
 }
 
+// sanitizeDanglingModeArgs 容错处理用户误传空 -mode（例如 `.\ech.443.exe -mode -ip 4` 或 `-mode -4`）：
+// 当 -mode / --mode 后紧跟另一个以 "-" 开头的 flag 或位于末尾时，自动剥离该悬空 -mode，避免吞掉后续 flag。
+func sanitizeDanglingModeArgs(args []string) []string {
+	if len(args) == 0 {
+		return args
+	}
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := strings.TrimSpace(args[i])
+		if a == "-mode" || a == "--mode" {
+			if i+1 >= len(args) || strings.HasPrefix(strings.TrimSpace(args[i+1]), "-") {
+				continue
+			}
+		}
+		out = append(out, args[i])
+	}
+	return out
+}
+
 func parseCLIArgs(progName string, args []string, getenv func(string) string) (CLICommand, error) {
 	if getenv == nil {
 		getenv = os.Getenv
@@ -122,7 +141,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	subMode := ""
 	subAll := false
 
-	restArgs := args
+	restArgs := sanitizeDanglingModeArgs(args)
 	if len(restArgs) > 0 && !strings.HasPrefix(restArgs[0], "-") {
 		switch strings.ToLower(restArgs[0]) {
 		case "run", "serve", "start", "proxy":
@@ -248,6 +267,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	configURL := fs.String("config", getenv("ECH_PROXY_CONFIG"), "upstream.json 地址")
 	ipModeFlag := fs.String("ipmode", defaultIPModeEnv, "出口协议族")
 	ipModeDash := fs.String("ip-mode", "", "出口协议族别名")
+	ipModeShort := fs.String("ip", "", "出口协议族别名 (-ip 4 / -ip 6 / -ip dual)")
 	localIP := fs.String("local-ip", getenv("LOCALIP"), "DoH 引导 IP")
 	httpMode := fs.Bool("http", false, "HTTP 明文模式")
 	noBrowser := fs.Bool("no-browser", false, "不自动打开浏览器")
@@ -379,6 +399,9 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	rawIPMode := strings.TrimSpace(*ipModeFlag)
 	if flagWasPassed(fs, "ip-mode") || strings.TrimSpace(*ipModeDash) != "" {
 		rawIPMode = strings.TrimSpace(*ipModeDash)
+	}
+	if flagWasPassed(fs, "ip") || strings.TrimSpace(*ipModeShort) != "" {
+		rawIPMode = strings.TrimSpace(*ipModeShort)
 	}
 	switch {
 	case *flag4:

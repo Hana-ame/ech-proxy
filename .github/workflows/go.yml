@@ -53,6 +53,29 @@ jobs:
       - name: Run full unit & integration tests with race detector
         run: go test ./... -race -v -coverprofile=coverage.out
 
+      - name: Setup Patched Go SDK for Windows 7 (XTLS/go-win7)
+        # 借鉴 XTLS/Xray-core 的 Windows 7 构建方案：
+        # 官方 Go 1.21.5+ 将 RtlGenRandom 替换为仅 Win8+ 存在的 bcryptprimitives.dll!ProcessPrng，
+        # 导致在 Win7 (386/amd64) 启动阶段即崩溃 (Exception 0xc0000005 PC=0x0 in asmstdcall)。
+        # 使用 XTLS/go-win7 (patched-1.26.7) 补丁版 SDK 编译 Windows 产物，既保留 uTLS v1.8.2 的 ECH 能力，
+        # 又将随机数与控制台/文件系统调用替换为 Win7 兼容实现 (BCryptGenRandom)。
+        run: |
+          mkdir -p /tmp/go-win7
+          curl -fsSL -o /tmp/go-win7.zip "https://github.com/XTLS/go-win7/releases/download/patched-1.26.7/go-for-win7-linux-amd64.zip" \
+            || curl -fsSL -o /tmp/go-win7.zip "https://github.com/XTLS/go-win7/releases/latest/download/go-for-win7-linux-amd64.zip"
+          unzip -q /tmp/go-win7.zip -d /tmp/go-win7
+          GO_BIN="$(find /tmp/go-win7 -type f -name go -perm -u+x | head -n1)"
+          if [ -z "$GO_BIN" ]; then
+            echo "::error::Failed to locate go binary in XTLS/go-win7 archive"
+            exit 1
+          fi
+          GO_BIN_DIR="$(dirname "$GO_BIN")"
+          GO_ROOT_DIR="$(dirname "$GO_BIN_DIR")"
+          echo "$GO_BIN_DIR" >> "$GITHUB_PATH"
+          echo "GOROOT=$GO_ROOT_DIR" >> "$GITHUB_ENV"
+          echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
+          "$GO_BIN" version
+
       - name: Cross-compile verification (Windows 386/amd64/arm64, Linux 386/amd64/arm64, macOS amd64)
         run: |
           mkdir -p build-check

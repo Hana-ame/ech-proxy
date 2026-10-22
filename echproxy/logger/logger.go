@@ -186,7 +186,9 @@ func (m *Manager) openFileLocked(truncate bool) error {
 		m.currentSize = 0
 	}
 	m.file = f
-	_ = debug.SetCrashOutput(f, debug.CrashOptions{})
+	// 注意：移除 Go 1.23+ 的 debug.SetCrashOutput 调用，兼顾 Go 1.20/1.21.4 降级编译兼容性，
+	// 并避免 Windows 7 (386/amd64) 下因运行时崩溃监控复制控制台/文件句柄引发异常。
+	// 崩溃转储统一由 RecoverAndLog 与 RecordFatalError 直接写入 crash-latest.log 与日志文件。
 	return nil
 }
 
@@ -334,7 +336,6 @@ func (m *Manager) Close() error {
 	defer m.mu.Unlock()
 	m.closed = true
 	if m.file != nil {
-		_ = debug.SetCrashOutput(nil, debug.CrashOptions{})
 		_ = m.file.Sync()
 		err := m.file.Close()
 		m.file = nil

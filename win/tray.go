@@ -41,6 +41,16 @@ type TrayMenuItem struct {
 	Separator bool
 }
 
+type UpdateCheckState int
+
+const (
+	UpdateStateIdle UpdateCheckState = iota
+	UpdateStateChecking
+	UpdateStateUpToDate
+	UpdateStateDownloaded
+	UpdateStateFailed
+)
+
 type TrayController struct {
 	mu              sync.Mutex
 	ListenAddr      string
@@ -59,8 +69,12 @@ type TrayController struct {
 	InstallCAFn     func(string) error
 	UninstallCAFn   func(string) error
 	CheckUpdateFn   func() (bool, error)
+	NotifyFn        func(title, msg string, isError bool)
 	OnExit          func()
 	OnStateChanged  func()
+
+	updateState UpdateCheckState
+	updateError string
 }
 
 func NewTrayController(listenAddr, portalURL, caPath string, sysProxy *SysProxyManager, console ConsoleWindowDriver, onExit func()) *TrayController {
@@ -174,9 +188,33 @@ func (tc *TrayController) MenuItems() []TrayMenuItem {
 		feedbackURL = DefaultFeedbackURL
 	}
 	updateTitle := "检查更新 (Check Update)"
-	updateStaged := tc.Updater != nil && tc.Updater.IsUpdateStaged()
-	if updateStaged {
+	updateChecked := false
+	tc.mu.Lock()
+	st := tc.updateState
+	errStr := tc.updateError
+	tc.mu.Unlock()
+
+	if tc.Updater != nil && tc.Updater.IsUpdateStaged() {
+		st = UpdateStateDownloaded
+	}
+
+	switch st {
+	case UpdateStateChecking:
+		updateTitle = "检查更新 (正在连接/下载中，请稍候...)"
+	case UpdateStateDownloaded:
 		updateTitle = "检查更新 (新版本已下载，退出重开自动替换)"
+		updateChecked = true
+	case UpdateStateUpToDate:
+		updateTitle = "检查更新 (当前已是最新版)"
+	case UpdateStateFailed:
+		if len(errStr) > 24 {
+			errStr = errStr[:24] + "..."
+		}
+		if errStr != "" {
+			updateTitle = fmt.Sprintf("检查更新 (失败: %s，点击重试)", errStr)
+		} else {
+			updateTitle = "检查更新 (检查失败，点击重试)"
+		}
 	}
 
 	return []TrayMenuItem{
@@ -192,7 +230,7 @@ func (tc *TrayController) MenuItems() []TrayMenuItem {
 		{ID: TrayCmdInstallCA, Title: "一键安装本地 CA 根证书 (Install CA)"},
 		{ID: TrayCmdUninstallCA, Title: "卸载本地 CA 根证书 (Uninstall CA)"},
 		{Separator: true},
-		{ID: TrayCmdCheckUpdate, Title: updateTitle, Checked: updateStaged},
+		{ID: TrayCmdCheckUpdate, Title: updateTitle, Checked: updateChecked},
 		{ID: TrayCmdOpenFeedback, Title: "反馈 (" + feedbackURL + ")"},
 		{ID: TrayCmdCopyPACURL, Title: "复制 PAC 地址 (Copy PAC URL)"},
 		{ID: TrayCmdOpenLogs, Title: "打开本地日志目录 (问题排查/上传日志)"},
@@ -234,14 +272,50 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 			echproxy.SafeGo("TrayUninstallCA", func() { _ = tc.UninstallCAFn(tc.CAPath) })
 		}
 	case TrayCmdCheckUpdate:
+		tc.mu.Lock()
+		if tc.updateState == UpdateStateChecking {
+			tc.mu.Unlock()
+			return false
+		}
+		tc.updateState = UpdateStateChecking
+		tc.updateError = ""
+		tc.mu.Unlock()
+		if tc.OnStateChanged != nil {
+			tc.OnStateChanged()
+		}
 		echproxy.SafeGo("TrayCheckUpdate", func() {
+			var staged bool
+			var err error
 			if tc.CheckUpdateFn != nil {
-				_, _ = tc.CheckUpdateFn()
+				staged, err = tc.CheckUpdateFn()
 			} else if tc.Updater != nil {
-				_, _ = tc.Updater.CheckAndDownloadOnce()
+				staged, err = tc.Updater.CheckAndDownloadOnce()
 			}
+			tc.mu.Lock()
+			if err != nil {
+				tc.updateState = UpdateStateFailed
+				tc.updateError = err.Error()
+			} else if staged {
+				tc.updateState = UpdateStateDownloaded
+				tc.updateError = ""
+			} else {
+				tc.updateState = UpdateStateUpToDate
+				tc.updateError = ""
+			}
+			tc.mu.Unlock()
+
 			if tc.OnStateChanged != nil {
 				tc.OnStateChanged()
+			}
+
+			if tc.NotifyFn != nil {
+				if err != nil {
+					tc.NotifyFn("ech-proxy 检查更新失败", fmt.Sprintf("无法连接更新源: %v", err), true)
+				} else if staged {
+					tc.NotifyFn("ech-proxy 新版本已下载", "新版本已就绪，退出重开程序即可自动替换生效！", false)
+				} else {
+					tc.NotifyFn("ech-proxy 当前已是最新版", "您正在运行最新发布版本，无需更新。", false)
+				}
 			}
 		})
 	case TrayCmdOpenFeedback:

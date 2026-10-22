@@ -30,6 +30,11 @@ const (
 	nifMessage = 0x00000001
 	nifIcon    = 0x00000002
 	nifTip     = 0x00000004
+	nifInfo    = 0x00000010
+
+	niifNone  = 0x00000000
+	niifInfo  = 0x00000001
+	niifError = 0x00000003
 
 	swHide    = 0
 	swShow    = 5
@@ -495,4 +500,41 @@ func copyToClipboardOnPlatform(text string) error {
 		return cerr
 	}
 	return nil
+}
+
+// showNotificationOnPlatform 在 Windows 托盘弹出气泡通知。
+func showNotificationOnPlatform(title, msg string, isError bool) {
+	activeTrayMu.Lock()
+	hwnd := activeTrayHwnd
+	hIcon := activeTrayIcon
+	activeTrayMu.Unlock()
+	if hwnd == 0 {
+		log.Printf("[Notification] %s: %s", title, msg)
+		return
+	}
+	var nid notifyIconDataW
+	nid.cbSize = uint32(unsafe.Sizeof(nid))
+	nid.hWnd = hwnd
+	nid.uID = 1
+	nid.uFlags = nifInfo
+	nid.hIcon = hIcon
+
+	utf16Title, _ := syscall.UTF16FromString(title)
+	if len(utf16Title) > len(nid.szInfoTitle)-1 {
+		utf16Title = utf16Title[:len(nid.szInfoTitle)-1]
+	}
+	copy(nid.szInfoTitle[:], utf16Title)
+
+	utf16Msg, _ := syscall.UTF16FromString(msg)
+	if len(utf16Msg) > len(nid.szInfo)-1 {
+		utf16Msg = utf16Msg[:len(nid.szInfo)-1]
+	}
+	copy(nid.szInfo[:], utf16Msg)
+
+	if isError {
+		nid.dwInfoFlags = niifError
+	} else {
+		nid.dwInfoFlags = niifInfo
+	}
+	_, _, _ = procShellNotifyIconW.Call(uintptr(nimModify), uintptr(unsafe.Pointer(&nid)))
 }

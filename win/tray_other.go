@@ -4,6 +4,7 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"sync"
 )
 
@@ -36,4 +37,8 @@ func startPlatformTray(_ *TrayController) func() {
 
 func copyToClipboardOnPlatform(text string) error {
 	return fmt.Errorf("clipboard copy is supported on Windows; text: %s", text)
+}
+
+func showNotificationOnPlatform(title, msg string, _ bool) {
+	log.Printf("[Notification] %s: %s", title, msg)
 }

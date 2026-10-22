@@ -828,8 +828,15 @@ func main() {
 		trayCtrl.AdScript = srv.AdScript
 		trayCtrl.IPMode = srv.GetIPMode()
 		trayCtrl.SetIPModeFn = func(m string) { srv.SetIPMode(m) }
+		trayCtrl.NotifyFn = showNotificationOnPlatform
 		if updater != nil {
+			trayCtrl.Updater = updater
 			trayCtrl.CheckUpdateFn = updater.CheckAndDownloadOnce
+			updater.onStateChanged = func() {
+				if trayCtrl.OnStateChanged != nil {
+					trayCtrl.OnStateChanged()
+				}
+			}
 		}
 		if logMgr != nil {
 			trayCtrl.LogDir = logMgr.LogDir()

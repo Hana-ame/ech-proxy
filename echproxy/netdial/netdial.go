@@ -476,30 +476,65 @@ func FetchBytes(rawURL string) ([]byte, error) {
 			return data, nil
 		}
 	}
-	// client 必须支持跟随 HTTP 重定向（GitHub Releases / CDN 下载均依赖 302 重定向）
 	client := &http.Client{
 		Timeout:   OpTimeout,
 		Transport: TransportWithIPMode(DefaultIPMode),
 	}
-	data, err := fetchWithClient(client, rawURL)
-	if err == nil {
-		return data, nil
+
+	// 针对 GitHub 资源，国内直连经常被 GFW 阻断或 DNS 污染，并发竞速直连与国内加速镜像源
+	if strings.Contains(rawURL, "github.com") || strings.Contains(rawURL, "githubusercontent.com") {
+		type fetchResult struct {
+			data []byte
+			err  error
+		}
+		candidates := []string{
+			rawURL,
+			"https://gh-proxy.com/" + rawURL,
+			"https://ghproxy.net/" + rawURL,
+		}
+		ch := make(chan fetchResult, len(candidates))
+		raceCtx, raceCancel := context.WithCancel(context.Background())
+		defer raceCancel()
+
+		for _, cand := range candidates {
+			go func(target string) {
+				req, err := http.NewRequestWithContext(raceCtx, http.MethodGet, target, nil)
+				if err != nil {
+					ch <- fetchResult{nil, err}
+					return
+				}
+				resp, err := client.Do(req)
+				if err != nil {
+					ch <- fetchResult{nil, err}
+					return
+				}
+				defer resp.Body.Close()
+				if resp.StatusCode != http.StatusOK {
+					ch <- fetchResult{nil, fmt.Errorf("unexpected status: %s", resp.Status)}
+					return
+				}
+				b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+				if err == nil && len(b) > 0 {
+					ch <- fetchResult{b, nil}
+					raceCancel()
+				} else {
+					ch <- fetchResult{nil, err}
+				}
+			}(cand)
+		}
+
+		var lastErr error
+		for i := 0; i < len(candidates); i++ {
+			res := <-ch
+			if res.err == nil && len(res.data) > 0 {
+				return res.data, nil
+			}
+			lastErr = res.err
+		}
+		return nil, lastErr
 	}
 
-	// 针对 GitHub 资源，国内直连经常被 GFW 阻断或 DNS 污染，自动尝试加速镜像源兜底
-	if strings.Contains(rawURL, "github.com") || strings.Contains(rawURL, "githubusercontent.com") {
-		mirrors := []string{
-			"https://gh-proxy.com/",
-			"https://ghproxy.net/",
-		}
-		for _, mirror := range mirrors {
-			altURL := mirror + rawURL
-			if altData, altErr := fetchWithClient(client, altURL); altErr == nil && len(altData) > 0 {
-				return altData, nil
-			}
-		}
-	}
-	return nil, err
+	return fetchWithClient(client, rawURL)
 }
 
 func fetchWithClient(client *http.Client, targetURL string) ([]byte, error) {

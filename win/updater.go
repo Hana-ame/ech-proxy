@@ -267,10 +267,12 @@ func (u *Updater) CheckAndDownloadOnce() (bool, error) {
 	if u == nil || u.exePath == "" || u.fetchFn == nil {
 		return false, nil
 	}
+	log.Printf("[Updater] Checking update for %s (%s)...", u.AssetName(), u.checksumsURL)
 	rawChecksums, err := u.fetchFn(u.checksumsURL)
 	if err != nil {
 		u.setLastError(err.Error())
-		return false, fmt.Errorf("fetch checksums.txt from %s: %w", u.checksumsURL, err)
+		log.Printf("[Updater] Failed to fetch checksums.txt: %v", err)
+		return false, fmt.Errorf("fetch checksums.txt: %w", err)
 	}
 	checksums := ParseChecksumsTxt(rawChecksums)
 	assetName := u.AssetName()
@@ -278,45 +280,55 @@ func (u *Updater) CheckAndDownloadOnce() (bool, error) {
 	if expectedHash == "" {
 		err := fmt.Errorf("asset %q not found in checksums.txt", assetName)
 		u.setLastError(err.Error())
+		log.Printf("[Updater] %v", err)
 		return false, err
 	}
-	if curHash, err := fileSHA256Hex(u.exePath); err == nil && strings.EqualFold(curHash, expectedHash) {
+	curHash, curErr := fileSHA256Hex(u.exePath)
+	if curErr == nil && strings.EqualFold(curHash, expectedHash) {
 		u.setLastError("")
+		log.Printf("[Updater] Already up to date (current sha256 matches latest: %s)", expectedHash[:12])
 		return false, nil
 	}
 	stagedPath := u.StagedPath()
 	if stHash, err := fileSHA256Hex(stagedPath); err == nil && strings.EqualFold(stHash, expectedHash) {
 		u.markStaged(expectedHash)
+		log.Printf("[Updater] New version already staged at %s (sha256:%s)", stagedPath, expectedHash[:12])
 		return true, nil
 	}
 	assetURL := u.downloadBaseURL + "/" + assetName
+	log.Printf("[Updater] Downloading new version: %s (latest sha256:%s)...", assetURL, expectedHash[:12])
 	binBytes, err := u.fetchFn(assetURL)
 	if err != nil {
 		u.setLastError(err.Error())
+		log.Printf("[Updater] Download failed: %v", err)
 		return false, fmt.Errorf("download %s: %w", assetURL, err)
 	}
 	if len(binBytes) < u.minBinaryBytes {
 		err := fmt.Errorf("downloaded %s is too small (%d bytes)", assetName, len(binBytes))
 		u.setLastError(err.Error())
+		log.Printf("[Updater] %v", err)
 		return false, err
 	}
 	if actualHash := bytesSHA256Hex(binBytes); !strings.EqualFold(actualHash, expectedHash) {
 		err := fmt.Errorf("SHA-256 mismatch for %s: got %s, want %s", assetName, actualHash, expectedHash)
 		u.setLastError(err.Error())
+		log.Printf("[Updater] %v", err)
 		return false, err
 	}
 	tmpPath := stagedPath + ".tmp"
 	if err := os.WriteFile(tmpPath, binBytes, 0o755); err != nil {
 		u.setLastError(err.Error())
+		log.Printf("[Updater] Failed to write temp file: %v", err)
 		return false, err
 	}
 	if err := os.Rename(tmpPath, stagedPath); err != nil {
 		_ = os.Remove(tmpPath)
 		u.setLastError(err.Error())
+		log.Printf("[Updater] Failed to rename temp file: %v", err)
 		return false, err
 	}
 	u.markStaged(expectedHash)
-	log.Printf("[Updater] Update staged (sha256:%s) -> %s", expectedHash[:12], stagedPath)
+	log.Printf("[Updater] Update staged successfully (sha256:%s) -> %s", expectedHash[:12], stagedPath)
 	return true, nil
 }
 

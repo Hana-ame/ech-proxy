@@ -219,3 +219,54 @@ func TestFragmentTLSClientHelloRecord(t *testing.T) {
 		t.Fatalf("reassembled payload mismatch:\ngot:  %q\nwant: %q", reassembled.String(), string(payload))
 	}
 }
+
+func TestSplitClientHelloAtSNIBreaksHostnameInHalf(t *testing.T) {
+	host := "nyaa.si"
+	sniHost := []byte(host)
+	sniExt := make([]byte, 9+len(sniHost))
+	sniExt[0], sniExt[1] = 0x00, 0x00 // ext type: server_name
+	extPayloadLen := 5 + len(sniHost)
+	sniExt[2], sniExt[3] = byte(extPayloadLen>>8), byte(extPayloadLen)
+	listLen := 3 + len(sniHost)
+	sniExt[4], sniExt[5] = byte(listLen>>8), byte(listLen)
+	sniExt[6] = 0x00 // host_name type
+	sniExt[7], sniExt[8] = byte(len(sniHost)>>8), byte(len(sniHost))
+	copy(sniExt[9:], sniHost)
+
+	var body bytes.Buffer
+	body.Write([]byte{0x03, 0x03})
+	body.Write(bytes.Repeat([]byte{1}, 32))
+	body.WriteByte(0)
+	body.Write([]byte{0x00, 0x02, 0x13, 0x01})
+	body.Write([]byte{0x01, 0x00})
+	body.Write([]byte{byte(len(sniExt) >> 8), byte(len(sniExt))})
+	body.Write(sniExt)
+
+	chBody := body.Bytes()
+	hs := make([]byte, 4+len(chBody))
+	hs[0] = 0x01
+	hs[1] = byte(len(chBody) >> 16)
+	hs[2] = byte(len(chBody) >> 8)
+	hs[3] = byte(len(chBody))
+	copy(hs[4:], chBody)
+
+	pkt := make([]byte, 5+len(hs))
+	pkt[0], pkt[1], pkt[2] = 0x16, 0x03, 0x01
+	pkt[3], pkt[4] = byte(len(hs)>>8), byte(len(hs))
+	copy(pkt[5:], hs)
+
+	recs := splitClientHelloAtSNI(pkt)
+	if len(recs) != 2 {
+		t.Fatalf("splitClientHelloAtSNI returned %d records, want 2", len(recs))
+	}
+	for i, r := range recs {
+		if bytes.Contains(r, sniHost) {
+			t.Errorf("record %d still contains full unsplit SNI %q", i, host)
+		}
+	}
+	joined := append(append([]byte(nil), recs[0][5:]...), recs[1][5:]...)
+	if !bytes.Equal(joined, hs) {
+		t.Fatalf("reassembled SNI-split ClientHello payload does not match original")
+	}
+}
+

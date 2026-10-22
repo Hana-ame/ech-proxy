@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -366,10 +367,10 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				dialTarget = dohIPs[0]
 			}
 
-			var certErr error
+			var permanentErr error
 			conn, err := netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() (net.Conn, error) {
-				if certErr != nil {
-					return nil, certErr
+				if permanentErr != nil {
+					return nil, permanentErr
 				}
 				rawConn, err := netdial.DialContextIPMode(ctx, dialTarget, "443", mode, dialTimeout)
 				if err != nil {
@@ -378,12 +379,16 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				uConn := utls.UClient(rawConn, uCfg, utls.HelloChrome_120)
 				if err := uConn.HandshakeContext(ctx); err != nil {
 					rawConn.Close()
+					if strings.Contains(strings.ToLower(err.Error()), "handshake failure") ||
+						strings.Contains(strings.ToLower(err.Error()), "tls:") {
+						permanentErr = err
+					}
 					return nil, err
 				}
 				// 核对服务端回传证书是否与伪装前访问的真实域名 host 一致、是否过期
 				if cerr := validateUpstreamCert(ctx, host, uConn.ConnectionState().PeerCertificates); cerr != nil {
 					rawConn.Close()
-					certErr = cerr
+					permanentErr = cerr
 					return nil, cerr
 				}
 				if uConn.ConnectionState().NegotiatedProtocol != "h2" {
@@ -392,8 +397,8 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				}
 				return uConn, nil
 			})
-			if certErr != nil {
-				return nil, certErr
+			if permanentErr != nil {
+				return nil, permanentErr
 			}
 			return conn, err
 		},

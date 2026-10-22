@@ -334,3 +334,31 @@ func TestSingleConnListenerNoPanicOnMultipleClose(t *testing.T) {
 	_ = conn.Close()
 	_ = l.Close()
 }
+
+func TestSingleConnListenerAndCloseNotifyConnNoDoubleClosePanic(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+
+	ln := newSingleConnListener(c1)
+	accepted, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("first Accept failed: %v", err)
+	}
+
+	// Simulate http.Server closing the accepted closeNotifyConn first,
+	// followed by http.Server.Serve's defer onceCloseListener.Close() -> singleConnListener.Close().
+	if err := accepted.Close(); err != nil {
+		t.Fatalf("accepted.Close failed: %v", err)
+	}
+	if err := ln.Close(); err != nil {
+		t.Fatalf("ln.Close after accepted.Close failed: %v", err)
+	}
+	// Repeat calls must be idempotent and never panic with "close of closed channel".
+	_ = accepted.Close()
+	_ = ln.Close()
+
+	if _, err := ln.Accept(); !errors.Is(err, net.ErrClosed) {
+		t.Errorf("second Accept after close = %v, want net.ErrClosed", err)
+	}
+}

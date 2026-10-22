@@ -150,3 +150,23 @@ func TestStartupClearsExistingLogFile(t *testing.T) {
 		t.Errorf("fresh startup marker missing from cleared log: %s", got)
 	}
 }
+
+func TestRepeatedCrashesDoNotNestExponentiallyInRecentLines(t *testing.T) {
+	dir := t.TempDir()
+	mgr, err := NewManager(Options{
+		LogDir:     dir,
+		ConsoleOut: &bytes.Buffer{},
+	})
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer mgr.Close()
+
+	_, _ = mgr.Write([]byte("normal log line\n"))
+	mgr.RecordCrash("serveMITMConnect", "close of closed channel", []byte("stack-1\n"))
+	r2 := mgr.RecordCrash("serveMITMConnect", "close of closed channel", []byte("stack-2\n"))
+
+	if strings.Count(r2, "==================== ECH-PROXY CRASH / PANIC REPORT ====================") != 1 {
+		t.Errorf("expected second crash report not to recursively nest full previous crash report header, got:\n%s", r2)
+	}
+}

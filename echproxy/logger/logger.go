@@ -191,6 +191,10 @@ func (m *Manager) openFileLocked(truncate bool) error {
 }
 
 func (m *Manager) Write(p []byte) (int, error) {
+	return m.writeInternal(p, true)
+}
+
+func (m *Manager) writeInternal(p []byte, addToRing bool) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -200,11 +204,13 @@ func (m *Manager) Write(p []byte) (int, error) {
 	if m.consoleOut != nil {
 		_, _ = m.consoleOut.Write(p)
 	}
-	for _, line := range strings.Split(strings.TrimRight(string(p), "\r\n"), "\n") {
-		m.ring = append(m.ring, line)
-	}
-	if len(m.ring) > m.maxRing {
-		m.ring = append([]string(nil), m.ring[len(m.ring)-m.maxRing:]...)
+	if addToRing {
+		for _, line := range strings.Split(strings.TrimRight(string(p), "\r\n"), "\n") {
+			m.ring = append(m.ring, line)
+		}
+		if len(m.ring) > m.maxRing {
+			m.ring = append([]string(nil), m.ring[len(m.ring)-m.maxRing:]...)
+		}
 	}
 	if !m.disableFile && !m.closed && m.file != nil {
 		if m.currentSize+int64(len(p)) > m.maxSizeBytes && m.currentSize > 0 {
@@ -217,6 +223,18 @@ func (m *Manager) Write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+
+func (m *Manager) appendRingLine(line string) {
+	if m == nil || line == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ring = append(m.ring, line)
+	if len(m.ring) > m.maxRing {
+		m.ring = append([]string(nil), m.ring[len(m.ring)-m.maxRing:]...)
+	}
 }
 
 func (m *Manager) rotateLocked() error {
@@ -409,7 +427,9 @@ func (m *Manager) recordDiagnosticReport(kind, component string, reason any, sta
 	report := sb.String()
 
 	if m != nil {
-		_, _ = m.Write([]byte(report))
+		// 仅将单行摘要推入内存环形缓冲区 m.ring，防止多次崩溃时 RecentLines(80) 把历史崩溃报告指数级套娃写入后续报告
+		_, _ = m.writeInternal([]byte(report), false)
+		m.appendRingLine(fmt.Sprintf("%s [%s] %s: %v", now.Format(time.RFC3339), kind, component, reason))
 		m.Sync()
 		m.mu.Lock()
 		dir := m.logDir

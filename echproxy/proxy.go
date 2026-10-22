@@ -53,6 +53,38 @@ func ModeName(mode string) string {
 	}
 }
 
+// isDocumentNavigation 判断请求是否为浏览器主文档或 iframe 页面导航请求。
+func isDocumentNavigation(req *http.Request) bool {
+	if req == nil || req.Method != http.MethodGet {
+		return false
+	}
+	dest := strings.ToLower(strings.TrimSpace(req.Header.Get("Sec-Fetch-Dest")))
+	mode := strings.ToLower(strings.TrimSpace(req.Header.Get("Sec-Fetch-Mode")))
+	if dest == "document" || dest == "iframe" || mode == "navigate" {
+		return true
+	}
+	accept := strings.ToLower(req.Header.Get("Accept"))
+	return strings.Contains(accept, "text/html") || strings.Contains(accept, "application/xhtml+xml")
+}
+
+// hasConditionalHeaders 判断客户端原始请求是否携带了条件缓存校验头。
+func hasConditionalHeaders(h http.Header) bool {
+	return h.Get("If-None-Match") != "" ||
+		h.Get("If-Modified-Since") != "" ||
+		h.Get("If-Match") != "" ||
+		h.Get("If-Unmodified-Since") != "" ||
+		h.Get("If-Range") != ""
+}
+
+// stripConditionalHeaders 剥离请求中的条件缓存头，强制上游返回完整响应体而非 304。
+func stripConditionalHeaders(h http.Header) {
+	h.Del("If-None-Match")
+	h.Del("If-Modified-Since")
+	h.Del("If-Match")
+	h.Del("If-Unmodified-Since")
+	h.Del("If-Range")
+}
+
 func ProxyHandler(upstreams config.UpstreamMap, blockedHosts []string) gin.HandlerFunc {
 	return ProxyHandlerWithOptions(upstreams, blockedHosts, nil, nil)
 }
@@ -70,7 +102,10 @@ func ProxyHandlerWithOptions(upstreams config.UpstreamMap, blockedHosts []string
 
 func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewrite.AdScriptManager) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		defer logger.RecoverAndLog("ProxyHandler", func(_ any, _ []byte) {
+		defer logger.RecoverAndLog("ProxyHandler", func(r any, _ []byte) {
+			if r == http.ErrAbortHandler {
+				panic(http.ErrAbortHandler)
+			}
 			if !c.Writer.Written() {
 				c.String(http.StatusInternalServerError, "internal proxy error")
 			}
@@ -205,6 +240,25 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, effectiveRewriter, port)
 		}
 
+		// 防御「孤儿 304」与文档导航 304 白屏：
+		// 若上游返回 304 Not Modified，但浏览器并未发送条件请求头（浏览器本地根本无缓存）或属于 HTML 导航请求，
+		// 自动剥离条件请求头并附加 Cache-Control: no-cache 向上游重拉一次完整的 200 OK 响应。
+		if resp.StatusCode == http.StatusNotModified && (!hasConditionalHeaders(c.Request.Header) || isDocumentNavigation(c.Request)) {
+			if retryReq, rerr := buildUpstreamRequestWithScheme(c, uc, targetScheme, reqPort); rerr == nil {
+				stripConditionalHeaders(retryReq.Header)
+				retryReq.Header.Set("Cache-Control", "no-cache")
+				retryReq.Header.Set("Pragma", "no-cache")
+				if retryResp, rerr2 := roundTripFn(retryReq, uc.Mode, uc.IPMode); rerr2 == nil && retryResp != nil {
+					_ = resp.Body.Close()
+					resp = retryResp
+					outReq = retryReq
+					cookie.DefaultJar.SaveResponseCookies(uc.Host, resp)
+					clearHeaders(c.Writer.Header())
+					prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, effectiveRewriter, port)
+				}
+			}
+		}
+
 		if uc.SWInject && config.IsPortalDomain(host) && c.Request.URL.Path == "/sw.js" && !rewrite.IsJavascriptResponse(resp) {
 			c.Writer.Header().Del("Content-Length")
 			c.Writer.Header().Set("Content-Type", "application/javascript")
@@ -213,7 +267,6 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			return
 		}
 
-		c.Status(resp.StatusCode)
 		sendResponseBody(c, host, uc, resp, effectiveRewriter, port, adScript)
 	}
 }
@@ -255,6 +308,12 @@ func buildUpstreamRequestWithScheme(c *gin.Context, uc config.UpstreamConfig, sc
 	outReq.Header.Del("Proxy-Connection")
 	outReq.Header.Del("Proxy-Authenticate")
 	outReq.Header.Del("Proxy-Authorization")
+
+	// 对 HTML 页面主文档导航请求主动剥离条件缓存头（If-None-Match / If-Modified-Since），
+	// 确保主文档永远返回完整正文，杜绝因浏览器残缺缓存收到 304 导致整页白屏。
+	if isDocumentNavigation(c.Request) {
+		stripConditionalHeaders(outReq.Header)
+	}
 
 	if _, ok := uc.Headers["X-Forwarded-For"]; !ok {
 		outReq.Header.Del("X-Forwarded-For")
@@ -309,6 +368,14 @@ func prepareResponseHeaders(dst, src http.Header, uc config.UpstreamConfig, cook
 	if rewriter != nil {
 		rewrite.RewriteRedirectHeaders(dst, rewriter, port)
 	}
+	ct := strings.ToLower(src.Get("Content-Type"))
+	if strings.Contains(ct, "text/html") || (rewriter != nil && rewrite.IsTextContent(ct)) {
+		dst.Del("ETag")
+		dst.Del("Last-Modified")
+		if strings.Contains(ct, "text/html") {
+			dst.Set("Cache-Control", "no-cache, must-revalidate")
+		}
+	}
 	rewrite.ApplyCORSHeaders(dst, req)
 }
 
@@ -348,6 +415,7 @@ func followSelfRedirect(c *gin.Context, outReq *http.Request, resp *http.Respons
 		return nil, false
 	}
 	rewrite.CopyHeaders(nextReq.Header, outReq.Header)
+	stripConditionalHeaders(nextReq.Header)
 	nextReq.Host = rawTarget.Host
 	cookie.DefaultJar.ApplyToRequestWithPriority(rawTarget.Host, nextReq, cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile), uc.CookiePriority)
 	nextResp, err := roundTripFn(nextReq, uc.Mode, uc.IPMode)
@@ -396,36 +464,54 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 		resp.StatusCode == http.StatusNoContent ||
 		resp.StatusCode == http.StatusNotModified ||
 		(resp.StatusCode >= 100 && resp.StatusCode < 200) {
+		c.Status(resp.StatusCode)
 		c.Writer.WriteHeaderNow()
 		return
 	}
 
 	rc := http.NewResponseController(c.Writer)
 
-	// 没有 adblock 需求且无需改写的请求，一律直接流式传输给客户端，不经过内存全部读入再写
+	// 没有 adblock 需求且无需改写的请求，直接流式传输给客户端（首包预读校验防止 0 字节断流被当成 200 缓存）
 	if !needsBodyRewrite(c, requestHost, uc, resp, rewriter, adScript) {
-		streamRemainingBody(c, rc, resp.Body)
+		streamRemainingBody(c, rc, resp)
 		return
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, rewrite.MaxRewriteSize+1))
+	if err != nil && len(body) == 0 {
+		clearHeaders(c.Writer.Header())
+		rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
+		c.String(http.StatusBadGateway, "upstream body read failed: %v", err)
+		return
+	}
 	if err != nil || len(body) > rewrite.MaxRewriteSize {
+		c.Status(resp.StatusCode)
 		if len(body) > 0 {
 			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if _, werr := c.Writer.Write(body); werr != nil {
 				return
 			}
 		}
-		if err == nil {
-			streamRemainingBody(c, rc, resp.Body)
+		if err != nil {
+			panic(http.ErrAbortHandler)
 		}
+		streamRemainingBodyAfterPrefix(c, rc, resp.Body)
 		return
 	}
 
 	origEnc := resp.Header.Get("Content-Encoding")
 	plain, derr := rewrite.DecompressBody(body, origEnc)
 	if derr != nil {
+		if len(body) == 0 && resp.ContentLength != 0 {
+			clearHeaders(c.Writer.Header())
+			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
+			c.String(http.StatusBadGateway, "upstream empty compressed body")
+			return
+		}
 		c.Writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		c.Status(resp.StatusCode)
 		_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
 		_, _ = c.Writer.Write(body)
 		return
@@ -451,11 +537,42 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 		c.Writer.Header().Set("Content-Encoding", enc)
 	}
 	c.Writer.Header().Set("Content-Length", strconv.Itoa(len(plain)))
+	c.Status(resp.StatusCode)
 	_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
 	_, _ = c.Writer.Write(plain)
 }
 
-func streamRemainingBody(c *gin.Context, rc *http.ResponseController, body io.Reader) {
+func streamRemainingBody(c *gin.Context, rc *http.ResponseController, resp *http.Response) {
+	buf := make([]byte, 32*1024)
+	n, rerr := resp.Body.Read(buf)
+	if n == 0 && rerr != nil && !errors.Is(rerr, io.EOF) {
+		clearHeaders(c.Writer.Header())
+		rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
+		c.String(http.StatusBadGateway, "upstream stream aborted before first byte: %v", rerr)
+		return
+	}
+
+	c.Status(resp.StatusCode)
+	if n > 0 {
+		_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if _, werr := c.Writer.Write(buf[:n]); werr != nil {
+			return
+		}
+		if f, ok := c.Writer.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+	if rerr != nil {
+		if !errors.Is(rerr, io.EOF) {
+			panic(http.ErrAbortHandler)
+		}
+		return
+	}
+	streamRemainingBodyAfterPrefix(c, rc, resp.Body)
+}
+
+func streamRemainingBodyAfterPrefix(c *gin.Context, rc *http.ResponseController, body io.Reader) {
 	buf := make([]byte, 32*1024)
 	for {
 		n, rerr := body.Read(buf)
@@ -469,8 +586,8 @@ func streamRemainingBody(c *gin.Context, rc *http.ResponseController, body io.Re
 			}
 		}
 		if rerr != nil {
-			if rerr != io.EOF && !isExpectedConnError(rerr) {
-				log.Printf("[%s] Error streaming response body from upstream (%s): %v", c.ClientIP(), c.Request.Host, rerr)
+			if !errors.Is(rerr, io.EOF) {
+				panic(http.ErrAbortHandler)
 			}
 			break
 		}

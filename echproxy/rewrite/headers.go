@@ -48,6 +48,23 @@ func CopyHeaders(dst, src http.Header) {
 	}
 }
 
+func appendVaryHeader(dst http.Header, token string) {
+	existing := dst.Values("Vary")
+	for _, v := range existing {
+		for _, part := range strings.Split(v, ",") {
+			p := strings.TrimSpace(part)
+			if p == "*" || strings.EqualFold(p, token) {
+				return
+			}
+		}
+	}
+	if len(existing) == 0 {
+		dst.Set("Vary", token)
+	} else {
+		dst.Set("Vary", strings.Join(existing, ", ")+", "+token)
+	}
+}
+
 // ApplyCORSHeaders 为响应注入完整的跨域许可头。
 func ApplyCORSHeaders(dst http.Header, req *http.Request) {
 	var origin, reqHeaders string
@@ -58,7 +75,7 @@ func ApplyCORSHeaders(dst http.Header, req *http.Request) {
 	if origin != "" {
 		dst.Set("Access-Control-Allow-Origin", origin)
 		dst.Set("Access-Control-Allow-Credentials", "true")
-		dst.Set("Vary", "Origin")
+		appendVaryHeader(dst, "Origin")
 	} else {
 		dst.Set("Access-Control-Allow-Origin", "*")
 		dst.Del("Access-Control-Allow-Credentials")

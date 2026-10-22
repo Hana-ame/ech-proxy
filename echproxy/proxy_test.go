@@ -636,3 +636,100 @@ func TestDirectStreamWhenNoRewriteRequired(t *testing.T) {
 	}
 }
 
+type errReader struct {
+	err error
+}
+
+func (e errReader) Read([]byte) (int, error) {
+	return 0, e.err
+}
+
+func TestPrevent304BlankPageAndZeroByteCachePollution(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	orig := roundTripFn
+	defer func() { roundTripFn = orig }()
+
+	var attempts int
+	var lastSawIfNoneMatch string
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		attempts++
+		lastSawIfNoneMatch = req.Header.Get("If-None-Match")
+		if req.URL.Path == "/orphan-304" && attempts == 1 {
+			return &http.Response{
+				StatusCode: http.StatusNotModified,
+				Header:     http.Header{"ETag": []string{`"v1"`}},
+				Body:       io.NopCloser(strings.NewReader("")),
+			}, nil
+		}
+		if req.URL.Path == "/stream-abort" {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type": []string{"text/html; charset=utf-8"},
+					"ETag":         []string{`"poisoned-etag"`},
+				},
+				Body: io.NopCloser(errReader{err: fmt.Errorf("stream error:INTERNAL_ERROR")}),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"text/html; charset=utf-8"},
+				"ETag":         []string{`"v1"`},
+				"Vary":         []string{"Accept-Encoding"},
+			},
+			Body: io.NopCloser(strings.NewReader("<html><body>Full Page</body></html>")),
+		}, nil
+	}
+
+	engine := NewEngine(&config.Config{})
+
+	// 1. HTML document navigation must strip If-None-Match and strip upstream ETag from response
+	attempts = 0
+	recDoc := httptest.NewRecorder()
+	reqDoc := httptest.NewRequest(http.MethodGet, "https://nyaa.si/", nil)
+	reqDoc.Host = "nyaa.si"
+	reqDoc.Header.Set("Accept", "text/html,application/xhtml+xml")
+	reqDoc.Header.Set("Sec-Fetch-Dest", "document")
+	reqDoc.Header.Set("If-None-Match", `"stale-empty-etag"`)
+	reqDoc.Header.Set("Origin", "https://nyaa.si")
+	engine.ServeHTTP(recDoc, reqDoc)
+
+	if recDoc.Code != http.StatusOK || recDoc.Body.String() != "<html><body>Full Page</body></html>" {
+		t.Fatalf("document navigation got status=%d body=%q", recDoc.Code, recDoc.Body.String())
+	}
+	if lastSawIfNoneMatch != "" {
+		t.Errorf("expected If-None-Match stripped on HTML navigation, upstream saw %q", lastSawIfNoneMatch)
+	}
+	if gotETag := recDoc.Header().Get("ETag"); gotETag != "" {
+		t.Errorf("expected ETag stripped on HTML response, got %q", gotETag)
+	}
+	if gotVary := recDoc.Header().Get("Vary"); !strings.Contains(gotVary, "Accept-Encoding") || !strings.Contains(gotVary, "Origin") {
+		t.Errorf("expected Vary to preserve Accept-Encoding and append Origin, got %q", gotVary)
+	}
+
+	// 2. Orphan 304 (browser never sent If-None-Match) must auto-retry and return 200 OK with body
+	attempts = 0
+	recOrphan := httptest.NewRecorder()
+	reqOrphan := httptest.NewRequest(http.MethodGet, "https://nyaa.si/orphan-304", nil)
+	reqOrphan.Host = "nyaa.si"
+	engine.ServeHTTP(recOrphan, reqOrphan)
+
+	if recOrphan.Code != http.StatusOK || recOrphan.Body.String() != "<html><body>Full Page</body></html>" {
+		t.Fatalf("orphan 304 did not auto-retry for 200 OK: status=%d body=%q (attempts=%d)", recOrphan.Code, recOrphan.Body.String(), attempts)
+	}
+
+	// 3. Upstream stream abort before first byte must return 502 with no-store (never 200 OK with 0 bytes + ETag)
+	recAbort := httptest.NewRecorder()
+	reqAbort := httptest.NewRequest(http.MethodGet, "https://nyaa.si/stream-abort", nil)
+	reqAbort.Host = "nyaa.si"
+	engine.ServeHTTP(recAbort, reqAbort)
+
+	if recAbort.Code != http.StatusBadGateway {
+		t.Fatalf("stream abort before first byte returned status=%d, want 502", recAbort.Code)
+	}
+	if gotETag := recAbort.Header().Get("ETag"); gotETag != "" {
+		t.Errorf("502 on stream abort must not leak upstream ETag, got %q", gotETag)
+	}
+}
+

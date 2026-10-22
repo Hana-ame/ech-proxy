@@ -384,8 +384,15 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		clearCachedRoute(host)
 	}
 
-	// 2. 无缓存或缓存失效时：并发竞速三种方案（ECH、SNI 伪装、TLS 分片），选出最快成功返回的方案！
-	return raceModes(req, []string{"ech", "sni", "fragment"}, normIPMode, host)
+	// 2. 先基于 DoH 解析出的真实 IP 判定是否为 Cloudflare 站点：
+	//    - 非 Cloudflare 站点（如 nyaa.si 走 DDoS-Guard、i.pximg.net 走 Fastly）绝不能向 cloudflare-ech.com 发 ECH 请求，
+	//      否则 Cloudflare 边缘必定返回 tls: handshake failure；直接竞速 fragment 与 sni。
+	if detected, confident := DetectTransportModeWithStatus(req.Context(), host, normIPMode); confident && detected != "ech" {
+		return raceModes(req, []string{"fragment", "sni"}, normIPMode, host)
+	}
+
+	// 3. Cloudflare 节点或未决节点：并发竞速三种方案（ECH、TLS 分片、SNI 伪装），选出最快成功返回的方案！
+	return raceModes(req, []string{"ech", "fragment", "sni"}, normIPMode, host)
 }
 
 func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
@@ -565,8 +572,7 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 	return ips, nil
 }
 
-// dialUTLSWithWrapper 统一的 uTLS Chrome 指纹拨号与上游证书校验封装（供 SNI 伪装与 Fragment 分片模式共同复用）。
-func dialUTLSWithWrapper(ctx context.Context, ip, sniName, verifyHost string, nextProtos []string, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
+func dialUTLSOnce(ctx context.Context, ip, sniName, verifyHost string, nextProtos []string, helloID utls.ClientHelloID, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
 	rawConn, err := (&net.Dialer{
 		Timeout:   dialTimeout,
 		KeepAlive: 30 * time.Second,
@@ -582,7 +588,7 @@ func dialUTLSWithWrapper(ctx context.Context, ip, sniName, verifyHost string, ne
 		ServerName:         sniName,
 		InsecureSkipVerify: true,
 		NextProtos:         nextProtos,
-	}, utls.HelloChrome_120)
+	}, helloID)
 	if err := uConn.HandshakeContext(ctx); err != nil {
 		rawConn.Close()
 		return nil, err
@@ -592,6 +598,29 @@ func dialUTLSWithWrapper(ctx context.Context, ip, sniName, verifyHost string, ne
 		return nil, cerr
 	}
 	return uConn, nil
+}
+
+// dialUTLSWithWrapper 统一的 uTLS 拨号与上游证书校验封装（供 SNI 伪装与 Fragment 分片模式共同复用）：
+//   - 在 Fragment 模式下，若双记录 TLS 分片握手被源站（如 DDoS-Guard / nyaa.si）以 tls: handshake failure 拒绝，
+//     自动无感降级至「纯 TCP 层分段 + Chrome_120」以及「纯 TCP 层分段 + Firefox_120（不含实验性 Kyber 扩展）」，
+//     确保既能绕过 GFW SNI 检测，又能 100% 兼容各类严苛源站 TLS 栈。
+func dialUTLSWithWrapper(ctx context.Context, ip, sniName, verifyHost string, nextProtos []string, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
+	uConn, err := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloChrome_120, wrapConn)
+	if err == nil || IsCertError(err) || ctx.Err() != nil {
+		return uConn, err
+	}
+	if wrapConn != nil {
+		tcpWrap := func(c net.Conn) net.Conn {
+			return newTCPFragmentConn(c, 32)
+		}
+		if uConn2, err2 := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloChrome_120, tcpWrap); err2 == nil || IsCertError(err2) {
+			return uConn2, err2
+		}
+		if uConn3, err3 := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloFirefox_120, tcpWrap); err3 == nil || IsCertError(err3) {
+			return uConn3, err3
+		}
+	}
+	return nil, err
 }
 
 func getUTLSH2Transport(cacheKey string, dialFn func(ctx context.Context, nextProtos []string) (*utls.UConn, error)) *http2.Transport {

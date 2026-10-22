@@ -46,8 +46,8 @@
         },
         "sukebei.l.moonchan.xyz": {
             "host": "sukebei.nyaa.si",
-            "mode": "sni",
-            "describe": "Sukebei Anime Torrent (SNI Camouflage)",
+            "mode": "fragment",
+            "describe": "Sukebei Anime Torrent (TLS ClientHello Fragment)",
             "display": true
         },
         "ao3.l.moonchan.xyz": {

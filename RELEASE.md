@@ -1,3 +1,14 @@
+## v3.5.25
+
+### Fixes & Improvements
+
+- **修复 386 冷资产自动更新下载超时失败（唯一可用镜像等槽位 + 单候选预算不足）**:
+  - **现象（v3.5.24 CI 产物实测，2026-10-22 Windows/国内网络）**：amd64 模块 `-update` 端到端成功（41s，`Update staged successfully`，目标文件被替换为真实 release 二进制，哈希一致）；386 模块 `-update` 失败——exit=1、112s、`download .../ech-proxy-windows-386.exe: context deadline exceeded`；
+  - **根因（时序拟合）**：`ghproxy.imciel.com` 排候选第 4 位，二进制竞速并发度为 3，前 3 个挂死候选占槽——它先白白等待约 22s 才拿到槽，随后自身 90s 单候选超时在 112s 处耗尽。amd64 资产在镜像上是热文件（17.7s 下完 18.8MB）故 41s 成功；386 资产是冷文件，镜像需回源拉取，实测超过 90s——不是槽位饿死（修复已按设计工作），而是冷文件拉取时间超过单候选预算；
+  - **候选顺序再调整**：`ghproxy.imciel.com` 提至首位——实证它是国内唯一能完成下载的镜像，置首位后 t=0 即占槽，不再浪费 22s 等槽时间；竞速语义不变，其他网络上最快的成功候选仍先返回；
+  - **二进制超时预算放宽**：单候选 90s → 150s、总超时 180s → 300s，为冷资产镜像回源拉取留足时间（文本类资源仍为 25s/45s 不变）；
+  - **硬性回归测试**：`TestGitHubFetchCandidatesOrder` 新增断言——`ghproxy.imciel.com` 必须为首候选，旧顺序下测试如预期失败。
+
 ## v3.5.24
 
 ### Fixes & Improvements

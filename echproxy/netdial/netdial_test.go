@@ -141,10 +141,10 @@ func TestGitHubFetchCandidatesOrder(t *testing.T) {
 	const raw = "https://github.com/Hana-ame/ech-proxy/releases/latest/download/checksums.txt"
 	got := gitHubFetchCandidates(raw)
 	want := []string{
+		"https://ghproxy.imciel.com/" + raw,
 		"https://gh-proxy.com/" + raw,
 		"https://ghfast.top/" + raw,
 		"https://gh.llkk.cc/" + raw,
-		"https://ghproxy.imciel.com/" + raw,
 		raw,
 	}
 	if len(got) != len(want) {
@@ -167,6 +167,12 @@ func TestGitHubFetchCandidatesOrder(t *testing.T) {
 		if i < directIdx && c == raw {
 			t.Errorf("mirror candidate[%d] equals the direct URL", i)
 		}
+	}
+	// 硬性契约（v3.5.25）：ghproxy.imciel.com 必须置首位。实证它是国内唯一
+	// 能完成下载的镜像；二进制并发度只有 3，排第 4 要先等槽位——386 冷资产
+	// 实测等 22s 后自身 90s 超时即耗尽（RELEASE.md v3.5.25）。
+	if got[0] != "https://ghproxy.imciel.com/"+raw {
+		t.Errorf("ghproxy.imciel.com must be the FIRST candidate, got %q", got[0])
 	}
 }
 

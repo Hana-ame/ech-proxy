@@ -706,15 +706,21 @@ func (g *gitHubProxyTransport) RoundTrip(req *http.Request) (*http.Response, err
 // 即被阻断（i/o timeout），而镜像可达。直连保留在末位——海外用户没有
 // 镜像时它仍是唯一通路，且排在最后不会给国内用户增加任何等待。
 //
+// ghproxy.imciel.com 置首位：实证（2026-10-22，v3.5.24 端到端实测）它是国内
+// 唯一能真正完成下载的镜像——amd64 资产 41s 成功、386 冷资产 112s 超时失败，
+// 两次都只有它进入实质传输。二进制竞速并发度只有 3，排第 4 的候选要先等槽位：
+// 386 实测白白等待 22s 后自身 90s candTimeout 即耗尽。置首位后它 t=0 占槽，
+// 拿满单候选超时预算；竞速语义不变——其他网络上最快的成功候选仍然先返回。
+//
 // 该顺序是硬性契约：二进制下载的并发度只有 3，一旦某个"挂死但排前面"的
-// 候选占住槽位 90s，唯一可用镜像就会被饿死（总超时先到）。TestGitHubFetchCandidatesOrder
+// 候选占住槽位，唯一可用镜像就会被饿死（总超时先到）。TestGitHubFetchCandidatesOrder
 // 锁定此顺序，回归即红。
 func gitHubFetchCandidates(rawURL string) []string {
 	return []string{
+		"https://ghproxy.imciel.com/" + rawURL,
 		"https://gh-proxy.com/" + rawURL,
 		"https://ghfast.top/" + rawURL,
 		"https://gh.llkk.cc/" + rawURL,
-		"https://ghproxy.imciel.com/" + rawURL,
 		rawURL,
 	}
 }
@@ -749,12 +755,15 @@ func FetchBytes(rawURL string) ([]byte, error) {
 		var maxReadBytes int64 = 8 << 20
 		maxConcurrent := len(candidates)
 		if isBinary {
-			candTimeout = 90 * time.Second
-			overallTimeout = 180 * time.Second
+			// 冷资产镜像拉取实测 >90s：v3.5.24 386 资产在 imciel 上 112s 才超时
+			// （其中 22s 浪费在等槽位，见 RELEASE.md v3.5.25）。单候选预算
+			// 90s->150s、总预算 180s->300s，给镜像的回源拉取留足时间。
+			candTimeout = 150 * time.Second
+			overallTimeout = 300 * time.Second
 			maxReadBytes = 64 << 20
 			// 二进制大文件限制并发下载数，避免多个镜像同时在内存缓冲数十 MB 的可执行文件。
 			// 必须 >= 3：实证（2026-10-22，Windows/国内网络）4 个镜像中只有 ghproxy.imciel.com
-			// 能真正完成下载，若只放行 2 路，排在前面的挂死候选各占槽 90s，唯一可用镜像
+			// 能真正完成下载，若只放行 2 路，排在前面的挂死候选各占槽，唯一可用镜像
 			// 永远抢不到槽，总超时先到——更新下载 100% 失败（见 RELEASE.md v3.5.24）。
 			maxConcurrent = 3
 		}

@@ -1,3 +1,12 @@
+## v3.4.3
+
+### Fixes & Improvements
+
+- **彻底移除 EasyList 与代理层 204 请求中断 (Complete Removal of EasyList AdBlock)**:
+  - 彻底移除 EasyList 清单拉取、规则解析与代理层网络拦截逻辑。
+  - 删除代理网关处对目标 URL 的 `204 No Content` 阻断，彻底消除因规则通配导致的 `pixiv.net`、`e-hentai.org` 等正常站点根路径与页面资源被误拦截为空响应的问题。
+  - 代理层回归纯净反向代理与隧道转发职责，所有流量 100% 直连上游正常加载。
+
 ## v3.4.2
 
 ### Fixes & Improvements

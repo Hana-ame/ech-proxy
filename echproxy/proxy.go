@@ -111,12 +111,6 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			return
 		}
 
-		// EasyList 网络过滤：命中 domain 或 domain+path -> 直接 204，不发起上游请求。
-		if adScript != nil && !adScript.SkipAdBlock() && !config.IsPortalDomain(host) &&
-			adScript.ShouldBlockEasyList(host, c.Request.URL.Path) {
-			c.Status(http.StatusNoContent)
-			return
-		}
 
 		ucForRewrite := uc
 		if ucForRewrite.Wildcard == nil && len(upstreams) > 0 {

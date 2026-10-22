@@ -30,10 +30,6 @@ const (
 	// 采用手动维护，不再依赖 HTML 自动检测。
 	DefaultAdultSitesURL = "https://" + netdial.DefaultSiteHost + "/adult.txt"
 
-	// DefaultEasyListURL 是 EasyList 网络过滤清单；仅取其「确定性可做子集」，且**只在 adult.txt 命中的站点生效**。
-	// 置为 "-" 可禁用拉取。
-	DefaultEasyListURL = "https://easylist.to/easylist/easylist.txt"
-
 	// DefaultBlocklistURL 是 PAC 方案专属的远程广告屏蔽规则（block.json）默认地址：
 	//   - 兼容 JSON 数组/对象、EasyList ||domain^、##selector、HOSTS 格式；
 	//   - 与 certs/ 路径完全解耦（certs/ 完全只与 8443 方案相关），拉取失败使用内存内置规则兜底。
@@ -427,7 +423,6 @@ type AdScriptOptions struct {
 	ScriptURL      string
 	WhitelistURL   string
 	AdultSitesURL  string
-	EasyListURL    string
 	BlocklistURL   string
 	UpdateInterval time.Duration
 	CacheDir       string
@@ -442,7 +437,6 @@ type AdScriptManager struct {
 	scriptURL      string
 	whitelistURL   string
 	adultSitesURL  string
-	easylistURL    string
 	blocklistURL   string
 	updateInterval time.Duration
 	cacheDir       string
@@ -451,7 +445,6 @@ type AdScriptManager struct {
 	whitelistPtr     atomic.Pointer[[]string]
 	whitelistHistory [][]string
 	adultSites       []string
-	easyMatcher      *EasyListMatcher
 
 	scriptBytes []byte
 	versionHash string
@@ -476,10 +469,6 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	if adultURL == "" {
 		adultURL = DefaultAdultSitesURL
 	}
-	easyURL := strings.TrimSpace(opts.EasyListURL)
-	if easyURL == "" {
-		easyURL = DefaultEasyListURL
-	}
 	blockURL := strings.TrimSpace(opts.BlocklistURL)
 	if blockURL == "" {
 		blockURL = DefaultBlocklistURL
@@ -497,7 +486,6 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 		scriptURL:      scriptURL,
 		whitelistURL:   whiteURL,
 		adultSitesURL:  adultURL,
-		easylistURL:    easyURL,
 		blocklistURL:   blockURL,
 		updateInterval: interval,
 		cacheDir:       strings.TrimSpace(opts.CacheDir),
@@ -963,23 +951,6 @@ func (m *AdScriptManager) StartAutoUpdate(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	// EasyList 体积大（~2.5MB）：独立协程刷新，静默失败，绝不阻塞 ads/pac 主刷新。
-	go func() {
-		defer func() { _ = recover() }()
-		_ = m.RefreshEasyListOnce()
-		t := time.NewTicker(m.updateInterval)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-m.stopCh:
-				return
-			case <-t.C:
-				_ = m.RefreshEasyListOnce()
-			}
-		}
-	}()
 	go func() {
 		defer func() { _ = recover() }()
 		_, _ = m.RefreshOnce()
@@ -1118,79 +1089,4 @@ func looksLikeHTMLDocument(b []byte) bool {
 		bytes.Contains(lower, []byte("<body"))
 }
 
-// EasyListURL 返回 EasyList 地址。
-func (m *AdScriptManager) EasyListURL() string {
-	if m == nil {
-		return ""
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.easylistURL
-}
 
-// EasyListLoaded 报告 EasyList 是否已成功加载（失败时保持上一版；从未成功则 false，此时不做任何剥离）。
-func (m *AdScriptManager) EasyListLoaded() bool {
-	if m == nil {
-		return false
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.easyMatcher != nil && m.easyMatcher.RuleCount() > 0
-}
-
-// EasyListRuleCount 返回 EasyList 归一后的规则条数。
-func (m *AdScriptManager) EasyListRuleCount() int {
-	if m == nil {
-		return 0
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.easyMatcher.RuleCount()
-}
-
-// EasyListMatcher 返回当前 EasyList 规则集合（未加载则为 nil）。
-func (m *AdScriptManager) EasyListMatcher() *EasyListMatcher {
-	if m == nil {
-		return nil
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.easyMatcher
-}
-
-// RefreshEasyListOnce 拉取并解析 EasyList（确定性子集）。失败静默：保留上一版；从未成功则保持 nil。
-func (m *AdScriptManager) RefreshEasyListOnce() error {
-	if m == nil {
-		return nil
-	}
-	m.mu.RLock()
-	url, fetch := m.easylistURL, m.fetchFn
-	m.mu.RUnlock()
-	if url == "" || url == "-" || fetch == nil {
-		return nil
-	}
-	raw, err := fetch(url)
-	if err != nil {
-		return nil // 静默
-	}
-	matcher := ParseEasyListNetworkRules(raw)
-	if matcher.RuleCount() == 0 {
-		return nil
-	}
-	m.mu.Lock()
-	m.easyMatcher = matcher
-	m.mu.Unlock()
-	return nil
-}
-
-// ShouldBlockEasyList 检查请求的目标域名和路径是否命中 EasyList 网络过滤规则（domain / domain+path）。
-func (m *AdScriptManager) ShouldBlockEasyList(host, path string) bool {
-	if m == nil || m.SkipAdBlock() {
-		return false
-	}
-	em := m.EasyListMatcher()
-	if em == nil {
-		return false
-	}
-	return em.ShouldBlock(host, path)
-}

@@ -314,7 +314,6 @@ func TestAdScriptManagerAutoUpdateAndDisableFlag(t *testing.T) {
 		ScriptURL:      srv.URL + "/ads.js",
 		WhitelistURL:   srv.URL + "/pac.txt",
 		AdultSitesURL:  srv.URL + "/adult.txt",
-		EasyListURL:    "-",
 		BlocklistURL:   srv.URL + "/block.json",
 		UpdateInterval: 25 * time.Millisecond,
 		CacheDir:       cacheDir,

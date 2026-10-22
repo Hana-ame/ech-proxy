@@ -80,7 +80,6 @@ var (
 	DefaultAdScriptURL      = rewrite.DefaultAdScriptURL
 	DefaultWhitelistURL     = rewrite.DefaultWhitelistURL
 	DefaultAdultSitesURL    = rewrite.DefaultAdultSitesURL
-	DefaultEasyListURL      = rewrite.DefaultEasyListURL
 	DefaultBlocklistURL     = rewrite.DefaultBlocklistURL
 	DefaultAdScriptInterval = rewrite.DefaultAdScriptUpdateInterval
 	DefaultPrimaryDoHURL    = cloudflare_ech.DefaultPrimaryDoHURL
@@ -130,7 +129,6 @@ type ServerOptions struct {
 	AdScriptURL         string
 	WhitelistURL        string
 	AdultSitesURL       string
-	EasyListURL         string
 	BlocklistURL        string
 	AdScriptInterval    time.Duration
 	Logger              *logger.Manager
@@ -314,7 +312,6 @@ func NewServer(opts ServerOptions) (*Server, error) {
 			ScriptURL:      strings.TrimSpace(opts.AdScriptURL),
 			WhitelistURL:   strings.TrimSpace(opts.WhitelistURL),
 			AdultSitesURL:  strings.TrimSpace(opts.AdultSitesURL),
-			EasyListURL:    strings.TrimSpace(opts.EasyListURL),
 			BlocklistURL:   strings.TrimSpace(opts.BlocklistURL),
 			UpdateInterval: opts.AdScriptInterval,
 			CacheDir:       cacheDir,

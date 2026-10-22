@@ -1,3 +1,14 @@
+## v3.5.23
+
+### Fixes & Improvements
+
+- **解决 Workbox Service Worker 预缓存 Source Map 403 导致的前端崩溃 (`bad-precaching-response`)**:
+  - 针对 `www.iwara.tv` 等网站注册的 Service Worker（如 `workbox-*.js`）在后台预缓存 `.map` 文件（如 `chunk-163.*.js.map`）遭遇上游 CDN / WAF 403 Forbidden、404 Not Found 或网络异常的问题；
+  - 代理层针对 `.js.map`、`.css.map`、`.map` 请求进行智能识别并返回标准空 Source Map JSON（`{"version":3,"sources":[],"mappings":""}`，状态码 200 OK 并附加标准 CORS 标头与长效缓存），使前端 Service Worker 顺利安装就绪，彻底杜绝控制台抛出 `bad-precaching-response` 未捕获异常。
+- **根治 CI 发布阶段 GoReleaser 与 Release 竞态冲突（`HTTP 422 tag_name already_exists`）**:
+  - 在 `release.yml` 任务中增加等待机制，协同 GoReleaser 优先完成桌面端二进制构建与 GitHub Release 创建；并在 `release.yml` 中修正 bash 双引号反引号转义缺陷；
+  - 在 `.goreleaser.yaml` 中配置 `mode: append` 与 `replace_existing_artifacts: true`，杜绝重复发布或并行构建时导致的 422 校验失败，实现 CI 全链路 100% 稳定通行。
+
 ## v3.5.22
 
 ### Fixes & Improvements

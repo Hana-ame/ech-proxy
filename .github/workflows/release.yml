@@ -142,13 +142,34 @@ jobs:
             echo "## Executable Features"
             cat RELEASE.md 2>/dev/null || true
             echo ""
-            echo "## Android APKs"
-            echo "Two versions of the Android APK are provided in this release:"
-            echo "- **Standard (`ech-proxy-android-<version>.apk`)**: Background-safe with Foreground Service & WakeLock (exempt from Android 11+ Cached Apps Freezer and Doze mode)."
-            echo "- **Lite / No-Perm (`ech-proxy-android-lite-<version>.apk`)**: Zero runtime permissions required, no notifications or background service."
+            cat << 'EOF'
+## Android APKs
+Two versions of the Android APK are provided in this release:
+- **Standard (`ech-proxy-android-<version>.apk`)**: Background-safe with Foreground Service & WakeLock (exempt from Android 11+ Cached Apps Freezer and Doze mode).
+- **Lite / No-Perm (`ech-proxy-android-lite-<version>.apk`)**: Zero runtime permissions required, no notifications or background service.
+EOF
           } > release_body.md
-          gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1 || \
-            gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release_body.md
+
+          # Wait up to 5 minutes for GoReleaser (goreleaser.yml) to create and publish the release first.
+          # GoReleaser compiles desktop binaries (~3.5m) and publishes the tag.
+          # Waiting avoids concurrent release creation race conditions (HTTP 422 tag_name already_exists).
+          echo "Waiting for GoReleaser to publish release ${{ github.ref_name }}..."
+          RELEASE_FOUND=0
+          for i in $(seq 1 30); do
+            if gh release view "${{ github.ref_name }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+              echo "Published release ${{ github.ref_name }} found!"
+              RELEASE_FOUND=1
+              break
+            fi
+            sleep 10
+          done
+
+          if [ "$RELEASE_FOUND" -eq 0 ]; then
+            echo "GoReleaser did not publish within timeout; creating release as fallback..."
+            gh release create "${{ github.ref_name }}" --repo "${{ github.repository }}" --notes-file release_body.md || true
+          fi
+
+          # Update release title and notes to include feature notes and Android APK documentation
           gh release edit "${{ github.ref_name }}" --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --notes-file release_body.md || true
 
       - name: Upload assets

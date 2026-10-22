@@ -734,3 +734,81 @@ func TestPrevent304BlankPageAndZeroByteCachePollution(t *testing.T) {
 	}
 }
 
+// TestSourcemapErrorFallbackReturnsEmptyMap200 verifies that .js.map / .css.map / .map
+// requests that fail upstream (e.g. 403 Forbidden, 404 Not Found, or dial error)
+// return a synthetic 200 OK with an empty sourcemap JSON object to prevent Service Worker
+// precache crashes (e.g. Workbox bad-precaching-response).
+func TestSourcemapErrorFallbackReturnsEmptyMap200(t *testing.T) {
+	orig := roundTripFn
+	roundTripFn = func(req *http.Request, mode string, ipMode string) (*http.Response, error) {
+		if strings.HasSuffix(req.URL.Path, ".js.map") {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+				Body:       io.NopCloser(strings.NewReader("Forbidden")),
+			}, nil
+		}
+		if strings.HasSuffix(req.URL.Path, ".css.map") {
+			return &http.Response{
+				StatusCode: http.StatusNotFound,
+				Header:     http.Header{"Content-Type": []string{"text/plain"}},
+				Body:       io.NopCloser(strings.NewReader("Not Found")),
+			}, nil
+		}
+		if strings.HasSuffix(req.URL.Path, ".map") {
+			return nil, fmt.Errorf("dial error: connection refused")
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/plain"}},
+			Body:       io.NopCloser(strings.NewReader("ok")),
+		}, nil
+	}
+	defer func() { roundTripFn = orig }()
+
+	engine := NewEngine(&config.Config{})
+
+	// 1. .js.map with upstream 403 -> must return synthetic 200 OK
+	recJSMap := httptest.NewRecorder()
+	reqJSMap := httptest.NewRequest(http.MethodGet, "https://www.iwara.tv/chunk-163.a3320d5de7e96f5b4b94.js.map", nil)
+	reqJSMap.Host = "www.iwara.tv"
+	engine.ServeHTTP(recJSMap, reqJSMap)
+
+	if recJSMap.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for .js.map fallback, got %d", recJSMap.Code)
+	}
+	if !strings.Contains(recJSMap.Header().Get("Content-Type"), "application/json") {
+		t.Errorf("expected application/json Content-Type, got %q", recJSMap.Header().Get("Content-Type"))
+	}
+	wantBody := `{"version":3,"sources":[],"mappings":""}`
+	if recJSMap.Body.String() != wantBody {
+		t.Errorf("expected empty sourcemap JSON %q, got %q", wantBody, recJSMap.Body.String())
+	}
+
+	// 2. .css.map with upstream 404 -> must return synthetic 200 OK
+	recCSSMap := httptest.NewRecorder()
+	reqCSSMap := httptest.NewRequest(http.MethodGet, "https://www.iwara.tv/styles.css.map", nil)
+	reqCSSMap.Host = "www.iwara.tv"
+	engine.ServeHTTP(recCSSMap, reqCSSMap)
+
+	if recCSSMap.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for .css.map fallback, got %d", recCSSMap.Code)
+	}
+	if recCSSMap.Body.String() != wantBody {
+		t.Errorf("expected empty sourcemap JSON %q, got %q", wantBody, recCSSMap.Body.String())
+	}
+
+	// 3. .map with upstream dial error -> must return synthetic 200 OK
+	recErrMap := httptest.NewRecorder()
+	reqErrMap := httptest.NewRequest(http.MethodGet, "https://www.iwara.tv/main.map", nil)
+	reqErrMap.Host = "www.iwara.tv"
+	engine.ServeHTTP(recErrMap, reqErrMap)
+
+	if recErrMap.Code != http.StatusOK {
+		t.Errorf("expected 200 OK for dial error on .map, got %d", recErrMap.Code)
+	}
+	if recErrMap.Body.String() != wantBody {
+		t.Errorf("expected empty sourcemap JSON %q, got %q", wantBody, recErrMap.Body.String())
+	}
+}
+

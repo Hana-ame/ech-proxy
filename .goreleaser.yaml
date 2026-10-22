@@ -165,6 +165,8 @@ release:
   # Hardcoded false on purpose — see the header note. Do not flip this back.
   draft: false
   prerelease: auto
+  mode: append
+  replace_existing_artifacts: true
   # A plain release must claim "latest"; a prerelease must not.
   #
   # This was originally hardcoded to false, to stop an -rc from being offered to

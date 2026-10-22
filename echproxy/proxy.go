@@ -212,6 +212,19 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			}
 		}
 
+		reqPath := strings.ToLower(c.Request.URL.Path)
+		isSourceMap := strings.HasSuffix(reqPath, ".js.map") || strings.HasSuffix(reqPath, ".css.map") || strings.HasSuffix(reqPath, ".map")
+		if isSourceMap && (err != nil || (resp != nil && resp.StatusCode >= 400)) {
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			c.Header("Content-Type", "application/json; charset=utf-8")
+			c.Header("Cache-Control", "public, max-age=86400")
+			c.String(http.StatusOK, `{"version":3,"sources":[],"mappings":""}`)
+			return
+		}
+
 		if err != nil {
 			log.Printf("[%s] Upstream request failed (%s): %v", clientIP, uc.Host, err)
 			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)

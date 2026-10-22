@@ -137,6 +137,35 @@ func TestFetchBytesLocalAndRetry(t *testing.T) {
 	}
 }
 
+func TestIsGitHubResourceURL(t *testing.T) {
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		// 真 GitHub 资源：必须进竞速
+		{"https://github.com/Hana-ame/ech-proxy/releases/latest/download/checksums.txt", true},
+		{"https://objects.githubusercontent.com/production-release-asset", true},
+		{"https://raw.githubusercontent.com/o/r/main/f.txt", true},
+		{"https://api.github.com/repos/o/r", true},
+		{"https://codeload.github.com/o/r/zip/refs/heads/main", true},
+		{"https://GITHUB.COM/o/r", true}, // 主机名大小写不敏感
+		// 查询串里带 github 主机名、但主机本身不是 GitHub：必须走直连。
+		// 旧实现用整串 substring 判定，此例被误判为 GitHub 资源——镜像前缀一个
+		// 非 GitHub URL 只会 404/超时（v3.5.25 实证：check/hosts-print 时好时坏）。
+		{"https://proxy.moonchan.xyz/Hana-ame/ech-proxy/refs/heads/main/certs/l.moonchan.xyz/upstream.json?proxy_host=raw.githubusercontent.com", false},
+		{"https://4545810.xyz/pac.txt", false},
+		{"http://127.0.0.1:8443/proxy.pac", false},
+		{"https://ghfast.top/https://github.com/x", false},
+		{"", false},
+		{"::not a url::", false},
+	}
+	for _, c := range cases {
+		if got := isGitHubResourceURL(c.url); got != c.want {
+			t.Errorf("isGitHubResourceURL(%q) = %v, want %v", c.url, got, c.want)
+		}
+	}
+}
+
 func TestGitHubFetchCandidatesOrder(t *testing.T) {
 	const raw = "https://github.com/Hana-ame/ech-proxy/releases/latest/download/checksums.txt"
 	got := gitHubFetchCandidates(raw)

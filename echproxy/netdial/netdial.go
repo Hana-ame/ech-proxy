@@ -699,6 +699,24 @@ func (g *gitHubProxyTransport) RoundTrip(req *http.Request) (*http.Response, err
 	return http.DefaultTransport.RoundTrip(req)
 }
 
+// isGitHubResourceURL 按**主机名**判定 URL 是否指向 GitHub。
+//
+// 不能用整串 substring 判定：DefaultUpstreamConfigURL 的查询串里带有
+// proxy_host=raw.githubusercontent.com，按 substring 判定会把非 GitHub 资源
+// 也送进镜像竞速——给镜像前缀一个非 GitHub URL 只会得到 404/超时。实证
+// （v3.5.25 CI 产物 function 测试）：同一 config URL，amd64 check 2.3s 成功、
+// -check-config 18.8s 失败、386 check 15.8s 失败、hosts-print 时好时坏
+// （48 条目 vs 缓存 15 条目），全部由这一次误判引发。
+func isGitHubResourceURL(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "github.com" || strings.HasSuffix(host, ".github.com") ||
+		host == "githubusercontent.com" || strings.HasSuffix(host, ".githubusercontent.com")
+}
+
 // gitHubFetchCandidates 返回 GitHub 资源的竞速候选列表，顺序即优先级。
 //
 // 国内加速镜像一律排在直连之前：实证（2026-10-22，Windows/国内网络，
@@ -739,8 +757,10 @@ func FetchBytes(rawURL string) ([]byte, error) {
 		Transport: TransportWithIPMode(DefaultIPMode),
 	}
 
-	// 针对 GitHub 资源，国内直连经常被 GFW 阻断或 DNS 污染，并发竞速国内加速镜像源与直连（FragmentDo 绕过 GFW）
-	if strings.Contains(rawURL, "github.com") || strings.Contains(rawURL, "githubusercontent.com") {
+	// 针对 GitHub 资源（按主机名判定，见 isGitHubResourceURL——整串 substring 会把
+	// 查询串里带 github 主机名的非 GitHub 资源误送进竞速），国内直连经常被 GFW
+	// 阻断或 DNS 污染，并发竞速国内加速镜像源与直连（FragmentDo 绕过 GFW）
+	if isGitHubResourceURL(rawURL) {
 		type fetchResult struct {
 			target string
 			data   []byte

@@ -8,6 +8,10 @@
   - **候选顺序再调整**：`ghproxy.imciel.com` 提至首位——实证它是国内唯一能完成下载的镜像，置首位后 t=0 即占槽，不再浪费 22s 等槽时间；竞速语义不变，其他网络上最快的成功候选仍先返回；
   - **二进制超时预算放宽**：单候选 90s → 150s、总超时 180s → 300s，为冷资产镜像回源拉取留足时间（文本类资源仍为 25s/45s 不变）；
   - **硬性回归测试**：`TestGitHubFetchCandidatesOrder` 新增断言——`ghproxy.imciel.com` 必须为首候选，旧顺序下测试如预期失败。
+- **修复 config/whitelist 等非 GitHub 资源被误送进 GitHub 镜像竞速导致 `check`/`hosts-print` 时好时坏**:
+  - **根因（v3.5.25 CI 产物 function 测试实证）**：`FetchBytes` 用整串 `strings.Contains` 判定 GitHub 资源，而 `DefaultUpstreamConfigURL` 的查询串里带有 `proxy_host=raw.githubusercontent.com`——非 GitHub 资源被误判，镜像前缀后只会得到 404/超时。实测同一 config URL：amd64 `check` 2.3s 成功、`-check-config` 18.8s 失败、386 `check` 15.8s 失败、`hosts-print` 时好时坏（48 条目 vs 缓存回退 15 条目）；而该 config 主机直连实测 200/2.0s 完全可达；
+  - **修复**：新增 `isGitHubResourceURL` 按**主机名**判定（github.com / *.github.com / githubusercontent.com / *.githubusercontent.com），非 GitHub 主机一律走直连通道；
+  - **硬性回归测试**：`TestIsGitHubResourceURL` 锁定查询串误判用例，旧 substring 逻辑下测试如预期失败。
 
 ## v3.5.24
 

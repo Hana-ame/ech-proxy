@@ -90,7 +90,11 @@ func DetectTransportModeWithStatus(ctx context.Context, host, ipMode string) (mo
 				return "ech", true
 			}
 		}
-		return "sni", true
+		// 非 Cloudflare 节点：若配置了显式自定义伪装 SNI 则首选 sni，否则首选 fragment（TLS 记录分片绕过 GFW）
+		if customSNI := SNIServerNameFromContext(ctx); customSNI != "" && customSNI != shellDomain {
+			return "sni", true
+		}
+		return "fragment", true
 	}
 	return "ech", false
 }
@@ -159,6 +163,8 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	secondary := "sni"
 	if primary == "sni" {
 		secondary = "ech"
+	} else if primary == "fragment" {
+		secondary = "sni"
 	}
 	resp2, err2 := doSingleMode(req, secondary, normIPMode)
 	if err2 == nil && !isCloudflareRouteRejection(resp2, secondary) {
@@ -172,16 +178,18 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		return nil, err2
 	}
 
-	respFrag, errFrag := FragmentDo(req, normIPMode)
-	if errFrag == nil {
-		setCachedRoute(host, "fragment")
-		return respFrag, nil
-	}
-	if respFrag != nil {
-		respFrag.Body.Close()
-	}
-	if IsCertError(errFrag) {
-		return nil, errFrag
+	if primary != "fragment" {
+		respFrag, errFrag := FragmentDo(req, normIPMode)
+		if errFrag == nil {
+			setCachedRoute(host, "fragment")
+			return respFrag, nil
+		}
+		if respFrag != nil {
+			respFrag.Body.Close()
+		}
+		if IsCertError(errFrag) {
+			return nil, errFrag
+		}
 	}
 
 	resp3, err3 := directDo(req, normIPMode)

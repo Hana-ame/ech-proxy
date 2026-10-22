@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -52,7 +53,12 @@ func TestResolveHostIPsByModeViaMockDoHAndFallback(t *testing.T) {
 			return
 		}
 		qtype := r.URL.Query().Get("type")
+		qname := r.URL.Query().Get("name")
 		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(qname, "noncf") {
+			_, _ = w.Write([]byte(`{"Answer":[{"type":1,"TTL":120,"data":"62.112.8.152"}]}`))
+			return
+		}
 		switch qtype {
 		case "1":
 			_, _ = w.Write([]byte(`{"Answer":[{"type":1,"TTL":120,"data":"104.16.10.20"}]}`))
@@ -93,6 +99,17 @@ func TestResolveHostIPsByModeViaMockDoHAndFallback(t *testing.T) {
 	mode, confident := DetectTransportModeWithStatus(context.Background(), "cf-test.example.org", "v4")
 	if mode != "ech" || !confident {
 		t.Errorf("DetectTransportModeWithStatus for CF IP = (%q, %v), want (ech, true)", mode, confident)
+	}
+
+	modeNonCF, confidentNonCF := DetectTransportModeWithStatus(context.Background(), "noncf.example.org", "v4")
+	if modeNonCF != "fragment" || !confidentNonCF {
+		t.Errorf("DetectTransportModeWithStatus for non-CF IP = (%q, %v), want (fragment, true)", modeNonCF, confidentNonCF)
+	}
+
+	ctxCustomSNI := WithSNIServerName(context.Background(), "custom.sni.example")
+	modeCustomSNI, confidentCustomSNI := DetectTransportModeWithStatus(ctxCustomSNI, "noncf.example.org", "v4")
+	if modeCustomSNI != "sni" || !confidentCustomSNI {
+		t.Errorf("DetectTransportModeWithStatus with custom SNI = (%q, %v), want (sni, true)", modeCustomSNI, confidentCustomSNI)
 	}
 
 	// 验证当首选 DoH (https://4545810.xyz/doh) 故障时自动回退至次选 DoH (https://1.1.1.1/dns-query)

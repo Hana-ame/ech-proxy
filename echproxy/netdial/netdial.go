@@ -7,10 +7,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -30,12 +32,6 @@ const (
 	DefaultSiteHost = "4545810.xyz"
 )
 
-var dnsServers = []string{
-	"8.8.8.8:53",
-	"1.1.1.1:53",
-	"223.5.5.5:53",
-	"114.114.114.114:53",
-}
 
 var cloudflareCIDRs = []string{
 	"104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "141.101.64.0/18",
@@ -205,34 +201,14 @@ func FormatIPMode(mode string) string {
 }
 
 var (
-	resolverOnce    sync.Once
-	resolver        *net.Resolver
-	rootPoolOnce    sync.Once
-	rootPool        *x509.CertPool
-	transportOnce   sync.Once
-	cachedTransport *http.Transport
-)
+	DoHResolver func(ctx context.Context, host, mode string) ([]string, error)
 
-func getResolver() *net.Resolver {
-	resolverOnce.Do(func() {
-		resolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
-				d := net.Dialer{Timeout: DoHTimeout}
-				var lastErr error
-				for _, dns := range dnsServers {
-					conn, err := d.DialContext(ctx, network, dns)
-					if err == nil {
-						return conn, nil
-					}
-					lastErr = err
-				}
-				return nil, lastErr
-			},
-		}
-	})
-	return resolver
-}
+	rootPoolOnce sync.Once
+	rootPool     *x509.CertPool
+
+	ipTransportMu sync.Mutex
+	ipTransports  = map[string]*http.Transport{}
+)
 
 func getRootPool() *x509.CertPool {
 	rootPoolOnce.Do(func() {
@@ -261,7 +237,6 @@ func Dialer() *net.Dialer {
 	return &net.Dialer{
 		Timeout:   DialTimeout,
 		KeepAlive: 30 * time.Second,
-		Resolver:  getResolver(),
 	}
 }
 
@@ -286,7 +261,78 @@ func FilterIPsByMode(ips []net.IP, mode string) []string {
 	return out
 }
 
+type dohJSONAnswer struct {
+	Type int    `json:"type"`
+	Data string `json:"data"`
+}
+
+type dohJSONResponse struct {
+	Status int             `json:"Status"`
+	Answer []dohJSONAnswer `json:"Answer"`
+}
+
+// resolveViaBootstrapDoH 仅通过 HTTPS（端口 443）向 IP 直连 DoH 端点查询，绝不发起任何 UDP/TCP 53 端口连接。
+func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, error) {
+	norm := EffectiveIPMode(mode)
+	qtypes := []int{1}
+	if norm == "v6" {
+		qtypes = []int{28}
+	} else if norm == "dual" {
+		qtypes = []int{1, 28}
+	}
+
+	bootstrapIPs := []string{"1.1.1.1", "1.0.0.1"}
+	var ips []net.IP
+
+	for _, qt := range qtypes {
+		for _, bIP := range bootstrapIPs {
+			reqURL := fmt.Sprintf("https://%s/dns-query?name=%s&type=%d", bIP, url.QueryEscape(host), qt)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+			if err != nil {
+				continue
+			}
+			req.Header.Set("Accept", "application/dns-json")
+			tr := &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					_, port, _ := net.SplitHostPort(addr)
+					return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(bIP, port))
+				},
+			}
+			client := &http.Client{Transport: tr, Timeout: 6 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil || resp.StatusCode != http.StatusOK {
+				if resp != nil && resp.Body != nil {
+					_ = resp.Body.Close()
+				}
+				continue
+			}
+			var d dohJSONResponse
+			_ = json.NewDecoder(resp.Body).Decode(&d)
+			_ = resp.Body.Close()
+			for _, ans := range d.Answer {
+				if ans.Type == qt {
+					if parsed := net.ParseIP(ans.Data); parsed != nil {
+						ips = append(ips, parsed)
+					}
+				}
+			}
+			if len(ips) > 0 {
+				break
+			}
+		}
+	}
+
+	filtered := FilterIPsByMode(ips, norm)
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("DoH resolve %s (%s) failed", host, norm)
+	}
+	return filtered, nil
+}
+
+// ResolveIPs 严格全链路采用 DoH 协议解析域名（优先调用 DoHResolver，兜底使用 1.1.1.1:443 HTTPS 直连），绝不触碰本地 53 端口。
 func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
+	host = CleanHost(host)
 	norm := EffectiveIPMode(mode)
 	if ip := net.ParseIP(host); ip != nil {
 		filtered := FilterIPsByMode([]net.IP{ip}, norm)
@@ -295,22 +341,12 @@ func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
 		}
 		return filtered, nil
 	}
-	addrs, err := getResolver().LookupIPAddr(ctx, host)
-	if err != nil {
-		return nil, fmt.Errorf("resolve %s: %w", host, err)
-	}
-	ips := make([]net.IP, 0, len(addrs))
-	for _, a := range addrs {
-		ips = append(ips, a.IP)
-	}
-	filtered := FilterIPsByMode(ips, norm)
-	if len(filtered) == 0 {
-		if norm != "dual" {
-			return nil, fmt.Errorf("no %s address for %s", norm, host)
+	if DoHResolver != nil {
+		if ips, err := DoHResolver(ctx, host, norm); err == nil && len(ips) > 0 {
+			return ips, nil
 		}
-		return nil, fmt.Errorf("no IP address for %s", host)
 	}
-	return filtered, nil
+	return resolveViaBootstrapDoH(ctx, host, norm)
 }
 
 func ResolvePreferredIP(ctx context.Context, host, mode string) (string, error) {
@@ -326,51 +362,42 @@ func DialContextIPMode(ctx context.Context, host, port, mode string, timeout tim
 		timeout = DialTimeout
 	}
 	norm := EffectiveIPMode(mode)
-	if norm == "v4" || norm == "v6" {
-		ips, err := ResolveIPs(ctx, host, norm)
-		if err != nil {
-			return nil, err
-		}
-		network := "tcp4"
-		if norm == "v6" {
-			network = "tcp6"
-		}
-		var lastErr error
-		for _, ip := range ips {
-			conn, err := (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ip, port))
-			if err == nil {
-				return conn, nil
-			}
-			lastErr = err
-		}
-		return nil, lastErr
+	ips, err := ResolveIPs(ctx, host, norm)
+	if err != nil {
+		return nil, err
 	}
-	return (&net.Dialer{
-		Timeout:   timeout,
-		KeepAlive: 30 * time.Second,
-		Resolver:  getResolver(),
-	}).DialContext(ctx, "tcp", net.JoinHostPort(host, port))
+	var lastErr error
+	for _, ip := range ips {
+		network := "tcp"
+		parsed := net.ParseIP(ip)
+		if parsed != nil {
+			if parsed.To4() != nil {
+				network = "tcp4"
+			} else {
+				network = "tcp6"
+			}
+		}
+		conn, err := (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ip, port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 func Transport() *http.Transport {
-	transportOnce.Do(func() {
-		cachedTransport = &http.Transport{
-			DialContext:       Dialer().DialContext,
-			TLSClientConfig:   &tls.Config{RootCAs: getRootPool()},
-			MaxIdleConns:      100,
-			IdleConnTimeout:   90 * time.Second,
-			ForceAttemptHTTP2: true,
-		}
-	})
-	return cachedTransport
+	return TransportWithIPMode(DefaultIPMode)
 }
 
 func TransportWithIPMode(mode string) *http.Transport {
 	norm := EffectiveIPMode(mode)
-	if norm != "v4" && norm != "v6" {
-		return Transport()
+	ipTransportMu.Lock()
+	defer ipTransportMu.Unlock()
+	if tr, ok := ipTransports[norm]; ok {
+		return tr
 	}
-	return &http.Transport{
+	tr := &http.Transport{
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
@@ -383,6 +410,8 @@ func TransportWithIPMode(mode string) *http.Transport {
 		IdleConnTimeout:   90 * time.Second,
 		ForceAttemptHTTP2: true,
 	}
+	ipTransports[norm] = tr
+	return tr
 }
 
 func TransportWithIPModeAndCertCheck(mode string, certCheck func(host string, peerCerts []*x509.Certificate) error) *http.Transport {

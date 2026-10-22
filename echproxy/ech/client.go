@@ -46,6 +46,10 @@ const (
 	maxTTL         = 24 * 3600
 )
 
+func init() {
+	netdial.DoHResolver = ResolveHostIPsByMode
+}
+
 // Client 是基于 cloudflare-ech.com ECH 域前置的 HTTP 客户端。
 type Client struct {
 	inner *http.Client
@@ -158,15 +162,17 @@ func GetIPMode() string {
 
 // CheckDualStack 检查 4545810.xyz 是否发布 A / AAAA 记录。
 func CheckDualStack(ctx context.Context) (hasV4, hasV6 bool) {
-	ips, err := netdial.Dialer().Resolver.LookupIPAddr(ctx, DefaultDoHHost)
+	ips, err := ResolveHostIPsByMode(ctx, DefaultDoHHost, "dual")
 	if err != nil {
 		return false, false
 	}
-	for _, addr := range ips {
-		if addr.IP.To4() != nil {
-			hasV4 = true
-		} else if addr.IP.To16() != nil {
-			hasV6 = true
+	for _, ipStr := range ips {
+		if ip := net.ParseIP(ipStr); ip != nil {
+			if ip.To4() != nil {
+				hasV4 = true
+			} else if ip.To16() != nil {
+				hasV6 = true
+			}
 		}
 	}
 	return

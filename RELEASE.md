@@ -1,3 +1,11 @@
+## v3.5.18
+
+### Fixes & Improvements
+
+- **回滚引导 DoH 变更**:
+  - 回滚 `resolveViaBootstrapDoH` 中引入的第三方端点，严格保持 1.1.1.1 / 1.0.0.1 纯净 DoH 链路与原设计标准；
+  - 保留更新下载超时放宽（45s / 150s）与 `github.moeyy.xyz` 镜像兜底，确保大文件下载稳定性。
+
 ## v3.5.17
 
 ### Fixes & Improvements

@@ -56,17 +56,20 @@ jobs:
           echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
           "$GO_BIN" version
 
-      - name: Build ech-proxy (Windows amd64)
-        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ech-proxy-windows-amd64.exe ./win/
-
-      - name: Build ech-proxy (Windows 386)
-        run: GOOS=windows GOARCH=386 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ech-proxy-windows-386.exe ./win/
-
-      - name: Build ech-proxy (Linux amd64)
-        run: GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ech-proxy-linux-amd64 ./win/
-
-      - name: Build ech-proxy (Linux 386)
-        run: GOOS=linux GOARCH=386 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ech-proxy-linux-386 ./win/
+      - name: Build ech-proxy (Windows & Linux, amd64 & 386 in parallel)
+        run: |
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ech-proxy-windows-amd64.exe ./win/ &
+          PID_WIN64=$!
+          GOOS=windows GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ech-proxy-windows-386.exe ./win/ &
+          PID_WIN32=$!
+          GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ech-proxy-linux-amd64 ./win/ &
+          PID_LNX64=$!
+          GOOS=linux   GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ech-proxy-linux-386 ./win/ &
+          PID_LNX32=$!
+          wait $PID_WIN64
+          wait $PID_WIN32
+          wait $PID_LNX64
+          wait $PID_LNX32
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

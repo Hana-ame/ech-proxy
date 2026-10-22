@@ -76,16 +76,17 @@ jobs:
           echo "GOTOOLCHAIN=local" >> "$GITHUB_ENV"
           "$GO_BIN" version
 
-      - name: Cross-compile verification (Windows 386/amd64/arm64, Linux 386/amd64/arm64, macOS amd64)
+      - name: Cross-compile verification (Windows 386/amd64/arm64, Linux 386/amd64/arm64, macOS amd64 in parallel)
         run: |
           mkdir -p build-check
-          GOOS=windows GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-386.exe ./win/
-          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-amd64.exe ./win/
-          GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-arm64.exe ./win/
-          GOOS=linux   GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-386 ./win/
-          GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-amd64 ./win/
-          GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-arm64 ./win/
-          GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-darwin-amd64 ./win/
+          GOOS=windows GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-386.exe ./win/ &
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-amd64.exe ./win/ &
+          GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-windows-arm64.exe ./win/ &
+          GOOS=linux   GOARCH=386   CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-386 ./win/ &
+          GOOS=linux   GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-amd64 ./win/ &
+          GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-linux-arm64 ./win/ &
+          GOOS=darwin  GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o build-check/ech-proxy-darwin-amd64 ./win/ &
+          wait
           rm -rf build-check
 
       - name: CLI tool commands verification (version, check, pac, help)

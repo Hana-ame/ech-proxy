@@ -50,19 +50,37 @@ func CopyHeaders(dst, src http.Header) {
 
 func appendVaryHeader(dst http.Header, token string) {
 	existing := dst.Values("Vary")
+	tokens := make([]string, 0, len(existing)+1)
+	hasToken := false
 	for _, v := range existing {
 		for _, part := range strings.Split(v, ",") {
 			p := strings.TrimSpace(part)
-			if p == "*" || strings.EqualFold(p, token) {
+			if p == "" {
+				continue
+			}
+			if p == "*" {
+				dst.Set("Vary", "*")
 				return
+			}
+			found := false
+			for _, t := range tokens {
+				if strings.EqualFold(t, p) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				tokens = append(tokens, p)
+			}
+			if strings.EqualFold(p, token) {
+				hasToken = true
 			}
 		}
 	}
-	if len(existing) == 0 {
-		dst.Set("Vary", token)
-	} else {
-		dst.Set("Vary", strings.Join(existing, ", ")+", "+token)
+	if !hasToken {
+		tokens = append(tokens, token)
 	}
+	dst.Set("Vary", strings.Join(tokens, ", "))
 }
 
 // ApplyCORSHeaders 为响应注入完整的跨域许可头。

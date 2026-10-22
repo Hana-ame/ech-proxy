@@ -94,10 +94,12 @@ func (fc *tlsFragmentConn) Write(b []byte) (int, error) {
 		splitAt = len(b) / 2
 	}
 	if splitAt > 0 && splitAt < len(b) {
-		if _, err := fc.Conn.Write(b[:splitAt]); err != nil {
-			return 0, err
+		n1, err := fc.Conn.Write(b[:splitAt])
+		if err != nil {
+			return n1, err
 		}
-		return fc.Conn.Write(b[splitAt:])
+		n2, err := fc.Conn.Write(b[splitAt:])
+		return n1 + n2, err
 	}
 	return fc.Conn.Write(b)
 }

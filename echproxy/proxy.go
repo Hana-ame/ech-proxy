@@ -469,6 +469,9 @@ func streamRemainingBody(c *gin.Context, rc *http.ResponseController, body io.Re
 			}
 		}
 		if rerr != nil {
+			if rerr != io.EOF && !isExpectedConnError(rerr) {
+				log.Printf("[%s] Error streaming response body from upstream (%s): %v", c.ClientIP(), c.Request.Host, rerr)
+			}
 			break
 		}
 	}

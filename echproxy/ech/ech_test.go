@@ -1,9 +1,13 @@
 package cloudflare_ech
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -193,6 +197,105 @@ func TestNyaaFragmentDo(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode == 0 {
 		t.Errorf("expected valid HTTP response, got status %d", resp.StatusCode)
+	}
+}
+
+func TestRaceModesBodyStreamingNotCanceled(t *testing.T) {
+	clearCachedRoute("race-stream.example.org")
+	defer clearCachedRoute("race-stream.example.org")
+
+	const payloadSize = 64 * 1024
+	expectedData := make([]byte, payloadSize)
+	for i := range expectedData {
+		expectedData[i] = byte(i % 256)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(payloadSize))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(expectedData)
+	}))
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	req.Host = "race-stream.example.org"
+
+	// 传入多个模式触发多路并发竞速分支
+	resp, err := raceModes(req, []string{"direct", "direct"}, "v4", "race-stream.example.org")
+	if err != nil {
+		t.Fatalf("raceModes failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading body failed (premature cancel bug): %v", err)
+	}
+	if len(body) != payloadSize {
+		t.Fatalf("read %d bytes, want %d", len(body), payloadSize)
+	}
+	if !bytes.Equal(body, expectedData) {
+		t.Errorf("read body data mismatch")
+	}
+}
+
+type testPipeConn struct {
+	net.Conn
+	w io.Writer
+}
+
+func (c *testPipeConn) Write(b []byte) (int, error) {
+	return c.w.Write(b)
+}
+
+func TestTLSFragmentConnWriteFullLength(t *testing.T) {
+	var buf bytes.Buffer
+	fc := newTLSFragmentConn(&testPipeConn{w: &buf}, 64)
+
+	fakeClientHello := make([]byte, 200)
+	fakeClientHello[0] = 0x16
+	fakeClientHello[1] = 0x03
+	fakeClientHello[2] = 0x03
+	fakeClientHello[3] = 0x00
+	fakeClientHello[4] = 195
+
+	n, err := fc.Write(fakeClientHello)
+	if err != nil {
+		t.Fatalf("fc.Write returned error: %v", err)
+	}
+	if n != len(fakeClientHello) {
+		t.Fatalf("fc.Write returned %d bytes, want %d (short write)", n, len(fakeClientHello))
+	}
+	if buf.Len() != len(fakeClientHello) {
+		t.Fatalf("buffer received %d bytes, want %d", buf.Len(), len(fakeClientHello))
+	}
+}
+
+func TestPximgLiveRoundTrip(t *testing.T) {
+	clearCachedRoute("i.pximg.net")
+	defer clearCachedRoute("i.pximg.net")
+
+	req, _ := http.NewRequest(http.MethodGet, "https://i.pximg.net/c/1200x1200_80_webp/img-master/img/2026/05/05/10/51/22/144386158_p0_master1200.jpg", nil)
+	req.Header.Set("Referer", "https://www.pixiv.net/")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+	resp, err := RoundTrip(req, "auto", "v4")
+	if err != nil {
+		t.Fatalf("RoundTrip to i.pximg.net failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading full image body failed: %v", err)
+	}
+	if len(body) != 159780 {
+		t.Errorf("read %d bytes, want 159780", len(body))
 	}
 }
 

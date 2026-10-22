@@ -197,6 +197,25 @@ type raceResult struct {
 	err  error
 }
 
+type bodyCloseNotifier struct {
+	io.ReadCloser
+	once    sync.Once
+	onClose func()
+}
+
+func (b *bodyCloseNotifier) Close() error {
+	var err error
+	if b.ReadCloser != nil {
+		err = b.ReadCloser.Close()
+	}
+	b.once.Do(func() {
+		if b.onClose != nil {
+			b.onClose()
+		}
+	})
+	return err
+}
+
 func raceModes(req *http.Request, modes []string, normIPMode string, host string) (*http.Response, error) {
 	if len(modes) == 0 {
 		return nil, fmt.Errorf("no transport modes to race for %s", host)
@@ -217,15 +236,15 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 		}
 	}
 
-	raceCtx, cancelAll := context.WithCancel(req.Context())
-	defer cancelAll()
-
+	racers := make(map[string]context.CancelFunc, len(modes))
 	resCh := make(chan raceResult, len(modes))
 
 	for _, m := range modes {
 		mode := m
+		ctx, cancel := context.WithCancel(req.Context())
+		racers[mode] = cancel
 		go func() {
-			cloneReq := cloneRequestForRace(req, raceCtx, bodyBytes)
+			cloneReq := cloneRequestForRace(req, ctx, bodyBytes)
 			resp, err := doSingleMode(cloneReq, mode, normIPMode)
 			if err != nil {
 				resCh <- raceResult{mode: mode, resp: nil, err: err}
@@ -248,6 +267,9 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 	for pending > 0 {
 		select {
 		case <-req.Context().Done():
+			for _, cancel := range racers {
+				cancel()
+			}
 			return nil, req.Context().Err()
 		case res := <-resCh:
 			pending--
@@ -256,7 +278,20 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 				continue
 			}
 			if res.resp.StatusCode < 500 {
-				cancelAll()
+				// 取消落后/失败分支的 context，但保留优胜分支的 context 直到 Response.Body 被完全读取并 Close，
+				// 避免在传输流读取期间因为取消上下文导致流中断（ERR_CONTENT_LENGTH_MISMATCH / 错误返回200）。
+				winnerCancel := racers[res.mode]
+				delete(racers, res.mode)
+				for _, cancel := range racers {
+					cancel()
+				}
+				if winnerCancel != nil && res.resp.Body != nil {
+					res.resp.Body = &bodyCloseNotifier{
+						ReadCloser: res.resp.Body,
+						onClose:    winnerCancel,
+					}
+				}
+
 				go func(rem int) {
 					for i := 0; i < rem; i++ {
 						r := <-resCh
@@ -279,8 +314,23 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 	}
 
 	if fallback5xxResp != nil {
+		winnerCancel := racers[fallback5xxMode]
+		delete(racers, fallback5xxMode)
+		for _, cancel := range racers {
+			cancel()
+		}
+		if winnerCancel != nil && fallback5xxResp.Body != nil {
+			fallback5xxResp.Body = &bodyCloseNotifier{
+				ReadCloser: fallback5xxResp.Body,
+				onClose:    winnerCancel,
+			}
+		}
 		setCachedRoute(host, fallback5xxMode)
 		return fallback5xxResp, nil
+	}
+
+	for _, cancel := range racers {
+		cancel()
 	}
 
 	if respDir, errDir := directDo(req, normIPMode); errDir == nil {

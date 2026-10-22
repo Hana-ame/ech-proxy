@@ -24,6 +24,13 @@ import (
 
 var Debug bool
 
+var streamBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
 func debugLogf(format string, args ...any) {
 	if Debug {
 		log.Printf(format, args...)
@@ -31,18 +38,11 @@ func debugLogf(format string, args ...any) {
 }
 
 const (
-	writeTimeout        = 30 * time.Second
+	writeTimeout        = 30 * time.Minute
 	maxSelfRedirectHops = 3
 	maxBufferedReqBody  = 1 << 20
 	forceCertQueryParam = "__ech_proxy_force_cert__"
 )
-
-var streamingBufPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 32*1024)
-		return &b
-	},
-}
 
 var roundTripFn = cloudflare_ech.RoundTrip
 
@@ -511,7 +511,9 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 		if err != nil {
 			return
 		}
-		streamRemainingBodyAfterPrefix(c, rc, resp.Body)
+		bufPtr := streamBufPool.Get().(*[]byte)
+		defer streamBufPool.Put(bufPtr)
+		streamRemainingBodyWithBuf(c, rc, resp.Body, *bufPtr)
 		return
 	}
 
@@ -558,8 +560,8 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 }
 
 func streamRemainingBody(c *gin.Context, rc *http.ResponseController, resp *http.Response) {
-	bufPtr := streamingBufPool.Get().(*[]byte)
-	defer streamingBufPool.Put(bufPtr)
+	bufPtr := streamBufPool.Get().(*[]byte)
+	defer streamBufPool.Put(bufPtr)
 	buf := *bufPtr
 
 	n, rerr := resp.Body.Read(buf)
@@ -584,20 +586,11 @@ func streamRemainingBody(c *gin.Context, rc *http.ResponseController, resp *http
 	if rerr != nil {
 		return
 	}
-	streamRemainingBodyAfterPrefix(c, rc, resp.Body)
+	streamRemainingBodyWithBuf(c, rc, resp.Body, buf)
 }
 
-func streamRemainingBodyAfterPrefix(c *gin.Context, rc *http.ResponseController, body io.Reader) {
-	bufPtr := streamingBufPool.Get().(*[]byte)
-	defer streamingBufPool.Put(bufPtr)
-	buf := *bufPtr
-
+func streamRemainingBodyWithBuf(c *gin.Context, rc *http.ResponseController, body io.Reader, buf []byte) {
 	for {
-		select {
-		case <-c.Request.Context().Done():
-			return
-		default:
-		}
 		n, rerr := body.Read(buf)
 		if n > 0 {
 			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
@@ -613,4 +606,3 @@ func streamRemainingBodyAfterPrefix(c *gin.Context, rc *http.ResponseController,
 		}
 	}
 }
-

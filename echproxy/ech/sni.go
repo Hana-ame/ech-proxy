@@ -24,6 +24,8 @@ import (
 const (
 	routeCacheTTL      = 30 * time.Minute
 	maxSNICacheEntries = 256
+	maxIPCacheEntries  = 1024
+	maxRouteEntries    = 1024
 )
 
 var (
@@ -149,6 +151,20 @@ func getCachedRoute(host string) (string, bool) {
 
 func setCachedRoute(host, mode string) {
 	routeMu.Lock()
+	if len(routes) >= maxRouteEntries {
+		now := time.Now()
+		for k, v := range routes {
+			if now.After(v.expiry) {
+				delete(routes, k)
+			}
+		}
+		if len(routes) >= maxRouteEntries {
+			for k := range routes {
+				delete(routes, k)
+				break
+			}
+		}
+	}
 	routes[host] = routeEntry{mode: mode, expiry: time.Now().Add(routeCacheTTL)}
 	routeMu.Unlock()
 }
@@ -466,33 +482,9 @@ func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 		mode = ipMode[0]
 	}
 	normMode := resolveEffectiveIPMode(mode)
-
-	hostPort := req.URL.Host
-	if hostPort == "" {
-		hostPort = req.Host
-	}
-	host := netdial.CleanHost(hostPort)
-	port := netdial.ExtractPort(hostPort)
-	if port == "" {
-		port = "80"
-	}
-
-	dialTarget := host
-	if ips, err := ResolveHostIPsByMode(req.Context(), host, normMode); err == nil && len(ips) > 0 {
-		dialTarget = ips[0]
-	}
-
-	tr := netdial.TransportWithIPMode(normMode).Clone()
-	defer tr.CloseIdleConnections()
-	tr.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return netdial.DialContextIPMode(ctx, dialTarget, port, normMode, dialTimeout)
-	}
-	c := &http.Client{
-		Transport:     tr,
-		Timeout:       netdial.OpTimeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	}
-	return c.Do(req)
+	// 直接复用按协议族共享的 netdial.ClientWithIPMode（底层 TransportWithIPMode 已通过 DialContextIPMode -> ResolveIPs 做 DoH 解析），
+	// 杜绝每次明文 HTTP 请求都 Clone 一份新的 http.Transport 导致连接池与协程泄漏。
+	return netdial.ClientWithIPMode(normMode, netdial.OpTimeout).Do(req)
 }
 
 var (
@@ -555,13 +547,46 @@ type ipCacheEntry struct {
 	expiry time.Time
 }
 
+type ipFlightCall struct {
+	done chan struct{}
+	ips  []string
+	err  error
+}
+
 var (
 	ipCacheMu     sync.Mutex
 	ipCache       = map[string]ipCacheEntry{}
+	ipFlightMu    sync.Mutex
+	ipFlights     = map[string]*ipFlightCall{}
 	utlsTransMu   sync.Mutex
 	utlsH2Trans   = map[string]*http2.Transport{}
 	utlsH1Clients = map[string]*http.Client{}
 )
+
+func storeIPCache(cacheKey string, ips []string, ttl int) {
+	if ttl < minTTL {
+		ttl = minTTL
+	} else if ttl > maxTTL {
+		ttl = maxTTL
+	}
+	ipCacheMu.Lock()
+	if len(ipCache) >= maxIPCacheEntries {
+		now := time.Now()
+		for k, v := range ipCache {
+			if now.After(v.expiry) {
+				delete(ipCache, k)
+			}
+		}
+		if len(ipCache) >= maxIPCacheEntries {
+			for k := range ipCache {
+				delete(ipCache, k)
+				break
+			}
+		}
+	}
+	ipCache[cacheKey] = ipCacheEntry{ips: ips, expiry: time.Now().Add(time.Duration(ttl) * time.Second)}
+	ipCacheMu.Unlock()
+}
 
 func ResolveHostIPs(ctx context.Context, host string) ([]string, error) {
 	return ResolveHostIPsByMode(ctx, host, "")
@@ -586,6 +611,29 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 		return e.ips, nil
 	}
 	ipCacheMu.Unlock()
+
+	// Singleflight 并发合并：同一 (host, normMode) 在缓存未命中时只发起一次 DoH 解析，
+	// 防止冷启动或页面并发加载数十个子资源时触发重复的 DoH 连接风暴。
+	ipFlightMu.Lock()
+	if call, inFlight := ipFlights[cacheKey]; inFlight {
+		ipFlightMu.Unlock()
+		select {
+		case <-call.done:
+			return call.ips, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &ipFlightCall{done: make(chan struct{})}
+	ipFlights[cacheKey] = call
+	ipFlightMu.Unlock()
+
+	defer func() {
+		ipFlightMu.Lock()
+		delete(ipFlights, cacheKey)
+		close(call.done)
+		ipFlightMu.Unlock()
+	}()
 
 	qtypes := []int{1}
 	switch normMode {
@@ -613,7 +661,7 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 				if json.NewDecoder(resp.Body).Decode(&d) == nil {
 					for _, ans := range d.Answer {
 						if ans.Type == qt {
-							if parsed := net.ParseIP(ans.Data); parsed != nil {
+							if parsed := net.ParseIP(ans.Data); parsed != nil && !parsed.IsLoopback() && !parsed.IsUnspecified() {
 								for _, m := range netdial.FilterIPsByMode([]net.IP{parsed}, normMode) {
 									if !seen[m] {
 										seen[m] = true
@@ -636,24 +684,21 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 	}
 
 	if len(ips) == 0 {
-		if fallbackIPs, rerr := netdial.ResolveIPs(ctx, host, normMode); rerr == nil && len(fallbackIPs) > 0 {
+		// 严格直接调用 netdial.ResolveViaBootstrapDoH（绝不可调用 netdial.ResolveIPs，否则 ResolveIPs 又会回调 DoHResolver = ResolveHostIPsByMode 造成无限相互递归导致栈与内存暴涨至 4~5GB）
+		if fallbackIPs, rerr := netdial.ResolveViaBootstrapDoH(ctx, host, normMode); rerr == nil && len(fallbackIPs) > 0 {
 			ips = fallbackIPs
 		} else {
 			if normMode != "dual" {
-				return nil, fmt.Errorf("no %s record for %s", normMode, host)
+				call.err = fmt.Errorf("no %s record for %s", normMode, host)
+				return nil, call.err
 			}
-			return nil, fmt.Errorf("no A/AAAA record for %s", host)
+			call.err = fmt.Errorf("no A/AAAA record for %s", host)
+			return nil, call.err
 		}
 	}
 
-	if ttl < minTTL {
-		ttl = minTTL
-	} else if ttl > maxTTL {
-		ttl = maxTTL
-	}
-	ipCacheMu.Lock()
-	ipCache[cacheKey] = ipCacheEntry{ips: ips, expiry: time.Now().Add(time.Duration(ttl) * time.Second)}
-	ipCacheMu.Unlock()
+	storeIPCache(cacheKey, ips, ttl)
+	call.ips = ips
 	return ips, nil
 }
 
@@ -754,6 +799,7 @@ func getUTLSH1Client(cacheKey string, dialFn func(ctx context.Context, nextProto
 		},
 		MaxIdleConns:        16,
 		MaxIdleConnsPerHost: 4,
+		MaxConnsPerHost:     16,
 		IdleConnTimeout:     15 * time.Second,
 	}
 	c := &http.Client{
@@ -783,7 +829,9 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 		return nil, err
 	}
 	effectiveSNI := sniName
-	if effectiveSNI == "" {
+	if strings.EqualFold(effectiveSNI, "none") {
+		effectiveSNI = ""
+	} else if effectiveSNI == "" {
 		if tag == "frag" {
 			effectiveSNI = host
 		} else if tag == "sni" {
@@ -835,5 +883,11 @@ func SNIFrontDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 	if len(ipMode) > 0 {
 		mode = ipMode[0]
 	}
-	return roundTripUTLS(req, mode, "sni", SNIServerNameFromContext(req.Context()), nil)
+	var customSNI string
+	if req != nil && req.Context() != nil {
+		if v, ok := req.Context().Value(sniServerNameKey{}).(string); ok && v != "" {
+			customSNI = v
+		}
+	}
+	return roundTripUTLS(req, mode, "sni", customSNI, nil)
 }

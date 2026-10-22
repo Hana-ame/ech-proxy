@@ -136,3 +136,33 @@ func TestFetchBytesLocalAndRetry(t *testing.T) {
 		t.Errorf("Retry got (%d, %v) after %d calls, want (42, nil) after 3 calls", val, err, calls)
 	}
 }
+
+func TestWithInsideDoHPreventsDoHResolverRecursion(t *testing.T) {
+	origResolver := DoHResolver
+	defer func() { DoHResolver = origResolver }()
+
+	resolverCalls := 0
+	DoHResolver = func(ctx context.Context, host, mode string) ([]string, error) {
+		resolverCalls++
+		if resolverCalls > 1 {
+			t.Fatalf("DoHResolver recursively re-entered (%d calls)", resolverCalls)
+		}
+		// Simulate DoHResolver dialing the DoH server (4545810.xyz) via ResolveIPs:
+		// because ResolveIPs passed WithInsideDoH(ctx), this nested ResolveIPs call must NOT re-enter DoHResolver.
+		if !IsInsideDoH(ctx) {
+			t.Errorf("expected IsInsideDoH(ctx) == true inside DoHResolver")
+		}
+		cCtx, cancel := context.WithCancel(ctx)
+		cancel()
+		_, _ = ResolveIPs(cCtx, DefaultSiteHost, mode)
+		return []string{"104.16.1.2"}, nil
+	}
+
+	ips, err := ResolveIPs(context.Background(), "example.com", "v4")
+	if err != nil || len(ips) != 1 || ips[0] != "104.16.1.2" {
+		t.Fatalf("ResolveIPs = %v, %v; want [104.16.1.2]", ips, err)
+	}
+	if resolverCalls != 1 {
+		t.Errorf("expected DoHResolver to be called exactly once, got %d", resolverCalls)
+	}
+}

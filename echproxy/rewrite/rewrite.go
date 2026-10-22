@@ -163,6 +163,9 @@ func stripBlockedURLs(body []byte, blocked []string) []byte {
 }
 
 func stripOneBlockedURL(body, blocked []byte) []byte {
+	if len(body) == 0 || len(blocked) == 0 || !bytes.Contains(body, blocked) {
+		return body
+	}
 	var out []byte
 	rest := body
 	for {
@@ -215,10 +218,14 @@ func buildDomainRewriter(rt map[string]string) func([]byte, string) []byte {
 }
 
 func replaceWildcardDomain(body []byte, suffix, target string) []byte {
+	suffixB := []byte(suffix)
+	if len(body) == 0 || len(suffixB) == 0 || !bytes.Contains(body, suffixB) {
+		return body
+	}
 	var out []byte
 	rest := body
 	for {
-		i := bytes.Index(rest, []byte(suffix))
+		i := bytes.Index(rest, suffixB)
 		if i < 0 {
 			out = append(out, rest...)
 			break
@@ -257,7 +264,11 @@ func replaceWildcardDomain(body []byte, suffix, target string) []byte {
 }
 
 func replaceDomainBounded(body []byte, from, to string) []byte {
-	fromB, toB := []byte(from), []byte(to)
+	fromB := []byte(from)
+	if len(body) == 0 || len(fromB) == 0 || !bytes.Contains(body, fromB) {
+		return body
+	}
+	toB := []byte(to)
 	var out []byte
 	rest := body
 	for {

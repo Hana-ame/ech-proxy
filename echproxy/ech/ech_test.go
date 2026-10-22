@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestSetIPModeNormalizesAndSNIServerNameContext(t *testing.T) {
@@ -159,6 +161,64 @@ func TestResolveHostIPsByModeViaMockDoHAndFallback(t *testing.T) {
 	fbIPs, err := ResolveHostIPsByMode(context.Background(), "fallback-test.example.org", "v4")
 	if err != nil || len(fbIPs) != 1 || fbIPs[0] != "104.16.99.88" {
 		t.Fatalf("ResolveHostIPsByMode via secondary DoH fallback = %v, %v; want [104.16.99.88]", fbIPs, err)
+	}
+}
+
+// TestNoDoHSelfResolutionOrMutualRecursion 验证：
+// 1. 当 DoH 返回空记录（或仅返回 127.0.0.1 / 0.0.0.0 污染记录）时，ResolveHostIPsByMode 绝不会与 netdial.ResolveIPs 发生无限相互递归；
+// 2. 并发请求同一域名时由 Singleflight 合并，不产生重复 DoH 请求风暴。
+func TestNoDoHSelfResolutionOrMutualRecursion(t *testing.T) {
+	var dohHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		dohHits.Add(1)
+		qname := r.URL.Query().Get("name")
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(qname, "dedup") {
+			time.Sleep(30 * time.Millisecond)
+			_, _ = w.Write([]byte(`{"Answer":[{"type":1,"TTL":120,"data":"104.16.88.77"}]}`))
+			return
+		}
+		// 返回 0.0.0.0 / 127.0.0.1 污染记录或空记录，测试不会触发自我连接或无限递归
+		_, _ = w.Write([]byte(`{"Answer":[{"type":1,"TTL":60,"data":"0.0.0.0"},{"type":1,"TTL":60,"data":"127.0.0.1"}]}`))
+	}))
+	defer srv.Close()
+
+	SetDohURL(srv.URL + "/doh")
+	SetFallbackDohURL(srv.URL + "/doh")
+	defer func() {
+		SetDohURL(defaultDohURL)
+		SetFallbackDohURL(fallbackDohURL)
+	}()
+
+	// 1. 20 个并发协程同时解析 dedup.example.org，Singleflight 应合并为 1 次 DoH 查询
+	dohHits.Store(0)
+	errCh := make(chan error, 20)
+	for i := 0; i < 20; i++ {
+		go func() {
+			ips, err := ResolveHostIPsByMode(context.Background(), "dedup.example.org", "v4")
+			if err != nil || len(ips) != 1 || ips[0] != "104.16.88.77" {
+				errCh <- io.ErrUnexpectedEOF
+				return
+			}
+			errCh <- nil
+		}()
+	}
+	for i := 0; i < 20; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("concurrent ResolveHostIPsByMode failed: %v", err)
+		}
+	}
+	if hits := dohHits.Load(); hits != 1 {
+		t.Errorf("expected Singleflight to coalesce 20 concurrent lookups into 1 DoH request, got %d", hits)
+	}
+
+	// 2. 空/污染记录场景：不得与 netdial.ResolveIPs 发生无限相互递归（应在短超时内立即返回错误，DoH 请求次数受限于 RetryAttempts=3）
+	dohHits.Store(0)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_, _ = ResolveHostIPsByMode(ctx, "nxdomain-poisoned.invalid", "v4")
+	if hits := dohHits.Load(); hits > 6 {
+		t.Fatalf("detected recursive DoH storm: got %d DoH hits for a single lookup", hits)
 	}
 }
 
@@ -317,4 +377,3 @@ func TestPximgLiveRoundTrip(t *testing.T) {
 		t.Errorf("read %d bytes, want 159780", len(body))
 	}
 }
-

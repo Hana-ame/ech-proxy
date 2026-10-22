@@ -30,8 +30,30 @@ const (
 	// DefaultSiteHost 是项目自有服务域名（DoH / ads.js / pac.txt / block.json 共用）的
 	// **唯一 true source**。其它包必须引用它派生，不得再各自硬编码该域名。
 	DefaultSiteHost = "4545810.xyz"
+
+	bootstrapCacheTTL      = 5 * time.Minute
+	maxBootstrapCacheItems = 512
 )
 
+type insideDoHKey struct{}
+
+// WithInsideDoH 在 Context 中标记当前调用链正处于 DoH 请求内部。
+// 当拨号处于 DoH 查询内部时，ResolveIPs 严禁再次回调 DoHResolver，彻底阻断 DoH 域名自解析的无限递归与协程爆炸。
+func WithInsideDoH(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, insideDoHKey{}, true)
+}
+
+// IsInsideDoH 报告当前 Context 是否正处于 DoH 查询内部。
+func IsInsideDoH(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(insideDoHKey{}).(bool)
+	return v
+}
 
 var cloudflareCIDRs = []string{
 	"104.16.0.0/13", "104.24.0.0/14", "172.64.0.0/13", "141.101.64.0/18",
@@ -200,6 +222,17 @@ func FormatIPMode(mode string) string {
 	}
 }
 
+type bootstrapCacheEntry struct {
+	ips    []string
+	expiry time.Time
+}
+
+type bootstrapFlightCall struct {
+	done chan struct{}
+	ips  []string
+	err  error
+}
+
 var (
 	DoHResolver func(ctx context.Context, host, mode string) ([]string, error)
 
@@ -211,6 +244,14 @@ var (
 
 	ipTransportMu sync.Mutex
 	ipTransports  = map[string]*http.Transport{}
+
+	bootstrapClientMu sync.Mutex
+	bootstrapClients  = map[string]*http.Client{}
+
+	bootstrapCacheMu  sync.Mutex
+	bootstrapCache    = map[string]bootstrapCacheEntry{}
+	bootstrapFlightMu sync.Mutex
+	bootstrapFlights  = map[string]*bootstrapFlightCall{}
 )
 
 // TransportPoolStats 返回 netdial 内部缓存的各模式 Transport 数量与标识。
@@ -222,6 +263,34 @@ func TransportPoolStats() (count int, modes []string) {
 		modes = append(modes, k)
 	}
 	return
+}
+
+func getBootstrapClient(bIP string) *http.Client {
+	bootstrapClientMu.Lock()
+	defer bootstrapClientMu.Unlock()
+	if c, ok := bootstrapClients[bIP]; ok {
+		return c
+	}
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			_, port, _ := net.SplitHostPort(addr)
+			if port == "" {
+				port = "443"
+			}
+			return (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(bIP, port))
+		},
+		MaxIdleConns:          8,
+		MaxIdleConnsPerHost:   4,
+		MaxConnsPerHost:       16,
+		IdleConnTimeout:       30 * time.Second,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 6 * time.Second,
+		ForceAttemptHTTP2:     true,
+	}
+	c := &http.Client{Transport: tr, Timeout: 6 * time.Second}
+	bootstrapClients[bIP] = c
+	return c
 }
 
 func getRootPool() *x509.CertPool {
@@ -285,9 +354,54 @@ type dohJSONResponse struct {
 	Answer []dohJSONAnswer `json:"Answer"`
 }
 
+// ResolveViaBootstrapDoH 仅通过 HTTPS（端口 443）向 IP 直连 DoH 端点查询，绝不发起任何 UDP/TCP 53 端口连接，
+// 且絕不回调上层 DoHResolver，内置内存缓存与 Singleflight 并发合并。
+func ResolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, error) {
+	return resolveViaBootstrapDoH(ctx, host, mode)
+}
+
 // resolveViaBootstrapDoH 仅通过 HTTPS（端口 443）向 IP 直连 DoH 端点查询，绝不发起任何 UDP/TCP 53 端口连接。
 func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, error) {
+	host = CleanHost(host)
 	norm := EffectiveIPMode(mode)
+	if ip := net.ParseIP(host); ip != nil {
+		filtered := FilterIPsByMode([]net.IP{ip}, norm)
+		if len(filtered) == 0 {
+			return nil, fmt.Errorf("IP %s does not match ip_mode %q", host, norm)
+		}
+		return filtered, nil
+	}
+
+	cacheKey := host + "|" + norm
+	now := time.Now()
+	bootstrapCacheMu.Lock()
+	if e, ok := bootstrapCache[cacheKey]; ok && now.Before(e.expiry) {
+		bootstrapCacheMu.Unlock()
+		return e.ips, nil
+	}
+	bootstrapCacheMu.Unlock()
+
+	bootstrapFlightMu.Lock()
+	if call, inFlight := bootstrapFlights[cacheKey]; inFlight {
+		bootstrapFlightMu.Unlock()
+		select {
+		case <-call.done:
+			return call.ips, call.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &bootstrapFlightCall{done: make(chan struct{})}
+	bootstrapFlights[cacheKey] = call
+	bootstrapFlightMu.Unlock()
+
+	defer func() {
+		bootstrapFlightMu.Lock()
+		delete(bootstrapFlights, cacheKey)
+		close(call.done)
+		bootstrapFlightMu.Unlock()
+	}()
+
 	qtypes := []int{1}
 	if norm == "v6" {
 		qtypes = []int{28}
@@ -306,17 +420,8 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 				continue
 			}
 			req.Header.Set("Accept", "application/dns-json")
-			tr := &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					_, port, _ := net.SplitHostPort(addr)
-					return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(bIP, port))
-				},
-				DisableKeepAlives: true,
-			}
-			client := &http.Client{Transport: tr, Timeout: 6 * time.Second}
+			client := getBootstrapClient(bIP)
 			resp, err := client.Do(req)
-			tr.CloseIdleConnections()
 			if err != nil || resp.StatusCode != http.StatusOK {
 				if resp != nil && resp.Body != nil {
 					_ = resp.Body.Close()
@@ -328,7 +433,7 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 			_ = resp.Body.Close()
 			for _, ans := range d.Answer {
 				if ans.Type == qt {
-					if parsed := net.ParseIP(ans.Data); parsed != nil {
+					if parsed := net.ParseIP(ans.Data); parsed != nil && !parsed.IsLoopback() && !parsed.IsUnspecified() {
 						ips = append(ips, parsed)
 					}
 				}
@@ -341,12 +446,37 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 
 	filtered := FilterIPsByMode(ips, norm)
 	if len(filtered) == 0 {
-		return nil, fmt.Errorf("DoH resolve %s (%s) failed", host, norm)
+		call.err = fmt.Errorf("DoH resolve %s (%s) failed", host, norm)
+		return nil, call.err
 	}
+
+	bootstrapCacheMu.Lock()
+	if len(bootstrapCache) >= maxBootstrapCacheItems {
+		pruneTime := time.Now()
+		for k, v := range bootstrapCache {
+			if pruneTime.After(v.expiry) {
+				delete(bootstrapCache, k)
+			}
+		}
+		if len(bootstrapCache) >= maxBootstrapCacheItems {
+			for k := range bootstrapCache {
+				delete(bootstrapCache, k)
+				break
+			}
+		}
+	}
+	bootstrapCache[cacheKey] = bootstrapCacheEntry{
+		ips:    filtered,
+		expiry: time.Now().Add(bootstrapCacheTTL),
+	}
+	bootstrapCacheMu.Unlock()
+
+	call.ips = filtered
 	return filtered, nil
 }
 
 // ResolveIPs 严格全链路采用 DoH 协议解析域名（优先调用 DoHResolver，兜底使用 1.1.1.1:443 HTTPS 直连），绝不触碰本地 53 端口。
+// 当 ctx 处于 DoH 请求内部（IsInsideDoH(ctx) == true）时，跳过 DoHResolver 直接走 Bootstrap DoH，杜绝自解析死循环。
 func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
 	host = CleanHost(host)
 	norm := EffectiveIPMode(mode)
@@ -357,8 +487,8 @@ func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
 		}
 		return filtered, nil
 	}
-	if DoHResolver != nil {
-		if ips, err := DoHResolver(ctx, host, norm); err == nil && len(ips) > 0 {
+	if DoHResolver != nil && !IsInsideDoH(ctx) {
+		if ips, err := DoHResolver(WithInsideDoH(ctx), host, norm); err == nil && len(ips) > 0 {
 			return ips, nil
 		}
 	}
@@ -378,7 +508,9 @@ func DialContextIPMode(ctx context.Context, host, port, mode string, timeout tim
 		timeout = DialTimeout
 	}
 	norm := EffectiveIPMode(mode)
-	ips, err := ResolveIPs(ctx, host, norm)
+	resolveCtx, cancel := context.WithTimeout(ctx, DoHTimeout)
+	ips, err := ResolveIPs(resolveCtx, host, norm)
+	cancel()
 	if err != nil {
 		return nil, err
 	}
@@ -424,6 +556,7 @@ func TransportWithIPMode(mode string) *http.Transport {
 		TLSClientConfig:       &tls.Config{RootCAs: getRootPool()},
 		MaxIdleConns:          64,
 		MaxIdleConnsPerHost:   8,
+		MaxConnsPerHost:       64,
 		IdleConnTimeout:       15 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
@@ -469,6 +602,7 @@ func TransportWithIPModeAndCertCheck(mode string, certCheck func(host string, pe
 		},
 		MaxIdleConns:        64,
 		MaxIdleConnsPerHost: 8,
+		MaxConnsPerHost:     64,
 		IdleConnTimeout:     15 * time.Second,
 		ForceAttemptHTTP2:   true,
 	}
@@ -544,11 +678,17 @@ func FetchBytes(rawURL string) ([]byte, error) {
 			strings.HasSuffix(rawURL, ".tar.gz") || strings.HasSuffix(rawURL, ".bin")
 		candTimeout := 25 * time.Second
 		overallTimeout := 45 * time.Second
+		var maxReadBytes int64 = 8 << 20
+		maxConcurrent := len(candidates)
 		if isBinary {
 			candTimeout = 90 * time.Second
 			overallTimeout = 150 * time.Second
+			maxReadBytes = 64 << 20
+			// 二进制大文件限制并发下载数为 2，避免 6 个镜像同时在内存缓冲数十 MB 的可执行文件
+			maxConcurrent = 2
 		}
 
+		sem := make(chan struct{}, maxConcurrent)
 		ch := make(chan fetchResult, len(candidates))
 		raceCtx, raceCancel := context.WithTimeout(context.Background(), overallTimeout)
 		defer raceCancel()
@@ -561,6 +701,14 @@ func FetchBytes(rawURL string) ([]byte, error) {
 
 		for _, cand := range candidates {
 			go func(target string) {
+				select {
+				case sem <- struct{}{}:
+					defer func() { <-sem }()
+				case <-raceCtx.Done():
+					ch <- fetchResult{target: target, err: raceCtx.Err()}
+					return
+				}
+
 				cCtx, cCancel := context.WithTimeout(raceCtx, candTimeout)
 				defer cCancel()
 
@@ -580,7 +728,7 @@ func FetchBytes(rawURL string) ([]byte, error) {
 					ch <- fetchResult{target: target, err: fmt.Errorf("unexpected status: %s", resp.Status)}
 					return
 				}
-				b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+				b, err := io.ReadAll(io.LimitReader(resp.Body, maxReadBytes))
 				if err == nil && len(b) > 0 {
 					ch <- fetchResult{target: target, data: b, err: nil}
 				} else {
@@ -629,7 +777,7 @@ func fetchWithClient(client *http.Client, targetURL string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status: %s", resp.Status)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+	return io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 }
 
 func Retry[T any](ctx context.Context, attempts int, backoff time.Duration, fn func() (T, error)) (T, error) {

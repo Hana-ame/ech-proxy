@@ -491,7 +491,9 @@ func writeConnectError(conn net.Conn, code int, body string) {
 func relay(a, b net.Conn) {
 	done := make(chan error, 2)
 	cp := func(dst, src net.Conn) {
-		_, err := io.Copy(dst, src)
+		bufPtr := streamBufPool.Get().(*[]byte)
+		_, err := io.CopyBuffer(dst, src, *bufPtr)
+		streamBufPool.Put(bufPtr)
 		done <- err
 	}
 	go cp(a, b)

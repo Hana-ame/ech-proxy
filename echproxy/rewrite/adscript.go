@@ -37,9 +37,10 @@ const (
 	// DefaultAdScriptUpdateInterval 是远程配置后台自动检查更新周期（30 分钟）。
 	DefaultAdScriptUpdateInterval = 30 * time.Minute
 
-	maxAdScriptBytes   = 2 << 20
-	maxDomainJSONBytes = 1 << 20
-	cachedScriptName   = "ads.js"
+	maxAdScriptBytes     = 2 << 20
+	maxDomainJSONBytes   = 1 << 20
+	maxWhitelistHistory  = 16
+	cachedScriptName     = "ads.js"
 )
 
 var DefaultAdNetworkBlockedURLs = []string{
@@ -664,6 +665,9 @@ func (m *AdScriptManager) SwapWhitelist(domains []string) []string {
 	var old []string
 	if oldPtr != nil {
 		old = append([]string(nil), (*oldPtr)...)
+	}
+	if len(m.whitelistHistory) >= maxWhitelistHistory {
+		m.whitelistHistory = append([][]string(nil), m.whitelistHistory[len(m.whitelistHistory)-maxWhitelistHistory+1:]...)
 	}
 	m.whitelistHistory = append(m.whitelistHistory, old)
 	m.mu.Unlock()

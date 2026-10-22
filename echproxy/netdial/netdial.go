@@ -213,6 +213,17 @@ var (
 	ipTransports  = map[string]*http.Transport{}
 )
 
+// TransportPoolStats 返回 netdial 内部缓存的各模式 Transport 数量与标识。
+func TransportPoolStats() (count int, modes []string) {
+	ipTransportMu.Lock()
+	defer ipTransportMu.Unlock()
+	count = len(ipTransports)
+	for k := range ipTransports {
+		modes = append(modes, k)
+	}
+	return
+}
+
 func getRootPool() *x509.CertPool {
 	rootPoolOnce.Do(func() {
 		pool, _ := x509.SystemCertPool()

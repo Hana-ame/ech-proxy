@@ -40,6 +40,20 @@ func (j *Jar) Reset() {
 	j.store = make(map[string][]*http.Cookie)
 }
 
+// Stats 返回 Cookie 缓存概况（存储的主机域名数与 Cookie 总条数）。
+func (j *Jar) Stats() (domainCount int, totalCookieCount int) {
+	if j == nil {
+		return 0, 0
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	domainCount = len(j.store)
+	for _, list := range j.store {
+		totalCookieCount += len(list)
+	}
+	return
+}
+
 // ReadFixedCookie 安全地获取预置 Cookie（修复 #28）：
 //   - 若 cookieVal 是形如 "k=v" 的原始 Cookie 字符串，直接返回；
 //   - 若通过 cookieFile 指定文件，仅允许读取受控 certs/ 目录下的纯文件名（禁止绝对路径、".." 路径穿越或任意系统路径读取）。

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Hana-ame/ech-proxy/echproxy/config"
@@ -30,11 +31,18 @@ func debugLogf(format string, args ...any) {
 }
 
 const (
-	writeTimeout        = 30 * time.Minute
+	writeTimeout        = 30 * time.Second
 	maxSelfRedirectHops = 3
 	maxBufferedReqBody  = 1 << 20
 	forceCertQueryParam = "__ech_proxy_force_cert__"
 )
+
+var streamingBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
 
 var roundTripFn = cloudflare_ech.RoundTrip
 
@@ -550,7 +558,10 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 }
 
 func streamRemainingBody(c *gin.Context, rc *http.ResponseController, resp *http.Response) {
-	buf := make([]byte, 32*1024)
+	bufPtr := streamingBufPool.Get().(*[]byte)
+	defer streamingBufPool.Put(bufPtr)
+	buf := *bufPtr
+
 	n, rerr := resp.Body.Read(buf)
 	if n == 0 && rerr != nil && !errors.Is(rerr, io.EOF) {
 		clearHeaders(c.Writer.Header())
@@ -577,8 +588,16 @@ func streamRemainingBody(c *gin.Context, rc *http.ResponseController, resp *http
 }
 
 func streamRemainingBodyAfterPrefix(c *gin.Context, rc *http.ResponseController, body io.Reader) {
-	buf := make([]byte, 32*1024)
+	bufPtr := streamingBufPool.Get().(*[]byte)
+	defer streamingBufPool.Put(bufPtr)
+	buf := *bufPtr
+
 	for {
+		select {
+		case <-c.Request.Context().Done():
+			return
+		default:
+		}
 		n, rerr := body.Read(buf)
 		if n > 0 {
 			_ = rc.SetWriteDeadline(time.Now().Add(writeTimeout))
@@ -594,3 +613,4 @@ func streamRemainingBodyAfterPrefix(c *gin.Context, rc *http.ResponseController,
 		}
 	}
 }
+

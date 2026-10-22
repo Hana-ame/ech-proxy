@@ -26,6 +26,7 @@ const (
 	TrayCmdIPModeDual    uintptr = 1013
 	TrayCmdUninstallCA   uintptr = 1014
 	TrayCmdCheckUpdate   uintptr = 1015
+	TrayCmdDumpMemory    uintptr = 1016
 )
 
 type ConsoleWindowDriver interface {
@@ -69,6 +70,7 @@ type TrayController struct {
 	InstallCAFn     func(string) error
 	UninstallCAFn   func(string) error
 	CheckUpdateFn   func() (bool, error)
+	DumpMemoryFn    func() string
 	NotifyFn        func(title, msg string, isError bool)
 	OnExit          func()
 	OnStateChanged  func()
@@ -233,6 +235,7 @@ func (tc *TrayController) MenuItems() []TrayMenuItem {
 		{ID: TrayCmdCheckUpdate, Title: updateTitle, Checked: updateChecked},
 		{ID: TrayCmdOpenFeedback, Title: "反馈 (" + feedbackURL + ")"},
 		{ID: TrayCmdCopyPACURL, Title: "复制 PAC 地址 (Copy PAC URL)"},
+		{ID: TrayCmdDumpMemory, Title: "转储内存诊断 (Dump Memory)"},
 		{ID: TrayCmdOpenLogs, Title: "打开本地日志目录 (问题排查/上传日志)"},
 		{Separator: true},
 		{ID: TrayCmdExit, Title: "退出程序并清理系统代理 (Exit)"},
@@ -336,6 +339,15 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 			if err := tc.CopyClipboardFn(pacURL); err != nil {
 				log.Printf("[Tray] Copy PAC URL failed (%v), PAC URL is: %s", err, pacURL)
 			}
+		}
+	case TrayCmdDumpMemory:
+		if tc.DumpMemoryFn != nil {
+			echproxy.SafeGo("TrayDumpMemory", func() {
+				msg := tc.DumpMemoryFn()
+				if tc.NotifyFn != nil && msg != "" {
+					tc.NotifyFn("内存诊断", msg, false)
+				}
+			})
 		}
 	case TrayCmdOpenLogs:
 		target := tc.LogDir

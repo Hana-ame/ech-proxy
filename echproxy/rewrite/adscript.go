@@ -544,6 +544,21 @@ func (m *AdScriptManager) SetEnabled(v bool) {
 	}
 }
 
+// Stats 返回 AdScript/规则模块的概况指标（白名单域名数、阻止规则域名数、脚本字节大小）。
+func (m *AdScriptManager) Stats() (whitelistCount int, blocklistCount int, scriptBytesLen int) {
+	if m == nil {
+		return 0, 0, 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if ptr := m.whitelistPtr.Load(); ptr != nil {
+		whitelistCount = len(*ptr)
+	}
+	blocklistCount = len(m.blocklist.Domains)
+	scriptBytesLen = len(m.scriptBytes)
+	return
+}
+
 func (m *AdScriptManager) BlocklistURL() string {
 	if m == nil {
 		return ""

@@ -716,8 +716,10 @@ func main() {
 		logMgr      *echproxy.Logger
 		sysProxyMgr *SysProxyManager
 		updater     *Updater
+		srv         *echproxy.Server
 	)
 	defer echproxy.RecoverAndLog("main", func(_ any, _ []byte) {
+		echproxy.DumpMemory("Crash", srv, logMgr)
 		if sysProxyMgr != nil {
 			sysProxyMgr.CleanupOnExit()
 		}
@@ -768,7 +770,8 @@ func main() {
 
 	echproxy.Debug = cmd.Verbose
 
-	srv, err := echproxy.NewServer(echproxy.ServerOptions{
+	var srvErr error
+	srv, srvErr = echproxy.NewServer(echproxy.ServerOptions{
 		Addr:             cmd.Addr,
 		FallbackAddr:     cmd.FallbackAddr,
 		HTTPMode:         cmd.HTTPMode,
@@ -792,14 +795,16 @@ func main() {
 		AdScriptInterval: cmd.AdScriptInterval,
 		Logger:           logMgr,
 	})
-	if err != nil {
-		echproxy.RecordFatalError("NewServer", err)
+	if srvErr != nil {
+		echproxy.RecordFatalError("NewServer", srvErr)
 		if logMgr != nil {
 			logMgr.Sync()
 			_ = logMgr.Close()
 		}
 		os.Exit(1)
 	}
+
+	echproxy.StartMemoryWatchDog(srv, logMgr, 300*1024*1024)
 
 	actualListenAddr := fmt.Sprintf("127.0.0.1:%d", srv.Port)
 	scheme := "https"
@@ -864,6 +869,9 @@ func main() {
 		if logMgr != nil {
 			trayCtrl.LogDir = logMgr.LogDir()
 		}
+		trayCtrl.DumpMemoryFn = func() string {
+			return echproxy.DumpMemory("Tray-Manual", srv, logMgr)
+		}
 		stopTray = startPlatformTray(trayCtrl)
 		if cmd.HideConsole {
 			trayCtrl.SetConsoleVisible(false)
@@ -877,6 +885,8 @@ func main() {
 
 	echproxy.SafeGo("ShutdownWatcher", func() {
 		<-ctx.Done()
+		log.Printf("[Shutdown] Signal received, dumping memory statistics before shutdown...")
+		echproxy.DumpMemory("Shutdown", srv, logMgr)
 		if sysProxyMgr != nil {
 			sysProxyMgr.CleanupOnExit()
 		}
@@ -894,6 +904,7 @@ func main() {
 
 	if err := srv.Serve(); err != nil && err != http.ErrServerClosed {
 		echproxy.RecordFatalError("Serve", err)
+		echproxy.DumpMemory("ServeError", srv, logMgr)
 		if sysProxyMgr != nil {
 			sysProxyMgr.CleanupOnExit()
 		}
@@ -906,6 +917,8 @@ func main() {
 		}
 		os.Exit(1)
 	}
+
+	echproxy.DumpMemory("NormalExit", srv, logMgr)
 }
 
 func openBrowser(url string) {

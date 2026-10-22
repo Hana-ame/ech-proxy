@@ -183,6 +183,13 @@ func (l *TunnelLimiter) ActiveCount() int {
 	return int(l.globalCur.Load())
 }
 
+func (l *TunnelLimiter) Stats() (active int, perPeerMax int, globalMax int) {
+	if l == nil {
+		return 0, 0, 0
+	}
+	return int(l.globalCur.Load()), l.PerPeerMax, l.GlobalMax
+}
+
 var dialConnectFn = func(ctx context.Context, host, port, ipMode string) (net.Conn, error) {
 	if net.ParseIP(host) == nil {
 		if ips, err := cloudflare_ech.ResolveHostIPsByMode(ctx, host, ipMode); err == nil && len(ips) > 0 {

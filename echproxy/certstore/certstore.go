@@ -119,6 +119,21 @@ func (st *Store) PortalCert() *tls.Certificate {
 	return st.portalCert
 }
 
+// Stats 返回证书存储模块的概况指标（是否已载入根 CA、根 CA 路径及内存缓存的叶子证书数量）。
+func (st *Store) Stats() (hasCA bool, caPath string, leafCount int) {
+	if st == nil {
+		return false, "", 0
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	hasCA = st.ca != nil && st.ca.Cert != nil
+	if st.ca != nil {
+		caPath = st.ca.CertPath
+	}
+	leafCount = len(st.leaf)
+	return
+}
+
 func DefaultDataDir() (string, error) {
 	exeDir := ""
 	if exe, err := os.Executable(); err == nil {

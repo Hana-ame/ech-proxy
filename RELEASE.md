@@ -1,3 +1,13 @@
+## v3.5.19
+
+### Fixes & Improvements
+
+- **退出与实时转储各模块内存占用诊断（Memory & Module Dump）**:
+  - **退出时自动 Dump 诊断报告**：程序在收到退出信号（Ctrl+C / SIGTERM / 托盘退出）、正常结束或异常崩溃时，自动将当前 Go 运行时内存指标（Alloc、Sys、Heap、Stack、GC）、各业务模块连接池与缓存（`cloudflare_ech` 路由/IP缓存/H2/H1客户端、`certstore` 动态证书、`connect` 活跃隧道、`netdial` 传输池、`cookie`、`rewrite` 规则）及 pprof 堆内存分布、完整协程栈转储至日志目录（`mem_dump_<timestamp>.txt`、`heap_<timestamp>.pprof`、`goroutines_<timestamp>.txt`），并同步输出至控制台与日志文件；
+  - **托盘菜单新增「转储内存诊断 (Dump Memory)」**：用户在运行或视频播放时可随时右键托盘点击转储，无需退出即可即时排查内存占用与定位异常连接；
+  - **内存警戒看门狗（WatchDog）**：后台监控当堆内存超过 300MB 警戒线时自动触发快照；
+  - **视频流式传输内存防泄漏与即时释放**：修复单块写入超时过长（由 30 分钟优化为 30 秒），并在流式传输循环中监听客户端中断（`Context().Done()`），配合 32KB 缓冲池复用，彻底避免用户跳进度或切片时孤儿流与底层连接堆积造成的内存膨胀。
+
 ## v3.5.18
 
 ### Fixes & Improvements

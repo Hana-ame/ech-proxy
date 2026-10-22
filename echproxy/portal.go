@@ -223,6 +223,9 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			wl = opts.AdScript.Whitelist()
 		}
 		fallback := c.Query("fallback")
+		if fallback != "" {
+			SetFallbackProxy(fallback)
+		}
 		pac := config.GeneratePACWithFallback(nil, proxyAddr, global, fallback, wl)
 		c.Header("Content-Type", "application/x-ns-proxy-autoconfig; charset=utf-8")
 		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")

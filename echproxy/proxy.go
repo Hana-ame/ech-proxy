@@ -45,7 +45,104 @@ const (
 	forceCertQueryParam = "__ech_proxy_force_cert__"
 )
 
-var roundTripFn = cloudflare_ech.RoundTrip
+var (
+	roundTripFn       = cloudflare_ech.RoundTrip
+	fallbackProxyMu   sync.RWMutex
+	fallbackProxyRaw  string
+	fallbackTransport http.RoundTripper
+)
+
+// SetFallbackRoundTripper 设置自定义 fallback RoundTripper（供单元测试注入模拟）。
+func SetFallbackRoundTripper(rt http.RoundTripper) {
+	fallbackProxyMu.Lock()
+	defer fallbackProxyMu.Unlock()
+	if oldTr, ok := fallbackTransport.(*http.Transport); ok && oldTr != nil {
+		oldTr.CloseIdleConnections()
+	}
+	fallbackTransport = rt
+	if rt != nil {
+		fallbackProxyRaw = "mock-fallback-proxy"
+	} else {
+		fallbackProxyRaw = ""
+	}
+}
+
+// SetFallbackProxy 配置上游备用代理（如本地 v2ray 127.0.0.1:10809），用于在直连分片遭遇 GFW 深度 IP 阻断时无感逃逸。
+func SetFallbackProxy(raw string) {
+	fallbackProxyMu.Lock()
+	defer fallbackProxyMu.Unlock()
+	raw = strings.TrimSpace(raw)
+	if raw == fallbackProxyRaw {
+		return
+	}
+	fallbackProxyRaw = raw
+	u := parseFallbackProxyURL(raw)
+	if u == nil {
+		if oldTr, ok := fallbackTransport.(*http.Transport); ok && oldTr != nil {
+			oldTr.CloseIdleConnections()
+		}
+		fallbackTransport = nil
+		return
+	}
+	if oldTr, ok := fallbackTransport.(*http.Transport); ok && oldTr != nil {
+		oldTr.CloseIdleConnections()
+	}
+	fallbackTransport = &http.Transport{
+		Proxy: http.ProxyURL(u),
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          64,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+}
+
+// GetFallbackProxy 获取当前生效的上游备用代理原始字符串。
+func GetFallbackProxy() string {
+	fallbackProxyMu.RLock()
+	defer fallbackProxyMu.RUnlock()
+	return fallbackProxyRaw
+}
+
+func getFallbackTransport() http.RoundTripper {
+	fallbackProxyMu.RLock()
+	defer fallbackProxyMu.RUnlock()
+	return fallbackTransport
+}
+
+func parseFallbackProxyURL(raw string) *url.URL {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.EqualFold(raw, "direct") {
+		return nil
+	}
+	if strings.HasPrefix(strings.ToUpper(raw), "PROXY ") {
+		raw = strings.TrimSpace(raw[6:])
+		if idx := strings.Index(raw, ";"); idx != -1 {
+			raw = strings.TrimSpace(raw[:idx])
+		}
+	}
+	if strings.Contains(raw, "=") {
+		for _, tok := range strings.Split(raw, ";") {
+			tok = strings.TrimSpace(tok)
+			kv := strings.SplitN(tok, "=", 2)
+			if len(kv) == 2 && (strings.EqualFold(kv[0], "http") || strings.EqualFold(kv[0], "https")) {
+				raw = strings.TrimSpace(kv[1])
+				break
+			}
+		}
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "http://" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil
+	}
+	return u
+}
 
 func ModeName(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
@@ -209,6 +306,20 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 				if httpResp, herr2 := roundTripFn(httpReq, uc.Mode, uc.IPMode); herr2 == nil {
 					outReq, resp, err = httpReq, httpResp, nil
 					targetScheme = "http"
+				}
+			}
+		}
+
+		if err != nil && !cloudflare_ech.IsCertError(err) && !errors.Is(err, context.Canceled) && (c.Request.Context().Err() == nil) {
+			if fbTransport := getFallbackTransport(); fbTransport != nil {
+				if bodyReplay != nil {
+					c.Request.Body = io.NopCloser(bytes.NewReader(bodyReplay))
+				}
+				if fbReq, herr := buildUpstreamRequestWithScheme(c, uc, targetScheme, reqPort); herr == nil {
+					if fbResp, fberr := fbTransport.RoundTrip(fbReq); fberr == nil {
+						log.Printf("[%s] Direct connection failed for %s (%v), seamlessly fell back to upstream proxy (%s)", clientIP, uc.Host, err, GetFallbackProxy())
+						outReq, resp, err = fbReq, fbResp, nil
+					}
 				}
 			}
 		}

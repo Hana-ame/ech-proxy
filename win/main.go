@@ -831,6 +831,9 @@ func main() {
 	if !cmd.LocalProxy {
 		sysProxyMgr = NewSysProxyManager(actualListenAddr, nil)
 		sysProxyMgr.SetAllMode(cmd.AllMode)
+		if fb := sysProxyMgr.FallbackProxy(); fb != "" {
+			echproxy.SetFallbackProxy(fb)
+		}
 		if srv.AdScript != nil {
 			srv.AdScript.SetOnWhitelistUpdated(func(domains []string) {
 				if sysProxyMgr != nil && sysProxyMgr.Mode() == SysProxyPAC {

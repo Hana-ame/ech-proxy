@@ -812,3 +812,58 @@ func TestSourcemapErrorFallbackReturnsEmptyMap200(t *testing.T) {
 	}
 }
 
+func TestDirectFailureFallsBackToUpstreamProxy(t *testing.T) {
+	fallbackHit := false
+	mockRT := &mockRoundTripper{
+		roundTrip: func(req *http.Request) (*http.Response, error) {
+			fallbackHit = true
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Status:     "200 OK",
+				Header:     make(http.Header),
+				Body:       io.NopCloser(bytes.NewBufferString("response from upstream fallback proxy")),
+				Request:    req,
+			}
+			resp.Header.Set("Content-Type", "text/plain")
+			return resp, nil
+		},
+	}
+
+	SetFallbackRoundTripper(mockRT)
+	defer SetFallbackRoundTripper(nil)
+
+	origRT := roundTripFn
+	defer func() { roundTripFn = origRT }()
+
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		return nil, fmt.Errorf("all IPs failed for %s: read tcp 192.168.1.2:57430->186.2.163.20:443: wsarecv: An existing connection was forcibly closed by the remote host", req.Host)
+	}
+
+	engine := gin.New()
+	cfg := &config.Config{Upstreams: config.UpstreamMap{}}
+	engine.NoRoute(ProxyHandlerWithConfig(cfg, nil, nil))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "https://nyaa.si/", nil)
+	req.Host = "nyaa.si"
+	engine.ServeHTTP(rec, req)
+
+	if !fallbackHit {
+		t.Errorf("expected request to hit fallback proxy, but it didn't")
+	}
+	if rec.Code != http.StatusOK {
+		t.Errorf("expected 200 OK via fallback, got %d (body: %s)", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "response from upstream fallback proxy") {
+		t.Errorf("unexpected response body: %q", rec.Body.String())
+	}
+}
+
+type mockRoundTripper struct {
+	roundTrip func(*http.Request) (*http.Response, error)
+}
+
+func (m *mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return m.roundTrip(req)
+}
+

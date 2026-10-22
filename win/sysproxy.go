@@ -178,6 +178,15 @@ func (m *SysProxyManager) captureOriginalLocked(current SysProxyState) {
 	}
 }
 
+func (m *SysProxyManager) FallbackProxy() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.getFallbackLocked()
+}
+
 func (m *SysProxyManager) getFallbackLocked() string {
 	if m.hasOriginal && m.originalState.ProxyEnable && strings.TrimSpace(m.originalState.ProxyServer) != "" {
 		if !isSelfProxy(m.originalState, m.listenAddr) {

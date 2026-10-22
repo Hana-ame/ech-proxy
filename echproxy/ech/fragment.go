@@ -167,7 +167,7 @@ func splitClientHelloAtSNI(pkt []byte) [][]byte {
 	verMajor, verMinor := pkt[1], pkt[2]
 	payload := pkt[5:]
 	splitOff := findSNISplitOffset(payload)
-	if splitOff <= 8 || splitOff >= len(payload)-4 {
+	if splitOff <= 0 || splitOff >= len(payload) {
 		splitOff = len(payload) / 2
 	}
 

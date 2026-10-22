@@ -776,10 +776,16 @@ func isTLSRetryableError(err error) bool {
 //   - 若首次拨号就是 TCP 连接/握手超时，立即跳过该 IP，杜绝同一个死 IP 串行重试 3 次（10s x 3 = 30s）。
 func dialUTLSWithWrapper(ctx context.Context, ip, sniName, verifyHost string, nextProtos []string, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
 	uConn, err := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloChrome_120, wrapConn)
-	if err == nil || IsCertError(err) || ctx.Err() != nil {
+	if err == nil || ctx.Err() != nil {
 		return uConn, err
 	}
-	if wrapConn != nil && isTLSRetryableError(err) {
+	needRetry := isTLSRetryableError(err)
+	if IsCertError(err) && strings.Contains(strings.ToLower(err.Error()), "ddos-guard") {
+		needRetry = true
+	} else if IsCertError(err) {
+		return uConn, err
+	}
+	if wrapConn != nil && needRetry {
 		tcpWrap := func(c net.Conn) net.Conn {
 			return newTCPFragmentConn(c, 32)
 		}

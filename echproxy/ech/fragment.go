@@ -247,6 +247,6 @@ func FragmentDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 		mode = ipMode[0]
 	}
 	return roundTripUTLS(req, mode, "frag", "", func(c net.Conn) net.Conn {
-		return newTLSFragmentConn(c, 32)
+		return newTCPFragmentConn(c, 32)
 	})
 }

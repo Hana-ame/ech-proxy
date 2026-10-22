@@ -141,13 +141,10 @@ jobs:
           {
             echo "## Executable Features"
             cat RELEASE.md 2>/dev/null || true
-            echo ""
-            cat << 'EOF'
-## Android APKs
-Two versions of the Android APK are provided in this release:
-- **Standard (`ech-proxy-android-<version>.apk`)**: Background-safe with Foreground Service & WakeLock (exempt from Android 11+ Cached Apps Freezer and Doze mode).
-- **Lite / No-Perm (`ech-proxy-android-lite-<version>.apk`)**: Zero runtime permissions required, no notifications or background service.
-EOF
+            echo "## Android APKs"
+            echo "Two versions of the Android APK are provided in this release:"
+            echo '- **Standard (`ech-proxy-android-<version>.apk`)**: Background-safe with Foreground Service & WakeLock (exempt from Android 11+ Cached Apps Freezer and Doze mode).'
+            echo '- **Lite / No-Perm (`ech-proxy-android-lite-<version>.apk`)**: Zero runtime permissions required, no notifications or background service.'
           } > release_body.md
 
           # Wait up to 5 minutes for GoReleaser (goreleaser.yml) to create and publish the release first.

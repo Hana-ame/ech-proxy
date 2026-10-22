@@ -377,3 +377,20 @@ func TestPximgLiveRoundTrip(t *testing.T) {
 		t.Errorf("read %d bytes, want 159780", len(body))
 	}
 }
+
+func TestPixivLiveRoundTrip(t *testing.T) {
+	ips, err := ResolveHostIPsByMode(context.Background(), "www.pixiv.net", "v4")
+	if err != nil || len(ips) == 0 {
+		t.Fatalf("ResolveHostIPsByMode for www.pixiv.net failed: %v", err)
+	}
+	req, _ := http.NewRequest(http.MethodGet, "https://www.pixiv.net/", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	resp, err := RoundTrip(req, "auto", "v4")
+	if err != nil {
+		t.Fatalf("RoundTrip to www.pixiv.net failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Pixiv status = %d, want 200", resp.StatusCode)
+	}
+}

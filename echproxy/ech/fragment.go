@@ -82,12 +82,24 @@ func (fc *tlsFragmentConn) Write(b []byte) (int, error) {
 	if !isFirst || len(b) <= 5 || b[0] != 0x16 {
 		return fc.Conn.Write(b)
 	}
-	for _, rec := range FragmentTLSClientHelloRecord(b, fc.maxFragSize) {
-		if _, err := fc.Conn.Write(rec); err != nil {
+
+	// TCP 记录分节（TCP Segmentation）：保持完整的单个合法 TLS ClientHello 格式不变，
+	// 在 TCP 传输层拆为两段发出（配合 TCP_NODELAY），打散 GFW DPI 明文 SNI 嗅探，
+	// 同时彻底兼容 DDoS-Guard、Cloudflare、Nginx 等对多 TLS Record 解析不健全的 WAF/反代源站。
+	splitAt := fc.maxFragSize
+	if splitAt <= 0 || splitAt >= len(b) {
+		splitAt = 64
+	}
+	if splitAt >= len(b) {
+		splitAt = len(b) / 2
+	}
+	if splitAt > 0 && splitAt < len(b) {
+		if _, err := fc.Conn.Write(b[:splitAt]); err != nil {
 			return 0, err
 		}
+		return fc.Conn.Write(b[splitAt:])
 	}
-	return len(b), nil
+	return fc.Conn.Write(b)
 }
 
 func FragmentDo(req *http.Request, ipMode ...string) (*http.Response, error) {
@@ -96,6 +108,6 @@ func FragmentDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 		mode = ipMode[0]
 	}
 	return roundTripUTLS(req, mode, "frag", "", func(c net.Conn) net.Conn {
-		return newTLSFragmentConn(c, 24)
+		return newTLSFragmentConn(c, 64)
 	})
 }

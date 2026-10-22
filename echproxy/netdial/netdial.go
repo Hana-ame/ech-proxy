@@ -447,9 +447,35 @@ func FetchBytes(rawURL string) ([]byte, error) {
 			return data, nil
 		}
 	}
-	client := Client(OpTimeout)
+	// client 必须支持跟随 HTTP 重定向（GitHub Releases / CDN 下载均依赖 302 重定向）
+	client := &http.Client{
+		Timeout:   OpTimeout,
+		Transport: TransportWithIPMode(DefaultIPMode),
+	}
+	data, err := fetchWithClient(client, rawURL)
+	if err == nil {
+		return data, nil
+	}
+
+	// 针对 GitHub 资源，国内直连经常被 GFW 阻断或 DNS 污染，自动尝试加速镜像源兜底
+	if strings.Contains(rawURL, "github.com") || strings.Contains(rawURL, "githubusercontent.com") {
+		mirrors := []string{
+			"https://gh-proxy.com/",
+			"https://ghproxy.net/",
+		}
+		for _, mirror := range mirrors {
+			altURL := mirror + rawURL
+			if altData, altErr := fetchWithClient(client, altURL); altErr == nil && len(altData) > 0 {
+				return altData, nil
+			}
+		}
+	}
+	return nil, err
+}
+
+func fetchWithClient(client *http.Client, targetURL string) ([]byte, error) {
 	resp, err := Retry(context.Background(), RetryAttempts, RetryBackoff, func() (*http.Response, error) {
-		r, e := client.Get(rawURL)
+		r, e := client.Get(targetURL)
 		if e != nil && r != nil {
 			r.Body.Close()
 		}

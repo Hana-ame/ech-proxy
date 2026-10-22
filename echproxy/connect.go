@@ -574,30 +574,35 @@ func newSingleConnListener(c net.Conn) net.Listener {
 	return &singleConnListener{conn: c, done: make(chan struct{})}
 }
 
+func (l *singleConnListener) closeDone() {
+	l.closed.Do(func() { close(l.done) })
+}
+
 func (l *singleConnListener) Accept() (net.Conn, error) {
 	var c net.Conn
 	l.once.Do(func() { c = l.conn })
 	if c != nil {
-		return &closeNotifyConn{Conn: c, done: l.done}, nil
+		return &closeNotifyConn{Conn: c, closeDone: l.closeDone}, nil
 	}
 	<-l.done
 	return nil, net.ErrClosed
 }
 
 func (l *singleConnListener) Close() error {
-	l.closed.Do(func() { close(l.done) })
+	l.closeDone()
 	return nil
 }
 
-// closeNotifyConn 在底层连接关闭时关闭 done，使阻塞中的第二次 Accept 返回。
+// closeNotifyConn 在底层连接关闭时通知 listener 关闭 done，统一复用 listener 的 sync.Once，避免重复 close panic。
 type closeNotifyConn struct {
 	net.Conn
-	done chan struct{}
-	once sync.Once
+	closeDone func()
 }
 
 func (c *closeNotifyConn) Close() error {
-	c.once.Do(func() { close(c.done) })
+	if c.closeDone != nil {
+		c.closeDone()
+	}
 	return c.Conn.Close()
 }
 func (l *singleConnListener) Addr() net.Addr {

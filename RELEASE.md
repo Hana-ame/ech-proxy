@@ -1,3 +1,16 @@
+## v3.5.6
+
+### Fixes & Improvements
+
+- **彻底修复 `serveMITMConnect` 崩溃（`close of closed channel`）**:
+  - 修复 `singleConnListener` 与 `closeNotifyConn` 之间因独立 `sync.Once` 重复关闭 `done` channel 导致的 panic，统一收拢至 listener 的单例关闭逻辑。
+- **TLS ClientHello 采用 TCP 记录分节（TCP Segmentation，完美支持 nyaa.si / DDoS-Guard）**:
+  - `fragment` 模式由原先拆分出 40+ 个微小 TLS Record 改为基于 TCP 层分节（保持合法单一 ClientHello 记录，配合 `TCP_NODELAY` 拆为多段 TCP 报文发出）。
+  - 既能彻底打破 GFW DPI 的单包明文 SNI 匹配，又能完美兼容 DDoS-Guard / WAF，不再回退到泛域名证书导致握手异常。
+- **自动检查更新全面支持 302 重定向与 GitHub 镜像加速兜底**:
+  - 修复 `FetchBytes` 因 `ErrUseLastResponse` 导致 GitHub Releases `latest/download/checksums.txt`（302 跳转）检查更新直接报错失败的问题。
+  - 为 GitHub Releases 与文件下载增加了国内镜像（`gh-proxy.com` / `ghproxy.net`）自动故障转移兜底。
+
 ## v3.5.5
 
 ### Changes & Features

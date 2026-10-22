@@ -310,3 +310,27 @@ func TestConnectSmartMITMRoutesThroughECHProxyPipeline(t *testing.T) {
 		}
 	}
 }
+
+func TestSingleConnListenerNoPanicOnMultipleClose(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+
+	l := newSingleConnListener(c1)
+	conn, err := l.Accept()
+	if err != nil {
+		t.Fatalf("Accept failed: %v", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		go func() {
+			_ = conn.Close()
+		}()
+		go func() {
+			_ = l.Close()
+		}()
+	}
+
+	time.Sleep(30 * time.Millisecond)
+	_ = conn.Close()
+	_ = l.Close()
+}

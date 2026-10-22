@@ -183,3 +183,16 @@ func TestRaceModesConcurrentWinnerSelection(t *testing.T) {
 		t.Errorf("getCachedRoute = (%q, %v), want (direct, true)", cached, ok)
 	}
 }
+
+func TestNyaaFragmentDo(t *testing.T) {
+	req, _ := http.NewRequest(http.MethodGet, "https://nyaa.si/favicon.ico", nil)
+	resp, err := FragmentDo(req, "v4")
+	if err != nil {
+		t.Fatalf("FragmentDo to nyaa.si failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 0 {
+		t.Errorf("expected valid HTTP response, got status %d", resp.StatusCode)
+	}
+}
+

@@ -40,7 +40,7 @@ func SNIServerNameFromContext(ctx context.Context) string {
 		}
 		return v
 	}
-	return shellDomain
+	return ""
 }
 
 type routeEntry struct {
@@ -93,7 +93,7 @@ func DetectTransportModeWithStatus(ctx context.Context, host, ipMode string) (mo
 			}
 		}
 		// 非 Cloudflare 节点：若配置了显式自定义伪装 SNI 则首选 sni，否则首选 fragment（TLS 记录分片绕过 GFW）
-		if customSNI := SNIServerNameFromContext(ctx); customSNI != "" && customSNI != shellDomain {
+		if customSNI := SNIServerNameFromContext(ctx); customSNI != "" {
 			return "sni", true
 		}
 		return "fragment", true
@@ -560,19 +560,6 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 	effectiveSNI := sniName
 	if effectiveSNI == "" && tag == "frag" {
 		effectiveSNI = host
-	} else if tag == "sni" && (effectiveSNI == "" || effectiveSNI == shellDomain) {
-		hasCF := false
-		for _, ipStr := range ips {
-			if netdial.IsCloudflareIP(net.ParseIP(ipStr)) {
-				hasCF = true
-				break
-			}
-		}
-		if hasCF {
-			effectiveSNI = shellDomain
-		} else {
-			effectiveSNI = ""
-		}
 	}
 
 	var lastErr error

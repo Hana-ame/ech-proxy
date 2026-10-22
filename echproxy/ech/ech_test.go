@@ -32,8 +32,8 @@ func TestSetIPModeNormalizesAndSNIServerNameContext(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	if got := SNIServerNameFromContext(ctx); got != shellDomain {
-		t.Errorf("default SNIServerName = %q, want %q", got, shellDomain)
+	if got := SNIServerNameFromContext(ctx); got != "" {
+		t.Errorf("default SNIServerName = %q, want empty", got)
 	}
 	ctxCustom := WithSNIServerName(ctx, "custom.sni.example")
 	if got := SNIServerNameFromContext(ctxCustom); got != "custom.sni.example" {

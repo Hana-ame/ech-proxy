@@ -284,12 +284,20 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 		qtypes = []int{1, 28}
 	}
 
-	bootstrapIPs := []string{"1.1.1.1", "1.0.0.1"}
+	bootstrapEndpoints := []struct {
+		urlFmt string
+		ip     string
+	}{
+		{"https://223.5.5.5/resolve?name=%s&type=%d", "223.5.5.5"},
+		{"https://223.6.6.6/resolve?name=%s&type=%d", "223.6.6.6"},
+		{"https://1.1.1.1/dns-query?name=%s&type=%d", "1.1.1.1"},
+		{"https://1.0.0.1/dns-query?name=%s&type=%d", "1.0.0.1"},
+	}
 	var ips []net.IP
 
 	for _, qt := range qtypes {
-		for _, bIP := range bootstrapIPs {
-			reqURL := fmt.Sprintf("https://%s/dns-query?name=%s&type=%d", bIP, url.QueryEscape(host), qt)
+		for _, ep := range bootstrapEndpoints {
+			reqURL := fmt.Sprintf(ep.urlFmt, url.QueryEscape(host), qt)
 			req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 			if err != nil {
 				continue
@@ -299,11 +307,11 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 					_, port, _ := net.SplitHostPort(addr)
-					return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(bIP, port))
+					return (&net.Dialer{Timeout: 3 * time.Second}).DialContext(ctx, "tcp", net.JoinHostPort(ep.ip, port))
 				},
 				DisableKeepAlives: true,
 			}
-			client := &http.Client{Transport: tr, Timeout: 6 * time.Second}
+			client := &http.Client{Transport: tr, Timeout: 4 * time.Second}
 			resp, err := client.Do(req)
 			tr.CloseIdleConnections()
 			if err != nil || resp.StatusCode != http.StatusOK {
@@ -526,15 +534,16 @@ func FetchBytes(rawURL string) ([]byte, error) {
 			"https://ghfast.top/" + rawURL,
 			"https://ghproxy.net/" + rawURL,
 			"https://ghproxy.cn/" + rawURL,
+			"https://github.moeyy.xyz/" + rawURL,
 		}
 
 		isBinary := strings.HasSuffix(rawURL, ".exe") || strings.HasSuffix(rawURL, ".zip") ||
 			strings.HasSuffix(rawURL, ".tar.gz") || strings.HasSuffix(rawURL, ".bin")
-		candTimeout := 15 * time.Second
-		overallTimeout := 25 * time.Second
+		candTimeout := 25 * time.Second
+		overallTimeout := 45 * time.Second
 		if isBinary {
 			candTimeout = 90 * time.Second
-			overallTimeout = 120 * time.Second
+			overallTimeout = 150 * time.Second
 		}
 
 		ch := make(chan fetchResult, len(candidates))

@@ -1,3 +1,11 @@
+## v3.4.2
+
+### Fixes & Improvements
+
+- **EasyList 过滤引擎纯净化 (Network-Only Domain+Path Filter)**:
+  - 彻底移除 EasyList 对网页 HTML 的破坏性篡改：彻底删除 HTML URL 剥离 (`StripMatchedURLs`)、元素隐藏样式 (`##` Cosmetic `<style id="ech-proxy-easylist-style">` 注入)、`$csp` 响应头篡改与 `$removeparam` 参数过滤。
+  - 严格遵循设计原则：**EasyList 仅在网络请求层对 `domain` 与 `domain + path` 进行匹配与 204 拦截**，绝不修改、隐藏或删除网页本身的 DOM 元素及静态资源，确保页面完整正常渲染。
+
 ## v3.4.1
 
 ### Fixes & Improvements

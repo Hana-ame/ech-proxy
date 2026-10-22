@@ -1072,27 +1072,11 @@ func (m *AdScriptManager) InjectIntoHTMLForHost(htmlBody []byte, hosts ...string
 	cleaned := htmlBody
 	if !skipBlock {
 		cleaned = stripBlockedURLs(cleaned, m.EffectiveBlockedURLs())
-		// EasyList 确定性子集：只在本站点（adult.txt 命中）剥离命中的广告 URL（含 JS 转义写法）。
-		if em := m.EasyListMatcher(); em != nil {
-			cleaned, _ = em.StripMatchedURLs(cleaned)
-			cleaned, _ = em.StripEscapedURLs(cleaned)
-		}
 	}
 
 	var payload bytes.Buffer
 	if !skipBlock && !bytes.Contains(cleaned, []byte(`id="ech-proxy-adblock-style"`)) {
 		payload.WriteString(m.EffectiveAdBlockStyle() + "\n")
-	}
-	// EasyList cosmetic（## / #@#）：仅在本站点生效，注入隐藏样式。
-	if !skipBlock && !bytes.Contains(cleaned, []byte(`id="ech-proxy-easylist-style"`)) {
-		if em := m.EasyListMatcher(); em != nil {
-			for _, h := range hosts {
-				if st := em.CosmeticStyle(h); st != "" {
-					payload.WriteString(st + "\n")
-					break
-				}
-			}
-		}
 	}
 	if !skipScript {
 		if scriptTags := BuildAdScriptTags(m.ScriptBytes()); len(scriptTags) > 0 {
@@ -1197,4 +1181,16 @@ func (m *AdScriptManager) RefreshEasyListOnce() error {
 	m.easyMatcher = matcher
 	m.mu.Unlock()
 	return nil
+}
+
+// ShouldBlockEasyList 检查请求的目标域名和路径是否命中 EasyList 网络过滤规则（domain / domain+path）。
+func (m *AdScriptManager) ShouldBlockEasyList(host, path string) bool {
+	if m == nil || m.SkipAdBlock() {
+		return false
+	}
+	em := m.EasyListMatcher()
+	if em == nil {
+		return false
+	}
+	return em.ShouldBlock(host, path)
 }

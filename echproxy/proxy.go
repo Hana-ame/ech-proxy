@@ -111,6 +111,13 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			return
 		}
 
+		// EasyList 网络过滤：命中 domain 或 domain+path -> 直接 204，不发起上游请求。
+		if adScript != nil && !adScript.SkipAdBlock() && !config.IsPortalDomain(host) &&
+			adScript.ShouldBlockEasyList(host, c.Request.URL.Path) {
+			c.Status(http.StatusNoContent)
+			return
+		}
+
 		ucForRewrite := uc
 		if ucForRewrite.Wildcard == nil && len(upstreams) > 0 {
 			ucForRewrite.Wildcard = config.InheritWildcard(upstreams, host)
@@ -135,16 +142,6 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			if b, rerr := io.ReadAll(io.LimitReader(c.Request.Body, maxBufferedReqBody+1)); rerr == nil && len(b) <= maxBufferedReqBody {
 				bodyReplay = b
 				c.Request.Body = io.NopCloser(bytes.NewReader(bodyReplay))
-			}
-		}
-
-		// 仅对 adult.txt 命中的站点做广告处理：EasyList $removeparam 移除指定 query 参数。
-		isAdultSite := adScript != nil && adScript.IsAdultSite(host, uc.Host)
-		if isAdultSite && adScript != nil && !adScript.SkipAdBlock() {
-			if em := adScript.EasyListMatcher(); em != nil {
-				if params := em.RemoveParamsFor(host); len(params) > 0 {
-					stripQueryParams(c.Request, params)
-				}
 			}
 		}
 
@@ -415,21 +412,12 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 		}
 
 		isHTML := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html")
-		isAdultSite := adScript != nil && adScript.IsAdultSite(requestHost, uc.Host)
 		if isHTML && adScript != nil && (!adScript.SkipAdScript() || !adScript.SkipAdBlock()) {
 			beforeLen := len(plain)
 			plain = adScript.InjectIntoHTMLForHost(plain, requestHost, uc.Host)
 			if len(plain) != beforeLen {
 				c.Writer.Header().Del("Content-Security-Policy")
 				c.Writer.Header().Del("Content-Security-Policy-Report-Only")
-			}
-		}
-		// EasyList $csp：仅 adult.txt 命中站点，向 HTML 响应附加 CSP（须在写响应头之前设置）。
-		if isHTML && isAdultSite && !adScript.SkipAdBlock() {
-			if em := adScript.EasyListMatcher(); em != nil {
-				if dirs := em.CSPFor(requestHost); len(dirs) > 0 {
-					c.Writer.Header().Set("Content-Security-Policy", strings.Join(dirs, "; "))
-				}
 			}
 		}
 
@@ -471,44 +459,6 @@ func streamRemainingBody(c *gin.Context, rc *http.ResponseController, body io.Re
 		}
 		if rerr != nil {
 			break
-		}
-	}
-}
-
-// stripQueryParams 从请求 URL 与 RequestURI 中移除指定 query 参数（EasyList $removeparam，仅 adult 站调用）。
-func stripQueryParams(r *http.Request, params []string) {
-	if r == nil || r.URL == nil || len(params) == 0 {
-		return
-	}
-	strip := func(rawQuery string) (string, bool) {
-		if rawQuery == "" {
-			return "", false
-		}
-		vals, err := url.ParseQuery(rawQuery)
-		if err != nil {
-			return rawQuery, false
-		}
-		changed := false
-		for _, p := range params {
-			if vals.Has(p) {
-				vals.Del(p)
-				changed = true
-			}
-		}
-		if !changed {
-			return rawQuery, false
-		}
-		return vals.Encode(), true
-	}
-	if q, ok := strip(r.URL.RawQuery); ok {
-		r.URL.RawQuery = q
-	}
-	if r.RequestURI != "" {
-		if pu, err := url.ParseRequestURI(r.RequestURI); err == nil {
-			if q, ok := strip(pu.RawQuery); ok {
-				pu.RawQuery = q
-				r.RequestURI = pu.RequestURI()
-			}
 		}
 	}
 }

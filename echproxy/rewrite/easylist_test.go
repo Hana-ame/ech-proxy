@@ -14,8 +14,6 @@ func TestParseEasyListDeterministicSubset(t *testing.T) {
 /banner/*/img^
 @@||allowed.example.com^
 ||skip.example.com^$third-party
-||rp.example.com^$removeparam=utm_source
-||csp.example.com^$csp=script-src 'none'
 ||imp.example.com^$important
 ||bad.example.com^$badfilter
 ||deny.example.com^$denyallow=ok.example.com
@@ -34,7 +32,6 @@ example.com#?#.proc:has-text(ad)
 		{"tracker.example.org", "/pixel.gif?a=1"},
 		{"cdn.example.net", "/ads.js"},
 		{"anything.test", "/banner/1/img"},
-		{"rp.example.com", "/"},
 		{"imp.example.com", "/"},
 		{"deny.example.com", "/"},
 	}
@@ -56,71 +53,9 @@ example.com#?#.proc:has-text(ad)
 			t.Errorf("should NOT block %s%s", c.host, c.path)
 		}
 	}
-
-	if got := m.RemoveParamsFor("rp.example.com"); len(got) != 1 || got[0] != "utm_source" {
-		t.Errorf("removeparam = %v, want [utm_source]", got)
-	}
-	if got := m.CSPFor("csp.example.com"); len(got) == 0 || !strings.Contains(got[0], "script-src") {
-		t.Errorf("csp = %v, want script-src ...", got)
-	}
-
-	// cosmetic：通用 + 域限定，且 #@# 例外与 ~domain 排除在主域名及子域名上均生效；procedural 跳过
-	for _, host := range []string{"example.com", "sub.example.com"} {
-		cos := m.CosmeticFor(host)
-		joined := strings.Join(cos, ",")
-		if !strings.Contains(joined, ".generic-ad") || !strings.Contains(joined, ".site-ad") {
-			t.Errorf("%s cosmetic missing selectors: %v", host, cos)
-		}
-		if strings.Contains(joined, ".generic-except") || strings.Contains(joined, ".site-except") || strings.Contains(joined, ".negated-on-example") {
-			t.Errorf("%s cosmetic #@# or ~domain exception not applied: %v", host, cos)
-		}
-		if strings.Contains(joined, "has-text") {
-			t.Errorf("procedural rule must be skipped: %v", cos)
-		}
-	}
-	other := strings.Join(m.CosmeticFor("elsewhere.test"), ",")
-	if !strings.Contains(other, ".generic-ad") || !strings.Contains(other, ".negated-on-example") || strings.Contains(other, ".site-ad") {
-		t.Errorf("unrelated domain cosmetic wrong: %v", other)
-	}
-	if st := m.CosmeticStyle("example.com"); !strings.Contains(st, "ech-proxy-easylist-style") {
-		t.Errorf("cosmetic style missing: %s", st)
-	}
 }
 
-func TestStripMatchedURLsAndEscaped(t *testing.T) {
-	m := ParseEasyListNetworkRules([]byte("||ads.example.com^\n||tracker.example.org/pixel.gif\n@@||allowed.example.com^\n"))
-	html := []byte(`<html><body>
-<script src="https://ads.example.com/x.js"></script>
-<img src="//tracker.example.org/pixel.gif">
-<script src="https://allowed.example.com/keep.js"></script>
-<img src="https://cdn.ok.example/img.png">
-</body></html>`)
-	out, n := m.StripMatchedURLs(html)
-	if n < 2 {
-		t.Fatalf("expected >=2 stripped URLs, got %d", n)
-	}
-	s := string(out)
-	if strings.Contains(s, "ads.example.com/x.js") || strings.Contains(s, "tracker.example.org/pixel.gif") {
-		t.Errorf("ad URLs not stripped: %s", s)
-	}
-	if !strings.Contains(s, "allowed.example.com/keep.js") {
-		t.Errorf("@@ exception URL must be kept: %s", s)
-	}
-	if !strings.Contains(s, "cdn.ok.example/img.png") {
-		t.Errorf("unrelated URL must be kept: %s", s)
-	}
-
-	esc := []byte(`<script>(function(){var tpl="<\/script>";var s=document.createElement('script');s.src="\/\/ads.example.com\/x.js";})()</script>`)
-	eout, en := m.StripEscapedURLs(esc)
-	if en == 0 || strings.Contains(string(eout), "ads.example.com") {
-		t.Errorf("escaped ad URL not stripped (n=%d): %s", en, string(eout))
-	}
-	if !strings.Contains(string(eout), `<\/script>`) {
-		t.Errorf("StripEscapedURLs must not corrupt unrelated <\\/script> escapes in JS strings: %s", string(eout))
-	}
-}
-
-func TestAdultScopedEasyListInjection(t *testing.T) {
+func TestEasyListNetworkBlockOnly_NoHTMLTampering(t *testing.T) {
 	mgr := NewAdScriptManager(AdScriptOptions{
 		Enabled:       true,
 		AdultSitesURL: "https://e/adult.txt",
@@ -149,30 +84,31 @@ func TestAdultScopedEasyListInjection(t *testing.T) {
 		t.Fatal("EasyList should be loaded")
 	}
 
-	html := []byte(`<!DOCTYPE html><html><head></head><body><div class="ad-slot">x</div><script src="https://ads.example.com/x.js"></script></body></html>`)
-
-	// adult 命中站点：剥离 EasyList 命中的 URL + 注入 cosmetic + 自有广告
-	out := string(mgr.InjectIntoHTMLForHost(html, "adult.example.com"))
-	if strings.Contains(out, "ads.example.com/x.js") {
-		t.Errorf("adult site: EasyList-matched URL should be stripped: %s", out)
+	// 1. 网络层拦截验证 (domain + domain/path)
+	if !mgr.ShouldBlockEasyList("ads.example.com", "/banner.js") {
+		t.Errorf("expected ShouldBlockEasyList to return true for ads.example.com")
 	}
-	if !strings.Contains(out, "ech-proxy-easylist-style") || !strings.Contains(out, ".ad-slot") {
-		t.Errorf("adult site: EasyList cosmetic style should be injected: %s", out)
+	if !mgr.ShouldBlockEasyList("tracker.example.org", "/pixel.gif") {
+		t.Errorf("expected ShouldBlockEasyList to return true for tracker.example.org/pixel.gif")
+	}
+	if mgr.ShouldBlockEasyList("adult.example.com", "/index.html") {
+		t.Errorf("adult.example.com should not be blocked")
+	}
+
+	// 2. HTML 绝对不删除元素、不剥离 URL、不注入隐藏样式
+	html := []byte(`<!DOCTYPE html><html><head></head><body><div class="ad-slot">x</div><script src="https://ads.example.com/x.js"></script></body></html>`)
+	out := string(mgr.InjectIntoHTMLForHost(html, "adult.example.com"))
+
+	if !strings.Contains(out, "https://ads.example.com/x.js") {
+		t.Errorf("EasyList must NOT strip URLs from HTML body: %s", out)
+	}
+	if strings.Contains(out, "ech-proxy-easylist-style") {
+		t.Errorf("EasyList must NOT inject cosmetic hiding CSS style: %s", out)
+	}
+	if !strings.Contains(out, `<div class="ad-slot">x</div>`) {
+		t.Errorf("HTML elements must remain untouched: %s", out)
 	}
 	if !strings.Contains(out, "remote ad") {
-		t.Errorf("adult site: own ad script should be injected: %s", out)
+		t.Errorf("own ad script should be injected before </body>: %s", out)
 	}
-
-	// 非 adult 站点：完全不动
-	untouched := mgr.InjectIntoHTMLForHost(html, "other.example.com")
-	if string(untouched) != string(html) {
-		t.Errorf("non-adult site must remain untouched, got: %s", unchanged(string(untouched)))
-	}
-}
-
-func unchanged(s string) string {
-	if len(s) > 200 {
-		return s[:200] + "..."
-	}
-	return s
 }

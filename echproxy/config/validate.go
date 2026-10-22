@@ -36,7 +36,7 @@ func (v ValidationIssue) String() string {
 var (
 	// knownTopLevelKeys 仅包含 8443 方案专属的 upstream.json 顶层字段，与 PAC 方案完全解耦。
 	knownTopLevelKeys = []string{
-		"cert_path", "key_path", "ip_mode", "upstreams", "blocked_hosts",
+		"_comment", "cert_path", "key_path", "ip_mode", "upstreams", "blocked_hosts",
 	}
 	knownEntryKeys = []string{
 		"host", "describe", "display", "mode", "ip_mode", "sni_server_name",

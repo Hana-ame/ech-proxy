@@ -148,6 +148,7 @@ type UpstreamMap map[string]UpstreamConfig
 
 type Config struct {
 	mu            sync.RWMutex `json:"-"`
+	Comment       string       `json:"_comment,omitempty"`
 	CertPath      string       `json:"cert_path"`
 	KeyPath       string       `json:"key_path"`
 	IPMode        string       `json:"ip_mode,omitempty"`

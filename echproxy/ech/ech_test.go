@@ -119,3 +119,29 @@ func TestResolveHostIPsByModeViaMockDoHAndFallback(t *testing.T) {
 		t.Fatalf("ResolveHostIPsByMode via secondary DoH fallback = %v, %v; want [104.16.99.88]", fbIPs, err)
 	}
 }
+
+func TestRaceModesConcurrentWinnerSelection(t *testing.T) {
+	clearCachedRoute("race.example.org")
+	defer clearCachedRoute("race.example.org")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("winner"))
+	}))
+	defer srv.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL, nil)
+	req.Host = "race.example.org"
+
+	resp, err := raceModes(req, []string{"direct"}, "v4", "race.example.org")
+	if err != nil {
+		t.Fatalf("raceModes failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("raceModes status = %d, want 200", resp.StatusCode)
+	}
+	if cached, ok := getCachedRoute("race.example.org"); !ok || cached != "direct" {
+		t.Errorf("getCachedRoute = (%q, %v), want (direct, true)", cached, ok)
+	}
+}

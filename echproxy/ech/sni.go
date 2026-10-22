@@ -1,11 +1,13 @@
 package cloudflare_ech
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -120,6 +122,122 @@ func extractRequestHost(req *http.Request) string {
 	return ""
 }
 
+const maxBufferedReqBody = 1 << 20 // 1MB
+
+func cloneRequestForRace(req *http.Request, ctx context.Context, bodyBytes []byte) *http.Request {
+	clone := req.Clone(ctx)
+	if len(bodyBytes) > 0 {
+		clone.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+	} else if req.Body == nil || req.Body == http.NoBody {
+		clone.Body = http.NoBody
+	}
+	return clone
+}
+
+type raceResult struct {
+	mode string
+	resp *http.Response
+	err  error
+}
+
+func raceModes(req *http.Request, modes []string, normIPMode string, host string) (*http.Response, error) {
+	if len(modes) == 0 {
+		return nil, fmt.Errorf("no transport modes to race for %s", host)
+	}
+	if len(modes) == 1 {
+		resp, err := doSingleMode(req, modes[0], normIPMode)
+		if err == nil && !isCloudflareRouteRejection(resp, modes[0]) && resp.StatusCode < 500 {
+			setCachedRoute(host, modes[0])
+		}
+		return resp, err
+	}
+
+	var bodyBytes []byte
+	if req.Body != nil && req.Body != http.NoBody {
+		if b, err := io.ReadAll(io.LimitReader(req.Body, maxBufferedReqBody)); err == nil {
+			bodyBytes = b
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+	}
+
+	raceCtx, cancelAll := context.WithCancel(req.Context())
+	defer cancelAll()
+
+	resCh := make(chan raceResult, len(modes))
+
+	for _, m := range modes {
+		mode := m
+		go func() {
+			cloneReq := cloneRequestForRace(req, raceCtx, bodyBytes)
+			resp, err := doSingleMode(cloneReq, mode, normIPMode)
+			if err != nil {
+				resCh <- raceResult{mode: mode, resp: nil, err: err}
+				return
+			}
+			if isCloudflareRouteRejection(resp, mode) {
+				_ = resp.Body.Close()
+				resCh <- raceResult{mode: mode, resp: nil, err: fmt.Errorf("cloudflare route rejection status %d", resp.StatusCode)}
+				return
+			}
+			resCh <- raceResult{mode: mode, resp: resp, err: nil}
+		}()
+	}
+
+	var lastErr error
+	var fallback5xxResp *http.Response
+	var fallback5xxMode string
+	pending := len(modes)
+
+	for pending > 0 {
+		select {
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		case res := <-resCh:
+			pending--
+			if res.err != nil {
+				lastErr = res.err
+				continue
+			}
+			if res.resp.StatusCode < 500 {
+				cancelAll()
+				go func(rem int) {
+					for i := 0; i < rem; i++ {
+						r := <-resCh
+						if r.resp != nil && r.resp.Body != nil {
+							_ = r.resp.Body.Close()
+						}
+					}
+				}(pending)
+
+				setCachedRoute(host, res.mode)
+				return res.resp, nil
+			}
+			if fallback5xxResp == nil {
+				fallback5xxResp = res.resp
+				fallback5xxMode = res.mode
+			} else {
+				_ = res.resp.Body.Close()
+			}
+		}
+	}
+
+	if fallback5xxResp != nil {
+		setCachedRoute(host, fallback5xxMode)
+		return fallback5xxResp, nil
+	}
+
+	if respDir, errDir := directDo(req, normIPMode); errDir == nil {
+		return respDir, nil
+	} else if IsCertError(errDir) {
+		return nil, errDir
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("all transport modes (%s) failed for %s", strings.Join(modes, ", "), host)
+}
+
 // RoundTrip 统一调度上游请求通道（供 PAC 方案、443 方案、8443 方案共同复用），并在所有 HTTPS 路径核对上游证书。
 func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	normIPMode := resolveEffectiveIPMode(ipMode)
@@ -135,71 +253,32 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	if trimmedMode == "fragment" || trimmedMode == "bypass" || trimmedMode == "gfw" {
 		return FragmentDo(req, normIPMode)
 	}
+	if trimmedMode == "sni" {
+		return SNIFrontDo(req, normIPMode)
+	}
+	if trimmedMode == "ech" {
+		return Do(req, normIPMode)
+	}
 
 	host := extractRequestHost(req)
-	primary := trimmedMode
-	confident := true
-	if primary == "" || primary == "auto" {
-		primary, confident = DetectTransportModeWithStatus(req.Context(), host, normIPMode)
-	} else if cached, ok := getCachedRoute(host); ok {
-		primary = cached
+
+	// 1. 若当前域名已有命中的历史成功路由缓存，直接使用该模式，零并发开销
+	if cached, ok := getCachedRoute(host); ok {
+		resp, err := doSingleMode(req, cached, normIPMode)
+		if err == nil && !isCloudflareRouteRejection(resp, cached) && resp.StatusCode < 500 {
+			return resp, nil
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		if IsCertError(err) {
+			return nil, err
+		}
+		clearCachedRoute(host)
 	}
 
-	resp, err := doSingleMode(req, primary, normIPMode)
-	if err == nil && !isCloudflareRouteRejection(resp, primary) {
-		if confident || resp.StatusCode < 500 {
-			setCachedRoute(host, primary)
-		}
-		return resp, nil
-	}
-	if resp != nil {
-		resp.Body.Close()
-	}
-	if IsCertError(err) {
-		return nil, err
-	}
-	clearCachedRoute(host)
-
-	secondary := "sni"
-	if primary == "sni" {
-		secondary = "ech"
-	} else if primary == "fragment" {
-		secondary = "sni"
-	}
-	resp2, err2 := doSingleMode(req, secondary, normIPMode)
-	if err2 == nil && !isCloudflareRouteRejection(resp2, secondary) {
-		setCachedRoute(host, secondary)
-		return resp2, nil
-	}
-	if resp2 != nil {
-		resp2.Body.Close()
-	}
-	if IsCertError(err2) {
-		return nil, err2
-	}
-
-	if primary != "fragment" {
-		respFrag, errFrag := FragmentDo(req, normIPMode)
-		if errFrag == nil {
-			setCachedRoute(host, "fragment")
-			return respFrag, nil
-		}
-		if respFrag != nil {
-			respFrag.Body.Close()
-		}
-		if IsCertError(errFrag) {
-			return nil, errFrag
-		}
-	}
-
-	resp3, err3 := directDo(req, normIPMode)
-	if err3 == nil {
-		return resp3, nil
-	}
-	if IsCertError(err3) {
-		return nil, err3
-	}
-	return nil, err
+	// 2. 无缓存或缓存失效时：并发竞速三种方案（ECH、SNI 伪装、TLS 分片），选出最快成功返回的方案！
+	return raceModes(req, []string{"ech", "sni", "fragment"}, normIPMode, host)
 }
 
 func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
@@ -481,6 +560,19 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 	effectiveSNI := sniName
 	if effectiveSNI == "" && tag == "frag" {
 		effectiveSNI = host
+	} else if tag == "sni" && (effectiveSNI == "" || effectiveSNI == shellDomain) {
+		hasCF := false
+		for _, ipStr := range ips {
+			if netdial.IsCloudflareIP(net.ParseIP(ipStr)) {
+				hasCF = true
+				break
+			}
+		}
+		if hasCF {
+			effectiveSNI = shellDomain
+		} else {
+			effectiveSNI = ""
+		}
 	}
 
 	var lastErr error

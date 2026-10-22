@@ -200,56 +200,17 @@ func TestOnlyInjectOnAdultSitesListAndPACWhitelistAtomicPop(t *testing.T) {
 		t.Fatalf("PopWhitelist failed: ok=%v popped=%v cur=%v", ok, poppedWL, mgr.Whitelist())
 	}
 
-	// 场景 A：不在成人清单中的站点（即便 HTML 含成人广告）-> 绝不注入、原样返回
+	// 不再拦截广告，不再插入广告，HTML 永远原样返回
 	adultAdHTML := []byte(`<!DOCTYPE html><html><head><title>Video</title><script src="https://syndication.exoclick.com/ads.js"></script></head><body><div class="exo-native-widget"></div></body></html>`)
 	outA := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "not-in-adult-list.example.com"))
-	if strings.Contains(outA, "remote ad inserted") || strings.Contains(outA, "ech-proxy-ad-script") {
-		t.Errorf("host NOT in adult.txt must NOT have ads injected, got: %s", outA)
-	}
 	if outA != string(adultAdHTML) {
 		t.Errorf("host NOT in adult.txt must remain untouched, got: %s", outA)
 	}
 
-	// 场景 B：成人清单站点（e-hentai.org）-> 剥离原广告 + 注入自有广告 + block.json selector
 	outInjected := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "e-hentai.org"))
-	if !strings.Contains(outInjected, "remote ad inserted") || !strings.Contains(outInjected, "<script>\n// ad-remote") {
-		t.Errorf("adult-listed host must have advertiser <script> tags injected, got: %s", outInjected)
+	if outInjected != string(adultAdHTML) {
+		t.Errorf("InjectIntoHTMLForHost must NOT modify HTML, got: %s", outInjected)
 	}
-	if strings.Contains(outInjected, "syndication.exoclick.com/ads.js") {
-		t.Errorf("adult-listed host should strip original adult ad URL, got: %s", outInjected)
-	}
-	if !strings.Contains(outInjected, ".custom-ero-slot") {
-		t.Errorf("injected style should include selector from block.json, got: %s", outInjected)
-	}
-
-	// 场景 B2：成人清单站点 + 干净 HTML（无成人广告）-> 仍按手动清单注入（不再依赖 HTML 检测）
-	cleanHTML := []byte(`<!DOCTYPE html><html><head><title>Gallery</title></head><body><p>Clean gallery page</p></body></html>`)
-	outClean := string(mgr.InjectIntoHTMLForHost(cleanHTML, "e-hentai.org"))
-	if !strings.Contains(outClean, "remote ad inserted") || !strings.Contains(outClean, "ech-proxy-ad-script") {
-		t.Errorf("adult-listed host with clean HTML should still inject (manual list), got: %s", outClean)
-	}
-
-	// 场景 C：--skip-ad-script：跳过插入广告商 JS，但仍拦截源站成人广告
-	mgr.SetSkipAdScript(true)
-	onlyBlocked := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "e-hentai.org"))
-	if strings.Contains(onlyBlocked, "remote ad inserted") {
-		t.Errorf("--skip-ad-script should not insert advertiser <script> tags, got: %s", onlyBlocked)
-	}
-	if strings.Contains(onlyBlocked, "syndication.exoclick.com/ads.js") {
-		t.Errorf("--skip-ad-script (without --skip-ad-block) should still block original adult ads, got: %s", onlyBlocked)
-	}
-	mgr.SetSkipAdScript(false)
-
-	// 场景 D：--skip-ad-block：禁止 block 源站原始广告，但仍插入广告商 JS
-	mgr.SetSkipAdBlock(true)
-	onlyInjected := string(mgr.InjectIntoHTMLForHost(adultAdHTML, "e-hentai.org"))
-	if !strings.Contains(onlyInjected, "syndication.exoclick.com/ads.js") {
-		t.Errorf("--skip-ad-block must NOT strip original ads, got: %s", onlyInjected)
-	}
-	if !strings.Contains(onlyInjected, "remote ad inserted") {
-		t.Errorf("--skip-ad-block (without --skip-ad-script) should still inject advertiser <script> tags, got: %s", onlyInjected)
-	}
-	mgr.SetSkipAdBlock(false)
 }
 
 // TestHTMLContainsAdultWebsiteAds 验证：
@@ -336,32 +297,17 @@ func TestAdScriptManagerAutoUpdateAndDisableFlag(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if strings.Contains(string(mgr.ScriptBytes()), "__REMOTE_VER__ = 1") && len(mgr.Whitelist()) == 1 {
+		if len(mgr.Whitelist()) == 1 {
 			break
 		}
 		time.Sleep(15 * time.Millisecond)
 	}
-	if !strings.Contains(string(mgr.ScriptBytes()), "__REMOTE_VER__ = 1") {
-		t.Fatalf("initial remote script fetch failed: got %q", string(mgr.ScriptBytes()))
+	if len(mgr.Whitelist()) != 1 {
+		t.Fatalf("auto-update pac.txt whitelist failed: got %v", mgr.Whitelist())
 	}
 
-	versionCounter.Store(2)
-	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if strings.Contains(string(mgr.ScriptBytes()), "__REMOTE_VER__ = 2") {
-			break
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
-	if !strings.Contains(string(mgr.ScriptBytes()), "__REMOTE_VER__ = 2") {
-		t.Fatalf("auto-update did not pull v2 script: got %q", string(mgr.ScriptBytes()))
-	}
-
-	// 同时开启 --skip-ad-script 与 --skip-ad-block 后不修改 HTML
-	mgr.SetSkipAdScript(true)
-	mgr.SetSkipAdBlock(true)
 	rawHTML := []byte(`<!DOCTYPE html><html><head><script src="https://syndication.exoclick.com/ads.js"></script></head><body></body></html>`)
-	if bytes.Contains(mgr.InjectIntoHTMLForHost(rawHTML, "adult.example.com"), []byte(`__REMOTE_VER__`)) {
-		t.Error("disabled AdScriptManager must not inject script")
+	if string(mgr.InjectIntoHTMLForHost(rawHTML, "adult.example.com")) != string(rawHTML) {
+		t.Error("InjectIntoHTMLForHost must not modify HTML")
 	}
 }

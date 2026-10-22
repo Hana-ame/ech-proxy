@@ -210,44 +210,18 @@ func TestUnifiedWhitelistPACAndAdultAdInjection(t *testing.T) {
 		t.Errorf("whitelisted site WITHOUT adult ads must NOT have ads injected: %s", recClean.Body.String())
 	}
 
-	// 2. 成人清单站点（e-hentai.org 含 exoclick） -> 替换并插入自己的成人广告
+	// 2. 统一用 pac.txt，不再拦截广告，不再插入广告 -> 所有站点（含 e-hentai.org）100% 原始数据直传
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "https://e-hentai.org/", nil)
 	req.Host = "e-hentai.org"
 	engine.ServeHTTP(rec, req)
 	bodyStr := rec.Body.String()
-	if !strings.Contains(bodyStr, "remote ad inserted") || !strings.Contains(bodyStr, "<script>\n// remote ads.js") {
-		t.Errorf("expected injected <script> tag for remote ads.js in HTML response, got: %s", bodyStr)
+	if strings.Contains(bodyStr, "remote ad inserted") || strings.Contains(bodyStr, "ech-proxy-ad-script") {
+		t.Errorf("expected NO advertiser script injected, got: %s", bodyStr)
 	}
-	if strings.Contains(bodyStr, "syndication.exoclick.com") {
-		t.Errorf("expected exoclick ad URL to be stripped from HTML")
+	if !strings.Contains(bodyStr, "syndication.exoclick.com") {
+		t.Errorf("expected original content completely preserved without ad blocking, got: %s", bodyStr)
 	}
-
-	adMgr.SetSkipAdScript(true)
-	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodGet, "https://e-hentai.org/", nil)
-	req2.Host = "e-hentai.org"
-	engine.ServeHTTP(rec2, req2)
-	if strings.Contains(rec2.Body.String(), "remote ad inserted") {
-		t.Errorf("expected no advertiser script when --skip-ad-script is enabled")
-	}
-	if !strings.Contains(rec2.Body.String(), "syndication.exoclick.com") {
-		t.Errorf("expected original HTML preserved and streamed directly when --skip-ad-script is set")
-	}
-	adMgr.SetSkipAdScript(false)
-
-	adMgr.SetSkipAdBlock(true)
-	rec3 := httptest.NewRecorder()
-	req3 := httptest.NewRequest(http.MethodGet, "https://e-hentai.org/", nil)
-	req3.Host = "e-hentai.org"
-	engine.ServeHTTP(rec3, req3)
-	if !strings.Contains(rec3.Body.String(), "syndication.exoclick.com") {
-		t.Errorf("expected original exoclick ad to be preserved when --skip-ad-block is enabled")
-	}
-	if !strings.Contains(rec3.Body.String(), "remote ad inserted") {
-		t.Errorf("expected advertiser <script> still injected when only --skip-ad-block is set")
-	}
-	adMgr.SetSkipAdBlock(false)
 
 	recScript := httptest.NewRecorder()
 	reqScript := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/__ech_proxy__/ads.js", nil)

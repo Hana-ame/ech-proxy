@@ -388,13 +388,6 @@ func needsBodyRewrite(c *gin.Context, requestHost string, uc config.UpstreamConf
 		return true
 	}
 
-	// 3. 广告脚本注入：仅当为 text/html、命中 adult.txt 成人站点、启用了脚本注入且脚本内容非空时才拦截重写
-	if isHTML && adScript != nil && !adScript.SkipAdScript() && len(adScript.ScriptBytes()) > 0 {
-		if adScript.IsAdultSite(requestHost, uc.Host) {
-			return true
-		}
-	}
-
 	return false
 }
 
@@ -443,15 +436,6 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 	}
 
 	isHTML := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html")
-	if isHTML && adScript != nil && !adScript.SkipAdScript() {
-		beforeLen := len(plain)
-		plain = adScript.InjectIntoHTMLForHost(plain, requestHost, uc.Host)
-		if len(plain) != beforeLen {
-			c.Writer.Header().Del("Content-Security-Policy")
-			c.Writer.Header().Del("Content-Security-Policy-Report-Only")
-		}
-	}
-
 	if isHTML && uc.SWInject && config.IsPortalDomain(requestHost) && !bytes.Contains(plain, []byte("serviceWorker")) {
 		reg := []byte(`<script>navigator.serviceWorker.register('/sw.js').catch(function(){})</script>`)
 		if idx := bytes.Index(plain, []byte("</head>")); idx >= 0 {

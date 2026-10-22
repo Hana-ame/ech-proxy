@@ -1,3 +1,13 @@
+## v3.5.1
+
+### Changes & Features
+
+- **全面移除广告拦截与广告插入 (Zero Ad Tampering)**:
+  - 彻底停用并移除 HTML 广告注入（`ads.js`）与拦截逻辑，代理对所有网页 HTML 内容零修改、零注入。
+  - 所有网站流量均通过原生 32KB 分块实时流式传输（Direct Streaming），零内存缓存等待。
+- **PAC 规则统一使用单一信源 (pac.txt Only)**:
+  - PAC 系统代理规则统一且仅使用 `https://4545810.xyz/pac.txt`，不再维护或依赖其他清单。
+
 ## v3.5.0
 
 ### Changes & Features

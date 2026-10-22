@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"html"
 	"os"
 	"path/filepath"
 	"strings"
@@ -906,45 +905,7 @@ func (m *AdScriptManager) RefreshOnce() (bool, error) {
 	}
 	_, whiteErr := m.RefreshWhitelistOnce()
 	_, _ = m.RefreshAdultSitesOnce()
-	_, _ = m.RefreshBlocklistOnce()
-	if !m.Enabled() {
-		return false, whiteErr
-	}
-	m.mu.RLock()
-	url, fetch, oldHash, cacheDir := m.scriptURL, m.fetchFn, m.versionHash, m.cacheDir
-	m.mu.RUnlock()
-	if url == "" || fetch == nil {
-		return false, whiteErr
-	}
-	raw, err := fetch(url)
-	if err != nil {
-		m.mu.Lock()
-		m.lastError = err.Error()
-		m.mu.Unlock()
-		return false, fmt.Errorf("fetch remote ads.js from %s: %w", url, err)
-	}
-	if !isValidAdScript(raw) {
-		err := fmt.Errorf("remote ads.js from %s failed validation (len=%d)", url, len(raw))
-		m.mu.Lock()
-		m.lastError = err.Error()
-		m.mu.Unlock()
-		return false, err
-	}
-	sum := sha256.Sum256(raw)
-	newHash := hex.EncodeToString(sum[:8])
-
-	m.mu.Lock()
-	m.lastError = ""
-	changed := newHash != oldHash || m.source != "remote"
-	m.setScriptLocked(raw, "remote")
-	m.mu.Unlock()
-
-	if changed && cacheDir != "" {
-		if err := os.MkdirAll(cacheDir, 0o755); err == nil {
-			_ = os.WriteFile(filepath.Join(cacheDir, cachedScriptName), raw, 0o644)
-		}
-	}
-	return changed, nil
+	return false, whiteErr
 }
 
 func (m *AdScriptManager) StartAutoUpdate(ctx context.Context) {
@@ -1020,55 +981,9 @@ func (m *AdScriptManager) InjectIntoHTML(htmlBody []byte) []byte {
 	return m.InjectIntoHTMLForHost(htmlBody)
 }
 
-// InjectIntoHTMLForHost 严格仅在真正检测到成人广告内容（hasAdultAd == true）时才执行替换并插入自己的成人广告；
-// 若未检测到成人广告内容，则绝不修改页面、绝不插入广告。
+// InjectIntoHTMLForHost 不再修改页面、不再拦截广告、不再插入广告，一律原样返回。
 func (m *AdScriptManager) InjectIntoHTMLForHost(htmlBody []byte, hosts ...string) []byte {
-	if m == nil || len(htmlBody) == 0 {
-		return htmlBody
-	}
-	skipScript, skipBlock := !m.Enabled(), m.SkipAdBlock()
-	if (skipScript && skipBlock) || !looksLikeHTMLDocument(htmlBody) || bytes.Contains(htmlBody, []byte(`id="ech-proxy-ad-script"`)) {
-		return htmlBody
-	}
-	// 闸门：只对「成人网站清单」（adult.txt，与 pac.txt 并列的第二个文件）中的站点去广告并注入自有广告。
-	// 不再使用 HTML 自动检测决定是否注入（检测值仍写入 data-has-adult-ad 供诊断）。
-	if !m.IsAdultSite(hosts...) {
-		return htmlBody
-	}
-	hasAdultAd := m.ContainsAdultAd(htmlBody)
-	whitelisted := m.IsWhitelisted(hosts...)
-	isAdult := true
-	adultReason := "adult-list"
-
-	cleaned := htmlBody
-	if !skipBlock {
-		cleaned = stripBlockedURLs(cleaned, m.EffectiveBlockedURLs())
-	}
-
-	var payload bytes.Buffer
-	if !skipBlock && !bytes.Contains(cleaned, []byte(`id="ech-proxy-adblock-style"`)) {
-		payload.WriteString(m.EffectiveAdBlockStyle() + "\n")
-	}
-	if !skipScript {
-		if scriptTags := BuildAdScriptTags(m.ScriptBytes()); len(scriptTags) > 0 {
-			fmt.Fprintf(&payload, "<!-- id=\"ech-proxy-ad-script\" data-version=%q data-whitelisted=%q data-is-adult=%q data-has-adult-ad=%q data-adult-reason=%q -->\n",
-				html.EscapeString(m.VersionHash()), boolBit(whitelisted), boolBit(isAdult), boolBit(hasAdultAd), html.EscapeString(adultReason))
-			payload.Write(scriptTags)
-			payload.WriteByte('\n')
-		}
-	}
-	injected := payload.Bytes()
-	if len(injected) == 0 {
-		return cleaned
-	}
-	lower := bytes.ToLower(cleaned)
-	if idx := bytes.Index(lower, []byte("</body>")); idx >= 0 {
-		out := make([]byte, 0, len(cleaned)+len(injected))
-		out = append(out, cleaned[:idx]...)
-		out = append(out, injected...)
-		return append(out, cleaned[idx:]...)
-	}
-	return append(cleaned, injected...)
+	return htmlBody
 }
 
 func boolBit(v bool) string {

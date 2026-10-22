@@ -280,9 +280,22 @@ func QueryDoH(ctx context.Context, name string, qtype int) (*http.Response, erro
 		if resp2 != nil && resp2.Body != nil {
 			_ = resp2.Body.Close()
 		}
-		if err != nil && err2 != nil {
-			return nil, fmt.Errorf("primary DoH (%s) failed: %v; secondary DoH (%s) failed: %w", cfg.dohURL, err, cfg.fallbackURL, err2)
+	}
+
+	// 兜底备用：若前序 DoH 均失败（如国内阻断 1.1.1.1:443），回退请求国内高速无污染 DoH（阿里云 223.5.5.5）
+	aliyunURL := fmt.Sprintf("https://223.5.5.5/resolve?name=%s&type=%d", url.QueryEscape(name), qtype)
+	resp3, err3 := doDohRequest(ctx, aliyunURL, "", cfg.ipMode)
+	if err3 == nil && resp3 != nil && resp3.StatusCode == http.StatusOK {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
 		}
+		return resp3, nil
+	}
+	if resp3 != nil && resp3.Body != nil {
+		_ = resp3.Body.Close()
+	}
+	if err != nil {
+		return nil, fmt.Errorf("all DoH endpoints failed (primary: %v, aliyun: %v)", err, err3)
 	}
 	return resp, err
 }
@@ -487,18 +500,19 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				if permanentErr != nil {
 					return nil, permanentErr
 				}
-				rawConn, err := netdial.DialContextIPMode(ctx, dialTarget, "443", mode, dialTimeout)
+				echDialTimeout := 3500 * time.Millisecond
+				rawConn, err := netdial.DialContextIPMode(ctx, dialTarget, "443", mode, echDialTimeout)
 				if err != nil {
 					return nil, err
 				}
 				uConn := utls.UClient(rawConn, uCfg, utls.HelloChrome_120)
-				if err := uConn.HandshakeContext(ctx); err != nil {
+				hsCtx, hsCancel := context.WithTimeout(ctx, 4*time.Second)
+				hsErr := uConn.HandshakeContext(hsCtx)
+				hsCancel()
+				if hsErr != nil {
 					rawConn.Close()
-					if strings.Contains(strings.ToLower(err.Error()), "handshake failure") ||
-						strings.Contains(strings.ToLower(err.Error()), "tls:") {
-						permanentErr = err
-					}
-					return nil, err
+					permanentErr = hsErr
+					return nil, hsErr
 				}
 				// 核对服务端回传证书是否与伪装前访问的真实域名 host 一致、是否过期
 				if cerr := validateUpstreamCert(ctx, host, uConn.ConnectionState().PeerCertificates); cerr != nil {

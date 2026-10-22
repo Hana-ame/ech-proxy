@@ -1,3 +1,14 @@
+## v3.5.22
+
+### Fixes & Improvements
+
+- **彻底修复全局网站访问超时（`ERR_CONNECTION_TIMED_OUT`）与并发引导死锁**:
+  - **根除 Bootstrap DoH 通道竞速死锁（Deadlock）**：修复 `resolveViaBootstrapDoH` 中并发竞速端点在获胜者取消上下文后，其余协程命中 `raceCtx.Done()` 导致未向结果 channel 发送数据而引发接收循环永久卡死的致命死锁；优化为缓冲通道安全解耦与胜出即时响应，对所有域名均并发竞速 5 节点（Cloudflare/阿里云/DNSPod），15ms 秒级就绪；
+  - **恢复 Fragment 单连接分片为主线首选**：纠正误将 Cloudflare 节点判定为首选 ECH 直连的严重退化（国内 GFW 全面阻断并丢弃 ECH 握手包，导致单次请求串行超时 30 秒击穿浏览器超时阈值）；主线探测坚定以单连接 TLS 记录分片（`FragmentDo`）直通源站，秒级穿透 GFW SNI 审查；
+  - **保留并透传 Cloudflare 403 挑战（Turnstile / Captcha）**：修复 `isCloudflareRouteRejection` 误将 `FragmentDo` / `SNIFrontDo` 接收到的 `cf-mitigated: challenge` 判为路由故障而丢弃的缺陷；允许合法 403 人机验证页面透传给浏览器进行交互验证；
+  - **DoH 三级兜底直连**：`QueryDoH` 在首选（`4545810.xyz`）与次选（`1.1.1.1`）均超时受阻时，自动回退请求阿里云无污染 HTTPS 解析（`223.5.5.5/resolve`），确保在极端断连下域名解析 100% 成功；
+  - **单 IP 拨号超时收紧与坏连接淘汰**：将 `dialUTLSOnce` 的 TCP 单 IP 连接超时收紧至 3.5s、TLS 握手超时至 5s，多 IP 节点遭遇死 IP 时毫秒级切换下一个候选 IP；遭遇错误时彻底清理对应的 H2/H1 传输池缓存，杜绝坏连接复用引发的连锁超时。
+
 ## v3.5.21
 
 ### Fixes & Improvements

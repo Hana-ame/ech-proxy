@@ -440,11 +440,7 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 			if cached, ok := getCachedRoute(host); ok {
 				return doSingleMode(req, cached, normIPMode)
 			}
-			detected, _ := DetectTransportModeWithStatus(req.Context(), host, normIPMode)
-			if detected == "" {
-				detected = "fragment"
-			}
-			return doSingleMode(req, detected, normIPMode)
+			return FragmentDo(req, normIPMode)
 		case <-req.Context().Done():
 			return nil, req.Context().Err()
 		}
@@ -460,39 +456,24 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		}()
 	}
 
-	// 3. 智能路由探测：优先尝试根据节点特征识别出的首选传输模式（Cloudflare 节点首选 ech，自定伪装 SNI 首选 sni，普通节点首选 fragment）
-	detected, confident := DetectTransportModeWithStatus(req.Context(), host, normIPMode)
-	primaryMode := detected
-	if primaryMode == "" {
-		primaryMode = "fragment"
+	// 3. 智能路由探测：优先尝试单连接 TLS 记录分片（fragment），绝不盲目并发连接打满系统套接字
+	respFrag, errFrag := FragmentDo(req, normIPMode)
+	if errFrag == nil && !isCloudflareRouteRejection(respFrag, "fragment") && respFrag.StatusCode < 500 {
+		setCachedRoute(host, "fragment")
+		return respFrag, nil
+	}
+	if respFrag != nil {
+		respFrag.Body.Close()
+	}
+	if IsCertError(errFrag) {
+		return nil, errFrag
 	}
 
-	respPri, errPri := doSingleMode(req, primaryMode, normIPMode)
-	if errPri == nil && !isCloudflareRouteRejection(respPri, primaryMode) && respPri.StatusCode < 500 {
-		setCachedRoute(host, primaryMode)
-		return respPri, nil
+	// 4. 若分片不通，再按站点类型降级备用通道竞速
+	if detected, confident := DetectTransportModeWithStatus(req.Context(), host, normIPMode); confident && detected != "ech" {
+		return raceModes(req, []string{"sni"}, normIPMode, host)
 	}
-	if respPri != nil {
-		respPri.Body.Close()
-	}
-	if IsCertError(errPri) {
-		return nil, errPri
-	}
-
-	// 4. 若首选模式不通或遭遇阻断，再按站点类型降级备用通道竞速
-	var fallbackModes []string
-	if primaryMode == "ech" {
-		fallbackModes = []string{"fragment", "sni"}
-	} else if primaryMode == "sni" {
-		fallbackModes = []string{"fragment"}
-	} else {
-		if confident && detected != "ech" {
-			fallbackModes = []string{"sni"}
-		} else {
-			fallbackModes = []string{"ech", "sni"}
-		}
-	}
-	return raceModes(req, fallbackModes, normIPMode, host)
+	return raceModes(req, []string{"sni", "ech"}, normIPMode, host)
 }
 
 func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
@@ -543,7 +524,10 @@ func doSingleMode(req *http.Request, mode, ipMode string) (*http.Response, error
 	}
 }
 
-func isCloudflareRouteRejection(resp *http.Response, _ ...string) bool {
+func isCloudflareRouteRejection(resp *http.Response, mode ...string) bool {
+	if len(mode) > 0 && mode[0] != "ech" && mode[0] != "" {
+		return false
+	}
 	if resp == nil {
 		return true
 	}
@@ -719,8 +703,9 @@ func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, e
 }
 
 func dialUTLSOnce(ctx context.Context, ip, sniName, verifyHost string, nextProtos []string, helloID utls.ClientHelloID, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
+	tcpTimeout := 3500 * time.Millisecond
 	rawConn, err := (&net.Dialer{
-		Timeout:   dialTimeout,
+		Timeout:   tcpTimeout,
 		KeepAlive: 30 * time.Second,
 	}).DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
 	if err != nil {
@@ -735,7 +720,9 @@ func dialUTLSOnce(ctx context.Context, ip, sniName, verifyHost string, nextProto
 		InsecureSkipVerify: true,
 		NextProtos:         nextProtos,
 	}, helloID)
-	if err := uConn.HandshakeContext(ctx); err != nil {
+	hsCtx, hsCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer hsCancel()
+	if err := uConn.HandshakeContext(hsCtx); err != nil {
 		rawConn.Close()
 		return nil, err
 	}
@@ -900,11 +887,17 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 			}
 		}
 		lastErr = err
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && (err == nil || !strings.Contains(err.Error(), "canceled")) {
+		if err != nil {
 			utlsTransMu.Lock()
 			if old, ok := utlsH2Trans[cacheKey]; ok {
 				old.CloseIdleConnections()
 				delete(utlsH2Trans, cacheKey)
+			}
+			if oldClient, ok := utlsH1Clients[cacheKey]; ok {
+				if oldTr, okTr := oldClient.Transport.(*http.Transport); okTr {
+					oldTr.CloseIdleConnections()
+				}
+				delete(utlsH1Clients, cacheKey)
 			}
 			utlsTransMu.Unlock()
 		}

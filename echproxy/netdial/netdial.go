@@ -456,66 +456,42 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 		qtypes = []int{1, 28}
 	}
 
-	cleanHost := CleanHost(host)
-	isSelfDoH := strings.EqualFold(cleanHost, "4545810.xyz") || strings.HasSuffix(cleanHost, ".4545810.xyz")
-
 	var ips []net.IP
 
 	for _, qt := range qtypes {
-		if isSelfDoH {
-			// 解析首选 DoH 节点自身（4545810.xyz）时，并发竞速 Cloudflare、阿里云与 DNSPod 引导端点，杜绝单点死锁
-			allEPs := append(append([]bootstrapEndpoint(nil), primaryBootstrapEndpoints...), fallbackBootstrapEndpoints...)
-			resCh := make(chan []net.IP, len(allEPs))
-			raceCtx, raceCancel := context.WithCancel(ctx)
-			for _, ep := range allEPs {
-				targetEP := ep
-				go func() {
-					res, err := queryBootstrapEndpoint(raceCtx, targetEP, host, qt)
-					if err == nil && len(res) > 0 {
-						select {
-						case resCh <- res:
-							raceCancel()
-						case <-raceCtx.Done():
-						}
-					} else {
-						select {
-						case resCh <- nil:
-						case <-raceCtx.Done():
-						}
-					}
-				}()
-			}
-			var won []net.IP
-			for i := 0; i < len(allEPs); i++ {
-				r := <-resCh
+		allEPs := append(append([]bootstrapEndpoint(nil), primaryBootstrapEndpoints...), fallbackBootstrapEndpoints...)
+		resCh := make(chan []net.IP, len(allEPs))
+		raceCtx, raceCancel := context.WithCancel(ctx)
+		for _, ep := range allEPs {
+			targetEP := ep
+			go func() {
+				res, err := queryBootstrapEndpoint(raceCtx, targetEP, host, qt)
+				if err == nil && len(res) > 0 {
+					resCh <- res
+				} else {
+					resCh <- nil
+				}
+			}()
+		}
+		var won []net.IP
+		for i := 0; i < len(allEPs); i++ {
+			select {
+			case r := <-resCh:
 				if len(r) > 0 && len(won) == 0 {
 					won = r
+					raceCancel()
 				}
+			case <-ctx.Done():
+				raceCancel()
+				break
 			}
-			raceCancel()
 			if len(won) > 0 {
-				ips = append(ips, won...)
+				break
 			}
-		} else {
-			// 普通域名：优先 1.1.1.1 / 1.0.0.1，若超时或受阻则立即回退至阿里云与 DNSPod 兜底引导节点
-			var found bool
-			for _, ep := range primaryBootstrapEndpoints {
-				res, err := queryBootstrapEndpoint(ctx, ep, host, qt)
-				if err == nil && len(res) > 0 {
-					ips = append(ips, res...)
-					found = true
-					break
-				}
-			}
-			if !found {
-				for _, ep := range fallbackBootstrapEndpoints {
-					res, err := queryBootstrapEndpoint(ctx, ep, host, qt)
-					if err == nil && len(res) > 0 {
-						ips = append(ips, res...)
-						break
-					}
-				}
-			}
+		}
+		raceCancel()
+		if len(won) > 0 {
+			ips = append(ips, won...)
 		}
 	}
 

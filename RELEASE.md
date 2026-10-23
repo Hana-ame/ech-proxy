@@ -1,3 +1,25 @@
+## v3.5.28
+
+### Fixes & Improvements
+
+- **把「原域名模式不改写 Set-Cookie」变成可复现的验收测试，并公开实测对照数据**:
+  - v3.5.27 的修复本身未改动一行生产代码，本版只补一件事：一条**能被证伪**的验收测试。新增 `echproxy/live_passthrough_acceptance_test.go`，默认 `t.Skip`，只有显式 `ECH_LIVE_ACCEPTANCE=1` 才访问真实 pixiv 上游，因此不进入 CI 常规路径；
+  - **断言内容**：经 `New443Engine` 打真实 `https://www.pixiv.net/` 与 `https://accounts.pixiv.net/login`，要求所有带 `Domain` 属性的 `Set-Cookie` 其域**不得等于请求宿主**（改写即失败），且必须观察到至少一条父域 `pixiv.net`，同时 `Cross-Origin-Opener-Policy` 必须保留；
+  - **闸门有效性实测**：同一测试文件在 `v3.5.26` 上运行 **FAIL**（`Set-Cookie Domain was rewritten to the request host "www.pixiv.net"`），在 `v3.5.27` 上 **PASS**（4.67s，两个子用例全绿）。不是只会在新代码上通过的装饰性测试；
+  - **本机实测对照（2026-10-23，Windows，443 本地模式，同一台机器同一时刻先后跑两个 release 二进制）**：
+
+    | 观测点 | v3.5.26 | v3.5.27 / v3.5.28 |
+    |---|---|---|
+    | `www.pixiv.net` 的 `PHPSESSID` | `Domain=www.pixiv.net` ❌ | `Domain=.pixiv.net` ✅ |
+    | `accounts.pixiv.net/login` 的 `PHPSESSID` | `Domain=accounts.pixiv.net` ❌ | `Domain=.pixiv.net` ✅ |
+    | 登录会话能否带到 `www.pixiv.net` | 不能（父域被裁成子域） | 能 |
+    | 浏览器 `Cookie` 头顺序 `zz=1; aa=2; mm=3` | 被重排为 `aa; mm; zz` ❌ | 逐字透传 ✅ |
+    | `Cross-Origin-Opener-Policy` | 被剥离 ❌ | `same-origin` ✅ |
+    | `OPTIONS` 预检 | 本地 `204 No Content` + 合成 CORS 头 ❌ | 转发上游（pixiv 返回 `405`）✅ |
+    | `Access-Control-Request-*` | 被剥离 ❌ | 原样透传 ✅ |
+
+  - 结论：v3.5.26 的「登录成功但跳回仍显示未登录」由 `Domain` 被改写直接导致——登录发生在 `accounts.pixiv.net`，会话 cookie 被裁到该子域，`www.pixiv.net` 收不到；v3.5.27 起父域原样保留，跨子域登录握手成立。
+
 ## v3.5.27
 
 ### Fixes & Improvements

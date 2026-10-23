@@ -684,7 +684,7 @@ func TestPrevent304BlankPageAndZeroByteCachePollution(t *testing.T) {
 
 	engine := NewEngine(&config.Config{})
 
-	// 1. Force refresh (Cache-Control: no-cache) must strip If-None-Match; normal request preserves ETag
+	// 1. Force refresh (Cache-Control: no-cache) must strip If-None-Match; normal request preserves ETag and Vary untouched
 	attempts = 0
 	recDoc := httptest.NewRecorder()
 	reqDoc := httptest.NewRequest(http.MethodGet, "https://nyaa.si/", nil)
@@ -705,8 +705,8 @@ func TestPrevent304BlankPageAndZeroByteCachePollution(t *testing.T) {
 	if gotETag := recDoc.Header().Get("ETag"); gotETag != `"v1"` {
 		t.Errorf("expected ETag preserved on untouched passthrough HTML response, got %q", gotETag)
 	}
-	if gotVary := recDoc.Header().Get("Vary"); !strings.Contains(gotVary, "Accept-Encoding") || !strings.Contains(gotVary, "Origin") {
-		t.Errorf("expected Vary to preserve Accept-Encoding and append Origin, got %q", gotVary)
+	if gotVary := recDoc.Header().Get("Vary"); gotVary != "Accept-Encoding" {
+		t.Errorf("expected Vary to be preserved untouched as Accept-Encoding, got %q", gotVary)
 	}
 
 	// 2. Orphan 304 (browser never sent If-None-Match) must auto-retry and return 200 OK with body
@@ -867,3 +867,119 @@ func (m *mockRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 	return m.roundTrip(req)
 }
 
+// TestOriginalDomainModeFullPassthroughCookiesHeadersRedirectsAndStream 验证 PAC / 443 原域名模式下：
+// 1. Set-Cookie 响应头完全原样透传（绝不把 Domain=.pixiv.net 改写为 Domain=accounts.pixiv.net），且不写入内存 DefaultJar；
+// 2. 浏览器请求 Cookie 头按原始顺序与内容完全透传，不被 DefaultJar 拦截、重排或旧值覆盖；
+// 3. 浏览器请求头（含 Access-Control-Request-* 预检头、Origin、Referer、Sec-CH-UA）与上游响应安全头（CSP、COOP、CORS）原样透传；
+// 4. OPTIONS 预检请求在原域名模式下直接转发给上游，不被 corsMiddleware 劫持；
+// 5. 上游 3xx 重定向（含 Location 头）原封不动透传给浏览器，不改写也不内部吞并；
+// 6. 响应体直接流式传输。
+func TestOriginalDomainModeFullPassthroughCookiesHeadersRedirectsAndStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cookie.DefaultJar.Reset()
+	defer cookie.DefaultJar.Reset()
+
+	// 预先往 DefaultJar 塞入旧的脏 Cookie，验证原域名模式下绝不会读取或覆盖浏览器请求 Cookie
+	cookie.DefaultJar.Seed("www.pixiv.net", "PHPSESSID=stale_dead_session; injected_by_jar=1")
+
+	origRT := roundTripFn
+	defer func() { roundTripFn = origRT }()
+
+	var lastReq *http.Request
+	rawSetCookie := "PHPSESSID=new_valid_session; expires=Sun, 22-Nov-2026 02:00:00 GMT; Max-Age=2592000; path=/; domain=.pixiv.net; secure; HttpOnly; SameSite=None"
+
+	roundTripFn = func(req *http.Request, mode, ipMode string) (*http.Response, error) {
+		lastReq = req
+		if req.Method == http.MethodOptions {
+			return &http.Response{
+				StatusCode: http.StatusNoContent,
+				Header: http.Header{
+					"Access-Control-Allow-Origin":  []string{"https://www.pixiv.net"},
+					"Access-Control-Allow-Methods": []string{"POST, GET, OPTIONS"},
+				},
+				Body: io.NopCloser(strings.NewReader("")),
+			}, nil
+		}
+		if req.Host == "accounts.pixiv.net" && req.URL.Path == "/login" {
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header: http.Header{
+					"Location":                []string{"https://www.pixiv.net/"},
+					"Set-Cookie":              []string{rawSetCookie},
+					"Content-Security-Policy": []string{"default-src 'self' *.pixiv.net"},
+				},
+				Body: io.NopCloser(strings.NewReader("")),
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type":               []string{"text/html; charset=utf-8"},
+				"Content-Security-Policy":    []string{"frame-ancestors 'none'"},
+				"Cross-Origin-Opener-Policy": []string{"same-origin"},
+			},
+			Body: io.NopCloser(strings.NewReader("<html><body>logged-in-pixiv-stream</body></html>")),
+		}, nil
+	}
+
+	engine := NewEngineWithOptions(EngineOptions{
+		Config: &config.Config{},
+	})
+
+	// 1. 验证 OPTIONS 预检请求与 Access-Control-Request-* 头透传至上游
+	recOpt := httptest.NewRecorder()
+	reqOpt := httptest.NewRequest(http.MethodOptions, "https://accounts.pixiv.net/api/login", nil)
+	reqOpt.Host = "accounts.pixiv.net"
+	reqOpt.Header.Set("Origin", "https://www.pixiv.net")
+	reqOpt.Header.Set("Access-Control-Request-Method", "POST")
+	reqOpt.Header.Set("Access-Control-Request-Headers", "content-type,x-csrf-token")
+	engine.ServeHTTP(recOpt, reqOpt)
+
+	if lastReq == nil || lastReq.Method != http.MethodOptions {
+		t.Fatalf("expected OPTIONS request forwarded to upstream, got %v", lastReq)
+	}
+	if lastReq.Header.Get("Access-Control-Request-Method") != "POST" ||
+		lastReq.Header.Get("Access-Control-Request-Headers") != "content-type,x-csrf-token" {
+		t.Errorf("CORS preflight request headers were stripped: %+v", lastReq.Header)
+	}
+	if got := recOpt.Header().Get("Access-Control-Allow-Origin"); got != "https://www.pixiv.net" {
+		t.Errorf("upstream Access-Control-Allow-Origin altered: got %q", got)
+	}
+
+	// 2. 验证 accounts.pixiv.net 登录 302 响应：Set-Cookie Domain=.pixiv.net 与 Location 原样透传
+	recLogin := httptest.NewRecorder()
+	reqLogin := httptest.NewRequest(http.MethodPost, "https://accounts.pixiv.net/login", strings.NewReader("pixiv_id=user&password=pw"))
+	reqLogin.Host = "accounts.pixiv.net"
+	engine.ServeHTTP(recLogin, reqLogin)
+
+	if recLogin.Code != http.StatusFound {
+		t.Fatalf("login status = %d, want 302", recLogin.Code)
+	}
+	if gotSC := recLogin.Header().Get("Set-Cookie"); gotSC != rawSetCookie {
+		t.Errorf("Set-Cookie was modified!\n got: %q\nwant: %q", gotSC, rawSetCookie)
+	}
+	if gotLoc := recLogin.Header().Get("Location"); gotLoc != "https://www.pixiv.net/" {
+		t.Errorf("Location header mismatch: got %q", gotLoc)
+	}
+	if gotCSP := recLogin.Header().Get("Content-Security-Policy"); gotCSP != "default-src 'self' *.pixiv.net" {
+		t.Errorf("CSP header stripped or altered: got %q", gotCSP)
+	}
+
+	// 3. 验证访问 www.pixiv.net 时：浏览器原始 Cookie 顺序与值完全透传，不受 DefaultJar 脏数据污染或字母序重排
+	rawBrowserCookie := "z_first=1; PHPSESSID=new_valid_session; a_last=2"
+	recHome := httptest.NewRecorder()
+	reqHome := httptest.NewRequest(http.MethodGet, "https://www.pixiv.net/", nil)
+	reqHome.Host = "www.pixiv.net"
+	reqHome.Header.Set("Cookie", rawBrowserCookie)
+	engine.ServeHTTP(recHome, reqHome)
+
+	if lastReq.Header.Get("Cookie") != rawBrowserCookie {
+		t.Errorf("browser Cookie header was altered or reordered by proxy!\n got: %q\nwant: %q", lastReq.Header.Get("Cookie"), rawBrowserCookie)
+	}
+	if recHome.Header().Get("Cross-Origin-Opener-Policy") != "same-origin" {
+		t.Errorf("expected Cross-Origin-Opener-Policy preserved, got %q", recHome.Header().Get("Cross-Origin-Opener-Policy"))
+	}
+	if recHome.Body.String() != "<html><body>logged-in-pixiv-stream</body></html>" {
+		t.Errorf("unexpected streamed body: %q", recHome.Body.String())
+	}
+}

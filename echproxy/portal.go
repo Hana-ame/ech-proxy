@@ -44,11 +44,11 @@ func NewEngine(cfg *config.Config) *gin.Engine {
 }
 
 // New443Engine 构建 443 方案专属的极简反代引擎：
-//   - 仅处理 443 原域名 HTTPS 流量，不挂载 PAC、广告脚本或 8443 门户路由。
+//   - 仅处理 443 原域名 HTTPS 流量，完全透传，不挂载 PAC、广告脚本、CORS 注入或 8443 门户路由。
 func New443Engine(_ *certstore.Store, auth *AuthConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
-	r.Use(gin.Recovery(), corsMiddleware())
+	r.Use(gin.Recovery())
 	emptyCfg := &config.Config{}
 	proxyHandler := ProxyHandlerWithConfig(emptyCfg, auth, nil)
 	r.NoRoute(proxyHandler)
@@ -253,6 +253,12 @@ func isPortalOrLocalAdminHost(host string) bool {
 
 func corsMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		host := netdial.CleanHost(c.Request.Host)
+		// PAC / 443 原域名模式下完全透传，不拦截 OPTIONS 预检请求，也不覆写上游响应的 CORS/安全头
+		if config.IsOriginalDomainMode(host) && !isPortalOrLocalAdminHost(host) {
+			c.Next()
+			return
+		}
 		rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
 		if c.Request.Method == http.MethodOptions {
 			c.AbortWithStatus(http.StatusNoContent)
@@ -265,7 +271,11 @@ func corsMiddleware() gin.HandlerFunc {
 
 func seedCookiesFromConfig(cfg *config.Config) {
 	upstreams, _ := cfg.Snapshot()
-	for _, uc := range upstreams {
+	for entry, uc := range upstreams {
+		// 仅对 8443 门户域名条目播种预置 Cookie，绝不污染原域名模式
+		if !config.IsPortalDomain(entry) {
+			continue
+		}
 		if raw := cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile); raw != "" {
 			cookie.DefaultJar.Seed(uc.Host, raw)
 		}

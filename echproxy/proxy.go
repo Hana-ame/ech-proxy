@@ -216,6 +216,16 @@ func ProxyHandlerWithOptions(upstreams config.UpstreamMap, blockedHosts []string
 	}, auth, adScript)
 }
 
+func attachReplayBody(req *http.Request, bodyReplay []byte) {
+	if req == nil || bodyReplay == nil {
+		return
+	}
+	req.Body = io.NopCloser(bytes.NewReader(bodyReplay))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(bodyReplay)), nil
+	}
+}
+
 func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewrite.AdScriptManager) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		defer logger.RecoverAndLog("ProxyHandler", func(r any, _ []byte) {
@@ -231,16 +241,21 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 		clientIP := c.ClientIP()
 		host := netdial.CleanHost(c.Request.Host)
 		reqPort := netdial.ExtractPort(c.Request.Host)
+		origDomainMode := config.IsOriginalDomainMode(host)
 
 		if auth != nil && auth.Enabled() {
 			ok, err := auth.Check(c.Request, clientIP)
 			if errors.Is(err, ErrAuthRateLimited) {
-				rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+				if !origDomainMode {
+					rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+				}
 				c.String(http.StatusTooManyRequests, "too many authentication failures")
 				return
 			}
 			if !ok {
-				rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+				if !origDomainMode {
+					rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+				}
 				c.Header("WWW-Authenticate", `Basic realm="ech-proxy"`)
 				c.String(http.StatusUnauthorized, "authentication required")
 				return
@@ -257,18 +272,20 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 
 		uc, ok := config.Resolve(upstreams, host)
 		if !ok {
-			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			if !origDomainMode {
+				rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			}
 			c.String(http.StatusBadGateway, "no upstream for host: %s", host)
 			return
 		}
 
-
-		ucForRewrite := uc
-		if ucForRewrite.Wildcard == nil && len(upstreams) > 0 {
-			ucForRewrite.Wildcard = config.InheritWildcard(upstreams, host)
-		}
+		// PAC / 443 原域名模式下完全透传，不构建响应重写器（仅 8443 门户域名启用重写器）
 		var rewriter func([]byte, string) []byte
-		if len(upstreams) > 0 || len(blocked) > 0 {
+		if !origDomainMode && (len(upstreams) > 0 || len(blocked) > 0) {
+			ucForRewrite := uc
+			if ucForRewrite.Wildcard == nil && len(upstreams) > 0 {
+				ucForRewrite.Wildcard = config.InheritWildcard(upstreams, host)
+			}
 			rewriter = rewrite.BuildEntryRewriterForHost(host, ucForRewrite, blocked)
 		}
 
@@ -278,12 +295,12 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 				reqPort == "80")
 
 		targetScheme := "https"
-		if clientSentPlainHTTP && reqPort != "" && reqPort != "80" && reqPort != "443" && config.IsOriginalDomainMode(host) {
+		if clientSentPlainHTTP && reqPort != "" && reqPort != "80" && reqPort != "443" && origDomainMode {
 			targetScheme = "http"
 		}
 
 		var bodyReplay []byte
-		if clientSentPlainHTTP && targetScheme == "https" && c.Request.Body != nil && c.Request.ContentLength <= maxBufferedReqBody {
+		if c.Request.Body != nil && c.Request.ContentLength >= 0 && c.Request.ContentLength <= maxBufferedReqBody {
 			if b, rerr := io.ReadAll(io.LimitReader(c.Request.Body, maxBufferedReqBody+1)); rerr == nil && len(b) <= maxBufferedReqBody {
 				bodyReplay = b
 				c.Request.Body = io.NopCloser(bytes.NewReader(bodyReplay))
@@ -292,17 +309,21 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 
 		outReq, err := buildUpstreamRequestWithScheme(c, uc, targetScheme, reqPort)
 		if err != nil {
-			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			if !origDomainMode {
+				rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			}
 			c.String(http.StatusInternalServerError, "create request: %v", err)
 			return
 		}
+		attachReplayBody(outReq, bodyReplay)
 
 		resp, err := roundTripFn(outReq, uc.Mode, uc.IPMode)
-		if err != nil && clientSentPlainHTTP && targetScheme == "https" && !cloudflare_ech.IsCertError(err) && config.IsOriginalDomainMode(host) {
+		if err != nil && clientSentPlainHTTP && targetScheme == "https" && !cloudflare_ech.IsCertError(err) && origDomainMode {
 			if bodyReplay != nil {
 				c.Request.Body = io.NopCloser(bytes.NewReader(bodyReplay))
 			}
 			if httpReq, herr := buildUpstreamRequestWithScheme(c, uc, "http", reqPort); herr == nil {
+				attachReplayBody(httpReq, bodyReplay)
 				if httpResp, herr2 := roundTripFn(httpReq, uc.Mode, uc.IPMode); herr2 == nil {
 					outReq, resp, err = httpReq, httpResp, nil
 					targetScheme = "http"
@@ -316,6 +337,7 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 					c.Request.Body = io.NopCloser(bytes.NewReader(bodyReplay))
 				}
 				if fbReq, herr := buildUpstreamRequestWithScheme(c, uc, targetScheme, reqPort); herr == nil {
+					attachReplayBody(fbReq, bodyReplay)
 					if fbResp, fberr := fbTransport.RoundTrip(fbReq); fberr == nil {
 						log.Printf("[%s] Direct connection failed for %s (%v), seamlessly fell back to upstream proxy (%s)", clientIP, uc.Host, err, GetFallbackProxy())
 						outReq, resp, err = fbReq, fbResp, nil
@@ -330,7 +352,9 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			if resp != nil && resp.Body != nil {
 				_ = resp.Body.Close()
 			}
-			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			if !origDomainMode {
+				rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			}
 			c.Header("Content-Type", "application/json; charset=utf-8")
 			c.Header("Cache-Control", "public, max-age=86400")
 			c.String(http.StatusOK, `{"version":3,"sources":[],"mappings":""}`)
@@ -346,7 +370,9 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 				return
 			}
 			log.Printf("[%s] Upstream request failed (%s): %v", clientIP, uc.Host, err)
-			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			if !origDomainMode {
+				rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+			}
 			if renderCertWarningIfMatch(c, uc.Host, err) {
 				return
 			}
@@ -359,7 +385,10 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			}
 		}()
 
-		cookie.DefaultJar.SaveResponseCookies(uc.Host, resp)
+		// PAC / 443 原域名模式下不写入内存 CookieJar，完全由浏览器自主存储与管理 Cookie
+		if !origDomainMode {
+			cookie.DefaultJar.SaveResponseCookies(uc.Host, resp)
+		}
 		debugLogf("[%s] %s %s -> %s (%s, %v)", clientIP, c.Request.Method, c.Request.URL.Path, uc.Host, resp.Status, time.Since(start))
 
 		port := reqPort
@@ -368,26 +397,29 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 			cookieDomain = host
 		}
 		effectiveRewriter := rewriter
-		if targetScheme == "http" && config.IsOriginalDomainMode(host) {
+		if origDomainMode {
 			effectiveRewriter = nil
 		}
 		prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, effectiveRewriter, port)
 
-		for hop := 0; hop < maxSelfRedirectHops && resp.StatusCode/100 == 3; hop++ {
-			loc := c.Writer.Header().Get("Location")
-			if loc == "" || !isSelfRedirect(loc, c.Request) {
-				break
+		// PAC / 443 原域名模式下完全透传上游 3xx 重定向，仅 8443 门户模式执行内部自我重定向熔断
+		if !origDomainMode {
+			for hop := 0; hop < maxSelfRedirectHops && resp.StatusCode/100 == 3; hop++ {
+				loc := c.Writer.Header().Get("Location")
+				if loc == "" || !isSelfRedirect(loc, c.Request) {
+					break
+				}
+				nextResp, ok := followSelfRedirect(c, outReq, resp, uc)
+				if !ok {
+					break
+				}
+				_ = resp.Body.Close()
+				resp = nextResp
+				outReq = nextResp.Request
+				cookie.DefaultJar.SaveResponseCookies(resp.Request.Host, resp)
+				clearHeaders(c.Writer.Header())
+				prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, effectiveRewriter, port)
 			}
-			nextResp, ok := followSelfRedirect(c, outReq, resp, uc)
-			if !ok {
-				break
-			}
-			_ = resp.Body.Close()
-			resp = nextResp
-			outReq = nextResp.Request
-			cookie.DefaultJar.SaveResponseCookies(resp.Request.Host, resp)
-			clearHeaders(c.Writer.Header())
-			prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, effectiveRewriter, port)
 		}
 
 		// 防御「孤儿 304」白屏：
@@ -395,6 +427,7 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 		// 自动剥离条件请求头并附加 Cache-Control: no-cache 向上游重拉一次完整的 200 OK 响应。
 		if resp.StatusCode == http.StatusNotModified && !hasConditionalHeaders(c.Request.Header) {
 			if retryReq, rerr := buildUpstreamRequestWithScheme(c, uc, targetScheme, reqPort); rerr == nil {
+				attachReplayBody(retryReq, bodyReplay)
 				stripConditionalHeaders(retryReq.Header)
 				retryReq.Header.Set("Cache-Control", "no-cache")
 				retryReq.Header.Set("Pragma", "no-cache")
@@ -402,7 +435,9 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 					_ = resp.Body.Close()
 					resp = retryResp
 					outReq = retryReq
-					cookie.DefaultJar.SaveResponseCookies(uc.Host, resp)
+					if !origDomainMode {
+						cookie.DefaultJar.SaveResponseCookies(uc.Host, resp)
+					}
 					clearHeaders(c.Writer.Header())
 					prepareResponseHeaders(c.Writer.Header(), resp.Header, uc, cookieDomain, c.Request, effectiveRewriter, port)
 				}
@@ -453,8 +488,14 @@ func buildUpstreamRequestWithScheme(c *gin.Context, uc config.UpstreamConfig, sc
 		return nil, err
 	}
 
-	cookie.DefaultJar.SaveClientCookies(uc.Host, c.Request)
-	rewrite.CopyHeaders(outReq.Header, c.Request.Header)
+	origDomainMode := config.IsOriginalDomainMode(c.Request.Host)
+	if origDomainMode {
+		// PAC / 443 原域名模式：完全透传客户端请求头（含原始 Cookie 头、CORS 预检头、安全头等），不经过内存 CookieJar 拦截重排
+		rewrite.CopyRawHeaders(outReq.Header, c.Request.Header)
+	} else {
+		cookie.DefaultJar.SaveClientCookies(uc.Host, c.Request)
+		rewrite.CopyHeaders(outReq.Header, c.Request.Header)
+	}
 	outReq.Header.Del("Proxy-Connection")
 	outReq.Header.Del("Proxy-Authenticate")
 	outReq.Header.Del("Proxy-Authorization")
@@ -471,19 +512,23 @@ func buildUpstreamRequestWithScheme(c *gin.Context, uc config.UpstreamConfig, sc
 	if _, ok := uc.Headers["X-Forwarded-Proto"]; !ok {
 		outReq.Header.Del("X-Forwarded-Proto")
 	}
-	if uc.Referer != "" {
-		outReq.Header.Set("Referer", uc.Referer)
+	if !origDomainMode {
+		if uc.Referer != "" {
+			outReq.Header.Set("Referer", uc.Referer)
+		}
+		rewrite.ApplyHeaderRules(outReq.Header, uc.Headers, true, c.Request)
 	}
-	rewrite.ApplyHeaderRules(outReq.Header, uc.Headers, true, c.Request)
 
 	outReq.Host = targetHost
 	outReq.ContentLength = c.Request.ContentLength
 
-	fixedCookie := cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile)
-	if fixedCookie != "" {
-		cookie.DefaultJar.Seed(uc.Host, fixedCookie)
+	if !origDomainMode {
+		fixedCookie := cookie.ReadFixedCookie(uc.Cookie, uc.CookieFile)
+		if fixedCookie != "" {
+			cookie.DefaultJar.Seed(uc.Host, fixedCookie)
+		}
+		cookie.DefaultJar.ApplyToRequestWithPriority(uc.Host, outReq, fixedCookie, uc.CookiePriority)
 	}
-	cookie.DefaultJar.ApplyToRequestWithPriority(uc.Host, outReq, fixedCookie, uc.CookiePriority)
 	return outReq, nil
 }
 
@@ -511,6 +556,12 @@ func consumeForceCertParam(reqURI, upstreamHost string) (string, bool) {
 }
 
 func prepareResponseHeaders(dst, src http.Header, uc config.UpstreamConfig, cookieDomain string, req *http.Request, rewriter func([]byte, string) []byte, port string) {
+	origDomainMode := req != nil && config.IsOriginalDomainMode(req.Host)
+	if origDomainMode {
+		// PAC / 443 原域名模式：100% 原样透传上游响应头（保留原始 Set-Cookie Domain、Location 重定向、CSP、CORS、ETag、Vary 等）
+		rewrite.CopyRawHeaders(dst, src)
+		return
+	}
 	rewrite.CopyHeaders(dst, src)
 	httpMode := req.TLS == nil && !strings.EqualFold(req.URL.Scheme, "https")
 	cookie.RewriteSetCookieHeaders(dst, cookieDomain, httpMode)
@@ -580,6 +631,10 @@ func clearHeaders(h http.Header) {
 }
 
 func needsBodyRewrite(c *gin.Context, requestHost string, uc config.UpstreamConfig, resp *http.Response, rewriter func([]byte, string) []byte, adScript *rewrite.AdScriptManager) bool {
+	// PAC / 443 原域名模式下永不缓冲或改写响应体，一律走流式直传
+	if config.IsOriginalDomainMode(requestHost) {
+		return false
+	}
 	if c.Request.Method == http.MethodHead ||
 		resp.StatusCode == http.StatusNoContent ||
 		resp.StatusCode == http.StatusNotModified ||
@@ -618,7 +673,7 @@ func sendResponseBody(c *gin.Context, requestHost string, uc config.UpstreamConf
 
 	rc := http.NewResponseController(c.Writer)
 
-	// 没有 adblock 需求且无需改写的请求，直接流式传输给客户端（首包预读校验防止 0 字节断流被当成 200 缓存）
+	// PAC / 443 原域名模式及无需改写的请求，一律直接流式传输给客户端（首包预读校验防止 0 字节断流被当成 200 缓存）
 	if !needsBodyRewrite(c, requestHost, uc, resp, rewriter, adScript) {
 		streamRemainingBody(c, rc, resp)
 		return
@@ -699,7 +754,9 @@ func streamRemainingBody(c *gin.Context, rc *http.ResponseController, resp *http
 	n, rerr := resp.Body.Read(buf)
 	if n == 0 && rerr != nil && !errors.Is(rerr, io.EOF) {
 		clearHeaders(c.Writer.Header())
-		rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+		if !config.IsOriginalDomainMode(c.Request.Host) {
+			rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+		}
 		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
 		c.String(http.StatusBadGateway, "upstream stream aborted before first byte: %v", rerr)
 		return

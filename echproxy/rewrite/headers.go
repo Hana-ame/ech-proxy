@@ -28,6 +28,9 @@ var (
 
 func isCORSOrSecurityHeader(key string) bool {
 	l := strings.ToLower(key)
+	if strings.HasPrefix(l, "access-control-request-") {
+		return false
+	}
 	return strings.HasPrefix(l, "access-control-") ||
 		strings.HasPrefix(l, "content-security-policy") ||
 		l == "cross-origin-resource-policy" ||
@@ -36,7 +39,21 @@ func isCORSOrSecurityHeader(key string) bool {
 		l == "timing-allow-origin"
 }
 
-// CopyHeaders 拷贝 HTTP 头，自动剥离 RFC 2616 逐跳头与上游自带的 CORS/CSP 限制头。
+// CopyRawHeaders 纯透传拷贝 HTTP 头，仅剥离 RFC 2616 逐跳传输头，
+// 完整保留请求与响应中的所有原始业务头（含 Cookie、Set-Cookie、Location、CSP、COOP/COEP/CORP 与 CORS 头）。
+// 专用于 PAC / 443 原域名模式的完全透传。
+func CopyRawHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		if hopByHopHeaders[http.CanonicalHeaderKey(k)] {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+}
+
+// CopyHeaders 拷贝 HTTP 头（用于 8443 门户模式），自动剥离 RFC 2616 逐跳头与上游自带的响应侧 CORS/CSP 限制头。
 func CopyHeaders(dst, src http.Header) {
 	for k, vs := range src {
 		if hopByHopHeaders[http.CanonicalHeaderKey(k)] || isCORSOrSecurityHeader(k) {
@@ -83,7 +100,7 @@ func appendVaryHeader(dst http.Header, token string) {
 	dst.Set("Vary", strings.Join(tokens, ", "))
 }
 
-// ApplyCORSHeaders 为响应注入完整的跨域许可头。
+// ApplyCORSHeaders 为响应注入完整的跨域许可头（仅用于 8443 门户模式与本地管理端点）。
 func ApplyCORSHeaders(dst http.Header, req *http.Request) {
 	var origin, reqHeaders string
 	if req != nil {

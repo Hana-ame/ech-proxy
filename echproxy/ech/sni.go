@@ -224,10 +224,37 @@ func extractRequestHost(req *http.Request) string {
 
 const maxBufferedReqBody = 1 << 20 // 1MB
 
+func ensureReplayableBody(req *http.Request) {
+	if req == nil || req.Body == nil || req.Body == http.NoBody || req.GetBody != nil {
+		return
+	}
+	if req.ContentLength < 0 || req.ContentLength > maxBufferedReqBody {
+		return
+	}
+	if b, err := io.ReadAll(io.LimitReader(req.Body, maxBufferedReqBody+1)); err == nil && len(b) <= maxBufferedReqBody {
+		_ = req.Body.Close()
+		req.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(b)), nil
+		}
+		req.Body = io.NopCloser(bytes.NewReader(b))
+	}
+}
+
+func rewindRequestBody(req *http.Request) {
+	if req != nil && req.GetBody != nil {
+		if b, err := req.GetBody(); err == nil {
+			req.Body = b
+		}
+	}
+}
+
 func cloneRequestForRace(req *http.Request, ctx context.Context, bodyBytes []byte) *http.Request {
 	clone := req.Clone(ctx)
 	if len(bodyBytes) > 0 {
 		clone.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		clone.GetBody = func() (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+		}
 	} else if req.Body == nil || req.Body == http.NoBody {
 		clone.Body = http.NoBody
 	}
@@ -264,6 +291,7 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 		return nil, fmt.Errorf("no transport modes to race for %s", host)
 	}
 	if len(modes) == 1 {
+		rewindRequestBody(req)
 		resp, err := doSingleMode(req, modes[0], normIPMode)
 		if err == nil && !isCloudflareRouteRejection(resp, modes[0]) && resp.StatusCode < 500 {
 			setCachedRoute(host, modes[0])
@@ -272,10 +300,18 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 	}
 
 	var bodyBytes []byte
-	if req.Body != nil && req.Body != http.NoBody {
+	if req.GetBody != nil {
+		if rc, err := req.GetBody(); err == nil {
+			bodyBytes, _ = io.ReadAll(io.LimitReader(rc, maxBufferedReqBody))
+			_ = rc.Close()
+		}
+	} else if req.Body != nil && req.Body != http.NoBody {
 		if b, err := io.ReadAll(io.LimitReader(req.Body, maxBufferedReqBody)); err == nil {
 			bodyBytes = b
 			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			req.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+			}
 		}
 	}
 
@@ -376,6 +412,7 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 		cancel()
 	}
 
+	rewindRequestBody(req)
 	if respDir, errDir := directDo(req, normIPMode); errDir == nil {
 		return respDir, nil
 	} else if IsCertError(errDir) {
@@ -391,6 +428,7 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 // RoundTrip 统一调度上游请求通道（供 PAC 方案、443 方案、8443 方案共同复用），并在所有 HTTPS 路径核对上游证书。
 func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	normIPMode := resolveEffectiveIPMode(ipMode)
+	ensureReplayableBody(req)
 
 	if req != nil && req.URL != nil && strings.EqualFold(req.URL.Scheme, "http") {
 		return PlainHTTPDo(req, normIPMode)
@@ -427,6 +465,7 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			clearCachedRoute(host)
 		}
+		rewindRequestBody(req)
 	}
 
 	// 2. 抑制并发风暴（Singleflight / In-Flight 去重）：
@@ -470,7 +509,8 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 		return nil, errFrag
 	}
 
-	// 第 2 步：若分片失败，立即尝试 SNI 伪装（如 apple.com / microsoft.com）
+	// 第 2 步：若分片失败，立即复原请求体并尝试 SNI 伪装（如 apple.com / microsoft.com）
+	rewindRequestBody(req)
 	respSNI, errSNI := SNIFrontDo(req, normIPMode)
 	if errSNI == nil && !isCloudflareRouteRejection(respSNI, "sni") && respSNI.StatusCode < 500 {
 		setCachedRoute(host, "sni")
@@ -484,6 +524,7 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	}
 
 	// 第 3 步：尝试 ECH 或多路竞速兜底
+	rewindRequestBody(req)
 	detected, _ := DetectTransportModeWithStatus(req.Context(), host, normIPMode)
 	modesToRace := []string{"sni", "ech"}
 	if detected == "ech" {
@@ -907,9 +948,12 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 	}
 
 	var lastErr error
-	for _, ip := range ips {
+	for i, ip := range ips {
 		if req.Context() != nil && req.Context().Err() != nil {
 			return nil, req.Context().Err()
+		}
+		if i > 0 {
+			rewindRequestBody(req)
 		}
 		cacheKey := tag + "|" + ip + "|" + effectiveSNI + "|" + host
 		dialFn := func(ctx context.Context, nextProtos []string) (*utls.UConn, error) {
@@ -928,6 +972,7 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 			return nil, err
 		}
 		if strings.Contains(err.Error(), "not h2") {
+			rewindRequestBody(req)
 			if resp1, err1 := getUTLSH1Client(cacheKey, dialFn).Do(req); err1 == nil {
 				return resp1, nil
 			} else {

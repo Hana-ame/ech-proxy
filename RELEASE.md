@@ -1,3 +1,19 @@
+## v3.5.27
+
+### Fixes & Improvements
+
+- **原域名模式（PAC / 443）彻底停止改写 Set-Cookie 与拦截 Cookie 头（代码级根治）**:
+  - **根因分析**：`ProxyHandlerWithConfig` 此前对所有宿主一视同仁——请求侧 `SaveClientCookies` 把浏览器 Cookie 灌进内存 `DefaultJar` 再 `ApplyToRequestWithPriority` 重排序并 `Header.Set("Cookie", ...)` 回写；响应侧 `RewriteSetCookieHeaders` 把上游 `Domain=.pixiv.net` 无条件替换成当前宿主（`accounts.pixiv.net`），并在 HTTP 模式下剥掉 `Secure`。在原域名模式下代理用的就是上游真实域名与真实证书，这两步纯属自毁：父域 Cookie 被裁成子域、登录态在 `www` 与 `accounts` 之间断链，且浏览器写入的条目被代理的字母序重排覆盖；
+  - **判定口径**：统一为 `config.IsOriginalDomainMode(host)`（非 8443 门户域名即原域名模式），请求侧与响应侧共用同一个布尔值，不再各处重复推导；
+  - **请求侧**：原域名模式下改走 `rewrite.CopyRawHeaders` 全量透传，不再 `SaveClientCookies`、不再 `Seed` 预置 Cookie、不再 `ApplyToRequestWithPriority`，浏览器原始 `Cookie` 头的内容与顺序原样上行；同时不再覆写 `Referer`、不再套用 `uc.Headers` 请求头规则；
+  - **响应侧**：`prepareResponseHeaders` 在原域名模式下直接 `CopyRawHeaders` 后返回，`RewriteSetCookieHeaders` 整条路径不可达——`Set-Cookie` 的 `Domain` / `Secure` / `SameSite` 与 `Location` / `CSP` / `COOP` / `ETag` / `Vary` 一律保持上游原样；`SaveResponseCookies`、自我重定向熔断、孤儿 304 重拉的 Cookie 写入点全部加上 `!origDomainMode` 闸门，内存 CookieJar 在原域名模式下彻底退出链路；
+  - **预置 Cookie 隔离**：`seedCookiesFromConfig` 只为门户域名条目播种，`certs/*/pixiv_cookie.txt` 之类不再污染原域名模式；
+  - **OPTIONS 预检**：`New443Engine` 摘除 `corsMiddleware`，`corsMiddleware` 自身在原域名模式（且非本地管理宿主）下直接 `c.Next()`——预检请求转发上游，不再被本地 204 短路，`Access-Control-Allow-*` 也不再由代理合成；
+  - **响应体**：`needsBodyRewrite` 在原域名模式下一律返回 `false`，直接流式直传，不缓冲、不注入、不改写；
+  - **请求体可重放**：`RoundTrip` 增加 `ensureReplayableBody`，分片 / SNI 伪装 / ECH 各通道切换前 `rewindRequestBody`，`ProxyHandler` 对所有请求（不再限于明文 HTTP）统一缓冲并 `attachReplayBody`——修复多通道降级重试时 `POST` 表单与登录请求体已被读空、上游收到空 body 的问题；
+  - **预检头误剥离**：`isCORSOrSecurityHeader` 不再把 `Access-Control-Request-Method` / `Access-Control-Request-Headers` 当受限头剥离；
+  - **回归测试**：新增 `TestOriginalDomainModeFullPassthroughCookiesHeadersRedirectsAndStream`——预置脏 Cookie 进 Jar，断言 `Set-Cookie`（含 `Domain=.pixiv.net; secure`）逐字节不变、`Location`/`CSP`/`COOP` 不丢、浏览器 `Cookie` 头顺序不被重排、`OPTIONS` 预检上行、响应体流式直出；`TestPassthrough...` 中原先断言 `Vary` 被追加 `Origin` 的用例同步改为断言 `Vary` 原样保留。
+
 ## v3.5.26
 
 ### Fixes & Improvements

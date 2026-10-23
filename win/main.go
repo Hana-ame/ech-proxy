@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Hana-ame/ech-proxy/echproxy"
+	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
 )
 
 const (
@@ -51,6 +52,13 @@ func FlagOverviewText() string {
 
   远程配置 Flag:
     -whitelist-url      自定义 pac.txt 代理白名单地址（默认 https://4545810.xyz/pac.txt）
+
+  诊断子命令（一次性真实请求，不启动监听、不改系统代理与 hosts）:
+    probe -host <域名>   逐通道诊断：direct / fragment / sni / ech / auto 各打一次并打印状态码与错误
+      -mode <通道>       只测指定通道（direct|fragment|sni|ech|auto）
+      -path <路径>       请求路径（默认 /）
+      -timeout <时长>    单通道超时（默认 20s）
+      例：ech-proxy probe -host steamcommunity.com -ip 4
 
   CA 证书与自动更新子命令 / Flag:
     ca install          一键安装本地 CA 根证书 (-ca-install)
@@ -100,6 +108,9 @@ type CLICommand struct {
 	LogDir           string
 	LogFile          string
 	NoLogFile        bool
+	ProbeHost        string
+	ProbePath        string
+	ProbeTimeout     time.Duration
 	Auth             *echproxy.AuthConfig
 }
 
@@ -164,6 +175,8 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 			subMode, restArgs = "portal", restArgs[1:]
 		case "check", "validate":
 			action, restArgs = "check", restArgs[1:]
+		case "probe", "diag":
+			action, restArgs = "probe", restArgs[1:]
 		case "pac":
 			action, restArgs = "pac", restArgs[1:]
 		case "version":
@@ -299,6 +312,9 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	caUninstall := fs.Bool("ca-uninstall", false, "卸载 CA")
 	allowConnect := fs.Bool("allow-connect", true, "允许 CONNECT")
 	connectMode := fs.String("connect-mode", echproxy.ConnectModeAuto, "CONNECT 模式")
+	probeHost := fs.String("host", getenv("ECH_PROXY_PROBE_HOST"), "probe: 目标域名")
+	probePath := fs.String("path", getenv("ECH_PROXY_PROBE_PATH"), "probe: 请求路径")
+	probeTimeout := fs.Duration("timeout", 20*time.Second, "probe: 单模式超时")
 	token := fs.String("token", getenv("ECH_PROXY_TOKEN"), "Token")
 	user := fs.String("user", getenv("ECH_PROXY_USER"), "User")
 	pass := fs.String("pass", getenv("ECH_PROXY_PASS"), "Pass")
@@ -478,6 +494,9 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		LogDir:           strings.TrimSpace(*logDir),
 		LogFile:          strings.TrimSpace(*logFile),
 		NoLogFile:        *noLogFile,
+		ProbeHost:        strings.TrimSpace(*probeHost),
+		ProbePath:        strings.TrimSpace(*probePath),
+		ProbeTimeout:     *probeTimeout,
 		Auth: &echproxy.AuthConfig{
 			Token:    strings.TrimSpace(*token),
 			Username: strings.TrimSpace(*user),
@@ -557,6 +576,8 @@ func runToolAction(cmd CLICommand, out io.Writer) int {
 			return 1
 		}
 		return 0
+	case "probe":
+		return runTransportProbe(cmd, out)
 	case "hosts-print":
 		cfg, _ := echproxy.LoadConfig(cmd.ConfigURL)
 		fmt.Fprint(out, echproxy.GenerateHostsBlock(cfg, "127.0.0.1"))
@@ -952,4 +973,96 @@ func openBrowser(url string) {
 	if err := cmd.Start(); err == nil {
 		echproxy.SafeGo("WaitBrowser", func() { _ = cmd.Wait() })
 	}
+}
+
+// probeDefaultModes 是 runTransportProbe 未指定 -mode 时依次尝试的通道顺序：
+// direct（原样直连）→ fragment（TCP 报文级分片）→ sni（伪装 SNI）→ ech → auto（三路竞速，即线上默认）。
+var probeDefaultModes = []string{"direct", "fragment", "sni", "ech", "auto"}
+
+// runTransportProbe 逐个通道打一次真实请求，用来定位「all transport modes failed」到底是哪条链路挂了。
+//
+//	ech-proxy probe -host steamcommunity.com
+//	ech-proxy probe -host steamcommunity.com -mode fragment -ip 4 -timeout 30s
+//
+// 只有 -host 必填；-mode 省略时按 probeDefaultModes 全跑一遍，逐个打印状态码与错误。
+// 该子命令不启动监听、不动系统代理、不碰 hosts，纯一次性诊断。
+func runTransportProbe(cmd CLICommand, out io.Writer) int {
+	host := strings.TrimSpace(cmd.ProbeHost)
+	if host == "" {
+		fmt.Fprintln(out, "ERROR: probe 需要 -host <域名>（例如：ech-proxy probe -host steamcommunity.com）")
+		return 2
+	}
+	host = strings.TrimPrefix(strings.TrimPrefix(strings.ToLower(host), "http://"), "https://")
+	if idx := strings.Index(host, "/"); idx >= 0 {
+		host = host[:idx]
+	}
+	ipMode := strings.TrimSpace(cmd.IPMode)
+	if ipMode == "" {
+		ipMode = "v4"
+	}
+	path := strings.TrimSpace(cmd.ProbePath)
+	if path == "" {
+		path = "/"
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	timeout := cmd.ProbeTimeout
+	if timeout <= 0 {
+		timeout = 20 * time.Second
+	}
+
+	if err := echproxy.InitECH(cmd.BootstrapIP, ipMode); err != nil {
+		fmt.Fprintf(out, "WARNING: InitECH failed (%v) — 继续，但 DoH 解析可能退化\n", err)
+	}
+
+	// -mode 未指定时 parseCLIArgs 会把默认运行方案写成 "smart"，和 "" / "auto" 一样都表示「全跑一遍」。
+	modes := probeDefaultModes
+	switch m := strings.ToLower(strings.TrimSpace(cmd.Mode)); m {
+	case "", "smart", "auto":
+	default:
+		modes = []string{m}
+	}
+
+	fmt.Fprintf(out, "probe https://%s%s  ipmode=%s  timeout=%v\n", host, path, ipMode, timeout)
+	fmt.Fprintf(out, "%-9s %-8s %-10s %s\n", "MODE", "STATUS", "LATENCY", "RESULT")
+	anyOK := false
+	for _, mode := range modes {
+		code, bytes, d, err := probeOnce(host, path, mode, ipMode, timeout)
+		if err != nil {
+			fmt.Fprintf(out, "%-9s %-8s %-10v FAIL %v\n", mode, "-", d.Truncate(time.Millisecond), err)
+			continue
+		}
+		anyOK = true
+		fmt.Fprintf(out, "%-9s %-8d %-10v OK %d bytes\n", mode, code, d.Truncate(time.Millisecond), bytes)
+	}
+	if !anyOK {
+		return 1
+	}
+	return 0
+}
+
+func probeOnce(host, path, mode, ipMode string, timeout time.Duration) (int, int64, time.Duration, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+path, nil)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	req.Host = host
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "*/*")
+	start := time.Now()
+	resp, err := cloudflare_ech.RoundTrip(req, mode, ipMode)
+	elapsed := time.Since(start)
+	if err != nil {
+		return 0, 0, elapsed, err
+	}
+	defer func() {
+		if resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+	return resp.StatusCode, n, elapsed, nil
 }

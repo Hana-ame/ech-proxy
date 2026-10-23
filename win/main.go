@@ -68,6 +68,8 @@ func FlagOverviewText() string {
   其他参数:
     -addr <host:port>   监听地址（PAC 方案默认 127.0.0.1:8443，支持任意非 443 端口）
     -hide-console       启动后隐藏控制台窗口到系统托盘
+    -fallback <代理>    上游代理兜底：直连分片被封时无感逃逸（443 方案下同样生效）
+                        例：-fallback 127.0.0.1:10809 / -fallback socks5://127.0.0.1:10808
     -no-tray            禁用系统托盘图标
     -local-ip <ip>      指定首选 DoH 引导 IP
     -v                  输出逐请求详细调试日志
@@ -105,6 +107,7 @@ type CLICommand struct {
 	BlocklistURL     string
 	AdScriptInterval time.Duration
 	NoAutoUpdate     bool
+	FallbackProxy    string
 	LogDir           string
 	LogFile          string
 	NoLogFile        bool
@@ -300,6 +303,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	updateNow := fs.Bool("update", false, "立即更新")
 	checkUpdateAlias := fs.Bool("check-update", false, "立即更新")
 	noAutoUpdate := fs.Bool("no-auto-update", envBool(getenv("ECH_PROXY_NO_AUTO_UPDATE")), "禁用自动更新")
+	fallbackProxy := fs.String("fallback", getenv("ECH_PROXY_FALLBACK"), "上游代理兜底（直连分片被封时无感逃逸，如 127.0.0.1:10809 / socks5://127.0.0.1:10808）")
 	logDir := fs.String("log-dir", getenv("ECH_PROXY_LOG_DIR"), "日志目录")
 	logFile := fs.String("log-file", getenv("ECH_PROXY_LOG_FILE"), "日志文件")
 	noLogFile := fs.Bool("no-log-file", envBool(getenv("ECH_PROXY_NO_LOG_FILE")), "禁用日志文件")
@@ -495,6 +499,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		BlocklistURL:     strings.TrimSpace(*blocklistURL),
 		AdScriptInterval: *adScriptInterval,
 		NoAutoUpdate:     noAutoUpd,
+		FallbackProxy:    strings.TrimSpace(*fallbackProxy),
 		LogDir:           strings.TrimSpace(*logDir),
 		LogFile:          strings.TrimSpace(*logFile),
 		NoLogFile:        *noLogFile,
@@ -853,12 +858,22 @@ func main() {
 		}
 	})
 
+	// 上游代理兜底：显式 -fallback 优先，且在 443 方案下同样生效。
+	// 兜底原本只来自「接管系统代理前的旧值」，443 方案根本不创建 SysProxyManager，
+	// 于是 443 模式下永远没有逃逸通道——本机有 v2ray/Clash 也用不上。
+	if fb := strings.TrimSpace(cmd.FallbackProxy); fb != "" {
+		echproxy.SetFallbackProxy(fb)
+		log.Printf("[fallback] upstream proxy configured explicitly: %s (fallback=%s)", fb, echproxy.GetFallbackProxy())
+	}
+
 	// 在 .*.443.exe 下（cmd.LocalProxy == true），只有 443 方案开启，系统代理、更新器、托盘等一律不运行
 	if !cmd.LocalProxy {
 		sysProxyMgr = NewSysProxyManager(actualListenAddr, nil)
 		sysProxyMgr.SetAllMode(cmd.AllMode)
-		if fb := sysProxyMgr.FallbackProxy(); fb != "" {
-			echproxy.SetFallbackProxy(fb)
+		if cmd.FallbackProxy == "" {
+			if fb := sysProxyMgr.FallbackProxy(); fb != "" {
+				echproxy.SetFallbackProxy(fb)
+			}
 		}
 		if srv.AdScript != nil {
 			srv.AdScript.SetOnWhitelistUpdated(func(domains []string) {
@@ -1030,7 +1045,11 @@ func runTransportProbe(cmd CLICommand, out io.Writer) int {
 		modes = []string{m}
 	}
 
-	fmt.Fprintf(out, "probe https://%s%s  ipmode=%s  timeout=%v\n", host, path, ipMode, timeout)
+	fb := echproxy.GetFallbackProxy()
+	if fb == "" {
+		fb = "(未配置，-fallback 可指定)"
+	}
+	fmt.Fprintf(out, "probe https://%s%s  ipmode=%s  timeout=%v  fallback=%s\n", host, path, ipMode, timeout, fb)
 	fmt.Fprintf(out, "%-9s %-8s %-10s %s\n", "MODE", "STATUS", "LATENCY", "RESULT")
 	anyOK := false
 	for _, mode := range modes {

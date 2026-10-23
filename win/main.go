@@ -55,7 +55,7 @@ func FlagOverviewText() string {
 
   诊断子命令（一次性真实请求，不启动监听、不改系统代理与 hosts）:
     probe -host <域名>   逐通道诊断：direct / fragment / sni / ech / auto 各打一次并打印状态码与错误
-      -mode <通道>       只测指定通道（direct|fragment|sni|ech|auto）
+      -transport <通道>  只测指定通道（direct|fragment|sni|ech|auto）
       -path <路径>       请求路径（默认 /）
       -timeout <时长>    单通道超时（默认 20s）
       例：ech-proxy probe -host steamcommunity.com -ip 4
@@ -109,6 +109,7 @@ type CLICommand struct {
 	LogFile          string
 	NoLogFile        bool
 	ProbeHost        string
+	ProbeMode        string
 	ProbePath        string
 	ProbeTimeout     time.Duration
 	Auth             *echproxy.AuthConfig
@@ -313,6 +314,9 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	allowConnect := fs.Bool("allow-connect", true, "允许 CONNECT")
 	connectMode := fs.String("connect-mode", echproxy.ConnectModeAuto, "CONNECT 模式")
 	probeHost := fs.String("host", getenv("ECH_PROXY_PROBE_HOST"), "probe: 目标域名")
+	// 注意：不能用全局 -mode。全局 -mode 只接受运行方案（smart/local/portal/http），
+	// 传 transport 名会被 parseCLIArgs 判为 unknown -mode 而直接报错退出。
+	probeMode := fs.String("transport", getenv("ECH_PROXY_PROBE_TRANSPORT"), "probe: 只测指定通道 (direct|fragment|sni|ech|auto)")
 	probePath := fs.String("path", getenv("ECH_PROXY_PROBE_PATH"), "probe: 请求路径")
 	probeTimeout := fs.Duration("timeout", 20*time.Second, "probe: 单模式超时")
 	token := fs.String("token", getenv("ECH_PROXY_TOKEN"), "Token")
@@ -495,6 +499,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		LogFile:          strings.TrimSpace(*logFile),
 		NoLogFile:        *noLogFile,
 		ProbeHost:        strings.TrimSpace(*probeHost),
+		ProbeMode:        strings.TrimSpace(*probeMode),
 		ProbePath:        strings.TrimSpace(*probePath),
 		ProbeTimeout:     *probeTimeout,
 		Auth: &echproxy.AuthConfig{
@@ -1016,10 +1021,11 @@ func runTransportProbe(cmd CLICommand, out io.Writer) int {
 		fmt.Fprintf(out, "WARNING: InitECH failed (%v) — 继续，但 DoH 解析可能退化\n", err)
 	}
 
-	// -mode 未指定时 parseCLIArgs 会把默认运行方案写成 "smart"，和 "" / "auto" 一样都表示「全跑一遍」。
+	// 通道选择走专用 -transport，不用全局 -mode（后者只接受运行方案名）。
+	// "" / "all" / "auto" / "smart" 都表示「全跑一遍」。
 	modes := probeDefaultModes
-	switch m := strings.ToLower(strings.TrimSpace(cmd.Mode)); m {
-	case "", "smart", "auto":
+	switch m := strings.ToLower(strings.TrimSpace(cmd.ProbeMode)); m {
+	case "", "all", "auto", "smart":
 	default:
 		modes = []string{m}
 	}

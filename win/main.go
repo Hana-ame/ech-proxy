@@ -778,6 +778,13 @@ func main() {
 		fmt.Fprintln(os.Stderr, FlagOverviewText())
 		os.Exit(2)
 	}
+	// 上游代理兜底必须在 action 分派之前生效：probe 等非服务类 action 不会进入 run()，
+	// 若放在 run() 内部，probe 拿到的 fallback 恒为空，「经上游代理可通」这条唯一出路会被漏诊。
+	if fb := strings.TrimSpace(cmd.FallbackProxy); fb != "" {
+		echproxy.SetFallbackProxy(fb)
+		log.Printf("[fallback] upstream proxy configured explicitly: %s (fallback=%s)", fb, echproxy.GetFallbackProxy())
+	}
+
 	if code := runToolAction(cmd, os.Stdout); code >= 0 {
 		os.Exit(code)
 	}
@@ -861,9 +868,9 @@ func main() {
 	// 上游代理兜底：显式 -fallback 优先，且在 443 方案下同样生效。
 	// 兜底原本只来自「接管系统代理前的旧值」，443 方案根本不创建 SysProxyManager，
 	// 于是 443 模式下永远没有逃逸通道——本机有 v2ray/Clash 也用不上。
+	// 幂等：main() 中通常已设置过，此处仅在服务启动时补齐（SetFallbackProxy 同值会提前返回）。
 	if fb := strings.TrimSpace(cmd.FallbackProxy); fb != "" {
 		echproxy.SetFallbackProxy(fb)
-		log.Printf("[fallback] upstream proxy configured explicitly: %s (fallback=%s)", fb, echproxy.GetFallbackProxy())
 	}
 
 	// 在 .*.443.exe 下（cmd.LocalProxy == true），只有 443 方案开启，系统代理、更新器、托盘等一律不运行
@@ -1053,13 +1060,17 @@ func runTransportProbe(cmd CLICommand, out io.Writer) int {
 	fmt.Fprintf(out, "%-9s %-8s %-10s %s\n", "MODE", "STATUS", "LATENCY", "RESULT")
 	anyOK := false
 	for _, mode := range modes {
-		code, bytes, d, err := probeOnce(host, path, mode, ipMode, timeout)
+		code, bytes, d, viaFallback, err := probeOnce(host, path, mode, ipMode, timeout)
 		if err != nil {
 			fmt.Fprintf(out, "%-9s %-8s %-10v FAIL %v\n", mode, "-", d.Truncate(time.Millisecond), err)
 			continue
 		}
 		anyOK = true
-		fmt.Fprintf(out, "%-9s %-8d %-10v OK %d bytes\n", mode, code, d.Truncate(time.Millisecond), bytes)
+		suffix := ""
+		if viaFallback {
+			suffix = fmt.Sprintf(" [via fallback %s]", echproxy.GetFallbackProxy())
+		}
+		fmt.Fprintf(out, "%-9s %-8d %-10v OK %d bytes%s\n", mode, code, d.Truncate(time.Millisecond), bytes, suffix)
 	}
 	if !anyOK {
 		return 1
@@ -1067,27 +1078,67 @@ func runTransportProbe(cmd CLICommand, out io.Writer) int {
 	return 0
 }
 
-func probeOnce(host, path, mode, ipMode string, timeout time.Duration) (int, int64, time.Duration, error) {
+const probeUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+// probeOnce 用指定通道打一次真实请求。viaFallback=true 表示该通道直连失败、
+// 结果实际来自上游兜底代理（-fallback），说明「本机可通，只是 ECH/分片链路被封」。
+func probeOnce(host, path, mode, ipMode string, timeout time.Duration) (code int, n int64, d time.Duration, viaFallback bool, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+path, nil)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, false, err
 	}
 	req.Host = host
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+	req.Header.Set("User-Agent", probeUserAgent)
 	req.Header.Set("Accept", "*/*")
 	start := time.Now()
 	resp, err := cloudflare_ech.RoundTrip(req, mode, ipMode)
 	elapsed := time.Since(start)
-	if err != nil {
-		return 0, 0, elapsed, err
+	if err == nil {
+		defer func() {
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+		}()
+		n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
+		return resp.StatusCode, n, elapsed, false, nil
 	}
-	defer func() {
-		if resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-	}()
-	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, 64*1024))
-	return resp.StatusCode, n, elapsed, nil
+
+	// 通道全挂时唯一出路是上游代理。不显式试一次就会得出「此站不可达」的假结论：
+	// 实测 manhuagui.com 的 107.189.8.124 在建连阶段就被黑洞，fragment/sni/race 全超时，
+	// 但经本机 v2ray (127.0.0.1:10809) 可在 1.5s 内拿到 301。
+	fbResp, fbErr, fbElapsed := probeViaFallback(host, path, timeout)
+	if fbErr == nil && fbResp != nil {
+		defer func() {
+			if fbResp.Body != nil {
+				_ = fbResp.Body.Close()
+			}
+		}()
+		fbn, _ := io.Copy(io.Discard, io.LimitReader(fbResp.Body, 64*1024))
+		return fbResp.StatusCode, fbn, fbElapsed, true, nil
+	}
+	if fbErr != nil {
+		return 0, 0, elapsed, false, fmt.Errorf("%w; fallback(%s) 也失败: %v", err, echproxy.GetFallbackProxy(), fbErr)
+	}
+	return 0, 0, elapsed, false, err
+}
+
+// probeViaFallback 经已配置的上游兜底代理发一次请求。未配置兜底时直接返回空，不视为失败。
+func probeViaFallback(host, path string, timeout time.Duration) (*http.Response, error, time.Duration) {
+	if echproxy.GetFallbackProxy() == "" {
+		return nil, nil, 0
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+host+path, nil)
+	if err != nil {
+		return nil, err, 0
+	}
+	req.Host = host
+	req.Header.Set("User-Agent", probeUserAgent)
+	req.Header.Set("Accept", "*/*")
+	start := time.Now()
+	resp, err := echproxy.FallbackRoundTrip(req)
+	return resp, err, time.Since(start)
 }

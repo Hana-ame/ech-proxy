@@ -113,6 +113,18 @@ func getFallbackTransport() http.RoundTripper {
 	return fallbackTransport
 }
 
+// FallbackRoundTrip 用已配置的上游兜底代理发起请求。
+// 未配置兜底时返回 (nil, nil)，调用方据此区分「没有兜底」与「兜底也失败」。
+// 诊断工具（probe）走的是 cloudflare_ech.RoundTrip，不经过本文件的 handler 兜底链路，
+// 必须显式调用本函数才能验证「经上游代理是否可通」。
+func FallbackRoundTrip(req *http.Request) (*http.Response, error) {
+	rt := getFallbackTransport()
+	if rt == nil {
+		return nil, nil
+	}
+	return rt.RoundTrip(req)
+}
+
 func parseFallbackProxyURL(raw string) *url.URL {
 	raw = strings.TrimSpace(raw)
 	if raw == "" || strings.EqualFold(raw, "direct") {

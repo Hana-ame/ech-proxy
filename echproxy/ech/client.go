@@ -361,7 +361,10 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 				echFlightMu.Unlock()
 			}()
 
-			resolveCtx, resolveCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			// 拉取预算对齐 OpTimeout（5 分钟）而不是 10 秒：DoH 节点偶发
+			// 「连接被远端强制关闭」时抖动窗口可达几十秒~几分钟，10 秒的
+			// 硬上限会把 doFetchECHConfig 里的重试预算整体掐死（见其注释）。
+			resolveCtx, resolveCancel := context.WithTimeout(context.Background(), netdial.OpTimeout)
 			defer resolveCancel()
 
 			call.cfg, call.err = doFetchECHConfig(resolveCtx, domain)
@@ -377,67 +380,131 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 	}
 }
 
+// doFetchECHConfig 拉取 domain 的 ECH 配置（type=65 SVCB），带指数退避重试。
+//
+// 为什么不用 netdial.Retry 的固定 3 次 × 1.5s 预算：DoH 节点偶发「连接被
+// 远端强制关闭」（Cloudflare 边缘 RST / 本地网络抖动，Windows 上表现为
+// wsarecv: An existing connection was forcibly closed by the remote host）时，
+// 抖动窗口可持续几十秒~几分钟，固定预算（约 4.5 秒）会让 ECH 初始化整体失败、
+// 代理直接启动不起来。这里把预算拉到约 2 分钟（8 次尝试、退避翻倍封顶 30s），
+// 配合 QueryDoH 内部「首选 → 1.1.1.1 → 223.5.5.5」三级回退，窗口内基本自愈。
+const (
+	echFetchAttempts    = 8
+	echFetchMaxBackoff  = 30 * time.Second
+)
+
 func doFetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 	dohURL := currentConfig().dohURL
-	return netdial.Retry(ctx, netdial.RetryAttempts, netdial.RetryBackoff, func() ([]byte, error) {
-		resp, err := QueryDoH(ctx, domain, 65)
+	cfg, err := retryExponential(ctx, echFetchAttempts, netdial.RetryBackoff, echFetchMaxBackoff, func() ([]byte, error) {
+		return fetchECHConfigOnce(ctx, domain)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("DoH %s (after %d attempts): %w", dohURL, echFetchAttempts, err)
+	}
+	return cfg, nil
+}
+
+// retryExponential retries fn up to attempts times, sleeping backoff between
+// failures (doubling each round, capped at maxBackoff; cancellable via ctx).
+// Returns the first success, or the last error.
+func retryExponential(ctx context.Context, attempts int, baseBackoff, maxBackoff time.Duration, fn func() ([]byte, error)) ([]byte, error) {
+	var last error
+	backoff := baseBackoff
+	for i := 0; i < attempts; i++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if i > 0 {
+			if !sleepCtx(ctx, backoff) {
+				return nil, ctx.Err()
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+		v, err := fn()
+		if err == nil {
+			return v, nil
+		}
+		last = err
+	}
+	return nil, last
+}
+
+// sleepCtx sleeps for d while respecting ctx cancellation; returns false if cancelled.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// fetchECHConfigOnce 单次拉取：QueryDoH（内部自带首选/1.1.1.1/223.5.5.5 回退）
+// → 解析 ech= SvcParam（base64），失败回退 SVCB wire 格式。
+func fetchECHConfigOnce(ctx context.Context, domain string) ([]byte, error) {
+	dohURL := currentConfig().dohURL
+	resp, err := QueryDoH(ctx, domain, 65)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("DoH %s status %d", dohURL, resp.StatusCode)
+	}
+	var d dohResponse
+	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
+		return nil, err
+	}
+	for _, ans := range d.Answer {
+		if ans.Type != 65 {
+			continue
+		}
+		var cfg []byte
+		if m := echSvcParamRE.FindStringSubmatch(ans.Data); len(m) > 1 {
+			cfg, err = base64.StdEncoding.DecodeString(m[1])
+		} else if m := wsvcWireRE.FindStringSubmatch(ans.Data); len(m) > 1 {
+			var wire []byte
+			wire, err = hex.DecodeString(nonHexRE.ReplaceAllString(m[2], ""))
+			if err == nil {
+				cfg, err = parseSVCBWire(wire)
+			}
+		}
 		if err != nil {
 			return nil, err
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("DoH %s status %d", dohURL, resp.StatusCode)
-		}
-		var d dohResponse
-		if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-			return nil, err
-		}
-		for _, ans := range d.Answer {
-			if ans.Type != 65 {
-				continue
+		if len(cfg) > 0 {
+			ttl := ans.TTL
+			if ttl < minTTL {
+				ttl = minTTL
+			} else if ttl > maxTTL {
+				ttl = maxTTL
 			}
-			var cfg []byte
-			if m := echSvcParamRE.FindStringSubmatch(ans.Data); len(m) > 1 {
-				cfg, err = base64.StdEncoding.DecodeString(m[1])
-			} else if m := wsvcWireRE.FindStringSubmatch(ans.Data); len(m) > 1 {
-				var wire []byte
-				wire, err = hex.DecodeString(nonHexRE.ReplaceAllString(m[2], ""))
-				if err == nil {
-					cfg, err = parseSVCBWire(wire)
+			cacheMu.Lock()
+			if len(cache) >= maxECHCacheSize {
+				now := time.Now()
+				for k, v := range cache {
+					if now.After(v.expiry) {
+						delete(cache, k)
+					}
 				}
-			}
-			if err != nil {
-				return nil, err
-			}
-			if len(cfg) > 0 {
-				ttl := ans.TTL
-				if ttl < minTTL {
-					ttl = minTTL
-				} else if ttl > maxTTL {
-					ttl = maxTTL
-				}
-				cacheMu.Lock()
 				if len(cache) >= maxECHCacheSize {
-					now := time.Now()
-					for k, v := range cache {
-						if now.After(v.expiry) {
-							delete(cache, k)
-						}
-					}
-					if len(cache) >= maxECHCacheSize {
-						for k := range cache {
-							delete(cache, k)
-							break
-						}
+					for k := range cache {
+						delete(cache, k)
+						break
 					}
 				}
-				cache[domain] = &echEntry{config: cfg, expiry: time.Now().Add(time.Duration(ttl) * time.Second)}
-				cacheMu.Unlock()
-				return cfg, nil
 			}
+			cache[domain] = &echEntry{config: cfg, expiry: time.Now().Add(time.Duration(ttl) * time.Second)}
+			cacheMu.Unlock()
+			return cfg, nil
 		}
-		return nil, fmt.Errorf("no ECH config found for %s", domain)
-	})
+	}
+	return nil, fmt.Errorf("no ECH config found for %s", domain)
 }
 
 func parseSVCBWire(wire []byte) ([]byte, error) {

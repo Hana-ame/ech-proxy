@@ -3,6 +3,7 @@ package cloudflare_ech
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -392,5 +393,77 @@ func TestPixivLiveRoundTrip(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("Pixiv status = %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestRetryExponentialSurvivesMoreThanThreeFailures 回归用例：DoH 偶发
+// 「连接被远端强制关闭」（wsarecv connection reset）时，旧实现固定 3 次 ×
+// 1.5s 预算（约 4.5 秒）不足以覆盖几十秒~几分钟的抖动窗口，导致 ECH 初始化
+// 整体失败、代理起不来。本用例验证新实现能重试超过 3 次（5 连败后第 6 次成功）。
+func TestRetryExponentialSurvivesMoreThanThreeFailures(t *testing.T) {
+	failures := 0
+	got, err := retryExponential(context.Background(), 10, time.Millisecond, 4*time.Millisecond, func() ([]byte, error) {
+		failures++
+		if failures < 6 {
+			return nil, errors.New("connection reset by peer")
+		}
+		return []byte("ok"), nil
+	})
+	if err != nil {
+		t.Fatalf("retryExponential = %v, want success after >3 failures", err)
+	}
+	if string(got) != "ok" {
+		t.Fatalf("got %q, want ok", got)
+	}
+	if failures != 6 {
+		t.Fatalf("attempts = %d, want 6 (must retry beyond the old 3)", failures)
+	}
+}
+
+// TestRetryExponentialGivesUpAfterConfiguredAttempts 验证退避封顶与尝试次数上限：
+// 全程失败时返回最后一次错误，且尝试次数不超过 echFetchAttempts。
+func TestRetryExponentialGivesUpAfterConfiguredAttempts(t *testing.T) {
+	attempts := 0
+	_, err := retryExponential(context.Background(), echFetchAttempts, time.Millisecond, 2*time.Millisecond, func() ([]byte, error) {
+		attempts++
+		return nil, errors.New("boom")
+	})
+	if err == nil || err.Error() != "boom" {
+		t.Fatalf("err = %v, want boom", err)
+	}
+	if attempts != echFetchAttempts {
+		t.Fatalf("attempts = %d, want echFetchAttempts=%d", attempts, echFetchAttempts)
+	}
+}
+
+// TestRetryExponentialRespectsContextCancel 验证退避等待期间 ctx 取消会立即返回。
+// 用 firstCall 通道 + 超长退避保证 cancel 必然落在第一次退避等待中（确定性，
+// 不依赖墙钟竞速）。
+func TestRetryExponentialRespectsContextCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	firstCall := make(chan struct{})
+	calls := 0
+	done := make(chan struct{})
+	var err error
+	go func() {
+		_, err = retryExponential(ctx, 10, time.Hour, time.Hour, func() ([]byte, error) {
+			calls++
+			close(firstCall)
+			return nil, errors.New("reset")
+		})
+		close(done)
+	}()
+	<-firstCall // 第一次失败已发生，函数正处于 1 小时的退避等待中
+	cancel()
+	select {
+	case <-done:
+		if err != context.Canceled {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("retryExponential did not return after ctx cancel")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 (cancelled during backoff, no second attempt)", calls)
 	}
 }

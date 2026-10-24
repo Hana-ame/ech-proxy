@@ -60,6 +60,22 @@ func FlagOverviewText() string {
       -timeout <时长>    单通道超时（默认 20s）
       例：ech-proxy probe -host steamcommunity.com -ip 4
 
+    diag -test <功能>    一次只测一个功能，把「all transport modes failed」拆到具体层
+      dns       DoH 解析：列出解析到的 IP 与所用 DoH 端点
+      tcp       逐 IP 建连计时：区分黑洞(timeout) / RST / refused
+      tls       TLS 握手：版本、套件、ALPN、证书签发者与 hostname 校验（-sni real|fake）
+      http      单通道完整 GET 并打印响应头（-transport 选通道）
+      transport 逐通道 HTTP（等价于 probe）
+      cookie    原域名模式 Set-Cookie 透传：Domain 是否被改写成请求 host
+      fallback  只测上游兜底代理（-fallback）能否打通
+      config    拉取/校验上游配置，打印目标域名命中的 upstream
+      pac       目标域名在 PAC 白名单里是否命中
+      all       依次跑 dns → tcp → tls → http → fallback
+      例：ech-proxy diag -test dns -host manhuagui.com -ip 4
+          ech-proxy diag -test tls -host manhuagui.com -sni fake
+          ech-proxy diag -test cookie -host www.pixiv.net
+          ech-proxy diag -test fallback -host manhuagui.com -fallback 127.0.0.1:10809
+
   CA 证书与自动更新子命令 / Flag:
     ca install          一键安装本地 CA 根证书 (-ca-install)
     ca uninstall        一键卸载本地 CA 根证书 (-ca-uninstall)
@@ -115,6 +131,10 @@ type CLICommand struct {
 	ProbeMode        string
 	ProbePath        string
 	ProbeTimeout     time.Duration
+	DiagTest         string
+	DiagPort         int
+	DiagSNI          string
+	DiagCookie       string
 	Auth             *echproxy.AuthConfig
 }
 
@@ -179,8 +199,10 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 			subMode, restArgs = "portal", restArgs[1:]
 		case "check", "validate":
 			action, restArgs = "check", restArgs[1:]
-		case "probe", "diag":
+		case "probe":
 			action, restArgs = "probe", restArgs[1:]
+		case "diag", "test":
+			action, restArgs = "diag", restArgs[1:]
 		case "pac":
 			action, restArgs = "pac", restArgs[1:]
 		case "version":
@@ -323,6 +345,10 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	probeMode := fs.String("transport", getenv("ECH_PROXY_PROBE_TRANSPORT"), "probe: 只测指定通道 (direct|fragment|sni|ech|auto)")
 	probePath := fs.String("path", getenv("ECH_PROXY_PROBE_PATH"), "probe: 请求路径")
 	probeTimeout := fs.Duration("timeout", 20*time.Second, "probe: 单模式超时")
+	diagTest := fs.String("test", getenv("ECH_PROXY_DIAG_TEST"), "diag: 要单独测试的功能 (dns|tcp|tls|http|transport|cookie|fallback|config|pac|all)")
+	diagPort := fs.Int("port", 0, "diag: 目标端口（默认 443）")
+	diagSNI := fs.String("sni", getenv("ECH_PROXY_DIAG_SNI"), "diag: tls 测试用真实 SNI(real) 还是伪装 SNI(fake)")
+	diagCookie := fs.String("cookie", getenv("ECH_PROXY_DIAG_COOKIE"), "diag: cookie 测试携带的请求 Cookie 头")
 	token := fs.String("token", getenv("ECH_PROXY_TOKEN"), "Token")
 	user := fs.String("user", getenv("ECH_PROXY_USER"), "User")
 	pass := fs.String("pass", getenv("ECH_PROXY_PASS"), "Pass")
@@ -507,6 +533,10 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		ProbeMode:        strings.TrimSpace(*probeMode),
 		ProbePath:        strings.TrimSpace(*probePath),
 		ProbeTimeout:     *probeTimeout,
+		DiagTest:         strings.TrimSpace(*diagTest),
+		DiagPort:         *diagPort,
+		DiagSNI:          strings.TrimSpace(*diagSNI),
+		DiagCookie:       strings.TrimSpace(*diagCookie),
 		Auth: &echproxy.AuthConfig{
 			Token:    strings.TrimSpace(*token),
 			Username: strings.TrimSpace(*user),
@@ -588,6 +618,8 @@ func runToolAction(cmd CLICommand, out io.Writer) int {
 		return 0
 	case "probe":
 		return runTransportProbe(cmd, out)
+	case "diag":
+		return runDiag(cmd, out)
 	case "hosts-print":
 		cfg, _ := echproxy.LoadConfig(cmd.ConfigURL)
 		fmt.Fprint(out, echproxy.GenerateHostsBlock(cfg, "127.0.0.1"))

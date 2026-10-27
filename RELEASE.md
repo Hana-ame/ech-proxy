@@ -1,3 +1,23 @@
+## v3.5.29
+
+### Fixes & Improvements
+
+- **Cloudflare 托管质询（`403` + `cf-mitigated: challenge`）不再被当成路由拒绝丢弃——PAC / 443 下 CF WAF 站点恢复可用**:
+  - **现象**：真实浏览器直连 `https://forums.e-hentai.org/` 正常；开启 PAC / 443 后同一站点拿不到质询页，日志只剩 `all transport modes failed ... race: cloudflare route rejection status 403`，浏览器侧表现为 502 或永远 403。
+  - **根因**：`isCloudflareRouteRejection` 把 `403` 且带 `cf-mitigated: challenge` 的响应当作「CF 边缘不认识该 Host」的路由拒绝（该分支由 49e15bb 引入）。但质询页是**正常业务响应**，必须原样交给浏览器执行 JS 去解；一旦被吞掉，代理会依次回退 fragment / sni，而这些通道在被墙线路上直接 RST，最终 `all transport modes failed`——质询根本没机会发生。
+  - **修复口径**：`403` 只在**不带** `cf-mitigated: challenge` 时才算路由拒绝（真正的域前置拒绝）；带质询标记的 403 原样上行。改动位置 `echproxy/ech/sni.go` 的 `isCloudflareRouteRejection`，`echproxy/ech/route_rejection_test.go` 覆盖三种情形（challenge 403 放行 / 普通 403 兜底 / 521-530、421 仍判拒绝）。
+  - **本机实测（2026-10-27，WSL，443 方案二进制直接监听 127.0.0.1:443，Chromium 非 headless，`MAP forums.e-hentai.org 127.0.0.1` + 忽略本地 CA 证书）**：
+
+    | 观测点 | 修复前（v3.5.28） | 修复后 |
+    |---|---|---|
+    | `GET /` | `all transport modes failed ... route rejection status 403`（无质询页） | `403 Forbidden`（质询页原样到达浏览器） |
+    | `POST /cdn-cgi/challenge-platform/.../fo/...` | 从未发生 | `200`（两次） |
+    | 质询完成后 `POST /` | 未发生 | `200` |
+    | 页面标题 | 错误页 | `E-Hentai Forums`（完整论坛首页） |
+    | Cookie | — | `cf_clearance` / `ipb_session_id` 均为 `Domain=.e-hentai.org`，原样透传未改写 |
+
+  - **边界**：本改动只影响「响应分类」，不碰 Cookie 处理——PAC / 443 仍按 v3.5.27 的口径原样透传请求与 `Set-Cookie`；8443 门户方案的 Jar 路径未改动。`TestNyaaFragmentDo` 在本机与基线同样失败（nyaa.si 对该出口 RST），与本改动无关。
+
 ## v3.5.28
 
 ### Fixes & Improvements

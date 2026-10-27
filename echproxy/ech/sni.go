@@ -603,9 +603,12 @@ func isCloudflareRouteRejection(resp *http.Response, mode ...string) bool {
 	case 521, 522, 523, 525, 530, 421:
 		return true
 	case 403:
-		if strings.EqualFold(resp.Header.Get("cf-mitigated"), "challenge") {
-			return true
-		}
+		// cf-mitigated: challenge 是 Cloudflare 的托管质询页，属于正常业务响应：
+		// 必须原样交给浏览器执行 JS 解质询，绝不能当路由拒绝丢弃重试（那会变成
+		// 「浏览器看到 502 / 永远 403」，而真实浏览器直连是正常的）。
+		// 只有不带质询标记的 403（典型是 CF 边缘不认识该 Host 的域前置拒绝）才
+		// 视为路由拒绝，交给其它通道兜底。
+		return !strings.EqualFold(resp.Header.Get("cf-mitigated"), "challenge")
 	}
 	return false
 }

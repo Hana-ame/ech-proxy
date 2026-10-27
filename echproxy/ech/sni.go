@@ -293,7 +293,7 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 	if len(modes) == 1 {
 		rewindRequestBody(req)
 		resp, err := doSingleMode(req, modes[0], normIPMode)
-		if err == nil && !isCloudflareRouteRejection(resp, modes[0]) && resp.StatusCode < 500 {
+		if err == nil {
 			setCachedRoute(host, modes[0])
 		}
 		return resp, err
@@ -329,18 +329,11 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 				resCh <- raceResult{mode: mode, resp: nil, err: err}
 				return
 			}
-			if isCloudflareRouteRejection(resp, mode) {
-				_ = resp.Body.Close()
-				resCh <- raceResult{mode: mode, resp: nil, err: fmt.Errorf("cloudflare route rejection status %d", resp.StatusCode)}
-				return
-			}
 			resCh <- raceResult{mode: mode, resp: resp, err: nil}
 		}()
 	}
 
 	var lastErr error
-	var fallback5xxResp *http.Response
-	var fallback5xxMode string
 	pending := len(modes)
 
 	for pending > 0 {
@@ -356,58 +349,33 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 				lastErr = res.err
 				continue
 			}
-			if res.resp.StatusCode < 500 {
-				// 取消落后/失败分支的 context，但保留优胜分支的 context 直到 Response.Body 被完全读取并 Close，
-				// 避免在传输流读取期间因为取消上下文导致流中断（ERR_CONTENT_LENGTH_MISMATCH / 错误返回200）。
-				winnerCancel := racers[res.mode]
-				delete(racers, res.mode)
-				for _, cancel := range racers {
-					cancel()
+			// 只要拿到响应就原样透传：取消落后/失败分支的 context，但保留优胜分支的
+			// context 直到 Response.Body 被完全读取并 Close，避免在传输流读取期间
+			// 因为取消上下文导致流中断（ERR_CONTENT_LENGTH_MISMATCH / 错误返回200）。
+			winnerCancel := racers[res.mode]
+			delete(racers, res.mode)
+			for _, cancel := range racers {
+				cancel()
+			}
+			if winnerCancel != nil && res.resp.Body != nil {
+				res.resp.Body = &bodyCloseNotifier{
+					ReadCloser: res.resp.Body,
+					onClose:    winnerCancel,
 				}
-				if winnerCancel != nil && res.resp.Body != nil {
-					res.resp.Body = &bodyCloseNotifier{
-						ReadCloser: res.resp.Body,
-						onClose:    winnerCancel,
+			}
+			go func(rem int) {
+				for i := 0; i < rem; i++ {
+					r := <-resCh
+					if r.resp != nil && r.resp.Body != nil {
+						_ = r.resp.Body.Close()
 					}
 				}
+			}(pending)
 
-				go func(rem int) {
-					for i := 0; i < rem; i++ {
-						r := <-resCh
-						if r.resp != nil && r.resp.Body != nil {
-							_ = r.resp.Body.Close()
-						}
-					}
-				}(pending)
-
-				setCachedRoute(host, res.mode)
-				return res.resp, nil
-			}
-			if fallback5xxResp == nil {
-				fallback5xxResp = res.resp
-				fallback5xxMode = res.mode
-			} else {
-				_ = res.resp.Body.Close()
-			}
+			setCachedRoute(host, res.mode)
+			return res.resp, nil
 		}
 	}
-
-	if fallback5xxResp != nil {
-		winnerCancel := racers[fallback5xxMode]
-		delete(racers, fallback5xxMode)
-		for _, cancel := range racers {
-			cancel()
-		}
-		if winnerCancel != nil && fallback5xxResp.Body != nil {
-			fallback5xxResp.Body = &bodyCloseNotifier{
-				ReadCloser: fallback5xxResp.Body,
-				onClose:    winnerCancel,
-			}
-		}
-		setCachedRoute(host, fallback5xxMode)
-		return fallback5xxResp, nil
-	}
-
 	for _, cancel := range racers {
 		cancel()
 	}
@@ -453,7 +421,7 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	// 1. 若当前域名已有命中的历史成功路由缓存，直接使用该模式，零并发开销
 	if cached, ok := getCachedRoute(host); ok {
 		resp, err := doSingleMode(req, cached, normIPMode)
-		if err == nil && !isCloudflareRouteRejection(resp, cached) && resp.StatusCode < 500 {
+		if err == nil {
 			return resp, nil
 		}
 		if resp != nil {
@@ -498,7 +466,7 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	// 3. 智能路由探测：三路机制依次尝试，绝不半途放弃（Fragment 分片 -> SNI 伪装 -> ECH / 并发竞速）
 	// 第 1 步：优先尝试单连接 TLS/TCP 记录分片（fragment）
 	respFrag, errFrag := FragmentDo(req, normIPMode)
-	if errFrag == nil && !isCloudflareRouteRejection(respFrag, "fragment") && respFrag.StatusCode < 500 {
+	if errFrag == nil {
 		setCachedRoute(host, "fragment")
 		return respFrag, nil
 	}
@@ -512,7 +480,7 @@ func RoundTrip(req *http.Request, mode, ipMode string) (*http.Response, error) {
 	// 第 2 步：若分片失败，立即复原请求体并尝试 SNI 伪装（如 apple.com / microsoft.com）
 	rewindRequestBody(req)
 	respSNI, errSNI := SNIFrontDo(req, normIPMode)
-	if errSNI == nil && !isCloudflareRouteRejection(respSNI, "sni") && respSNI.StatusCode < 500 {
+	if errSNI == nil {
 		setCachedRoute(host, "sni")
 		return respSNI, nil
 	}
@@ -590,27 +558,6 @@ func doSingleMode(req *http.Request, mode, ipMode string) (*http.Response, error
 	default:
 		return Do(req, ipMode)
 	}
-}
-
-func isCloudflareRouteRejection(resp *http.Response, mode ...string) bool {
-	if len(mode) > 0 && mode[0] != "ech" && mode[0] != "" {
-		return false
-	}
-	if resp == nil {
-		return true
-	}
-	switch resp.StatusCode {
-	case 521, 522, 523, 525, 530, 421:
-		return true
-	case 403:
-		// cf-mitigated: challenge 是 Cloudflare 的托管质询页，属于正常业务响应：
-		// 必须原样交给浏览器执行 JS 解质询，绝不能当路由拒绝丢弃重试（那会变成
-		// 「浏览器看到 502 / 永远 403」，而真实浏览器直连是正常的）。
-		// 只有不带质询标记的 403（典型是 CF 边缘不认识该 Host 的域前置拒绝）才
-		// 视为路由拒绝，交给其它通道兜底。
-		return !strings.EqualFold(resp.Header.Get("cf-mitigated"), "challenge")
-	}
-	return false
 }
 
 type ipCacheEntry struct {

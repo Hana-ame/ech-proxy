@@ -1,3 +1,12 @@
+## v3.5.30
+
+### Fixes & Improvements
+
+- **彻底取消「按响应分类判定路由拒绝」：只要上游有 HTTP 响应就原样透传，只有传输层失败（RST / 超时 / 无响应 / 证书错误）才换通道**:
+  - **v3.5.29 的口径被推翻**：v3.5.29 只把「`403` + `cf-mitigated: challenge`」从路由拒绝里放行，但仍保留了按状态码/响应头分类的 `isCloudflareRouteRejection`（`403` 无质询标记、`521/522/523/525/530/421` 仍会被当作拒绝丢弃并换通道）。这仍然可能在响应已经返回时把页面吞掉——任何 `403`/`5xx` 都是 Cloudflare 或源站给出的**真实响应**，浏览器应当看到它（质询页可以解、拒绝页可以展示原因），而不是由代理猜"这不是正常响应"然后丢弃。
+  - **新口径**：`RoundTrip` / `raceModes` 的每一条通道，**`err == nil` 即透传并缓存该通道**；只有 `err != nil`（连接被 RST、超时、无响应、证书校验失败）才走下一通道或并发竞速。`isCloudflareRouteRejection` 整体删除，连带 v3.5.29 新增的 `route_rejection_test.go` 一并移除。
+  - **实测（2026-10-27，WSL，443 方案监听 127.0.0.1:443，非 headless Chromium + `MAP forums.e-hentai.org 127.0.0.1` + 忽略本地 CA）**：`GET /` → `403` 质询页透传 → `POST /cdn-cgi/challenge-platform/.../fo/...` `200` ×2 → `POST /` `200` → 标题 `E-Hentai Forums`；`cf_clearance` / `ipb_session_id` 均为 `Domain=.e-hentai.org` 原样透传。
+
 ## v3.5.29
 
 ### Fixes & Improvements

@@ -234,3 +234,22 @@ func TestWithInsideDoHPreventsDoHResolverRecursion(t *testing.T) {
 		t.Errorf("expected DoHResolver to be called exactly once, got %d", resolverCalls)
 	}
 }
+
+// TestDomesticBootstrapFallbackGate 验证 issue #41：
+// 国内 DoH 端点默认只作为「主端点优先窗口」失败后的最后兜底，可显式禁用。
+func TestDomesticBootstrapFallbackGate(t *testing.T) {
+	t.Setenv("ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP", "")
+	if !domesticBootstrapAllowed() {
+		t.Error("domestic last-resort fallback must be allowed by default (needed behind blocked 1.1.1.1)")
+	}
+	for _, v := range []string{"1", "true", "YES", "on"} {
+		t.Setenv("ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP", v)
+		if domesticBootstrapAllowed() {
+			t.Errorf("ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP=%q must disable domestic fallback", v)
+		}
+	}
+	t.Setenv("ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP", "0")
+	if !domesticBootstrapAllowed() {
+		t.Error("value '0' must keep domestic fallback enabled")
+	}
+}

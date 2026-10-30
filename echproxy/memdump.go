@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -217,7 +218,55 @@ func DumpMemory(reason string, srv *Server, logMgr *logger.Manager) string {
 	summary := fmt.Sprintf("已转储内存诊断报告至: %s (HeapAlloc: %.2f MB, Goroutines: %d)",
 		filepath.Base(txtPath), float64(m.Alloc)/1024/1024, numGoroutines)
 	log.Printf("[MemDump] %s", summary)
+
+	// 9. 轮转：只保留最近 maxMemDumpFiles 份，避免 mem_dump/heap/goroutines 无限累积（issue #44）。
+	pruneMemDumps(logDir, maxMemDumpFiles)
 	return summary
+}
+
+// maxMemDumpFiles 是每类内存转储产物（mem_dump_*.txt / heap_*.pprof / goroutines_*.txt）
+// 最多保留的份数，超出后删除最旧的。
+const maxMemDumpFiles = 5
+
+// memDumpFilePrefixes 列出 DumpMemory 产生的三类文件名前缀，用于轮转与清理。
+var memDumpFilePrefixes = []struct {
+	prefix string
+	suffix string
+}{
+	{"mem_dump_", ".txt"},
+	{"heap_", ".pprof"},
+	{"goroutines_", ".txt"},
+}
+
+// pruneMemDumps 保留 logDir 下每类内存转储文件最新的 keep 份，删除其余。
+func pruneMemDumps(logDir string, keep int) {
+	if strings.TrimSpace(logDir) == "" || keep <= 0 {
+		return
+	}
+	entries, err := os.ReadDir(logDir)
+	if err != nil {
+		return
+	}
+	for _, cat := range memDumpFilePrefixes {
+		var matched []string
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if strings.HasPrefix(name, cat.prefix) && strings.HasSuffix(name, cat.suffix) {
+				matched = append(matched, name)
+			}
+		}
+		if len(matched) <= keep {
+			continue
+		}
+		// 文件名内嵌 20060102-150405 时间戳，字典序即时间序，升序后删除最旧的。
+		sort.Strings(matched)
+		for _, name := range matched[:len(matched)-keep] {
+			_ = os.Remove(filepath.Join(logDir, name))
+		}
+	}
 }
 
 // StartMemoryWatchDog 启动轻量级后台内存看门狗，当堆内存超过警戒阈值时自动转储诊断报告。

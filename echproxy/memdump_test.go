@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDumpMemoryExecutionAndFiles(t *testing.T) {
@@ -65,5 +66,53 @@ func TestDumpMemoryExecutionAndFiles(t *testing.T) {
 	}
 	if !hasGoroutine {
 		t.Errorf("expected goroutines_*.txt file to be generated")
+	}
+}
+
+// TestPruneMemDumpsKeepsLatest 验证 issue #44：内存转储产物按数量轮转，只保留最新 keep 份。
+func TestPruneMemDumpsKeepsLatest(t *testing.T) {
+	dir := t.TempDir()
+	stamp := func(i int) string {
+		return time.Date(2026, 1, 1, 0, 0, i, 0, time.UTC).Format("20060102-150405")
+	}
+	for i := 0; i < 8; i++ {
+		ts := stamp(i)
+		for _, name := range []string{
+			"mem_dump_" + ts + ".txt",
+			"heap_" + ts + ".pprof",
+			"goroutines_" + ts + ".txt",
+		} {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	pruneMemDumps(dir, 3)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := map[string]int{}
+	for _, e := range entries {
+		name := e.Name()
+		switch {
+		case strings.HasPrefix(name, "mem_dump_"):
+			counts["txt"]++
+		case strings.HasPrefix(name, "heap_"):
+			counts["pprof"]++
+		case strings.HasPrefix(name, "goroutines_"):
+			counts["goroutine"]++
+		}
+	}
+	if counts["txt"] != 3 || counts["pprof"] != 3 || counts["goroutine"] != 3 {
+		t.Errorf("prune kept %v, want 3 of each", counts)
+	}
+	// 保留的必须是最新的（时间戳最大的 3 个）
+	if _, err := os.Stat(filepath.Join(dir, "mem_dump_"+stamp(7)+".txt")); err != nil {
+		t.Errorf("newest mem_dump removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "mem_dump_"+stamp(0)+".txt")); err == nil {
+		t.Error("oldest mem_dump should have been pruned")
 	}
 }

@@ -577,9 +577,22 @@ var (
 	ipFlightMu    sync.Mutex
 	ipFlights     = map[string]*ipFlightCall{}
 	utlsTransMu   sync.Mutex
-	utlsH2Trans   = map[string]*http2.Transport{}
-	utlsH1Clients = map[string]*http.Client{}
+	utlsH2Trans   = map[string]*utlsH2Entry{}
+	utlsH1Clients = map[string]*utlsH1Entry{}
 )
+
+// utlsH2Entry / utlsH1Entry 为每个连接池记录最近使用时间。
+// 满容量时按「最久未使用」淘汰，而不是原先的「随机删一个 + CloseIdleConnections」——
+// 后者可能恰好关掉正在高频复用的主站连接池，把并发下载中的连接腰斩（issue #45）。
+type utlsH2Entry struct {
+	tr       *http2.Transport
+	lastUsed time.Time
+}
+
+type utlsH1Entry struct {
+	client   *http.Client
+	lastUsed time.Time
+}
 
 func storeIPCache(cacheKey string, ips []string, ttl int) {
 	if ttl < minTTL {
@@ -596,9 +609,17 @@ func storeIPCache(cacheKey string, ips []string, ttl int) {
 			}
 		}
 		if len(ipCache) >= maxIPCacheEntries {
-			for k := range ipCache {
-				delete(ipCache, k)
-				break
+			// 先清已过期条目；仍满则淘汰「最早过期」的一个（等价于最旧），
+			// 不再随机删——随机淘汰可能误删热点域名解析结果（issue #45）。
+			var oldestKey string
+			var oldest time.Time
+			for k, v := range ipCache {
+				if oldestKey == "" || v.expiry.Before(oldest) {
+					oldestKey, oldest = k, v.expiry
+				}
+			}
+			if oldestKey != "" {
+				delete(ipCache, oldestKey)
 			}
 		}
 	}
@@ -816,8 +837,10 @@ func dialUTLSWithWrapper(ctx context.Context, ip, sniName, verifyHost string, ne
 func getUTLSH2Transport(cacheKey string, dialFn func(ctx context.Context, nextProtos []string) (*utls.UConn, error)) *http2.Transport {
 	utlsTransMu.Lock()
 	defer utlsTransMu.Unlock()
-	if t, ok := utlsH2Trans[cacheKey]; ok {
-		return t
+	now := time.Now()
+	if e, ok := utlsH2Trans[cacheKey]; ok {
+		e.lastUsed = now
+		return e.tr
 	}
 	t := &http2.Transport{
 		AllowHTTP:       false,
@@ -835,21 +858,32 @@ func getUTLSH2Transport(cacheKey string, dialFn func(ctx context.Context, nextPr
 		},
 	}
 	if len(utlsH2Trans) >= maxSNICacheEntries {
-		for k, old := range utlsH2Trans {
-			old.CloseIdleConnections()
-			delete(utlsH2Trans, k)
-			break
+		// LRU：淘汰最久未使用的连接池，而不是随机淘汰（issue #45）。
+		var oldestKey string
+		var oldest time.Time
+		for k, e := range utlsH2Trans {
+			if oldestKey == "" || e.lastUsed.Before(oldest) {
+				oldestKey, oldest = k, e.lastUsed
+			}
+		}
+		if oldestKey != "" {
+			if old := utlsH2Trans[oldestKey]; old != nil {
+				old.tr.CloseIdleConnections()
+			}
+			delete(utlsH2Trans, oldestKey)
 		}
 	}
-	utlsH2Trans[cacheKey] = t
+	utlsH2Trans[cacheKey] = &utlsH2Entry{tr: t, lastUsed: now}
 	return t
 }
 
 func getUTLSH1Client(cacheKey string, dialFn func(ctx context.Context, nextProtos []string) (*utls.UConn, error)) *http.Client {
 	utlsTransMu.Lock()
 	defer utlsTransMu.Unlock()
-	if c, ok := utlsH1Clients[cacheKey]; ok {
-		return c
+	now := time.Now()
+	if e, ok := utlsH1Clients[cacheKey]; ok {
+		e.lastUsed = now
+		return e.client
 	}
 	tr := &http.Transport{
 		DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -866,15 +900,24 @@ func getUTLSH1Client(cacheKey string, dialFn func(ctx context.Context, nextProto
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	if len(utlsH1Clients) >= maxSNICacheEntries {
-		for k, old := range utlsH1Clients {
-			if oldTr, ok := old.Transport.(*http.Transport); ok {
-				oldTr.CloseIdleConnections()
+		// LRU：淘汰最久未使用，而不是随机淘汰（issue #45）。
+		var oldestKey string
+		var oldest time.Time
+		for k, e := range utlsH1Clients {
+			if oldestKey == "" || e.lastUsed.Before(oldest) {
+				oldestKey, oldest = k, e.lastUsed
 			}
-			delete(utlsH1Clients, k)
-			break
+		}
+		if oldestKey != "" {
+			if old := utlsH1Clients[oldestKey]; old != nil {
+				if oldTr, ok := old.client.Transport.(*http.Transport); ok {
+					oldTr.CloseIdleConnections()
+				}
+			}
+			delete(utlsH1Clients, oldestKey)
 		}
 	}
-	utlsH1Clients[cacheKey] = c
+	utlsH1Clients[cacheKey] = &utlsH1Entry{client: c, lastUsed: now}
 	return c
 }
 
@@ -939,11 +982,11 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			utlsTransMu.Lock()
 			if old, ok := utlsH2Trans[cacheKey]; ok {
-				old.CloseIdleConnections()
+				old.tr.CloseIdleConnections()
 				delete(utlsH2Trans, cacheKey)
 			}
 			if oldClient, ok := utlsH1Clients[cacheKey]; ok {
-				if oldTr, okTr := oldClient.Transport.(*http.Transport); okTr {
+				if oldTr, okTr := oldClient.client.Transport.(*http.Transport); okTr {
 					oldTr.CloseIdleConnections()
 				}
 				delete(utlsH1Clients, cacheKey)
@@ -957,6 +1000,39 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 		ipCacheMu.Unlock()
 	}
 	return nil, fmt.Errorf("all IPs failed for %s: %w", host, lastErr)
+}
+
+// DialRawTLS 为需要原始字节流的场景（WebSocket over CONNECT MITM 等）建立到 host:443 的
+// 已握手 uTLS 连接：DoH 解析 + 与主传输一致的 uTLS 指纹与 ClientHello 分片重试 + 上游证书核对。
+//
+// 分片包装只在首包（ClientHello）生效，握手完成后的业务字节流（WebSocket 帧等）原样透传，
+// 不会拖慢长连接吞吐。
+func DialRawTLS(ctx context.Context, host, ipMode string) (net.Conn, error) {
+	host = netdial.CleanHost(host)
+	if host == "" {
+		return nil, fmt.Errorf("DialRawTLS: empty host")
+	}
+	norm := resolveEffectiveIPMode(ipMode)
+	ips, err := ResolveHostIPsByMode(ctx, host, norm)
+	if err != nil {
+		return nil, err
+	}
+	fragWrap := func(c net.Conn) net.Conn { return newTCPFragmentConn(c, 32) }
+	var lastErr error
+	for _, ip := range ips {
+		uConn, derr := dialUTLSWithWrapper(ctx, ip, host, host, []string{"http/1.1"}, fragWrap)
+		if derr == nil {
+			return uConn, nil
+		}
+		if IsCertError(derr) {
+			return nil, derr
+		}
+		lastErr = derr
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("DialRawTLS: no usable IP for %s", host)
+	}
+	return nil, lastErr
 }
 
 func SNIFrontDo(req *http.Request, ipMode ...string) (*http.Response, error) {

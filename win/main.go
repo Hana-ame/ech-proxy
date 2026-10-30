@@ -985,8 +985,9 @@ func main() {
 
 	select {
 	case <-ctx.Done():
-		log.Printf("[Shutdown] Signal received, dumping memory statistics before shutdown...")
-		echproxy.DumpMemory("Shutdown", srv, logMgr)
+		// 不再在这里单独 DumpMemory("Shutdown")：select 结束后下方统一执行
+		// DumpMemory("NormalExit")，原先两处都写会导致每次正常退出转储两遍（issue #44）。
+		log.Printf("[Shutdown] Signal received, shutting down...")
 		if sysProxyMgr != nil {
 			sysProxyMgr.CleanupOnExit()
 		}

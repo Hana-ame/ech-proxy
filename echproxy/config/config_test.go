@@ -166,3 +166,19 @@ func TestGenerateAndManageHostsAndPACDecoupledFromUpstreamJSON(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveOriginalDomainLeavesIPModeEmpty 验证 issue #40：
+// 原域名（PAC/443 方案）解析结果必须把 IPMode 留空，交给 resolveEffectiveIPMode
+// 回退到全局 ip_mode，否则 -6 / -dual 对原域名请求永不生效。
+func TestResolveOriginalDomainLeavesIPModeEmpty(t *testing.T) {
+	uc, ok := Resolve(nil, "example.com")
+	if !ok {
+		t.Fatal("Resolve(example.com) = false, want true")
+	}
+	if uc.IPMode != "" {
+		t.Errorf("original-domain Resolve IPMode = %q, want empty (global ip_mode fallback)", uc.IPMode)
+	}
+	if uc.Host != "example.com" || uc.Mode != "auto" {
+		t.Errorf("unexpected original-domain config: %+v", uc)
+	}
+}

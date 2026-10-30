@@ -396,9 +396,12 @@ func Resolve(upstreams UpstreamMap, host string) (UpstreamConfig, bool) {
 	}
 	if !IsPortalDomain(host) && net.ParseIP(host) == nil && strings.Contains(host, ".") {
 		return UpstreamConfig{
-			Host:           host,
-			Mode:           "auto",
-			IPMode:         netdial.DefaultIPMode,
+			Host: host,
+			Mode: "auto",
+			// IPMode 故意留空：由 ech.resolveEffectiveIPMode / connect 路径回退到
+			// 全局 currentConfig().ipMode，使 -6 / -dual / 托盘切换对原域名（PAC、443 方案）同样生效。
+			// 不能硬编码 netdial.DefaultIPMode("v4")，否则用户显式选择的 v6/dual 会被静默覆盖。
+			IPMode:         "",
 			CookiePriority: "browser",
 		}, true
 	}

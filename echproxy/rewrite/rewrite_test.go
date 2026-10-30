@@ -173,6 +173,10 @@ func TestOnlyInjectOnAdultSitesListAndPACWhitelistAtomicPop(t *testing.T) {
 	if _, err := mgr.RefreshOnce(); err != nil {
 		t.Fatalf("RefreshOnce failed: %v", err)
 	}
+	// adult.txt 不再随 RefreshOnce 自动拉取（issue #46），测试显式刷新以覆盖该 API。
+	if _, err := mgr.RefreshAdultSitesOnce(); err != nil {
+		t.Fatalf("RefreshAdultSitesOnce failed: %v", err)
+	}
 
 	// 成人网站清单（adult.txt，与 pac.txt 并列的第二个文件）才是注入闸门
 	if !mgr.IsAdultSite("e-hentai.org") || !mgr.IsAdultSite("www.missav.com") || mgr.IsAdultSite("github.com") {

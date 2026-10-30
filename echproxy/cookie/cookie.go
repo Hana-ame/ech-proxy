@@ -174,6 +174,15 @@ func parseSetCookie(raw string) (*http.Cookie, bool) {
 	return cookies[0], true
 }
 
+// ParseSetCookie 是 parseSetCookie 的导出版本，供其它包（如 win/diag.go 的 cookie
+// 透传诊断）复用同一套 Go 1.20 / 1.21.4 兼容实现。
+//
+// 不要直接使用 Go 1.23+ 才引入的 http.ParseSetCookie：那会破坏
+// scripts/downgrade-go1214.sh 的官方原版 Go 1.21.4 降级编译路径（issue #42）。
+func ParseSetCookie(raw string) (*http.Cookie, bool) {
+	return parseSetCookie(raw)
+}
+
 // SaveResponseCookies 将上游响应的 Set-Cookie 存入 Jar；
 // 若上游下发了过期/登出指令（Max-Age <= 0、Expires 已过期或值为 "deleted"），则主动从 Jar 中清除该 Cookie。
 func (j *Jar) SaveResponseCookies(host string, resp *http.Response) {

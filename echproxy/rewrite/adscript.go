@@ -963,8 +963,12 @@ func (m *AdScriptManager) RefreshOnce() (bool, error) {
 	if m == nil {
 		return false, nil
 	}
+	// 只刷新 PAC 路由真正需要的 pac.txt 白名单。
+	//
+	// 不再在这里顺带拉取 adult.txt：网页广告拦截/注入已停用（InjectIntoHTMLForHost
+	// 一律原样返回），保留后台每 30 分钟一次 adult.txt 网络请求纯属无意义开销与
+	// 隐私泄露面（issue #46）。需要手动刷新仍可显式调用 RefreshAdultSitesOnce。
 	_, whiteErr := m.RefreshWhitelistOnce()
-	_, _ = m.RefreshAdultSitesOnce()
 	return false, whiteErr
 }
 

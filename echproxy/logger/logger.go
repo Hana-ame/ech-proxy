@@ -484,14 +484,37 @@ func CleanLogs(logDir string) error {
 		return err
 	}
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".log") {
-			p := filepath.Join(logDir, e.Name())
-			if e.Name() == logFileName {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		p := filepath.Join(logDir, name)
+		switch {
+		case strings.HasSuffix(name, ".log"):
+			if name == logFileName {
 				_ = os.Truncate(p, 0)
 			} else {
 				_ = os.Remove(p)
 			}
+		case isMemDumpArtifact(name):
+			// 内存诊断产物（mem_dump_*.txt / heap_*.pprof / goroutines_*.txt）同样清除，
+			// 避免「清理日志」后这些大文件仍长期堆积（issue #44）。
+			_ = os.Remove(p)
 		}
 	}
 	return nil
+}
+
+// isMemDumpArtifact 判断文件名是否属于 DumpMemory 产生的诊断产物。
+func isMemDumpArtifact(name string) bool {
+	if strings.HasPrefix(name, "mem_dump_") && strings.HasSuffix(name, ".txt") {
+		return true
+	}
+	if strings.HasPrefix(name, "heap_") && strings.HasSuffix(name, ".pprof") {
+		return true
+	}
+	if strings.HasPrefix(name, "goroutines_") && strings.HasSuffix(name, ".txt") {
+		return true
+	}
+	return false
 }

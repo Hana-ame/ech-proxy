@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
@@ -252,6 +253,11 @@ var (
 	bootstrapCache    = map[string]bootstrapCacheEntry{}
 	bootstrapFlightMu sync.Mutex
 	bootstrapFlights  = map[string]*bootstrapFlightCall{}
+
+	// 主端点连续不可达后的冷却期：冷却期内直接走国内兜底，避免每次解析都白等
+	// bootstrapPrimaryPreferWindow（3 次重试下会耗尽上层 10s 预算）。
+	primaryBootstrapMu      sync.Mutex
+	primaryBootstrapRetryAt time.Time
 )
 
 // TransportPoolStats 返回 netdial 内部缓存的各模式 Transport 数量与标识。
@@ -272,7 +278,13 @@ func getBootstrapClient(bIP string) *http.Client {
 		return c
 	}
 	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		// 引导 DoH 端点全部持有带 IP SAN 的合法公网证书
+		// （Cloudflare 1.1.1.1/1.0.0.1、AliDNS、DNSPod），必须校验证书链：
+		// 原先 InsecureSkipVerify: true 等于允许路径上的中间人伪造解析结果（issue #41）。
+		TLSClientConfig: &tls.Config{
+			RootCAs:    getRootPool(),
+			MinVersion: tls.VersionTLS12,
+		},
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			_, port, _ := net.SplitHostPort(addr)
 			if port == "" {
@@ -370,6 +382,45 @@ var fallbackBootstrapEndpoints = []bootstrapEndpoint{
 	{ip: "1.12.12.12", urlPattern: "https://%s/dns-query?name=%s&type=%d"},
 }
 
+// bootstrapPrimaryPreferWindow 是「主端点优先窗口」：主端点（1.1.1.1 / 1.0.0.1）在此窗口内
+// 未返回结果时才启用国内兜底端点。窗口足够覆盖正常 Cloudflare anycast 往返，
+// 又不会在 1.1.1.1 被封锁时把每次重试都拖到超时（否则 3 次重试会耗尽上层 10s 预算）。
+const bootstrapPrimaryPreferWindow = 800 * time.Millisecond
+
+// bootstrapPrimaryCooldown 是主端点判定不可达后的冷却期：冷却期内跳过主端点直接走国内兜底，
+// 避免每次解析都白等一个优先窗口。冷却结束会重新尝试主端点（网络可能恢复）。
+const bootstrapPrimaryCooldown = 10 * time.Minute
+
+// primaryBootstrapUsable 报告当前是否仍需给主端点优先尝试机会（冷却期外）。
+func primaryBootstrapUsable(now time.Time) bool {
+	primaryBootstrapMu.Lock()
+	defer primaryBootstrapMu.Unlock()
+	return now.After(primaryBootstrapRetryAt)
+}
+
+// markPrimaryBootstrapUnreachable 记录主端点不可达，进入冷却期。
+func markPrimaryBootstrapUnreachable(now time.Time) {
+	primaryBootstrapMu.Lock()
+	primaryBootstrapRetryAt = now.Add(bootstrapPrimaryCooldown)
+	primaryBootstrapMu.Unlock()
+}
+
+// domesticBootstrapAllowed 报告是否允许把国内公共 DoH 作为「最后兜底」。
+//
+// 默认允许：这是墙内保证可用的必要取舍——1.1.1.1 / 1.0.0.1 被完全阻断时，
+// 只有国内 DoH 还能解析项目自有 DoH 域名。但它绝不与主端点并发竞速：
+// 主端点只要在 bootstrapPrimaryPreferWindow 内返回就绝不使用国内端点，
+// 因此 README「引导 IP 仅限 1.1.1.1 / 1.0.0.1」在正常网络下严格成立。
+// 如需彻底禁用（严格隐私模式，代价是 1.1.1.1 被封锁时无法解析），
+// 设置 ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP=1。
+func domesticBootstrapAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP"))) {
+	case "1", "true", "yes", "on":
+		return false
+	}
+	return true
+}
+
 func queryBootstrapEndpoint(ctx context.Context, ep bootstrapEndpoint, host string, qt int) ([]net.IP, error) {
 	reqURL := fmt.Sprintf(ep.urlPattern, ep.ip, url.QueryEscape(host), qt)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
@@ -457,6 +508,39 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 	}
 }
 
+// raceBootstrapEndpoints 在给定端点集合内并发竞速，返回首个有非空结果的解析结果。
+// 只在该集合内竞速，不跨集合混合——用于把「主端点」与「国内兜底端点」严格分层。
+func raceBootstrapEndpoints(ctx context.Context, eps []bootstrapEndpoint, host string, qt int) []net.IP {
+	if len(eps) == 0 {
+		return nil
+	}
+	resCh := make(chan []net.IP, len(eps))
+	raceCtx, raceCancel := context.WithCancel(ctx)
+	defer raceCancel()
+	for _, ep := range eps {
+		targetEP := ep
+		go func() {
+			res, err := queryBootstrapEndpoint(raceCtx, targetEP, host, qt)
+			if err == nil && len(res) > 0 {
+				resCh <- res
+			} else {
+				resCh <- nil
+			}
+		}()
+	}
+	for i := 0; i < len(eps); i++ {
+		select {
+		case r := <-resCh:
+			if len(r) > 0 {
+				return r
+			}
+		case <-ctx.Done():
+			return nil
+		}
+	}
+	return nil
+}
+
 func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) ([]string, error) {
 	qtypes := []int{1}
 	if norm == "v6" {
@@ -468,37 +552,26 @@ func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) 
 	var ips []net.IP
 
 	for _, qt := range qtypes {
-		allEPs := append(append([]bootstrapEndpoint(nil), primaryBootstrapEndpoints...), fallbackBootstrapEndpoints...)
-		resCh := make(chan []net.IP, len(allEPs))
-		raceCtx, raceCancel := context.WithCancel(ctx)
-		for _, ep := range allEPs {
-			targetEP := ep
-			go func() {
-				res, err := queryBootstrapEndpoint(raceCtx, targetEP, host, qt)
-				if err == nil && len(res) > 0 {
-					resCh <- res
-				} else {
-					resCh <- nil
-				}
-			}()
-		}
 		var won []net.IP
-		for i := 0; i < len(allEPs); i++ {
-			select {
-			case r := <-resCh:
-				if len(r) > 0 && len(won) == 0 {
-					won = r
-					raceCancel()
-				}
-			case <-ctx.Done():
-				raceCancel()
-				break
-			}
-			if len(won) > 0 {
-				break
+		// 第一阶段：只竞速主端点（1.1.1.1 / 1.0.0.1），并给它们一个「优先窗口」。
+		// 正常网络下主端点在窗口内返回即直接采用，国内端点全程不参与，
+		// 严格符合 README「引导 IP 仅限 1.1.1.1 / 1.0.0.1」。
+		// 主端点一旦被判定不可达则进入冷却期，后续解析不再重复等待优先窗口。
+		if primaryBootstrapUsable(time.Now()) {
+			preferCtx, preferCancel := context.WithTimeout(ctx, bootstrapPrimaryPreferWindow)
+			won = raceBootstrapEndpoints(preferCtx, primaryBootstrapEndpoints, host, qt)
+			preferCancel()
+			if len(won) == 0 {
+				markPrimaryBootstrapUnreachable(time.Now())
 			}
 		}
-		raceCancel()
+		if len(won) == 0 && domesticBootstrapAllowed() {
+			// 第二阶段（最后兜底）：主端点全部失败后才串行启用国内端点。
+			// 原实现把国内端点与主端点放进同一并发竞速，国内延迟更低会几乎总是胜出，
+			// 导致实际用的是 223.5.5.5 等国内 DoH，违背 README 承诺（issue #41）。
+			log.Printf("[netdial] bootstrap DoH primary endpoints (1.1.1.1/1.0.0.1) unreachable for %q, trying domestic endpoints as last resort", host)
+			won = raceBootstrapEndpoints(ctx, fallbackBootstrapEndpoints, host, qt)
+		}
 		if len(won) > 0 {
 			ips = append(ips, won...)
 		}
@@ -506,7 +579,10 @@ func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) 
 
 	filtered := FilterIPsByMode(ips, norm)
 	if len(filtered) == 0 {
-		return nil, fmt.Errorf("DoH resolve %s (%s) failed", host, norm)
+		if domesticBootstrapAllowed() {
+			return nil, fmt.Errorf("DoH resolve %s (%s) failed (primary and domestic bootstrap endpoints both unreachable)", host, norm)
+		}
+		return nil, fmt.Errorf("DoH resolve %s (%s) failed (primary bootstrap endpoints unreachable; domestic fallback disabled by ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP)", host, norm)
 	}
 
 	bootstrapCacheMu.Lock()

@@ -222,10 +222,10 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		if opts.AdScript != nil {
 			wl = opts.AdScript.Whitelist()
 		}
+		// fallback 仅用于本 PAC 脚本文本内容（客户端侧兜底），绝不在这里修改服务端全局兜底代理：
+		// 该路由是 loopback 上的无鉴权 GET，任意网页都能发起，历史上 SetFallbackProxy(fallback)
+		// 会让恶意页面一条 GET 就把全局上游代理改成任意地址（安全 issue #39）。
 		fallback := c.Query("fallback")
-		if fallback != "" {
-			SetFallbackProxy(fallback)
-		}
 		pac := config.GeneratePACWithFallback(nil, proxyAddr, global, fallback, wl)
 		c.Header("Content-Type", "application/x-ns-proxy-autoconfig; charset=utf-8")
 		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")

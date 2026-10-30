@@ -50,3 +50,18 @@ func TestCookiePriorityBrowserVsSeed(t *testing.T) {
 		t.Errorf("seed priority got %q, want token=from_seed", got)
 	}
 }
+
+// TestParseSetCookieCompat 验证导出兼容解析器（issue #42），
+// 确保 Go 1.21.4 降级编译路径不依赖 http.ParseSetCookie。
+func TestParseSetCookieCompat(t *testing.T) {
+	c, ok := ParseSetCookie("PHPSESSID=abc123; Path=/; Domain=.pixiv.net; Secure; HttpOnly; Max-Age=3600")
+	if !ok || c == nil {
+		t.Fatal("ParseSetCookie returned !ok")
+	}
+	if c.Name != "PHPSESSID" || c.Value != "abc123" || !c.Secure || !c.HttpOnly || c.MaxAge != 3600 {
+		t.Errorf("unexpected parsed cookie: %+v", c)
+	}
+	if _, ok := ParseSetCookie("   "); ok {
+		t.Error("empty Set-Cookie must parse as !ok")
+	}
+}

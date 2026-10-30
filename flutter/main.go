@@ -51,7 +51,18 @@ import (
 	"unsafe"
 
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
+	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 )
+
+// apiHTTPClient 是 apiProxyHandler 复用的共享客户端（issue #47）：
+//   - Transport 用 netdial 的 DoH 解析连接池，而不是 http.DefaultTransport
+//     （后者走系统 UDP 53 解析 x.moonchan.xyz，移动端弱网/污染下极易失败）；
+//   - 同时共享同一个 Transport，连接池跨请求复用；
+//   - "dual" 让移动网络下 v4/v6 都能兜底（DialContextIPMode 会逐个尝试全部解析结果）。
+var apiHTTPClient = &http.Client{
+	Timeout:   30 * time.Second,
+	Transport: netdial.TransportWithIPMode("dual"),
+}
 
 //go:embed web/index.html
 var indexHTML string
@@ -594,8 +605,8 @@ func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		}
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
+	// 复用包级共享 client：DoH 解析 + 连接池跨请求复用（issue #47）。
+	resp, err := apiHTTPClient.Do(req)
 	if err != nil {
 		log.Printf("API error: %v", err)
 		http.Error(w, "API fetch failed: "+err.Error(), http.StatusBadGateway)

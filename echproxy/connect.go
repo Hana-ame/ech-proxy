@@ -34,6 +34,9 @@ const (
 	DefaultTunnelIdleTimeout = 60 * time.Second
 	authFailureWindow        = 5 * time.Minute
 	maxAuthFailures          = 10
+	// authFailuresPurgeThreshold 是 failures map 的清扫触发阈值：达到该条目数时
+	// 顺带删除所有已过窗口的条目，防止来自大量一次性来源 IP 的失败记录无界堆积。
+	authFailuresPurgeThreshold = 4096
 
 	ConnectModeAuto   = "auto"
 	ConnectModeMITM   = "mitm"
@@ -76,6 +79,15 @@ func (a *AuthConfig) Check(req *http.Request, clientIP string) (bool, error) {
 	a.mu.Lock()
 	if a.failures == nil {
 		a.failures = make(map[string]*authFailWindow)
+	}
+	// 过期条目只在「同一 IP 再次失败/成功」时才被覆盖或删除，攻击来源 IP 一旦不再出现
+	// 就永久滞留。这里在 map 达到阈值时顺带清扫所有已过窗口的条目，避免无界增长（issue #45）。
+	if len(a.failures) >= authFailuresPurgeThreshold {
+		for k, v := range a.failures {
+			if !now.Before(v.windowEnd) {
+				delete(a.failures, k)
+			}
+		}
 	}
 	fw, exists := a.failures[clientIP]
 	if exists && now.Before(fw.windowEnd) && fw.count >= maxAuthFailures {
@@ -171,7 +183,11 @@ func (l *TunnelLimiter) Acquire(peerIP string) (func(), bool) {
 	return func() {
 		once.Do(func() {
 			l.globalCur.Add(-1)
-			peerCounter.Add(-1)
+			// 计数归零时删除该 peer 条目：原先只 Add(-1) 不 Delete，每个出现过的客户端 IP
+			// 都会在 sync.Map 里永久留下一个 *atomic.Int32，长期运行无界增长（issue #45）。
+			if peerCounter.Add(-1) == 0 {
+				l.peers.CompareAndDelete(peerIP, peerCounter)
+			}
 		})
 	}, true
 }
@@ -412,6 +428,10 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 
 	if first[0] != 0x16 {
 		plainHandler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			if isWebSocketUpgrade(req) {
+				serveWebSocketMITM(w, req, targetHost, targetPort, false, opts)
+				return
+			}
 			if req.Host == "" {
 				if targetPort != "" && targetPort != "80" {
 					req.Host = net.JoinHostPort(targetHost, targetPort)
@@ -452,6 +472,13 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 
 	tlsState := tlsConn.ConnectionState()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		// WebSocket over wss://：必须原样转发 Upgrade 逐跳头并做 101 之后的双向字节流 relay，
+		// 不能交给普通 HTTP 代理链路（其会剥离 Connection/Upgrade 且无法处理 101 升级，
+		// 导致 MITM 隧道内白名单站点的实时连接全部失败，issue #43）。
+		if isWebSocketUpgrade(req) {
+			serveWebSocketMITM(w, req, targetHost, targetPort, true, opts)
+			return
+		}
 		if req.Host == "" {
 			req.Host = targetHost
 		}
@@ -476,6 +503,127 @@ func serveMITMConnect(clientConn net.Conn, clientBuf *bufio.ReadWriter, targetHo
 	}
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 15 * time.Second}
 	_ = srv.Serve(newSingleConnListener(tlsConn))
+}
+
+// isWebSocketUpgrade 判断请求是否为 HTTP/1.1 WebSocket 升级（Upgrade: websocket）。
+func isWebSocketUpgrade(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if !strings.Contains(strings.ToLower(r.Header.Get("Connection")), "upgrade") {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get("Upgrade")), "websocket")
+}
+
+// dialWebSocketUpstream 为 MITM 隧道内的 WebSocket 升级建立到上游的原始连接。
+//   - TLS 目标（wss://，CONNECT 443）：优先走 ech.DialRawTLS（DoH 解析 + uTLS 指纹 + ClientHello 分片）；
+//   - 明文目标（ws://）：直接走 dialConnectFn。
+func dialWebSocketUpstream(ctx context.Context, host, port string, upstreamTLS bool, ipMode string) (net.Conn, error) {
+	if !upstreamTLS {
+		return dialConnectFn(ctx, host, port, ipMode)
+	}
+	if port == "" {
+		port = "443"
+	}
+	if port == "443" && net.ParseIP(host) == nil {
+		if c, err := cloudflare_ech.DialRawTLS(ctx, host, ipMode); err == nil {
+			return c, nil
+		}
+	}
+	raw, err := dialConnectFn(ctx, host, port, ipMode)
+	if err != nil {
+		return nil, err
+	}
+	tc := tls.Client(raw, &tls.Config{
+		ServerName: host,
+		RootCAs:    netdial.RootPool(),
+		MinVersion: tls.VersionTLS12,
+	})
+	hctx, cancel := context.WithTimeout(ctx, netdial.DialTimeout)
+	defer cancel()
+	if err := tc.HandshakeContext(hctx); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	return tc, nil
+}
+
+// writeRawUpgradeRequest 把 WebSocket 升级请求原样写给上游。
+// 与普通 HTTP 转发相反，这里必须保留 Connection / Upgrade / Sec-WebSocket-* 等逐跳头。
+func writeRawUpgradeRequest(w io.Writer, req *http.Request, targetHost, targetPort string) error {
+	uri := req.RequestURI
+	if uri == "" && req.URL != nil {
+		uri = req.URL.RequestURI()
+	}
+	if uri == "" {
+		uri = "/"
+	}
+	host := req.Host
+	if host == "" {
+		if targetPort != "" && targetPort != "443" && targetPort != "80" {
+			host = net.JoinHostPort(targetHost, targetPort)
+		} else {
+			host = targetHost
+		}
+	}
+	var sb strings.Builder
+	sb.WriteString(req.Method)
+	sb.WriteByte(' ')
+	sb.WriteString(uri)
+	sb.WriteString(" HTTP/1.1\r\n")
+	sb.WriteString("Host: ")
+	sb.WriteString(host)
+	sb.WriteString("\r\n")
+	for k, vs := range req.Header {
+		if strings.EqualFold(k, "Host") {
+			continue
+		}
+		for _, v := range vs {
+			sb.WriteString(k)
+			sb.WriteString(": ")
+			sb.WriteString(v)
+			sb.WriteString("\r\n")
+		}
+	}
+	sb.WriteString("\r\n")
+	_, err := io.WriteString(w, sb.String())
+	return err
+}
+
+// serveWebSocketMITM 在 CONNECT MITM 隧道内完成 WebSocket 升级并转入双向字节流 relay。
+// 返回后该请求的生命周期完全由本函数接管。
+func serveWebSocketMITM(w http.ResponseWriter, req *http.Request, targetHost, targetPort string, upstreamTLS bool, opts ConnectOptions) {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "websocket: connection hijacking unsupported", http.StatusNotImplemented)
+		return
+	}
+	clientConn, clientBuf, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	clientConn = newPrefixConn(clientConn, clientBuf)
+
+	upConn, derr := dialWebSocketUpstream(req.Context(), targetHost, targetPort, upstreamTLS, opts.IPMode)
+	if derr != nil {
+		_ = clientConn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_, _ = clientConn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+		_ = clientConn.Close()
+		return
+	}
+
+	if werr := writeRawUpgradeRequest(upConn, req, targetHost, targetPort); werr != nil {
+		_ = upConn.Close()
+		_ = clientConn.Close()
+		return
+	}
+
+	idleTimeout := opts.IdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = DefaultTunnelIdleTimeout
+	}
+	relay(newDeadlineConn(clientConn, idleTimeout), newDeadlineConn(upConn, idleTimeout))
 }
 
 func writeConnectError(conn net.Conn, code int, body string) {

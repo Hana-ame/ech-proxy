@@ -983,3 +983,26 @@ func TestOriginalDomainModeFullPassthroughCookiesHeadersRedirectsAndStream(t *te
 		t.Errorf("unexpected streamed body: %q", recHome.Body.String())
 	}
 }
+
+// TestProxyPACFallbackQueryDoesNotMutateGlobalFallback 验证 issue #39：
+// 无鉴权 GET /proxy.pac?fallback= 只能影响返回的 PAC 文本，绝不能改写服务端全局兜底代理。
+func TestProxyPACFallbackQueryDoesNotMutateGlobalFallback(t *testing.T) {
+	orig := GetFallbackProxy()
+	defer SetFallbackProxy(orig)
+	SetFallbackProxy("")
+
+	engine := NewEngine(&config.Config{})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/proxy.pac?fallback=http://attacker.example:8080", nil)
+	req.Host = "127.0.0.1:8443"
+	engine.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/proxy.pac status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "attacker.example:8080") {
+		t.Errorf("PAC text should still honor the fallback query param: %s", rec.Body.String())
+	}
+	if got := GetFallbackProxy(); got != "" {
+		t.Errorf("GET /proxy.pac?fallback= must NOT mutate the server-wide fallback proxy, got %q", got)
+	}
+}

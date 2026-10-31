@@ -1,3 +1,19 @@
+## v3.5.31
+
+### Fixes & Improvements
+
+- **处理 issue #39–#47（安全 / 兼容 / 资源 / 清理 + CONNECT MITM 内 WebSocket）**:
+  - **#39** `GET /proxy.pac?fallback=` 不再改写服务端全局兜底代理：`fallback` 仅用于生成的 PAC 文本，删除无鉴权 GET 上的 `SetFallbackProxy` 全局副作用（`portal.go` + 回归测试 `TestProxyPACFallbackQueryDoesNotMutateGlobalFallback`）。
+  - **#40** 原域名（PAC/443）`Resolve` 的 IPMode 留空，交给 `resolveEffectiveIPMode` 回退全局 `ip_mode`，使 `-6` / `-dual` / 托盘切换真正生效（`config.go` + `TestResolveOriginalDomainLeavesIPModeEmpty`）。
+  - **#41** 引导 DoH：强制校验证书链（去掉 `InsecureSkipVerify`）；主端点 `1.1.1.1` / `1.0.0.1` 优先（800ms 窗口），国内端点仅作最后兜底串行启用、不再与主端点并发竞速；主端点不可达进入 10 分钟冷却；可用 `ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP=1` 彻底禁用兜底（`netdial.go` + `TestDomesticBootstrapFallbackGate`，README 同步说明）。
+  - **#42** `win/diag.go` 不再使用 Go 1.23+ 的 `http.ParseSetCookie`，改用本仓库 `cookie.ParseSetCookie` 兼容实现，恢复 `scripts/downgrade-go1214.sh` 可编译性（`cookie.go` / `diag.go` + `TestParseSetCookieCompat`）。
+  - **#43** CONNECT MITM 内支持 WebSocket：识别 `Upgrade: websocket`，原样保留逐跳头转发升级请求，`101` 后转入双向字节流 relay；新增 `ech.DialRawTLS`（DoH + uTLS + ClientHello 分片）作为上游原始连接（`connect.go` / `sni.go` + 3 个回归测试）。
+  - **#44** 正常退出不再连续两次 `DumpMemory`；`mem_dump` / heap / goroutines 产物按数量轮转（保留最新 5 份），`CleanLogs` 一并清理这些诊断文件（`win/main.go` / `memdump.go` / `logger.go` + `TestPruneMemDumpsKeepsLatest`）。
+  - **#45** SNI 连接池与 IP 缓存满容量时按 LRU / 最早过期淘汰，不再随机删并 `CloseIdleConnections` 误伤热点池；`TunnelLimiter` 计数归零删除 peer 条目；`AuthConfig.failures` 达到阈值清扫过期条目（`sni.go` / `connect.go` + 2 个回归测试）。
+  - **#46** 停止后台每 30 分钟拉取 `adult.txt`（广告注入已停用），`RefreshOnce` 只刷 `pac.txt` 白名单；成人清单改为按需显式 `RefreshAdultSitesOnce`（`adscript.go` + 测试更新）。
+  - **#47** flutter `apiProxyHandler` 复用包级共享 `http.Client`：`Transport` 改为 `netdial.TransportWithIPMode("dual")`（DoH 解析 + 连接池复用），不再每请求新建 client / 走系统 UDP 53（`flutter/main.go`）。
+  - **验证**：`go build ./...`、`go vet ./...`（含 `GOOS=windows amd64/386`）、`go test ./...` 与关键包 `-race` 全绿；唯一失败 `TestNyaaFragmentDo` 为**改动前即存在**的墙内网络型失败（`connection reset`），与本次改动无关（RELEASE.md v3.5.29 段已记录同一基线失败）。
+
 ## v3.5.30
 
 ### Fixes & Improvements

@@ -114,17 +114,16 @@
 - 自 **Go 1.21.5** 及 **Go 1.22 ~ 1.26+** 起，Go 官方运行时在启动阶段（`runtime.osinit` -> `runtime.getRandomData`）将随机数接口从 Windows XP/7 原生支持的 `advapi32.dll!SystemFunction036`（`RtlGenRandom`）强制替换为仅 **Windows 8+** 才存在的 `bcryptprimitives.dll!ProcessPrng`。
 - 在 Windows 7 系统上，由于系统目录缺失 `bcryptprimitives.dll`，`_ProcessPrng` 函数指针解析为 `0x0`（空指针），程序启动执行第一条 `internal/runtime/syscall/windows.asmstdcall` 时直接 `CALL 0x0`，触发 `Exception 0xc0000005 0x8 0x0 0x0 (PC=0x0)` 崩溃退出。
 
-### 2. 本项目的双轨解决方案（借鉴 `XTLS/Xray-core`）
+### 2. 本项目的解决方案（借鉴 `XTLS/Xray-core`）
 为了同时满足 **Windows 7 (`386` / `amd64`) 原生运行** 与 **`uTLS v1.8.2` 完整 ECH 加密客户端问候支持**，本项目采用与 `XTLS/Xray-core` 相同的工程方案：
 
-1. **项目源码层降级至 Go 1.20 标准库基线**：
-   - 移除项目源码中对 Go 1.23+ 专属标准库 API 的依赖（将 `http.ParseSetCookie` 替换为兼容 Go 1.0+ 的 `parseSetCookie` 辅助函数；移除在 Win7 下存在控制台/句柄克隆兼容隐患的 `debug.SetCrashOutput`）。
+1. **Win7 运行时安全加固**：
    - 对所有 Windows 动态库过程调用（`user32.dll`、`shell32.dll`、`wininet.dll` 等）统一通过 `safeCallProc`（调用前先执行 `proc.Find()` 校验）保护，彻底杜绝缺失导出函数导致的 `PC=0x0` 空指针异常。
+   - 移除 Win7 下存在控制台/句柄克隆兼容隐患的 `debug.SetCrashOutput`。
 2. **CI 与发布流水线采用 `XTLS/go-win7` (`patched-1.26.7`) 补丁版 SDK 编译**：
    - `.github/workflows/ech-proxy.yml`、`.github/workflows/go.yml` 与 `.github/workflows/goreleaser.yml` 在构建 Windows 产物时自动拉取 [`XTLS/go-win7`](https://github.com/XTLS/go-win7/releases)（`patched-1.26.7`）并锁定 `GOTOOLCHAIN=local`。
    - 该补丁版工具链将 `ProcessPrng` 替换为 Windows 7 原生支持的 `bcrypt.dll!BCryptGenRandom`，并修复了 Win7 控制台句柄（`CONIN$`/`CONOUT$`）、PEB 长路径与 `os.RemoveAll` 兼容性问题。
 3. **本地构建方式**：
-   - **推荐方案（保留完整 ECH 与最新依赖）**：直接运行 `./scripts/build-win7.sh`，自动下载 `XTLS/go-win7` 并交叉编译出兼容 Windows 7 ~ 11 的 `dist/ech-proxy-windows-amd64.exe`、`dist/ech-proxy-windows-386.exe` 及 `dist/ech-proxy.443.exe`。
-   - **备选方案（强制降级至官方原版 `Go 1.21.4`）**：若需在无补丁的官方原版 Go 下编译，最高只能使用 **Go 1.21.4** 或 **Go 1.20.14**，可运行 `./scripts/downgrade-go1214.sh` 自动回退 `go.mod` 与第三方依赖版本。
+   - 直接运行 `./scripts/build-win7.sh`，自动下载 `XTLS/go-win7` 并交叉编译出兼容 Windows 7 ~ 11 的 `dist/ech-proxy-windows-amd64.exe`、`dist/ech-proxy-windows-386.exe` 及 `dist/ech-proxy.443.exe`。
 4. **Windows 7 客户端运行环境建议**：
    - 建议使用 **Windows 7 SP1** 并安装基础更新汇总（KB3125574）与 SHA-2 签名支持补丁（KB4474419）。

@@ -18,7 +18,6 @@ import (
 
 	"github.com/Hana-ame/ech-proxy/echproxy"
 	echconfig "github.com/Hana-ame/ech-proxy/echproxy/config"
-	echcookie "github.com/Hana-ame/ech-proxy/echproxy/cookie"
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
 	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 )
@@ -433,12 +432,10 @@ func diagCookie(out io.Writer, cmd CLICommand, host, ipMode string, timeout time
 	fmt.Fprintf(out, "   HTTP %d，共 %d 条 Set-Cookie：\n", resp.StatusCode, len(raw))
 	bad := 0
 	for i, line := range raw {
-		// 用本仓库自实现的兼容解析器，而非 Go 1.23+ 才有的 http.ParseSetCookie，
-		// 以确保 scripts/downgrade-go1214.sh（官方原版 Go 1.21.4）仍可编译（issue #42）。
-		c, ok := echcookie.ParseSetCookie(line)
+		c, perr := http.ParseSetCookie(line)
 		fmt.Fprintf(out, "   [%d] %s\n", i, truncate(line, 140))
-		if !ok {
-			fmt.Fprintf(out, "        (解析失败: 非法 Set-Cookie)\n")
+		if perr != nil {
+			fmt.Fprintf(out, "        (解析失败: %v)\n", perr)
 			continue
 		}
 		attrs := []string{}

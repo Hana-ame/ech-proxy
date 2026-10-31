@@ -160,8 +160,8 @@ func (j *Jar) SaveClientCookies(host string, req *http.Request) {
 	}
 }
 
-// parseSetCookie 使用 Go 1.0+ 兼容的 (&http.Response{Header: ...}).Cookies() 解析单条 Set-Cookie，
-// 避免依赖 Go 1.23+ 才引入的 http.ParseSetCookie，确保在 Go 1.20 / 1.21.4 及 go-win7 工具链下均可编译。
+// parseSetCookie 使用 (&http.Response{Header: ...}).Cookies() 解析单条 Set-Cookie，
+// 该解析方式在 go-win7 补丁 SDK（基于 Go 1.26.7）与当前 Go 工具链下均可用。
 func parseSetCookie(raw string) (*http.Cookie, bool) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
@@ -172,15 +172,6 @@ func parseSetCookie(raw string) (*http.Cookie, bool) {
 		return nil, false
 	}
 	return cookies[0], true
-}
-
-// ParseSetCookie 是 parseSetCookie 的导出版本，供其它包（如 win/diag.go 的 cookie
-// 透传诊断）复用同一套 Go 1.20 / 1.21.4 兼容实现。
-//
-// 不要直接使用 Go 1.23+ 才引入的 http.ParseSetCookie：那会破坏
-// scripts/downgrade-go1214.sh 的官方原版 Go 1.21.4 降级编译路径（issue #42）。
-func ParseSetCookie(raw string) (*http.Cookie, bool) {
-	return parseSetCookie(raw)
 }
 
 // SaveResponseCookies 将上游响应的 Set-Cookie 存入 Jar；

@@ -1,3 +1,13 @@
+## v3.5.32
+
+### Fixes & Improvements
+
+- **修复 CONNECT MITM 叶子证书缺失吊销信息导致 Windows/schannel 拒绝连接**（根因修复）:
+  - **根因**：`certstore` 生成的本地 CA 与叶子证书仅含 KeyUsage / BasicConstraints / SKI / AKI(/SAN)，**不含 CRL Distribution Points（2.5.29.31）与 Authority Information Access（1.3.6.1.5.5.7.1.1）**。Windows schannel 对缺少吊销点的证书返回 `CERT_TRUST_REVOCATION_STATUS_UNKNOWN`，导致开启吊销校验的客户端（curl/schannel、.NET、部分浏览器）在 CONNECT MITM 握手时直接拒绝证书，站点无法加载。`curl --ssl-no-revoke` 可绕过 → 证明 SAN/网络/站点均正常，唯一缺陷即吊销信息缺失。
+  - **修复**：叶子证书现在携带 `CRLDistributionPoints = http://127.0.0.1:<port>/crl`；代理在其明文 HTTP 监听上新增 `/crl` 与 `/ca.pem` 端点，分别提供**本地 CA 签名、无任何吊销条目的空 CRL**（`Store.CRL()`，经 `x509.CreateRevocationList`）与根证书 PEM（AIA）。CA 原本即带 `KeyUsageCRLSign`，可直接签发 CRL。`Store.SetCRLBaseURL` 在监听端口绑定后由服务端调用（`server.go`），仅 PAC 主线（明文 + CONNECT MITM）启用；443 方案为 TLS 监听且不提供 /crl 路由，保持旧行为不变。
+  - **验证**：`/crl` 返回 `application/pkix-crl` 的合法空 CRL（可解析、由 CA 正确签名、0 吊销条目）；叶子证书 CRL DP 存在；`curl --proxy http://127.0.0.1:8443 https://icdn.123av.me/`（**不带** `--ssl-no-revoke`）由之前的 `exit 60 CERT_TRUST_REVOCATION_STATUS_UNKNOWN` 改为返回 `302`，`123av.me` → `302`、`www.123av.me` → `301`，吊销校验全部通过。新增回归测试 `TestCRLAndCRLDP`（`crl_test.go`）。
+  - **验证**：`go build ./...`、`go vet ./...`、`go test ./...` 全绿；唯一失败 `TestNyaaFragmentDo` 为既有墙内网络型失败（`nyaa.si` 无 v4 记录），与本次改动无关。
+
 ## v3.5.31
 
 ### Fixes & Improvements

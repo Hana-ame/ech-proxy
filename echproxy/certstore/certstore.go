@@ -99,6 +99,7 @@ type Store struct {
 	ca         *CA
 	portalCert *tls.Certificate
 	leaf       map[string]*tls.Certificate
+	crlBaseURL string
 }
 
 func (st *Store) SetPortalCert(cert *tls.Certificate) {
@@ -117,6 +118,18 @@ func (st *Store) PortalCert() *tls.Certificate {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.portalCert
+}
+
+// SetCRLBaseURL 设置叶子证书 CRL Distribution Points 的基地址（不含 /crl 后缀）。
+// 由服务端在绑定监听端口后调用，确保生成的叶子证书携带可被客户端访问的吊销列表地址，
+// 从而避免 Windows schannel 因缺少 CRL 吊销信息而返回 CERT_TRUST_REVOCATION_STATUS_UNKNOWN。
+func (st *Store) SetCRLBaseURL(baseURL string) {
+	if st == nil {
+		return
+	}
+	st.mu.Lock()
+	st.crlBaseURL = baseURL
+	st.mu.Unlock()
 }
 
 // Stats 返回证书存储模块的概况指标（是否已载入根 CA、根 CA 路径及内存缓存的叶子证书数量）。
@@ -213,6 +226,28 @@ func (st *Store) CAValidUntil() time.Time {
 		return time.Time{}
 	}
 	return st.ca.Cert.NotAfter
+}
+
+// CRL 生成并返回一份由本地 CA 签名、不含任何吊销条目的空 CRL（PEM 编码）。
+// 由于 ech-proxy 从不主动吊销叶子证书，空 CRL 即表示"无一被吊销"，
+// 供客户端（如 Windows schannel）在证书校验时经 CRL Distribution Points 拉取。
+func (st *Store) CRL() ([]byte, error) {
+	if st == nil || st.ca == nil || st.ca.Cert == nil || st.ca.Key == nil {
+		return nil, errors.New("certstore: CA not initialized")
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	now := time.Now()
+	tmpl := &x509.RevocationList{
+		Number:     big.NewInt(now.Unix()),
+		ThisUpdate: now,
+		NextUpdate: now.Add(30 * 24 * time.Hour),
+	}
+	der, err := x509.CreateRevocationList(rand.Reader, tmpl, st.ca.Cert, st.ca.Key)
+	if err != nil {
+		return nil, err
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}), nil
 }
 
 func (st *Store) TLSConfig(portalCert *tls.Certificate) *tls.Config {
@@ -322,6 +357,11 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 	}
 	skid := sha1.Sum(x509.MarshalPKCS1PublicKey(&key.PublicKey))
 
+	var crlPoints []string
+	if st.crlBaseURL != "" {
+		crlPoints = []string{st.crlBaseURL + "/crl"}
+	}
+
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
 		Subject:               pkix.Name{CommonName: domain, Organization: []string{"ech-proxy local CA"}},
@@ -333,6 +373,7 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 		SubjectKeyId:          skid[:],
 		AuthorityKeyId:        st.ca.Cert.SubjectKeyId,
 		DNSNames:              sans,
+		CRLDistributionPoints: crlPoints,
 	}
 	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, st.ca.Cert, &key.PublicKey, st.ca.Key)
 	if err != nil {

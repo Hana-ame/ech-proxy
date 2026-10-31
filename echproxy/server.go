@@ -309,6 +309,13 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 
 	// 5. PAC 主线方案：启动独有的 pac.txt、block.json 与 ads.js 管理器（与 upstream.json 及 certs/ 完全解耦）
+	// 叶子证书的 CRL Distribution Points 指向本代理的 /crl 端点（本地回环，明文 HTTP，客户端可直达），
+	// 使 Windows schannel 在校验证书时能拉取到空 CRL，避免 CERT_TRUST_REVOCATION_STATUS_UNKNOWN。
+	// 注意：仅在 PAC 主线（明文监听 + CONNECT MITM）设置；443 方案为 TLS 监听且不提供 /crl 路由，
+	// 保持其叶子证书无 CRL DP（与旧行为一致），避免指向不可达的明文地址。
+	if store != nil {
+		store.SetCRLBaseURL(fmt.Sprintf("http://127.0.0.1:%d", port))
+	}
 	var adScript *rewrite.AdScriptManager
 	if !opts.PortalMode {
 		skipAdScript := opts.NoAdScript || opts.SkipAdScript
@@ -372,6 +379,24 @@ func NewServer(opts ServerOptions) (*Server, error) {
 
 	topHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer logger.RecoverAndLog("HTTPTopHandler", nil)
+		// 提供吊销列表与根证书，供客户端证书校验时经 CRL Distribution Points / AIA 拉取。
+		if store != nil {
+			switch r.URL.Path {
+			case "/crl":
+				if crl, err := store.CRL(); err == nil {
+					w.Header().Set("Content-Type", "application/pkix-crl")
+					w.Header().Set("Cache-Control", "no-store")
+					w.Write(crl)
+					return
+				}
+			case "/ca.pem":
+				if caPEM, err := store.CAPEM(); err == nil {
+					w.Header().Set("Content-Type", "application/x-pem-file")
+					w.Write(caPEM)
+					return
+				}
+			}
+		}
 		if r.Method == http.MethodConnect {
 			co := connectOpts
 			co.IPMode = cloudflare_ech.GetIPMode()

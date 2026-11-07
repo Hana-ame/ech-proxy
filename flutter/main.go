@@ -42,7 +42,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -657,33 +656,6 @@ func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		log.Printf("← %s (client closed mid-body)", targetURL)
 	}
-}
-
-func isRedirect(code int) bool {
-	return code == http.StatusMovedPermanently ||
-		code == http.StatusFound ||
-		code == http.StatusSeeOther ||
-		code == http.StatusTemporaryRedirect ||
-		code == http.StatusPermanentRedirect
-}
-
-// resolveSameHost 解析重定向 Location：仅当目标是 [targetHost] 的 http(s)
-// URL（或相对路径）时返回完整 URL，否则返回空串（表示不跟随）。
-func resolveSameHost(loc, targetHost string) string {
-	if loc == "" {
-		return ""
-	}
-	if strings.HasPrefix(loc, "/") {
-		return "https://" + targetHost + loc
-	}
-	u, err := url.Parse(loc)
-	if err != nil {
-		return ""
-	}
-	if (u.Scheme == "http" || u.Scheme == "https") && strings.TrimSuffix(u.Hostname(), ".") == targetHost {
-		return loc
-	}
-	return ""
 }
 
 func main() {}

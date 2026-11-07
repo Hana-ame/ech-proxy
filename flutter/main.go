@@ -38,11 +38,9 @@ import "C"
 import (
 	_ "embed"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"runtime/debug"
 	"strconv"
@@ -53,7 +51,18 @@ import (
 	"unsafe"
 
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
+	"github.com/Hana-ame/ech-proxy/echproxy/netdial"
 )
+
+// apiHTTPClient 是 apiProxyHandler 复用的共享客户端（issue #47）：
+//   - Transport 用 netdial 的 DoH 解析连接池，而不是 http.DefaultTransport
+//     （后者走系统 UDP 53 解析 x.moonchan.xyz，移动端弱网/污染下极易失败）；
+//   - 同时共享同一个 Transport，连接池跨请求复用；
+//   - "dual" 让移动网络下 v4/v6 都能兜底（DialContextIPMode 会逐个尝试全部解析结果）。
+var apiHTTPClient = &http.Client{
+	Timeout:   30 * time.Second,
+	Transport: netdial.TransportWithIPMode("dual"),
+}
 
 //go:embed web/index.html
 var indexHTML string
@@ -570,15 +579,9 @@ func echProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 
 // apiProxyHandler 转发 JSON/API 到 x.moonchan.xyz。
 //
-// Flutter 控制面（twitter-api 的 `_dio`/`_gallery`）现在也改走本代理
-// （见 twitter-pic-flutter lib/api/twitter_api.dart setProxyPort），因此：
-//   - 上游必须走 **ECH 隧道**（cloudflare_ech.Do）：x.moonchan.xyz 是
-//     Cloudflare IP（104.21.x / 172.67.x），ECH 可直接承载；直连在墙内会
-//     被阻断（历史注释"上游返回 400"正是直连被墙的表现）。
-//   - ECH client 不自动跟随重定向（CheckRedirect: ErrUseLastResponse），
-//     而后端 `/api/twitter/<username>` 有 302 → `.json.gz?t=`（见 go 仓库
-//     api/handlers_v1.go:198）。这里手动跟随**同主机** 3xx，Location 仍走
-//     ECH，否则客户端拿到 302 会去直连被墙域名。
+// 仅供内嵌的 demo Web UI（index.html）使用：Flutter 侧的 API 请求是
+// **直连** x.moonchan.xyz 的（见 lib/api/twitter_api.dart kApiBase），
+// 经本代理转发时上游返回 400，故不要把 App 的 API 流量接到这里。
 func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path string) {
 	targetURL := withQuery("https://"+targetHost+normalizePath(path), r)
 	log.Printf("→ %s (from %s)", targetURL, r.RemoteAddr)
@@ -602,46 +605,12 @@ func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		}
 	}
 
-	// 走 ECH 隧道（与媒体同一条通道）。共享 cloudflare_ech.Do：
-	// 它内部按目标 host 做 DoH 解析 + ECH 配置 + 证书校验，且已带 index.html
-	// StartProxy 阶段做好的初始化。
-	resp, err := cloudflare_ech.Do(req)
+	// 复用包级共享 client：DoH 解析 + 连接池跨请求复用（issue #47）。
+	resp, err := apiHTTPClient.Do(req)
 	if err != nil {
-		log.Printf("ECH API error: %v", err)
+		log.Printf("API error: %v", err)
 		http.Error(w, "API fetch failed: "+err.Error(), http.StatusBadGateway)
 		return
-	}
-
-	// 手动跟随同主机 3xx（ECH client 不自动跟随）。只处理 Location 指向
-	// 同一目标 host 的重定向；跳到别处的（如登录态失效跳首页）原样回传给
-	// 客户端，由上层决定。
-	attempts := 0
-	for isRedirect(resp.StatusCode) && attempts < 5 {
-		loc := resp.Header.Get("Location")
-		resp.Body.Close()
-		if loc == "" {
-			break
-		}
-		next := resolveSameHost(loc, targetHost)
-		if next == "" {
-			// 跨主机/非 http(s)：不再跟随，原样返回 3xx 给客户端。
-			break
-		}
-		attempts++
-		log.Printf("→ (redirect %d) %s", resp.StatusCode, next)
-		redirectReq, rerr := http.NewRequestWithContext(r.Context(), http.MethodGet, next, nil)
-		if rerr != nil {
-			http.Error(w, "redirect request: "+rerr.Error(), http.StatusBadRequest)
-			return
-		}
-		redirectReq.Header.Set("User-Agent", "Mozilla/5.0 (TwitterPic)")
-		redirectReq.Header.Set("Accept-Encoding", "identity")
-		resp, err = cloudflare_ech.Do(redirectReq)
-		if err != nil {
-			log.Printf("ECH API redirect error: %v", err)
-			http.Error(w, "API fetch failed: "+err.Error(), http.StatusBadGateway)
-			return
-		}
 	}
 	defer resp.Body.Close()
 
@@ -656,36 +625,18 @@ func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.Printf("← %s (client closed mid-body)", targetURL)
+	buf := make([]byte, 64*1024)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
 	}
-}
-
-func isRedirect(code int) bool {
-	return code == http.StatusMovedPermanently ||
-		code == http.StatusFound ||
-		code == http.StatusSeeOther ||
-		code == http.StatusTemporaryRedirect ||
-		code == http.StatusPermanentRedirect
-}
-
-// resolveSameHost 解析重定向 Location：仅当目标是 [targetHost] 的 http(s)
-// URL（或相对路径）时返回完整 URL，否则返回空串（表示不跟随）。
-func resolveSameHost(loc, targetHost string) string {
-	if loc == "" {
-		return ""
-	}
-	if strings.HasPrefix(loc, "/") {
-		return "https://" + targetHost + loc
-	}
-	u, err := url.Parse(loc)
-	if err != nil {
-		return ""
-	}
-	if (u.Scheme == "http" || u.Scheme == "https") && strings.TrimSuffix(u.Hostname(), ".") == targetHost {
-		return loc
-	}
-	return ""
 }
 
 func main() {}

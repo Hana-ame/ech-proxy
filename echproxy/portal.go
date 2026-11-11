@@ -146,6 +146,7 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		allMode := opts.AllMode
 		adSource, adVersion := "disabled", ""
 		whitelistCount, adultSitesCount, blocklistCount := 0, 0, 0
+		whitelistSource, whitelistKind, whitelistPath := DefaultWhitelistURL, WhitelistKindRemote, ""
 		if opts.AdScript != nil {
 			adEnabled = opts.AdScript.Enabled()
 			skipAdScript = opts.AdScript.SkipAdScript()
@@ -159,6 +160,9 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			adultSitesCount = len(opts.AdScript.AdultSites())
 			bl := opts.AdScript.Blocklist()
 			blocklistCount = len(bl.Domains) + len(bl.Selectors)
+			whitelistSource = opts.AdScript.WhitelistURL()
+			whitelistKind = opts.AdScript.WhitelistSourceKind()
+			whitelistPath = opts.AdScript.WhitelistLocalPath()
 		}
 		logFile := ""
 		if opts.Logger != nil {
@@ -184,6 +188,9 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			"ad_script_source":  adSource,
 			"ad_script_version": adVersion,
 			"whitelist_count":   whitelistCount,
+			"whitelist_source":  whitelistSource,
+			"whitelist_kind":    whitelistKind,
+			"whitelist_path":    whitelistPath,
 			"adult_sites_count": adultSitesCount,
 			"blocklist_count":   blocklistCount,
 			"log_file":          logFile,

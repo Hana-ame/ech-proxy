@@ -1,3 +1,17 @@
+## v3.5.33
+
+### Fixes & Improvements
+
+- **自定义本地 `pac.txt` 优先：文件存在即默认使用本地，否则回退在线**（用户需求：自定义本地 text 文件）:
+  - **行为**：启动时按 `程序同目录/pac.txt` → `<dataDir>/pac.txt` → `<cwd>/pac.txt` 顺序探测，**只要命中就用本地文件**（完全离线、无需任何参数）；全部未命中才回退 `https://4545810.xyz/pac.txt`。判定与降级全部集中在新增的 `echproxy/rewrite/paclocal.go`（`ResolveWhitelistSource` / `DefaultLocalWhitelistCandidates` / `IsLocalWhitelistSource`），`AdScriptManager`、`ServerOptions`、`win/main.go`、`win/diag.go` 共用同一条解析路径，避免 CLI 与运行时各判一次导致口径分叉。
+  - **热加载**：本地来源的后台刷新周期固定 30s（在线来源仍 30 分钟），保存文件约 30 秒内 `/proxy.pac` 即反映新清单，无需重启。
+  - **优先级**：`-whitelist-url`（含 `ECH_PROXY_WHITELIST_URL`）显式指定时永远优先，本地文件不参与；新增 `-pac-file` 显式指定本地路径（`ECH_PROXY_PAC_FILE`）、`-no-local-pac` 忽略本地强制在线（`ECH_PROXY_NO_LOCAL_PAC`）。
+  - **安全降级**：命中但内容非法（空文件 / HTML 错误页 / 超长 / 目录）的候选被跳过并打 WARN，继续尝试下一个、最终回退在线——坏文件不会把白名单清空成全部直连。
+  - **缓存隔离**：本地来源既不读取也不写入 `<dataDir>/cache/pac.txt`（原逻辑启动时读该缓存，会把上次联网的旧名单顶掉用户刚放的本地文件），在线来源行为不变。
+  - **可观测性**：启动横幅 `Routing Scope: PAC Whitelist (...)` 与启动日志、`/statusz` 的 `whitelist_kind`/`whitelist_path`/`whitelist_source`、`diag -test pac` 首行、`pac` 子命令注释均打印实际来源（`local-pac` / `explicit` / `remote`）与本地路径。
+  - **验证**：`go build ./...`、`go vet ./...`、`go test ./...` 通过；唯一失败 `TestNyaaFragmentDo` 为既有墙内网络型失败（与本次改动无关）。新增回归测试 `TestResolveWhitelistSourceLocalPriority`、`TestNewAdScriptManagerPrefersLocalPAC`、`TestNewAdScriptManagerLocalPACReloadInterval`、`TestDefaultLocalWhitelistCandidates`、`TestIsLocalWhitelistSource`（`echproxy/rewrite/paclocal_test.go`）、`TestProxyPACUsesLocalPACTxt` / `TestProxyPACFallsBackToRemoteWhenNoLocalFile`（`echproxy/paclocal_engine_test.go`）、`TestLocalPACFileFlagAndDiag`（`win/main_test.go`）。
+  - **实测（2026-11-12，WSL，`./ech-proxy` + 同目录 pac.txt，监听 127.0.0.1:18443）**：启动日志 `[PAC] whitelist source: file:///tmp/pacsmoke/pac.txt (kind=local-pac)`、横幅 `Routing Scope: PAC Whitelist (local pac.txt (/tmp/pacsmoke/pac.txt))`；`/proxy.pac` 的 `EXACT_HOSTS` 恰为本地两条域名；把 pac.txt 改成一条后 34s 内 `/proxy.pac` 变为 `{"hot-reload.example.net":true}` 且 `/statusz` `whitelist_count` 1 → 热加载成立；`-no-local-pac` 下即使同目录有 pac.txt，来源变为 `https://4545810.xyz/pac.txt (kind=remote)`、`whitelist_count=70`（在线清单）；`diag -test pac` 报 `kind=local-pac` 并命中本地域名。
+
 ## v3.5.32
 
 ### Fixes & Improvements

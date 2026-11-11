@@ -39,8 +39,11 @@ type (
 	AdScriptManager = rewrite.AdScriptManager
 	AdScriptOptions = rewrite.AdScriptOptions
 	BlocklistRules  = rewrite.BlocklistRules
-	Logger          = logger.Manager
-	LoggerOptions   = logger.Options
+	// WhitelistSourceOptions / WhitelistSource 是「本地 pac.txt 优先」的来源解析类型。
+	WhitelistSourceOptions = rewrite.WhitelistSourceOptions
+	WhitelistSource        = rewrite.WhitelistSource
+	Logger                 = logger.Manager
+	LoggerOptions          = logger.Options
 )
 
 var (
@@ -82,22 +85,30 @@ var (
 	DefaultAdultSitesURL    = rewrite.DefaultAdultSitesURL
 	DefaultBlocklistURL     = rewrite.DefaultBlocklistURL
 	DefaultAdScriptInterval = rewrite.DefaultAdScriptUpdateInterval
-	DefaultPrimaryDoHURL    = cloudflare_ech.DefaultPrimaryDoHURL
-	DefaultSecondaryDoHURL  = cloudflare_ech.DefaultSecondaryDoHURL
-	DefaultDoHHost          = cloudflare_ech.DefaultDoHHost
-	DefaultSNIDomains       = cloudflare_ech.DefaultSNIDomains
-	NextDefaultSNIServerName = cloudflare_ech.NextDefaultSNIServerName
-	SetGlobalIPMode         = cloudflare_ech.SetIPMode
-	GetGlobalIPMode         = cloudflare_ech.GetIPMode
-	InitLogger              = logger.Init
-	NewLogger               = logger.NewManager
-	DefaultLogger           = logger.Default
-	EnsureDefaultLogger     = logger.EnsureDefault
-	DefaultLogDir           = logger.DefaultLogDir
-	RecordFatalError        = logger.RecordFatalError
-	RecoverAndLog           = logger.RecoverAndLog
-	SafeGo                  = logger.SafeGo
-	CleanLogs               = logger.CleanLogs
+	// 本地 pac.txt 优先：解析与探测入口统一从 rewrite 暴露，避免 win/ 与 echproxy/ 各写一份判定。
+	ResolveWhitelistSource          = rewrite.ResolveWhitelistSource
+	DefaultLocalWhitelistCandidates = rewrite.DefaultLocalWhitelistCandidates
+	IsLocalWhitelistSource          = rewrite.IsLocalWhitelistSource
+	LocalWhitelistFileName          = rewrite.LocalWhitelistFileName
+	WhitelistKindExplicit           = rewrite.WhitelistKindExplicit
+	WhitelistKindLocal              = rewrite.WhitelistKindLocal
+	WhitelistKindRemote             = rewrite.WhitelistKindRemote
+	DefaultPrimaryDoHURL            = cloudflare_ech.DefaultPrimaryDoHURL
+	DefaultSecondaryDoHURL          = cloudflare_ech.DefaultSecondaryDoHURL
+	DefaultDoHHost                  = cloudflare_ech.DefaultDoHHost
+	DefaultSNIDomains               = cloudflare_ech.DefaultSNIDomains
+	NextDefaultSNIServerName        = cloudflare_ech.NextDefaultSNIServerName
+	SetGlobalIPMode                 = cloudflare_ech.SetIPMode
+	GetGlobalIPMode                 = cloudflare_ech.GetIPMode
+	InitLogger                      = logger.Init
+	NewLogger                       = logger.NewManager
+	DefaultLogger                   = logger.Default
+	EnsureDefaultLogger             = logger.EnsureDefault
+	DefaultLogDir                   = logger.DefaultLogDir
+	RecordFatalError                = logger.RecordFatalError
+	RecoverAndLog                   = logger.RecoverAndLog
+	SafeGo                          = logger.SafeGo
+	CleanLogs                       = logger.CleanLogs
 )
 
 func init() {
@@ -136,10 +147,15 @@ type ServerOptions struct {
 	SkipAdBlock         bool
 	AdScriptURL         string
 	WhitelistURL        string
-	AdultSitesURL       string
-	BlocklistURL        string
-	AdScriptInterval    time.Duration
-	Logger              *logger.Manager
+	// PACFile 是显式指定的本地 pac.txt 路径（-pac-file）；为空则自动探测
+	// 程序同目录 / 数据目录 / 当前目录下的 pac.txt，存在即默认使用（离线优先）。
+	PACFile string
+	// NoLocalPAC 为 true 时忽略本地 pac.txt，强制使用在线白名单（-no-local-pac）。
+	NoLocalPAC       bool
+	AdultSitesURL    string
+	BlocklistURL     string
+	AdScriptInterval time.Duration
+	Logger           *logger.Manager
 }
 
 type Server struct {
@@ -326,6 +342,9 @@ func NewServer(opts ServerOptions) (*Server, error) {
 			AllMode:        opts.AllMode,
 			ScriptURL:      strings.TrimSpace(opts.AdScriptURL),
 			WhitelistURL:   strings.TrimSpace(opts.WhitelistURL),
+			PACFile:        strings.TrimSpace(opts.PACFile),
+			NoLocalPAC:     opts.NoLocalPAC,
+			DataDir:        dataDir,
 			AdultSitesURL:  strings.TrimSpace(opts.AdultSitesURL),
 			BlocklistURL:   strings.TrimSpace(opts.BlocklistURL),
 			UpdateInterval: opts.AdScriptInterval,
@@ -691,7 +710,13 @@ func (s *Server) PrintBanner(localIP string) {
 		if s.Options.AllMode {
 			fmt.Printf("  Routing Scope: ALL Mode (-all)\n")
 		} else {
-			fmt.Printf("  Routing Scope: PAC Whitelist (%s)\n", DefaultWhitelistURL)
+			// 白名单来源可能是本地 pac.txt（默认优先）或在线地址，横幅必须显示真实来源，
+			// 否则用户放了本地 pac.txt 却仍看到在线 URL，会误判「本地文件没生效」。
+			source := DefaultWhitelistURL
+			if s.AdScript != nil {
+				source = s.AdScript.WhitelistSourceLabel()
+			}
+			fmt.Printf("  Routing Scope: PAC Whitelist (%s)\n", source)
 		}
 		pacSuffix := ""
 		if s.Options.AllMode {

@@ -543,21 +543,39 @@ func diagConfig(out io.Writer, cmd CLICommand, host string) int {
 // 注意 GeneratePACWithFallback 的第一个参数是 `_`（cfg 被丢弃），白名单只来自 extraWhitelist，
 // 所以这里必须先拉 pac.txt 再喂进去——直接 GeneratePAC(cfg) 得到的是空名单，恒不命中，等于没测。
 func diagPAC(out io.Writer, cmd CLICommand, host string) int {
-	src := strings.TrimSpace(cmd.WhitelistURL)
-	if src == "" {
-		src = echproxy.DefaultWhitelistURL
-	}
+	// 与运行时同一条解析路径：本地 pac.txt 存在则默认用它（否则用户放下的本地文件
+	// 在 diag 里永远不生效，会给出与实际代理行为相反的结论）。
+	resolved := echproxy.ResolveWhitelistSource(echproxy.WhitelistSourceOptions{
+		ExplicitURL:  strings.TrimSpace(cmd.WhitelistURL),
+		ExplicitPath: strings.TrimSpace(cmd.PACFile),
+		DataDir:      resolveDataDir(cmd),
+		DisableLocal: cmd.NoLocalPAC,
+	})
+	src := resolved.URL
 	fmt.Fprintf(out, "== pac: %s 是否会被 PAC 送进代理 ==\n", host)
-	fmt.Fprintf(out, "   白名单源: %s\n", src)
+	fmt.Fprintf(out, "   白名单源: %s (kind=%s)\n", src, resolved.Kind)
+	if resolved.LocalPath != "" {
+		fmt.Fprintf(out, "   本地 pac.txt: %s\n", resolved.LocalPath)
+	}
+	for _, w := range resolved.Warnings {
+		fmt.Fprintf(out, "   WARN %s\n", w)
+	}
 	buf, err := echproxy.FetchBytes(src)
 	if err != nil {
 		fmt.Fprintf(out, "   FAIL 拉取白名单失败: %v\n", err)
 		return 1
 	}
+	// 走统一解析（支持 JSON 数组/对象、注释、URL、HOSTS），原先按行裸切会把
+	// "# comments" 一类残留也当条目计入，读数和运行时不一致。
 	var whitelist []string
-	for _, line := range strings.Split(string(buf), "\n") {
-		if d := netdial.NormalizeDomainEntry(line); d != "" {
-			whitelist = append(whitelist, d)
+	if parsed, perr := echproxy.ParseDomainList(buf); perr == nil {
+		whitelist = parsed
+	} else {
+		fmt.Fprintf(out, "   WARN 白名单解析失败: %v（按行裸切兜底）\n", perr)
+		for _, line := range strings.Split(string(buf), "\n") {
+			if d := netdial.NormalizeDomainEntry(line); d != "" {
+				whitelist = append(whitelist, d)
+			}
 		}
 	}
 	fmt.Fprintf(out, "   白名单条目: %d\n", len(whitelist))

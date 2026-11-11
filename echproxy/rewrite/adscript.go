@@ -38,11 +38,11 @@ const (
 	// DefaultAdScriptUpdateInterval 是远程配置后台自动检查更新周期（30 分钟）。
 	DefaultAdScriptUpdateInterval = 30 * time.Minute
 
-	maxAdScriptBytes     = 2 << 20
-	maxDomainJSONBytes   = 1 << 20
-	maxWhitelistHistory  = 16
-	cachedScriptName     = "ads.js"
-	cachedWhitelistName  = "pac.txt"
+	maxAdScriptBytes    = 2 << 20
+	maxDomainJSONBytes  = 1 << 20
+	maxWhitelistHistory = 16
+	cachedScriptName    = "ads.js"
+	cachedWhitelistName = "pac.txt"
 )
 
 var DefaultAdNetworkBlockedURLs = []string{
@@ -418,32 +418,43 @@ func ContainsAdultAdInHTML(htmlBody []byte) bool {
 }
 
 type AdScriptOptions struct {
-	Enabled        bool
-	SkipAdScript   bool
-	SkipAdBlock    bool
-	AllMode        bool
-	ScriptURL      string
-	WhitelistURL   string
-	AdultSitesURL  string
-	BlocklistURL   string
-	UpdateInterval time.Duration
+	Enabled            bool
+	SkipAdScript       bool
+	SkipAdBlock        bool
+	AllMode            bool
+	ScriptURL          string
+	WhitelistURL       string
+	AdultSitesURL      string
+	BlocklistURL       string
+	UpdateInterval     time.Duration
 	CacheDir           string
 	FetchFn            func(string) ([]byte, error)
 	OnWhitelistUpdated func([]string)
+
+	// PACFile 是显式指定的本地 pac.txt 路径（-pac-file / ECH_PROXY_PAC_FILE）。
+	PACFile string
+	// NoLocalPAC 为 true 时忽略一切本地 pac.txt，直接用在线白名单（-no-local-pac）。
+	NoLocalPAC bool
+	// DataDir 是数据目录，用于探测 <dataDir>/pac.txt；可为空。
+	DataDir string
 }
 
 type AdScriptManager struct {
-	mu             sync.RWMutex
-	enabled        atomic.Bool
-	skipAdBlock    atomic.Bool
-	allMode        atomic.Bool
-	scriptURL      string
-	whitelistURL   string
-	adultSitesURL  string
-	blocklistURL   string
-	updateInterval time.Duration
-	cacheDir       string
-	fetchFn        func(string) ([]byte, error)
+	mu           sync.RWMutex
+	enabled      atomic.Bool
+	skipAdBlock  atomic.Bool
+	allMode      atomic.Bool
+	scriptURL    string
+	whitelistURL string
+	// whitelistKind 记录 whitelistURL 的来源类别（explicit / local-pac / remote）。
+	whitelistKind string
+	// whitelistLocalPath 是命中的本地 pac.txt 绝对路径（非本地来源时为空）。
+	whitelistLocalPath string
+	adultSitesURL      string
+	blocklistURL       string
+	updateInterval     time.Duration
+	cacheDir           string
+	fetchFn            func(string) ([]byte, error)
 
 	onWhitelistUpdated func([]string)
 
@@ -466,9 +477,17 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	if scriptURL == "" {
 		scriptURL = DefaultAdScriptURL
 	}
-	whiteURL := strings.TrimSpace(opts.WhitelistURL)
-	if whiteURL == "" {
-		whiteURL = DefaultWhitelistURL
+	// PAC 白名单来源：本地 pac.txt 存在则默认用本地（issue：自定义本地 text 文件），
+	// 否则回退到在线 DefaultWhitelistURL。显式 -whitelist-url 永远优先。
+	src := ResolveWhitelistSource(WhitelistSourceOptions{
+		ExplicitURL:  strings.TrimSpace(opts.WhitelistURL),
+		ExplicitPath: strings.TrimSpace(opts.PACFile),
+		DataDir:      strings.TrimSpace(opts.DataDir),
+		DisableLocal: opts.NoLocalPAC,
+	})
+	whiteURL := src.URL
+	for _, w := range src.Warnings {
+		log.Printf("[AdScript] %s", w)
 	}
 	adultURL := strings.TrimSpace(opts.AdultSitesURL)
 	if adultURL == "" {
@@ -488,14 +507,16 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	}
 
 	m := &AdScriptManager{
-		scriptURL:      scriptURL,
-		whitelistURL:   whiteURL,
-		adultSitesURL:  adultURL,
-		blocklistURL:   blockURL,
-		updateInterval: interval,
-		cacheDir:       strings.TrimSpace(opts.CacheDir),
-		fetchFn:        fetchFn,
-		stopCh:         make(chan struct{}),
+		scriptURL:          scriptURL,
+		whitelistURL:       whiteURL,
+		whitelistKind:      src.Kind,
+		whitelistLocalPath: src.LocalPath,
+		adultSitesURL:      adultURL,
+		blocklistURL:       blockURL,
+		updateInterval:     interval,
+		cacheDir:           strings.TrimSpace(opts.CacheDir),
+		fetchFn:            fetchFn,
+		stopCh:             make(chan struct{}),
 	}
 	emptyWL := []string{}
 	m.whitelistPtr.Store(&emptyWL)
@@ -509,10 +530,26 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 		if cached, err := os.ReadFile(filepath.Join(m.cacheDir, cachedScriptName)); err == nil && isValidAdScript(cached) {
 			m.setScriptLocked(cached, "cache")
 		}
-		if cachedWL, err := os.ReadFile(filepath.Join(m.cacheDir, cachedWhitelistName)); err == nil {
-			if domains, perr := ParseDomainList(cachedWL); perr == nil && len(domains) > 0 {
-				m.SwapWhitelist(domains)
+		// 本地 pac.txt（或显式本地路径）是白名单的唯一权威来源，绝不让本地 cache/pac.txt
+		// 里的旧远程缓存覆盖它：否则用户放下的自定义 pac.txt 会被上次联网残留顶掉。
+		if src.LocalPath == "" {
+			if cachedWL, err := os.ReadFile(filepath.Join(m.cacheDir, cachedWhitelistName)); err == nil {
+				if domains, perr := ParseDomainList(cachedWL); perr == nil && len(domains) > 0 {
+					m.SwapWhitelist(domains)
+				}
 			}
+		}
+	}
+	if src.LocalPath != "" {
+		// 本地文件同步读取，保证 /proxy.pac 从第一帧起就是本地清单（不依赖后台刷新时序）。
+		if raw, err := os.ReadFile(src.LocalPath); err == nil {
+			if domains, perr := ParseDomainList(raw); perr == nil {
+				m.SwapWhitelist(domains)
+			} else {
+				log.Printf("[AdScript] parse local pac.txt %s: %v", src.LocalPath, perr)
+			}
+		} else {
+			log.Printf("[AdScript] read local pac.txt %s: %v", src.LocalPath, err)
 		}
 	}
 	return m
@@ -661,6 +698,49 @@ func (m *AdScriptManager) WhitelistURL() string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.whitelistURL
+}
+
+// WhitelistSourceKind 返回 PAC 白名单来源类别：explicit / local-pac / remote。
+func (m *AdScriptManager) WhitelistSourceKind() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.whitelistKind
+}
+
+// WhitelistLocalPath 返回命中的本地 pac.txt 绝对路径（来源非本地时为空）。
+func (m *AdScriptManager) WhitelistLocalPath() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.whitelistLocalPath
+}
+
+// WhitelistSourceLabel 返回给横幅 / 诊断 / 前端展示的简短来源描述。
+func (m *AdScriptManager) WhitelistSourceLabel() string {
+	if m == nil {
+		return "disabled"
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	switch m.whitelistKind {
+	case WhitelistKindLocal:
+		if m.whitelistLocalPath != "" {
+			return "local pac.txt (" + m.whitelistLocalPath + ")"
+		}
+		return "local pac.txt"
+	case WhitelistKindExplicit:
+		if m.whitelistLocalPath != "" {
+			return "explicit pac.txt (" + m.whitelistLocalPath + ")"
+		}
+		return "explicit (" + m.whitelistURL + ")"
+	default:
+		return m.whitelistURL
+	}
 }
 
 func (m *AdScriptManager) Whitelist() []string {
@@ -890,13 +970,24 @@ func (m *AdScriptManager) RefreshWhitelistOnce() ([]string, error) {
 		return []string{}, nil
 	}
 	m.mu.RLock()
-	url, fetch, cacheDir := m.whitelistURL, m.fetchFn, m.cacheDir
+	url, fetch, cacheDir, kind, localPath := m.whitelistURL, m.fetchFn, m.cacheDir, m.whitelistKind, m.whitelistLocalPath
 	m.mu.RUnlock()
 
 	if url == "" || fetch == nil {
 		return m.Whitelist(), nil
 	}
-	raw, err := fetch(url)
+	var raw []byte
+	var err error
+	if p, ok := localWhitelistPath(url); ok {
+		// 本地 pac.txt 是磁盘文件，必须直接读盘：FetchBytes/FetchFn 是远端拉取器
+		// （自定义 FetchFn 甚至只认 http），经它们读本地文件会误报拉取失败。
+		if localPath != "" {
+			p = localPath
+		}
+		raw, err = os.ReadFile(p)
+	} else {
+		raw, err = fetch(url)
+	}
 	if err != nil {
 		log.Printf("[AdScript] Failed to fetch pac whitelist from %s: %v (retaining previous whitelist)", url, err)
 		return m.Whitelist(), fmt.Errorf("fetch pac whitelist from %s: %w", url, err)
@@ -907,7 +998,8 @@ func (m *AdScriptManager) RefreshWhitelistOnce() ([]string, error) {
 		return m.Whitelist(), fmt.Errorf("parse pac whitelist from %s: %w", url, perr)
 	}
 	prev := m.SwapWhitelist(domains)
-	if cacheDir != "" && len(raw) > 0 {
+	// 本地 pac.txt 本身就是权威文件，绝不把它回写到 cache/pac.txt（否则缓存会与用户文件互相顶）。
+	if cacheDir != "" && len(raw) > 0 && kind != WhitelistKindLocal {
 		_ = os.MkdirAll(cacheDir, 0o755)
 		_ = os.WriteFile(filepath.Join(cacheDir, cachedWhitelistName), raw, 0o644)
 	}
@@ -918,6 +1010,24 @@ func (m *AdScriptManager) RefreshWhitelistOnce() ([]string, error) {
 		cb(domains)
 	}
 	return append([]string(nil), domains...), nil
+}
+
+// refreshInterval 返回后台白名单刷新周期：本地 pac.txt 允许用户随时编辑，
+// 用更短的周期做热加载（30s）；在线来源仍按默认 30 分钟。
+func (m *AdScriptManager) refreshInterval() time.Duration {
+	if m == nil {
+		return DefaultAdScriptUpdateInterval
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.whitelistKind == WhitelistKindLocal {
+		const localReloadInterval = 30 * time.Second
+		if m.updateInterval < localReloadInterval {
+			return m.updateInterval
+		}
+		return localReloadInterval
+	}
+	return m.updateInterval
 }
 
 func slicesEqual(a, b []string) bool {
@@ -979,7 +1089,8 @@ func (m *AdScriptManager) StartAutoUpdate(ctx context.Context) {
 	go func() {
 		defer func() { _ = recover() }()
 		_, _ = m.RefreshOnce()
-		ticker := time.NewTicker(m.updateInterval)
+		// 本地 pac.txt 用短周期热加载（用户改文件即生效）；在线来源用配置的 30 分钟。
+		ticker := time.NewTicker(m.refreshInterval())
 		defer ticker.Stop()
 		for {
 			select {
@@ -1067,5 +1178,3 @@ func looksLikeHTMLDocument(b []byte) bool {
 		bytes.Contains(lower, []byte("<head")) ||
 		bytes.Contains(lower, []byte("<body"))
 }
-
-

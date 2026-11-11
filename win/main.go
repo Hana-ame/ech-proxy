@@ -52,6 +52,10 @@ func FlagOverviewText() string {
 
   远程配置 Flag:
     -whitelist-url      自定义 pac.txt 代理白名单地址（默认 https://4545810.xyz/pac.txt）
+                        （显式指定后不再使用本地 pac.txt）
+    -pac-file           显式指定本地 pac.txt 路径（默认自动探测：程序同目录 → 数据目录 → 当前目录）
+    -no-local-pac       忽略本地 pac.txt，强制使用在线白名单
+                        本地 pac.txt 存在则默认优先使用：离线可用，改文件约 30s 内热加载，无需重启
 
   诊断子命令（一次性真实请求，不启动监听、不改系统代理与 hosts）:
     probe -host <域名>   逐通道诊断：direct / fragment / sni / ech / auto 各打一次并打印状态码与错误
@@ -119,6 +123,8 @@ type CLICommand struct {
 	SkipAdBlock      bool
 	AdScriptURL      string
 	WhitelistURL     string
+	PACFile          string
+	NoLocalPAC       bool
 	AdultSitesURL    string
 	BlocklistURL     string
 	AdScriptInterval time.Duration
@@ -315,6 +321,10 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	noTray := fs.Bool("no-tray", false, "禁用托盘")
 	hideConsole := fs.Bool("hide-console", false, "隐藏控制台")
 	whitelistURL := fs.String("whitelist-url", defaultWhitelistEnv, "pac.txt 地址")
+	// 本地 pac.txt 优先：默认自动探测程序同目录 / 数据目录 / 当前目录下的 pac.txt，
+	// 存在即用它（离线可用），不存在才用 -whitelist-url / 内置在线地址。
+	pacFile := fs.String("pac-file", getenv("ECH_PROXY_PAC_FILE"), "本地 pac.txt 路径（存在则默认优先使用）")
+	noLocalPAC := fs.Bool("no-local-pac", envBool(getenv("ECH_PROXY_NO_LOCAL_PAC")), "忽略本地 pac.txt，强制使用在线白名单")
 	adultSitesURL := fs.String("adult-sites-url", getenv("ECH_PROXY_ADULT_SITES_URL"), "自定义站点清单地址")
 	adultDomainsAlias := fs.String("adult-domains-url", "", "pac.txt 别名")
 	blocklistURL := fs.String("blocklist-url", getenv("ECH_PROXY_BLOCKLIST_URL"), "自定义补充规则地址")
@@ -521,6 +531,8 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		SkipAdBlock:      *skipAdBlock,
 		AdScriptURL:      strings.TrimSpace(*adScriptURL),
 		WhitelistURL:     resolvedWhitelistURL,
+		PACFile:          strings.TrimSpace(*pacFile),
+		NoLocalPAC:       *noLocalPAC,
 		AdultSitesURL:    strings.TrimSpace(*adultSitesURL),
 		BlocklistURL:     strings.TrimSpace(*blocklistURL),
 		AdScriptInterval: *adScriptInterval,
@@ -562,11 +574,17 @@ func resolveLogDir(cmd CLICommand) string {
 	if cmd.LogDir != "" {
 		return cmd.LogDir
 	}
-	dataDir := cmd.DataDir
-	if dataDir == "" {
-		dataDir, _ = echproxy.DefaultDataDir()
+	return echproxy.DefaultLogDir(resolveDataDir(cmd))
+}
+
+// resolveDataDir 返回生效的数据目录：显式 -data-dir 优先，否则用 echproxy 的默认探测结果。
+// 本地 pac.txt 的自动探测候选（<dataDir>/pac.txt）与日志目录共用同一个 dataDir，保证两处口径一致。
+func resolveDataDir(cmd CLICommand) string {
+	if d := strings.TrimSpace(cmd.DataDir); d != "" {
+		return d
 	}
-	return echproxy.DefaultLogDir(dataDir)
+	d, _ := echproxy.DefaultDataDir()
+	return d
 }
 
 func runToolAction(cmd CLICommand, out io.Writer) int {
@@ -690,12 +708,22 @@ func runToolAction(cmd CLICommand, out io.Writer) int {
 		return 0
 	case "pac":
 		var wl []string
-		wlURL := cmd.WhitelistURL
-		if wlURL == "" {
-			wlURL = echproxy.DefaultWhitelistURL
+		src := echproxy.ResolveWhitelistSource(echproxy.WhitelistSourceOptions{
+			ExplicitURL:  strings.TrimSpace(cmd.WhitelistURL),
+			ExplicitPath: strings.TrimSpace(cmd.PACFile),
+			DataDir:      resolveDataDir(cmd),
+			DisableLocal: cmd.NoLocalPAC,
+		})
+		// 这些是 PAC 脚本的前置注释，必须是 JS 行注释 //：PAC 内容最终被浏览器当
+		// JavaScript 解析，用 # 会直接抛语法错误（整份 PAC 失效）。
+		for _, w := range src.Warnings {
+			fmt.Fprintf(out, "// warning: %s\n", w)
 		}
-		if raw, err := echproxy.FetchBytes(wlURL); err == nil {
+		fmt.Fprintf(out, "// whitelist source: %s (%s)\n", src.URL, src.Kind)
+		if raw, err := echproxy.FetchBytes(src.URL); err == nil {
 			wl, _ = echproxy.ParseDomainList(raw)
+		} else {
+			fmt.Fprintf(out, "// warning: fetch whitelist failed: %v\n", err)
 		}
 		fmt.Fprint(out, echproxy.GeneratePAC(nil, cmd.Addr, cmd.AllMode, wl))
 		return 0
@@ -860,6 +888,8 @@ func main() {
 		SkipAdBlock:      cmd.SkipAdBlock,
 		AdScriptURL:      cmd.AdScriptURL,
 		WhitelistURL:     cmd.WhitelistURL,
+		PACFile:          cmd.PACFile,
+		NoLocalPAC:       cmd.NoLocalPAC,
 		AdultSitesURL:    cmd.AdultSitesURL,
 		BlocklistURL:     cmd.BlocklistURL,
 		AdScriptInterval: cmd.AdScriptInterval,
@@ -875,6 +905,15 @@ func main() {
 	}
 
 	echproxy.StartMemoryWatchDog(srv, logMgr, 300*1024*1024)
+
+	// 明确记录 PAC 白名单真实来源：本地 pac.txt 优先这条行为是隐式的（放文件即生效），
+	// 不打印出来用户无从判断到底用了本地还是在线，排查时只能猜。
+	if srv.AdScript != nil {
+		log.Printf("[PAC] whitelist source: %s (kind=%s)", srv.AdScript.WhitelistURL(), srv.AdScript.WhitelistSourceKind())
+		if p := srv.AdScript.WhitelistLocalPath(); p != "" {
+			log.Printf("[PAC] local pac.txt in use: %s (%d domains)", p, len(srv.AdScript.Whitelist()))
+		}
+	}
 
 	actualListenAddr := fmt.Sprintf("127.0.0.1:%d", srv.Port)
 	scheme := "https"

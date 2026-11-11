@@ -191,7 +191,8 @@ func TestSysProxyManagerAtomicReplaceAndOldValuePop(t *testing.T) {
 
 // TestSysProxyRestoreOriginalSceneOnDirectAndExit 验证：
 // 1. 本地运行 v2ray（全局代理 127.0.0.1:10809、自动代理 autoDetect、或 PAC）时启动 ech-proxy：
-//    - PAC URL 自动挂载 fallback=127.0.0.1:10809 参数，实现白名单走 ech-proxy，非白名单走 v2ray 无缝共存；
+//   - PAC URL 自动挂载 fallback=127.0.0.1:10809 参数，实现白名单走 ech-proxy，非白名单走 v2ray 无缝共存；
+//
 // 2. 从 PAC 模式切换为「直连模式 (SysProxyOff)」时，现场必须完整无损还原（包含全局代理、自动代理、PAC 三项）；
 // 3. 再次切回 PAC 模式后退出进程（CleanupOnExit），现场再次无损还原，绝不破坏原有 v2ray 设置；
 // 4. 若启动前系统代理残留的是 ech-proxy 自身（如前次异常崩溃残留的 127.0.0.1:8443/proxy.pac），安全识别为自身地址，切直连时还原为纯净 Direct 模式。
@@ -283,7 +284,6 @@ func TestSysProxyRestoreOriginalSceneOnDirectAndExit(t *testing.T) {
 		t.Errorf("clearing self residual proxy want clean Off, got %+v", st3)
 	}
 }
-
 
 func TestTrayControllerMenuRefinementsUninstallCAAndUpdate(t *testing.T) {
 	drv := &stubSysProxyDriver{}
@@ -592,5 +592,59 @@ func TestDanglingModeFlagAndShortIPFlagCompatibility(t *testing.T) {
 	cmd6, err := parseCLIArgs("ech-proxy.exe", []string{"-mode", "-ip", "6"}, noEnv)
 	if err != nil || cmd6.IPMode != "v6" || cmd6.Mode != "smart" {
 		t.Errorf("parseCLIArgs(ech-proxy.exe -mode -ip 6) = %+v, %v", cmd6, err)
+	}
+}
+
+// TestLocalPACFileFlagAndDiag 验证：
+// 1. -pac-file / -no-local-pac 能被 CLI 正确解析并落到 CLICommand（否则功能在 Windows 上根本接不上）；
+// 2. diag -test pac 使用与运行时同一条来源解析（本地 pac.txt 存在即用本地），并把来源类别打印出来。
+func TestLocalPACFileFlagAndDiag(t *testing.T) {
+	noEnv := func(string) string { return "" }
+
+	localPAC := filepath.Join(t.TempDir(), "pac.txt")
+	if err := os.WriteFile(localPAC, []byte("local-diag-site.example.com\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd, err := parseCLIArgs("ech-proxy.exe", []string{"-pac-file", localPAC, "-no-local-pac"}, noEnv)
+	if err != nil {
+		t.Fatalf("parseCLIArgs(-pac-file ...) failed: %v", err)
+	}
+	if cmd.PACFile != localPAC || !cmd.NoLocalPAC {
+		t.Fatalf("-pac-file/-no-local-pac not parsed: %+v", cmd)
+	}
+
+	// -no-local-pac 生效：即使 -pac-file 指向真实文件，diag 也必须报在线来源。
+	var out bytes.Buffer
+	if code := runDiag(CLICommand{
+		DiagTest:   "pac",
+		ProbeHost:  "local-diag-site.example.com",
+		PACFile:    localPAC,
+		NoLocalPAC: true,
+	}, &out); code != 0 {
+		t.Fatalf("diag pac with -no-local-pac returned %d, out=%q", code, out.String())
+	}
+	if !strings.Contains(out.String(), "kind=remote") {
+		t.Fatalf("-no-local-pac should force remote source, out=%q", out.String())
+	}
+
+	// 默认（未禁用）：本地 pac.txt 命中，且域名判为会被 PAC 送进代理。
+	out.Reset()
+	if code := runDiag(CLICommand{
+		DiagTest:  "pac",
+		ProbeHost: "local-diag-site.example.com",
+		PACFile:   localPAC,
+	}, &out); code != 0 {
+		t.Fatalf("diag pac with local file returned %d, out=%q", code, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "kind=local-pac") {
+		t.Fatalf("diag pac should report local-pac source, out=%q", got)
+	}
+	if !strings.Contains(got, localPAC) {
+		t.Fatalf("diag pac should print local pac.txt path, out=%q", got)
+	}
+	if !strings.Contains(got, "白名单条目: 1") || !strings.Contains(got, "命中白名单条目") {
+		t.Fatalf("diag pac should hit local domain, out=%q", got)
 	}
 }

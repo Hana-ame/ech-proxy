@@ -79,7 +79,8 @@
 
 1. **PAC 方案（默认主流 Mainstream，`ech-proxy.exe`）**：
    - 启动后默认将系统代理原子替换为本地 PAC 脚本（`http://127.0.0.1:8443/proxy.pac?t=<ts>`），并将旧系统代理状态压栈（退出或 `Pop` 时自动 `pop` 恢复旧值）。
-   - 严格仅依据远程白名单 `https://4545810.xyz/pac.txt`（一行一个 domain，支持原子替换 `SwapWhitelist` 与旧值 `PopWhitelist`）生成 PAC 规则，**与 `upstream.json` 及 `certs/` 路径完全解耦**。
+   - 白名单**优先本地 `pac.txt`**：启动时按「程序同目录 → `<dataDir>` → 当前工作目录」探测 `pac.txt`，**只要存在就默认使用本地文件**（完全离线、无需任何参数）；探测不到才回退到在线 `https://4545810.xyz/pac.txt`。本地文件改动约 30 秒内热加载，无需重启；`-whitelist-url` 显式指定时永远优先于本地文件（详见下节「本地 pac.txt 优先」）。
+   - 严格仅依据 PAC 白名单（一行一个 domain，支持原子替换 `SwapWhitelist` 与旧值 `PopWhitelist`）生成 PAC 规则，**与 `upstream.json` 及 `certs/` 路径完全解耦**。
    - 本地自签 CA 与动态签发的域名叶子证书统一存放在 `<dataDir>/ca/`（`ca/ca.pem`、`ca/leaves/`），绝不触碰 `certs/` 目录。
 2. **443 方案（仅当文件名匹配 `.*.443.exe` 时开启）**：
    - **只与 `listen 443` 有关**：仅在可执行文件名匹配 `.*.443.exe` 时开启，严格仅监听 `443` 端口（不回退到 `8443`），其余所有功能（PAC、8443 门户、系统代理、托盘、自动更新、CONNECT 隧道）一律不运行。
@@ -98,13 +99,35 @@
 | `-6` | 强制 v6 出口（IPv6 only） |
 | `-dual` | 双端出口（IPv4 + IPv6 双栈自动优选） |
 | `-all` | 开启全局模式（无视 `pac.txt` 白名单，所有网站均通过 `ech-proxy` 代理；仅命令行 `-all` 可开启，不在托盘中显示） |
-| `-whitelist-url` | 自定义 `pac.txt` 地址（默认 `https://4545810.xyz/pac.txt`） |
+| `-whitelist-url` | 自定义 `pac.txt` 地址（默认 `https://4545810.xyz/pac.txt`）；**显式指定后不再使用本地 pac.txt** |
+| `-pac-file` | 显式指定本地 `pac.txt` 路径（默认自动探测，见「本地 pac.txt 优先」一节） |
+| `-no-local-pac` | 忽略本地 `pac.txt`，强制使用在线白名单（等价环境变量 `ECH_PROXY_NO_LOCAL_PAC=1`） |
 | `-ip` | 出口 IP 协议族兼容别名（支持 `4` / `ipv4` / `6` / `ipv6` / `dual` / `0`，兼容旧版 `-ip 4` 调用习惯） |
 | `-mode` | 运行模式选择（`smart` / `443` / `local`；若旧版脚本误传悬空 `-mode -ip 4` 将自动容错忽略） |
 | `ca install` / `-ca-install` | 一键安装本地 CA 根证书到受信任根证书库 |
 | `ca uninstall` / `-ca-uninstall` | 一键从受信任根证书库卸载本地 CA 根证书 |
 | `update` / `-update` | 立即检查并下载 GitHub Releases 最新版本 |
 | `help` / `-h` | 打印完整命令行 Flag 一览 |
+
+---
+
+## 四·补、 本地 `pac.txt` 优先（自定义本地白名单）
+
+PAC 白名单支持「放文件即生效」，**不需要任何命令行参数**：
+
+1. 把一份 `pac.txt`（一行一个 domain，支持 `#` / `//` 注释、URL 与 JSON 数组/对象格式）放到下列任一位置：
+   - 程序所在目录：`<ech-proxy.exe 同目录>/pac.txt`（**推荐**，离线也成立）
+   - 数据目录：`<dataDir>/pac.txt`（显式 `-data-dir` 或默认数据目录）
+   - 当前工作目录：`<cwd>/pac.txt`
+2. 启动时按上述顺序探测，**只要命中就用本地文件**，完全不联网；一个都没探测到才回退到在线 `https://4545810.xyz/pac.txt`。
+3. 本地文件编辑保存后约 **30 秒内热加载**（本地来源的刷新周期固定 30s；在线来源仍为 30 分钟），不需要重启程序。
+4. 优先级与开关：
+   - `-whitelist-url <地址>`：显式指定来源，**永远优先**，此时本地 `pac.txt` 被忽略；
+   - `-pac-file <路径>`：显式指定本地文件路径（优先于自动探测，但仍低于 `-whitelist-url`）；
+   - `-no-local-pac`（或 `ECH_PROXY_NO_LOCAL_PAC=1`）：忽略一切本地文件，强制在线。
+5. 安全降级：命中但内容非法（空文件 / HTML 错误页 / 超长 / 目录）的本地文件会被**跳过并记录 WARN**，继续尝试下一个候选、最终回退在线——一份坏文件不会把白名单清空成「全部直连」。
+6. 可观测性：启动横幅 `Routing Scope: PAC Whitelist (...)`、`/statusz` 的 `whitelist_kind` / `whitelist_path`、`diag -test pac` 的首行都会明确打印**实际使用的来源**（`local-pac` / `explicit` / `remote`）与本地路径；`ech-proxy pac` 子命令输出也会带 `// whitelist source:` 前置注释（JS 行注释，不破坏 PAC 语法），便于确认本地是否真的生效。
+7. 缓存隔离：本地来源**不写入也不读取** `<dataDir>/cache/pac.txt`（该缓存只服务在线来源），避免上次联网残留的旧名单顶掉用户刚放的本地文件。
 
 ---
 

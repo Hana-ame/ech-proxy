@@ -72,9 +72,11 @@ func localWhitelistPath(source string) (string, bool) {
 	}
 	lower := strings.ToLower(s)
 	if strings.HasPrefix(lower, "file://") {
-		p := strings.TrimPrefix(s, "file://")
-		if strings.HasPrefix(p, "/") && len(p) > 1 && p[2] == ':' {
-			// file:///C:/... 形式：去掉前导斜杠
+		// strings.TrimPrefix 用原始大小写匹配，大小写混写（File://）时靠下面的 ToSlash 兼容。
+		p := s[len("file://"):]
+		// file:///C:/dir/pac.txt -> C:/dir/pac.txt（Windows 盘符前那个斜杠要去掉）。
+		// 必须先判长度再索引，否则 file:/// 或 file:///x 这类短串会 panic。
+		if len(p) >= 3 && p[0] == '/' && p[2] == ':' {
 			p = p[1:]
 		}
 		return p, p != ""

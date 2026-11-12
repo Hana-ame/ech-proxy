@@ -224,3 +224,39 @@ func TestIsLocalWhitelistSource(t *testing.T) {
 		}
 	}
 }
+
+// TestLocalWhitelistPathEdgeCases 验证 file:// 解析的边界：
+// 短串不 panic（历史上的 len(p)>1 && p[2]==':' 在 "file://" 与 "file:///" 上会越界），
+// Windows 盘符形式去掉前导斜杠，大小写混写的 File:// 也能识别。
+func TestLocalWhitelistPathEdgeCases(t *testing.T) {
+	cases := []struct {
+		in   string
+		path string
+		ok   bool
+	}{
+		{"file://", "", false},
+		// "file:///" 的路径就是根目录 "/"：路径还原是准确的，由 usableLocalWhitelist 的目录检查拒绝。
+		{"file:///", "/", true},
+		{"file:///x", "/x", true},
+		{"file:///C:/dir/pac.txt", "C:/dir/pac.txt", true},
+		{"file:///c:/dir/pac.txt", "c:/dir/pac.txt", true},
+		{"FILE:///tmp/pac.txt", "/tmp/pac.txt", true},
+		{"File:///tmp/pac.txt", "/tmp/pac.txt", true},
+		{"https://example.com/pac.txt", "", false},
+		{"HTTP://example.com/pac.txt", "", false},
+		{"/abs/pac.txt", "/abs/pac.txt", true},
+	}
+	for _, c := range cases {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("localWhitelistPath(%q) panicked: %v", c.in, r)
+				}
+			}()
+			got, ok := localWhitelistPath(c.in)
+			if ok != c.ok || got != c.path {
+				t.Errorf("localWhitelistPath(%q) = (%q, %v), want (%q, %v)", c.in, got, ok, c.path, c.ok)
+			}
+		}()
+	}
+}

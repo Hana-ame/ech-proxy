@@ -1,3 +1,13 @@
+## v3.5.34
+
+### Fixes & Improvements
+
+- **修复本地 `pac.txt` 来源解析在畸形 `file://` 输入上的索引越界 panic**:
+  - **根因**：`localWhitelistPath`（`echproxy/rewrite/paclocal.go`）在 `file://` 分支先 `strings.TrimPrefix` 再判 `len(p) > 1 && p[2] == ':'`。当剩余路径长度恰为 2 且以 `/` 开头时（例如显式传入 `-whitelist-url file:///x`），`p[2]` 直接下标越界，进程 panic。触发面是显式配置的错误输入，不是默认路径。
+  - **修复**：改为 `s[len("file://"):]` 切片 + `len(p) >= 3` 前置长度判断；同时 `TrimPrefix` 区分大小写导致 `File://` / `FILE://` 混写落到裸路径分支的问题一并用小写前缀判定 + 原串切片解决。
+  - **验证**：新增 `TestLocalWhitelistPathEdgeCases` 覆盖 10 种输入（`file://`、`file:///`、`file:///x`、`file:///C:/dir/pac.txt`、`FILE:///tmp/pac.txt`、`File:///tmp/pac.txt`、`https://…`、`HTTP://…`、裸绝对路径等），含 `recover()` 断言不 panic；`go build ./...` / `go vet ./...` / `go test ./...` 通过，唯一失败 `TestNyaaFragmentDo` 为既有墙内网络型失败。CI（`ech-proxy` 与 `Go CI & Smoke Test`）双绿，含 Windows 386/amd64/arm64 + Linux/macOS 交叉编译与 `-race` 全量测试。
+  - **实测（2026-11-12，WSL）**：`-pac-file /nonexistent/pac.txt` 且目录内无 pac.txt 时，启动不 panic、来源降级为 `https://4545810.xyz/pac.txt (kind=remote)`、`whitelist_count=70`；同目录有 pac.txt 时仍优先本地（`kind=local-pac`）。
+
 ## v3.5.33
 
 ### Fixes & Improvements

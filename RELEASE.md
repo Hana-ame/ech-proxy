@@ -1,3 +1,36 @@
+## v3.6.0
+
+> **本次为 minor 版本**：新增「本地 `pac.txt` 优先」能力（新功能，非修复），故从 3.5.x 提升到 3.6.0；v3.5.33 / v3.5.34 是同一功能线的两个中间发布，内容已全部并入本版，功能上等价。
+
+### Features
+
+- **自定义本地 `pac.txt` 优先：文件存在即默认使用本地，否则回退在线**（用户需求：自定义本地 text 文件）:
+  - **行为**：启动时按 `程序同目录/pac.txt` → `<dataDir>/pac.txt` → `<cwd>/pac.txt` 顺序探测，**只要命中就用本地文件**（完全离线、无需任何参数）；全部未命中才回退 `https://4545810.xyz/pac.txt`。判定与降级全部集中在新增的 `echproxy/rewrite/paclocal.go`（`ResolveWhitelistSource` / `DefaultLocalWhitelistCandidates` / `IsLocalWhitelistSource`），`AdScriptManager`、`ServerOptions`、`win/main.go`、`win/diag.go` 共用同一条解析路径，避免 CLI 与运行时各判一次导致口径分叉。
+  - **热加载**：本地来源的后台刷新周期固定 30s（在线来源仍 30 分钟），保存文件约 30 秒内 `/proxy.pac` 即反映新清单，无需重启。
+  - **优先级**：`-whitelist-url`（含 `ECH_PROXY_WHITELIST_URL`）显式指定时永远优先，本地文件不参与；新增 `-pac-file` 显式指定本地路径（`ECH_PROXY_PAC_FILE`）、`-no-local-pac` 忽略本地强制在线（`ECH_PROXY_NO_LOCAL_PAC`）。
+  - **安全降级**：命中但内容非法（空文件 / HTML 错误页 / 超长 / 目录 / 解析全失败）的候选被跳过并打 WARN，继续尝试下一个、最终回退在线——坏文件不会把白名单清空成全部直连。
+  - **缓存隔离**：本地来源既不读取也不写入 `<dataDir>/cache/pac.txt`（原逻辑启动时读该缓存，会把上次联网的旧名单顶掉用户刚放的本地文件），在线来源行为不变。
+  - **可观测性**：启动横幅 `Routing Scope: PAC Whitelist (...)` 与启动日志、`/statusz` 的 `whitelist_kind`/`whitelist_path`/`whitelist_source`、`diag -test pac` 首行、`pac` 子命令的 `//` 前置注释均打印实际来源（`local-pac` / `explicit` / `remote`）与本地路径。
+
+### Fixes & Improvements
+
+- **修复本地 `pac.txt` 来源解析在畸形 `file://` 输入上的索引越界 panic**:
+  - **根因**：`localWhitelistPath`（`echproxy/rewrite/paclocal.go`）在 `file://` 分支先 `strings.TrimPrefix` 再判 `len(p) > 1 && p[2] == ':'`。当剩余路径长度恰为 2 且以 `/` 开头时（例如显式传入 `-whitelist-url file:///x`），`p[2]` 直接下标越界，进程 panic。触发面是显式配置的错误输入，不是默认路径。
+  - **修复**：改为 `s[len("file://"):]` 切片 + `len(p) >= 3` 前置长度判断；同时 `TrimPrefix` 区分大小写导致 `File://` / `FILE://` 混写落到裸路径分支的问题一并用小写前缀判定 + 原串切片解决。
+
+### Tests
+
+- 新增 `TestResolveWhitelistSourceLocalPriority`、`TestNewAdScriptManagerPrefersLocalPAC`、`TestNewAdScriptManagerLocalPACReloadInterval`、`TestDefaultLocalWhitelistCandidates`、`TestIsLocalWhitelistSource`、`TestLocalWhitelistPathEdgeCases`（`echproxy/rewrite/paclocal_test.go`，其中路径边界用例覆盖 10 种输入并含 `recover()` 断言不 panic）；
+- 新增 `TestProxyPACUsesLocalPACTxt` / `TestProxyPACFallsBackToRemoteWhenNoLocalFile`（`echproxy/paclocal_engine_test.go`，验证 `/proxy.pac` 实际取本地清单、`/statusz` 读数）；
+- 新增 `TestLocalPACFileFlagAndDiag`（`win/main_test.go`，验证 CLI 解析 + `diag -test pac` 与运行时同源）。
+
+### Verification
+
+- `go build ./...`、`go vet ./...`（含 `GOOS=windows amd64`+`386`）、`go test ./...` 通过；唯一失败 `TestNyaaFragmentDo` 为既有墙内网络型失败（`nyaa.si` 连接被 reset），与本版改动无关。
+- CI 全绿：`Go CI & Smoke Test`（跨平台 `go vet`、`-race` 全量测试、Windows 386/amd64/arm64 + Linux 386/amd64/arm64 + macOS 交叉编译、CLI 子命令验证）、`ech-proxy`（Win7 补丁 SDK 构建 + 单测）、`goreleaser`、`release`（Android APK）。
+- **实测（2026-11-12，WSL）**：同目录放 `pac.txt` 启动 → 启动日志 `[PAC] whitelist source: file:///…/pac.txt (kind=local-pac)`，横幅 `Routing Scope: PAC Whitelist (local pac.txt (…))`，`/proxy.pac` 的 `EXACT_HOSTS` 恰为本地域名；改文件 **34s** 后 `/proxy.pac` 与 `/statusz` 同步为新清单（热加载成立）；`-no-local-pac` 下即使同目录有 pac.txt 也变为 `kind=remote`、`whitelist_count=70`；`-pac-file` 指向不存在路径时降级在线且不 panic。
+- **发布产物回验**：下载本版 `ech-proxy-linux-amd64` 后 sha256 与 `checksums.txt` 一致，跑起来 `/proxy.pac` 只含本地域名、`/statusz` 报 `whitelist_kind=local-pac`；`-whitelist-url file:///x` 不再 panic。
+
 ## v3.5.34
 
 ### Fixes & Improvements

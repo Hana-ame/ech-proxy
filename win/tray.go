@@ -27,6 +27,7 @@ const (
 	TrayCmdUninstallCA   uintptr = 1014
 	TrayCmdCheckUpdate   uintptr = 1015
 	TrayCmdDumpMemory    uintptr = 1016
+	TrayCmdAllMode       uintptr = 1017
 )
 
 type ConsoleWindowDriver interface {
@@ -122,6 +123,70 @@ func (tc *TrayController) SetIPMode(mode string) {
 	}
 }
 
+// AllMode 返回当前「全代理」状态：系统代理管理器的 AllMode（决定 PAC 内容的 mode=all）
+// 与广告/白名单管理器的 AllMode（决定 PAC 路由与 MITM 判定）任一为真即视为开启。
+func (tc *TrayController) AllMode() bool {
+	if tc.SysProxy != nil && tc.SysProxy.AllMode() {
+		return true
+	}
+	tc.mu.Lock()
+	ad := tc.AdScript
+	tc.mu.Unlock()
+	return ad != nil && ad.AllMode()
+}
+
+// SetAllMode 热开启 / 热关闭「全代理（-all）」模式，无需重启进程。
+//
+// 三处状态必须同时翻转，缺一都会出现「菜单勾了但流量没变」：
+//  1. AdScriptManager.AllMode —— 决定 /proxy.pac 生成的是全量 PROXY 还是白名单分流；
+//  2. SysProxyManager.AllMode —— 决定系统 PAC URL 上是否带 ?mode=all（URL 级兜底）；
+//  3. 系统 PAC 热刷新 —— 换带新时间戳的 URL 覆盖上去，逼 WinHTTP/WinINET 立即重新拉取。
+//
+// 若当前处于 PAC 模式则只覆盖 PAC URL（不压栈）；若当前是直连，则顺带打开 PAC 让开关立刻见效；
+// 全局 HTTP 代理模式下不介入（那是另一条拓扑，由用户自行选择菜单项）。
+func (tc *TrayController) SetAllMode(all bool) error {
+	tc.mu.Lock()
+	ad, sp, notify, cb := tc.AdScript, tc.SysProxy, tc.NotifyFn, tc.OnStateChanged
+	tc.mu.Unlock()
+
+	ad.SetAllMode(all)
+	if sp != nil {
+		sp.SetAllMode(all)
+	}
+
+	var err error
+	switch {
+	case sp != nil && sp.Mode() == SysProxyPAC:
+		_, _, err = sp.RefreshPAC()
+	case sp != nil && sp.Mode() == SysProxyOff:
+		err = sp.SetMode(SysProxyPAC)
+	}
+
+	if err != nil {
+		log.Printf("[Tray] switch ALL mode (%v) failed: %v", all, err)
+		if notify != nil {
+			notify("ech-proxy 全代理切换失败", err.Error(), true)
+		}
+	} else {
+		if all {
+			log.Printf("[PAC] Routing scope switched to ALL mode at runtime (all domains via proxy)")
+		} else {
+			log.Printf("[PAC] Routing scope switched back to PAC whitelist at runtime")
+		}
+		if notify != nil {
+			if all {
+				notify("ech-proxy 已开启全代理", "所有网站流量现已全部经 ech-proxy 转发（无视 pac.txt 白名单）。", false)
+			} else {
+				notify("ech-proxy 已切回白名单", "仅白名单站点走代理，其余网站恢复直连。", false)
+			}
+		}
+	}
+	if cb != nil {
+		cb()
+	}
+	return err
+}
+
 func (tc *TrayController) IsConsoleVisible() bool {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
@@ -164,6 +229,9 @@ func (tc *TrayController) TooltipText() string {
 		switch tc.SysProxy.Mode() {
 		case SysProxyPAC:
 			modeStr = "系统PAC自动分流"
+			if tc.AllMode() {
+				modeStr = "系统PAC全代理(ALL)"
+			}
 		case SysProxyGlobal:
 			modeStr = "全局系统代理"
 		}
@@ -185,6 +253,7 @@ func (tc *TrayController) MenuItems() []TrayMenuItem {
 		curMode = tc.SysProxy.Mode()
 	}
 	curIPMode := tc.CurrentIPMode()
+	allMode := tc.AllMode()
 	feedbackURL := strings.TrimSpace(tc.FeedbackURL)
 	if feedbackURL == "" {
 		feedbackURL = DefaultFeedbackURL
@@ -231,6 +300,7 @@ func (tc *TrayController) MenuItems() []TrayMenuItem {
 		{Separator: true},
 		{ID: TrayCmdSysProxyPAC, Title: "系统代理：自动配置 PAC 模式 (推荐)", Checked: curMode == SysProxyPAC},
 		{ID: TrayCmdSysProxyClear, Title: clearTitle, Checked: curMode == SysProxyOff},
+		{ID: TrayCmdAllMode, Title: "全代理模式：所有网站均走代理 (ALL, 即时生效)", Checked: allMode},
 		{Separator: true},
 		{ID: TrayCmdIPModeV4, Title: "强制 v4 出口", Checked: curIPMode == "v4"},
 		{ID: TrayCmdIPModeV6, Title: "强制 v6 出口", Checked: curIPMode == "v6"},
@@ -267,6 +337,8 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 		if tc.OnStateChanged != nil {
 			tc.OnStateChanged()
 		}
+	case TrayCmdAllMode:
+		_ = tc.SetAllMode(!tc.AllMode())
 	case TrayCmdIPModeV4:
 		tc.SetIPMode("v4")
 	case TrayCmdIPModeV6:

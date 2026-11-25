@@ -49,6 +49,7 @@ func FlagOverviewText() string {
     -6                  强制 v6 出口 (IPv6 only)
     -dual               双端出口 (IPv4 + IPv6 双栈)
     -all                开启全局模式（无视 pac.txt 白名单，所有网站均通过 ech-proxy 代理）
+                        （托盘右键菜单「全代理模式」可随时热切换，无需重启）
 
   远程配置 Flag:
     -whitelist-url      自定义 pac.txt 代理白名单地址（默认 https://4545810.xyz/pac.txt）
@@ -948,6 +949,11 @@ func main() {
 	if !cmd.LocalProxy {
 		sysProxyMgr = NewSysProxyManager(actualListenAddr, nil)
 		sysProxyMgr.SetAllMode(cmd.AllMode)
+		// 以系统代理管理器为单一 true source：命令行 -all 与托盘热开关共用同一份状态，
+		// 保证菜单勾选状态与 PAC 实际内容不会出现「命令行开了、托盘却显示没开」的分裂。
+		if srv.AdScript != nil {
+			srv.AdScript.SetAllMode(sysProxyMgr.AllMode())
+		}
 		if cmd.FallbackProxy == "" {
 			if fb := sysProxyMgr.FallbackProxy(); fb != "" {
 				echproxy.SetFallbackProxy(fb)
@@ -966,6 +972,15 @@ func main() {
 		if cmd.SysProxy != SysProxyOff {
 			if err := sysProxyMgr.SetMode(cmd.SysProxy); err != nil {
 				log.Printf("WARNING: Failed to set system proxy (%s): %v", cmd.SysProxy, err)
+			}
+		}
+		// 系统上残留的 PAC 若是「白名单版」而本次为 -all（或反过来），此处补一次热刷新，
+		// 否则会出现「进程内已全代理、系统仍按旧 PAC 分流」的静默不一致。
+		if sysProxyMgr.ShouldRefreshPAC() {
+			if _, applied, rerr := sysProxyMgr.RefreshPAC(); rerr != nil {
+				log.Printf("WARNING: Failed to align system PAC with current routing scope: %v", rerr)
+			} else if applied {
+				log.Printf("[PAC] system PAC aligned to current routing scope (allMode=%v)", sysProxyMgr.AllMode())
 			}
 		}
 		defer sysProxyMgr.CleanupOnExit()

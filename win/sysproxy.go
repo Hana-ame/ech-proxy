@@ -101,6 +101,10 @@ type SysProxyManager struct {
 	prevStates    []SysProxyState
 	driver        SysProxyDriver
 	nowUnix       func() int64
+	// appliedPACURL 是最近一次真正写入系统的 PAC 地址（仅在成功 ApplyPAC 后记录）。
+	// 用于「全代理热切换」：PAC 模式下的开关切换不压栈、也不改变系统代理拓扑，
+	// 只需把新的 PAC URL 原子覆盖上去，避免用户每勾选一次就在恢复栈里堆一层。
+	appliedPACURL string
 }
 
 func NewSysProxyManager(listenAddr string, driver SysProxyDriver) *SysProxyManager {
@@ -133,6 +137,68 @@ func (m *SysProxyManager) SetAllMode(all bool) {
 	if m != nil {
 		m.allMode.Store(all)
 	}
+}
+
+// RefreshPAC 用「当前」的 AllMode 重新生成 PAC 地址并原子覆盖到系统代理上。
+//
+// 这是托盘「全代理（-all）」热开关的落地动作：
+//   - 不修改系统代理模式（仍是 PAC），因此**不压栈**（不新增 prevStates），
+//     否则用户在菜单里反复勾选几次，退出时的恢复栈就会被塞满一叠同样的 PAC 记录；
+//   - 带上新的 t 时间戳，确保 WinHTTP / WinINET 不会命中旧 PAC 缓存而「看起来没生效；
+//   - 若当前根本没在 PAC 模式（直连 / 全局代理），则直接返回 applied=false，
+//     由调用方决定是否顺带打开 PAC，绝不隐式改动用户的系统代理设置。
+func (m *SysProxyManager) RefreshPAC() (pacURL string, applied bool, err error) {
+	if m == nil {
+		return "", false, nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.mode != SysProxyPAC {
+		return BuildPACURL(m.listenAddr, m.allMode.Load(), 0, m.getFallbackLocked()), false, nil
+	}
+	pacURL = BuildPACURL(m.listenAddr, m.allMode.Load(), m.nowUnix(), m.getFallbackLocked())
+	if err := m.driver.ApplyPAC(pacURL); err != nil {
+		return pacURL, false, fmt.Errorf("refresh system PAC (%s): %w", pacURL, err)
+	}
+	m.appliedPACURL = pacURL
+	m.modified = true
+	log.Printf("[SysProxy] system PAC hot-refreshed: %s (allMode=%v)", pacURL, m.allMode.Load())
+	return pacURL, true, nil
+}
+
+// ShouldRefreshPAC 判断系统上实际生效的 PAC 是否与期望（含 AllMode）不一致。
+//
+// 典型场景：启动时 -all 已开启、系统 PAC 却还是上一次运行残留的「白名单版」地址；
+// 或用户在外部手动改过 PAC URL。启动阶段据此补一次刷新，保证菜单勾选状态与真实流量路径一致。
+func (m *SysProxyManager) ShouldRefreshPAC() bool {
+	if m == nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.mode != SysProxyPAC {
+		return false
+	}
+	wantGlobal := m.allMode.Load()
+	applied := m.appliedPACURL
+	if st, err := m.driver.Query(); err == nil && st.Mode == SysProxyPAC {
+		applied = st.AutoConfigURL
+	}
+	if applied == "" {
+		return true
+	}
+	return pacIsGlobal(applied) != wantGlobal
+}
+
+// pacIsGlobal 判断一条 PAC URL 是否是「全代理」版本（带有 mode=all 参数）。
+func pacIsGlobal(pacURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(pacURL))
+	if err != nil {
+		return strings.Contains(pacURL, "mode=all") || strings.Contains(pacURL, "global=1")
+	}
+	q := u.Query()
+	return q.Get("mode") == "all" || q.Get("global") == "1"
 }
 
 func (m *SysProxyManager) Mode() SysProxyMode {
@@ -210,6 +276,7 @@ func (m *SysProxyManager) ReplacePAC(pacURL string) (SysProxyState, error) {
 	m.prevStates = append(m.prevStates, prev)
 	m.mode = SysProxyPAC
 	m.modified = true
+	m.appliedPACURL = pacURL
 	log.Printf("[SysProxy] Windows/OS system proxy atomically set to PAC mode: %s (pushed old mode=%s url=%q)", pacURL, prev.Mode, prev.AutoConfigURL)
 	return prev, nil
 }
@@ -262,6 +329,7 @@ func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
 		m.prevStates = append(m.prevStates, prev)
 		m.mode = SysProxyPAC
 		m.modified = true
+		m.appliedPACURL = pacURL
 		log.Printf("[SysProxy] Windows/OS system proxy set to PAC mode: %s", pacURL)
 		return nil
 

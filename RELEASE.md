@@ -1,3 +1,27 @@
+## v3.6.1
+
+> **本次为 patch 版本**：`-all` 全代理模式从「仅命令行可用」升级为「托盘菜单可热切换」，不改变默认行为与既有配置语义，故 3.6.0 → 3.6.1。
+
+### Features
+
+- **托盘右键菜单新增「全代理模式：所有网站均走代理 (ALL, 即时生效)」，勾选 / 取消**热生效**，无需重启进程**（用户需求：`-all` 放到右键菜单里可选开启）:
+  - **行为**：原先 `-all` 只能靠命令行开启且不在托盘中体现，本版把它做成菜单项（`TrayCmdAllMode`）。勾选后无视 `pac.txt` 白名单，所有站点一律经 `ech-proxy` 转发；取消勾选立即回到白名单分流。菜单勾选状态由 `SysProxyManager` 与 `AdScriptManager` 的真实状态推导，**永远不会与命令行 `-all` 出现「一边开一边没开」的分裂**。
+  - **热生效机制**：新增 `SysProxyManager.RefreshPAC()`，用当前 `AllMode` 重新生成 PAC URL 并原子覆盖到系统代理上，并带上新的 `t` 时间戳，迫使 WinHTTP / WinINET 重新拉取脚本（不带时间戳会命中旧 PAC 缓存，表现为「勾了没反应」）。切换时同时翻转三处状态：`AdScriptManager.AllMode`（决定 `/proxy.pac` 生成全量 PROXY 还是白名单分流）、`SysProxyManager.AllMode`（决定 PAC URL 是否带 `?mode=all`）、系统 PAC 地址本身。
+  - **不污染退出恢复栈**：PAC 模式下的热切换只覆盖 URL，**不 push `prevStates`**；否则用户在菜单里反复勾选几次，退出时的恢复栈就会被塞满一叠同样的 PAC 记录，`Pop` / `CleanupOnExit` 的语义随之失真。退出时仍按原有逻辑精确还原启动前的系统代理。
+  - **不隐式改动用户设置**：`RefreshPAC` 在直连 / 全局 HTTP 代理模式下是 no-op，返回 `applied=false`，绝不偷偷把系统代理改成 PAC。唯一例外是**用户主动在直连状态下勾选 ALL**——此时顺带打开 PAC 模式，否则开关看起来毫无效果（否则用户会以为功能坏了）。
+  - **启动期对齐**：新增 `ShouldRefreshPAC()`，启动时比对系统上实际生效的 PAC 与本次 `AllMode` 期望值（识别 `?mode=all` / `?global=1`）。若系统残留的是上一次运行的白名单版、而本次以 `-all` 启动（或反之），启动阶段补一次热刷新，避免「进程内已全代理、系统仍按旧 PAC 分流」的静默不一致。
+  - **可观测性**：托盘悬停提示区分 `系统PAC自动分流` 与 `系统PAC全代理(ALL)`；开 / 关时各自弹出气泡通知并写入日志（`[PAC] Routing scope switched to ALL mode at runtime` / `switched back to PAC whitelist`）。
+
+### Tests
+
+- 新增 `win/allmode_test.go`，6 个用例覆盖：PAC 模式下开 / 关 ALL 会重写系统 PAC 且**恢复栈深度不变**；非 PAC 模式下 `RefreshPAC` 为 no-op 且不碰 driver；启动期「残留白名单版 PAC + `allMode=true`」被判定为需要刷新、刷新后不再误判；`pacIsGlobal` 对 `mode=all` / `global=1` / 无参 / 非法输入共 7 种 PAC URL 的识别；托盘 `HandleCommand(TrayCmdAllMode)` 端到端联动（三方状态同步翻转 + 菜单项 `Checked` + 系统 PAC 实际带 `mode=all`）；直连状态下勾选 ALL 会自动打开 PAC。
+
+### Verification
+
+- 本地：`go build ./...`、`go vet ./win/` 通过，`go test ./win/ ./echproxy/rewrite/` 全绿（含上述 6 个新用例）。
+- CI 全绿（commit `971a01f`）：`Go CI & Smoke Test`（Linux & Windows 双目标 `go vet`、`-race` 全量测试、Windows 386/amd64/arm64 + Linux 386/amd64/arm64 + macOS 交叉编译、CLI 子命令验证）、`ech-proxy`（Win7 补丁 SDK 构建 Windows & Linux amd64/386 + 单测）。
+- 注：`TestNyaaFragmentDo` 在本地墙内网络下会因 `nyaa.si` 连接被 reset 而失败，CI 上通过，与本版改动无关。
+
 ## v3.6.0
 
 > **本次为 minor 版本**：新增「本地 `pac.txt` 优先」能力（新功能，非修复），故从 3.5.x 提升到 3.6.0；v3.5.33 / v3.5.34 是同一功能线的两个中间发布，内容已全部并入本版，功能上等价。

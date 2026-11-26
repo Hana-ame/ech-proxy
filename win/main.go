@@ -181,7 +181,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	is8443 := filenameIs8443(progName)
 	action := "run"
 	subMode := ""
-	subAll := false
+	subAll := true
 
 	restArgs := sanitizeDanglingModeArgs(args)
 	if len(restArgs) > 0 && !strings.HasPrefix(restArgs[0], "-") {

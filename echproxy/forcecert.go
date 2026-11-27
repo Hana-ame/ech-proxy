@@ -193,19 +193,26 @@ var sharedHostingSuffixes = map[string]bool{
 //
 // 早期实现硬编码了 10 个双段公共后缀，遗漏 com.au / co.kr / gov.cn / com.br 等大量后缀：
 // 批准 bad.com.au 时会把 ".com.au" 写入 approved，导致本会话内所有 *.com.au 全部跳过证书校验。
-// 现改为使用 publicsuffix 权威后缀表；共享托管域（github.io 等）直接返回空，只按精确主机放行。
+// 现改为使用 publicsuffix 权威后缀表（实测 bad.com.au -> bad.com.au，不再退化成 com.au）。
+//
+// 共享托管域（github.io / vercel.app 等）直接返回空，只按精确主机放行：这类后缀下每个子域
+// 归属不同主体，批准 attacker.github.io 绝不能连带放行 victim.github.io。
+// 注意 publicsuffix 的 private 段其实已收录其中大部分（EffectiveTLDPlusOne 会返回完整子域），
+// 但仍保留这层不依赖表的显式判断——表会随版本变化，而这里是安全边界。
 func baseRegistrableDomain(host string) string {
 	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
 	if host == "" || net.ParseIP(host) != nil {
 		return ""
 	}
+	for suffix := range sharedHostingSuffixes {
+		if host == suffix || strings.HasSuffix(host, "."+suffix) {
+			return ""
+		}
+	}
 	base, err := publicsuffix.EffectiveTLDPlusOne(host)
 	if err != nil || base == "" {
 		// 单标签主机（localhost、内网短名）与纯公共后缀（com、co.uk）在这里报错，
 		// 只按精确主机放行，不写父域记忆。
-		return ""
-	}
-	if sharedHostingSuffixes[base] {
 		return ""
 	}
 	return base

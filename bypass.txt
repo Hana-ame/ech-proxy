@@ -128,3 +128,19 @@ login.microsoftonline.com
 login.live.com
 appleid.apple.com
 idmsa.apple.com
+
+# === AI 服务（AI Services，命中转交上游全局代理，自动匹配所有子域名） ===
+# Google / YouTube
+google.com
+youtube.com
+googlevideo.com
+
+# OpenAI / ChatGPT
+openai.com
+chatgpt.com
+
+# Claude / Anthropic 全家桶
+claude.ai
+claude.com
+anthropic.com
+claudeusercontent.com

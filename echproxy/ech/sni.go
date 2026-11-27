@@ -530,23 +530,46 @@ var (
 	directClients  = map[string]*http.Client{}
 )
 
-func directDo(req *http.Request, ipMode string) (*http.Response, error) {
-	normMode := resolveEffectiveIPMode(ipMode)
-	directClientMu.Lock()
-	client, ok := directClients[normMode]
-	if !ok {
-		tr := netdial.TransportWithIPModeAndCertCheck(normMode, func(host string, peerCerts []*x509.Certificate) error {
-			return validateUpstreamCert(context.Background(), host, peerCerts)
-		})
-		client = &http.Client{
-			Transport:     tr,
-			Timeout:       netdial.OpTimeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-		}
-		directClients[normMode] = client
+// directClientFor 返回 direct 模式专用的 client。
+//
+// 连接池必须按「是否跳过证书校验」分成两组：证书校验回调在 client 创建时就被 tls.Config
+// 与连接池固定下来，无法在每次请求时变化。若只按 ipMode 缓存，第一个带「强行访问」标记的
+// 请求会决定整个池的校验策略——要么之后所有请求（含用户从未批准的）都跳过校验（污染），
+// 要么用户点了「强行访问」却永远不生效（失效）。两者都是真实故障，故拆成两个池。
+func directClientFor(normMode string, allowBad bool) *http.Client {
+	key := normMode
+	if allowBad {
+		key += "|allowbad"
 	}
-	directClientMu.Unlock()
-	return client.Do(req)
+	directClientMu.Lock()
+	defer directClientMu.Unlock()
+	if c, ok := directClients[key]; ok {
+		return c
+	}
+	tr := netdial.TransportWithIPModeAndCertCheck(normMode, func(host string, peerCerts []*x509.Certificate) error {
+		if allowBad {
+			// 该池只服务用户已在警告页明确批准的请求。
+			return nil
+		}
+		// 此处传 Background 是安全的：allowBad 已由池的归属决定，
+		// 本分支只做真实校验，不再依赖 ctx 上的 allowBadCert 标记。
+		return validateUpstreamCert(context.Background(), host, peerCerts)
+	})
+	c := &http.Client{
+		Transport:     tr,
+		Timeout:       netdial.OpTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
+	directClients[key] = c
+	return c
+}
+
+func directDo(req *http.Request, ipMode string) (*http.Response, error) {
+	allowBad := false
+	if req != nil {
+		allowBad = allowBadCert(req.Context())
+	}
+	return directClientFor(resolveEffectiveIPMode(ipMode), allowBad).Do(req)
 }
 
 func doSingleMode(req *http.Request, mode, ipMode string) (*http.Response, error) {

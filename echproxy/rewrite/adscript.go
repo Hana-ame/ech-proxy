@@ -1268,6 +1268,46 @@ func (m *AdScriptManager) RefreshOnce() (bool, error) {
 	return false, whiteErr
 }
 
+// updateIntervalValue 返回远程来源的刷新周期（默认 30 分钟）。
+func (m *AdScriptManager) updateIntervalValue() time.Duration {
+	if m == nil {
+		return DefaultAdScriptUpdateInterval
+	}
+	m.mu.RLock()
+	iv := m.updateInterval
+	m.mu.RUnlock()
+	if iv <= 0 {
+		return DefaultAdScriptUpdateInterval
+	}
+	return iv
+}
+
+// refreshLocalSources 只重读本地文件来源，绝不发起任何网络请求。
+func (m *AdScriptManager) refreshLocalSources() {
+	if m == nil {
+		return
+	}
+	if m.WhitelistSourceKind() == WhitelistKindLocal {
+		_, _ = m.RefreshWhitelistOnce()
+	}
+	if m.BypassSourceKind() == WhitelistKindLocal {
+		_, _ = m.RefreshBypassOnce()
+	}
+}
+
+// refreshRemoteSources 只拉取远程来源，不重复读本地文件。
+func (m *AdScriptManager) refreshRemoteSources() {
+	if m == nil {
+		return
+	}
+	if k := m.WhitelistSourceKind(); k != "" && k != WhitelistKindLocal {
+		_, _ = m.RefreshWhitelistOnce()
+	}
+	if k := m.BypassSourceKind(); k != "" && k != WhitelistKindLocal {
+		_, _ = m.RefreshBypassOnce()
+	}
+}
+
 func (m *AdScriptManager) StartAutoUpdate(ctx context.Context) {
 	if m == nil {
 		return
@@ -1275,17 +1315,26 @@ func (m *AdScriptManager) StartAutoUpdate(ctx context.Context) {
 	go func() {
 		defer func() { _ = recover() }()
 		_, _ = m.RefreshOnce()
-		// 本地 pac.txt 用短周期热加载（用户改文件即生效）；在线来源用配置的 30 分钟。
-		ticker := time.NewTicker(m.refreshInterval())
-		defer ticker.Stop()
+		// 两种周期必须分开调度：本地文件来源（pac.txt / bypass.txt）用短周期热加载，
+		// 用户改文件即生效；远程来源仍用 updateInterval（默认 30 分钟）。
+		//
+		// 早期实现用单一 ticker + refreshInterval()，而后者只要「任一来源是本地」就返回 30s，
+		// 于是远程 bypass.txt 被以 30 秒一次的频率反复拉取——无意义网络请求、上游服务器压力
+		// 与额外的隐私暴露面。
+		fast := time.NewTicker(m.refreshInterval())
+		defer fast.Stop()
+		slow := time.NewTicker(m.updateIntervalValue())
+		defer slow.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-m.stopCh:
 				return
-			case <-ticker.C:
-				_, _ = m.RefreshOnce()
+			case <-fast.C:
+				m.refreshLocalSources()
+			case <-slow.C:
+				m.refreshRemoteSources()
 			}
 		}
 	}()

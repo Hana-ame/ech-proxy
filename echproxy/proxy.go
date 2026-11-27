@@ -503,7 +503,12 @@ func buildUpstreamRequestWithScheme(c *gin.Context, uc config.UpstreamConfig, sc
 	}
 
 	targetHost := uc.Host
-	if scheme == "http" && reqPort != "" && reqPort != "80" && reqPort != "443" && !strings.Contains(targetHost, ":") {
+	// 原域名模式下 reqPort 是客户端真实要访问的上游端口：HTTPS 非标端口（2053/2083/2087/
+	// 2096/8443 等，正是 isMITMCapablePort 认可做 MITM 的那批）必须保留，否则请求被悄悄
+	// 改发到默认 443 而失败。早期实现只对 scheme=="http" 生效，漏掉了 https 非标端口。
+	// 门户模式下 reqPort 是代理自身监听端口，绝不能拼到上游地址上。
+	if config.IsOriginalDomainMode(c.Request.Host) &&
+		reqPort != "" && reqPort != "80" && reqPort != "443" && !strings.Contains(targetHost, ":") {
 		targetHost = net.JoinHostPort(targetHost, reqPort)
 	}
 

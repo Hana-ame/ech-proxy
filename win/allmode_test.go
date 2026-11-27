@@ -194,3 +194,47 @@ func TestTrayAllModeOpensPACFromDirect(t *testing.T) {
 		t.Fatalf("system PAC = %q, want mode=all", st.AutoConfigURL)
 	}
 }
+
+// TestDefaultAllModeReachesTrayMenu 锁死「-all 默认开启」这条契约的最后一公里：
+// parseCLIArgs 默认值 → SysProxyManager → 托盘菜单勾选状态。
+//
+// 中间这一段（把 cmd.AllMode 灌进 manager、再由 MenuItems() 读回来渲染）此前没有任何
+// 测试覆盖：已有用例要么只断言 CLICommand.AllMode 字段，要么手动 SetAllMode 走热切换。
+// 于是「双击启动后托盘没勾选」这种反馈无法用测试证伪——链路任何一段被改坏，现象都一样。
+func TestDefaultAllModeReachesTrayMenu(t *testing.T) {
+	noEnv := func(string) string { return "" }
+
+	// 模拟双击：没有任何参数，文件名是普通（非 .443 / .8443）名字。
+	cmd, err := parseCLIArgs("ech-proxy-windows-amd64.exe", nil, noEnv)
+	if err != nil {
+		t.Fatalf("parseCLIArgs: %v", err)
+	}
+	if !cmd.AllMode {
+		t.Fatalf("默认 AllMode = false；subAll 自 7d7c248 起为 true，双击启动必须开启全代理")
+	}
+
+	// 复刻 main() 的接线顺序：先建 manager 并灌入 AllMode，再建托盘控制器。
+	drv := &stubSysProxyDriver{}
+	mgr := NewSysProxyManager("127.0.0.1:8443", drv)
+	mgr.SetAllMode(cmd.AllMode)
+	ad := rewrite.NewAdScriptManager(rewrite.AdScriptOptions{Enabled: false, AllMode: cmd.AllMode})
+	tc := NewTrayController("127.0.0.1:8443", "", "", mgr, &stubConsoleDriver{}, func() {})
+	tc.AdScript = ad
+
+	if !tc.AllMode() {
+		t.Fatal("TrayController.AllMode() = false，期望 true")
+	}
+	items := tc.MenuItems()
+	var all *TrayMenuItem
+	for i := range items {
+		if items[i].ID == TrayCmdAllMode {
+			all = &items[i]
+		}
+	}
+	if all == nil {
+		t.Fatal("托盘菜单里找不到 TrayCmdAllMode 项")
+	}
+	if !all.Checked {
+		t.Fatalf("菜单项 %q 未勾选，期望 Checked=true", all.Title)
+	}
+}

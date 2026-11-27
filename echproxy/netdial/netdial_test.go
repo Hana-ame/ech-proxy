@@ -343,3 +343,47 @@ func TestResolveDefaultSiteHostSystemDNSAndOneTimeCFFallback(t *testing.T) {
 		t.Errorf("systemLookupIPFn called %d times after failure, want exactly 1 (one-time flag)", failCalls)
 	}
 }
+
+func TestBadIPCooldownAndOrderHealthyFirst(t *testing.T) {
+	MarkBadIP("198.51.100.1")
+	defer ClearBadIP("198.51.100.1")
+
+	if !IsBadIP("198.51.100.1") {
+		t.Fatal("expected 198.51.100.1 to be marked bad")
+	}
+	ordered := OrderIPsHealthyFirst([]string{"198.51.100.1", "198.51.100.2", "198.51.100.3"})
+	if len(ordered) != 3 || ordered[0] != "198.51.100.2" || ordered[2] != "198.51.100.1" {
+		t.Fatalf("OrderIPsHealthyFirst = %v, want bad IP moved to end", ordered)
+	}
+	ClearBadIP("198.51.100.1")
+	if IsBadIP("198.51.100.1") {
+		t.Fatal("expected ClearBadIP to remove cooldown")
+	}
+}
+
+func TestDialContextHappyEyeballsRacesAndReturnsFastest(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := DialContextHappyEyeballs(ctx, []string{"192.0.2.1", "127.0.0.1"}, port, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("DialContextHappyEyeballs failed: %v", err)
+	}
+	_ = conn.Close()
+	ClearBadIP("192.0.2.1")
+}

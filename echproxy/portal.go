@@ -185,6 +185,7 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			"auth_enabled":      opts.Auth != nil && opts.Auth.Enabled(),
 			"all_mode":          allMode,
 			"ip_mode":           netdial.FormatIPMode(cloudflare_ech.GetIPMode()),
+			"ech_h3_enabled":    cloudflare_ech.GetECHHTTP3(),
 			"doh_primary":       cloudflare_ech.PrimaryDoHURL(),
 			"doh_secondary":     cloudflare_ech.SecondaryDoHURL(),
 			"ad_script_enabled": adEnabled,

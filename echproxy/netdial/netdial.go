@@ -36,6 +36,11 @@ const (
 	bootstrapCacheTTL      = 5 * time.Minute
 	bootstrapNegCacheTTL   = 15 * time.Second
 	maxBootstrapCacheItems = 512
+
+	badIPCooldown            = 3 * time.Minute
+	maxBadIPEntries          = 1024
+	happyEyeballsMaxParallel = 3
+	happyEyeballsStagger     = 100 * time.Millisecond
 )
 
 type insideDoHKey struct{}
@@ -261,6 +266,11 @@ var (
 	// bootstrapPrimaryPreferWindow（3 次重试下会耗尽上层 10s 预算）。
 	primaryBootstrapMu      sync.Mutex
 	primaryBootstrapRetryAt time.Time
+
+	// badIPUntil 记录近期连接超时/失败的 IP 及其冷却截止时间，
+	// 晚高峰拥塞时自动将其排到末尾，避免所有请求死磕同一个高丢包节点。
+	badIPMu    sync.Mutex
+	badIPUntil = map[string]time.Time{}
 
 	// defaultSiteUseBuiltinCF 是一次性开关：解析 4545810.xyz（DefaultSiteHost）时不再走 DoH，
 	// 优先使用系统 DNS；一旦系统 DNS 失败，置位此标志并在本次进程生命周期内直接使用内置 Cloudflare 广播 IP。
@@ -751,6 +761,188 @@ func ResolvePreferredIP(ctx context.Context, host, mode string) (string, error) 
 	return ips[0], nil
 }
 
+// MarkBadIP 将近期超时或建连失败的 IP 标记进入短暂冷却期（3 分钟），后续拨号优先避开。
+func MarkBadIP(ip string) {
+	ip = CleanHost(ip)
+	if ip == "" {
+		return
+	}
+	now := time.Now()
+	badIPMu.Lock()
+	if len(badIPUntil) >= maxBadIPEntries {
+		for k, exp := range badIPUntil {
+			if !now.Before(exp) {
+				delete(badIPUntil, k)
+			}
+		}
+	}
+	badIPUntil[ip] = now.Add(badIPCooldown)
+	badIPMu.Unlock()
+}
+
+// ClearBadIP 在某 IP 成功恢复建连后立即移出冷却表。
+func ClearBadIP(ip string) {
+	ip = CleanHost(ip)
+	if ip == "" {
+		return
+	}
+	badIPMu.Lock()
+	delete(badIPUntil, ip)
+	badIPMu.Unlock()
+}
+
+// IsBadIP 报告该 IP 当前是否处于故障冷却期内。
+func IsBadIP(ip string) bool {
+	ip = CleanHost(ip)
+	if ip == "" {
+		return false
+	}
+	now := time.Now()
+	badIPMu.Lock()
+	exp, ok := badIPUntil[ip]
+	if ok && !now.Before(exp) {
+		delete(badIPUntil, ip)
+		ok = false
+	}
+	badIPMu.Unlock()
+	return ok
+}
+
+// OrderIPsHealthyFirst 将未处于故障冷却期的 IP 排在前面、冷却中的 IP 排到末尾（保序），
+// 既避免死磕故障节点，又保留全部 IP 作为最终兜底。
+func OrderIPsHealthyFirst(ips []string) []string {
+	if len(ips) <= 1 {
+		return append([]string(nil), ips...)
+	}
+	now := time.Now()
+	badIPMu.Lock()
+	healthy := make([]string, 0, len(ips))
+	degraded := make([]string, 0)
+	for _, ip := range ips {
+		if exp, ok := badIPUntil[CleanHost(ip)]; ok && now.Before(exp) {
+			degraded = append(degraded, ip)
+		} else {
+			healthy = append(healthy, ip)
+		}
+	}
+	badIPMu.Unlock()
+	return append(healthy, degraded...)
+}
+
+func dialSingleIP(ctx context.Context, ip, port string, timeout time.Duration) (net.Conn, error) {
+	network := "tcp"
+	if parsed := net.ParseIP(ip); parsed != nil {
+		if parsed.To4() != nil {
+			network = "tcp4"
+		} else {
+			network = "tcp6"
+		}
+	}
+	return (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ip, port))
+}
+
+// DialContextHappyEyeballs 对候选 IP 执行多路并发竞速拨号（最多并发 3 路，间隔 100ms 阶梯发起）：
+//   - 健康 IP 优先（OrderIPsHealthyFirst）；
+//   - 首个完成 TCP 握手的连接立即胜出返回，其余迟到连接自动关闭避免泄漏；
+//   - 超时或建连失败的 IP 自动记入 3 分钟故障冷却表，避免晚高峰死磕拥塞节点。
+func DialContextHappyEyeballs(ctx context.Context, ips []string, port string, timeout time.Duration) (net.Conn, error) {
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no candidate IPs to dial port %s", port)
+	}
+	if timeout <= 0 {
+		timeout = DialTimeout
+	}
+	ordered := OrderIPsHealthyFirst(ips)
+	if len(ordered) == 1 {
+		conn, err := dialSingleIP(ctx, ordered[0], port, timeout)
+		if err != nil {
+			if ctx.Err() == nil {
+				MarkBadIP(ordered[0])
+			}
+			return nil, err
+		}
+		ClearBadIP(ordered[0])
+		return conn, nil
+	}
+
+	raceCount := len(ordered)
+	if raceCount > happyEyeballsMaxParallel {
+		raceCount = happyEyeballsMaxParallel
+	}
+
+	type dialResult struct {
+		conn net.Conn
+		ip   string
+		err  error
+	}
+	raceCtx, raceCancel := context.WithCancel(ctx)
+	defer raceCancel()
+
+	resCh := make(chan dialResult, raceCount)
+	for i := 0; i < raceCount; i++ {
+		targetIP := ordered[i]
+		delay := time.Duration(i) * happyEyeballsStagger
+		go func() {
+			if delay > 0 {
+				timer := time.NewTimer(delay)
+				select {
+				case <-timer.C:
+				case <-raceCtx.Done():
+					timer.Stop()
+					resCh <- dialResult{ip: targetIP, err: raceCtx.Err()}
+					return
+				}
+			}
+			conn, err := dialSingleIP(raceCtx, targetIP, port, timeout)
+			if err != nil {
+				if raceCtx.Err() == nil {
+					MarkBadIP(targetIP)
+				}
+				resCh <- dialResult{ip: targetIP, err: err}
+				return
+			}
+			resCh <- dialResult{conn: conn, ip: targetIP}
+		}()
+	}
+
+	var lastErr error
+	var winner net.Conn
+	for i := 0; i < raceCount; i++ {
+		r := <-resCh
+		if r.err == nil && r.conn != nil {
+			if winner == nil {
+				winner = r.conn
+				ClearBadIP(r.ip)
+				raceCancel()
+			} else {
+				_ = r.conn.Close()
+			}
+		} else if r.err != nil {
+			lastErr = r.err
+		}
+	}
+	if winner != nil {
+		return winner, nil
+	}
+
+	// 若前 raceCount 个并发候选全败，继续顺延尝试剩余候选 IP。
+	for i := raceCount; i < len(ordered); i++ {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		conn, err := dialSingleIP(ctx, ordered[i], port, timeout)
+		if err == nil {
+			ClearBadIP(ordered[i])
+			return conn, nil
+		}
+		if ctx.Err() == nil {
+			MarkBadIP(ordered[i])
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 func DialContextIPMode(ctx context.Context, host, port, mode string, timeout time.Duration) (net.Conn, error) {
 	if timeout <= 0 {
 		timeout = DialTimeout
@@ -762,24 +954,7 @@ func DialContextIPMode(ctx context.Context, host, port, mode string, timeout tim
 	if err != nil {
 		return nil, err
 	}
-	var lastErr error
-	for _, ip := range ips {
-		network := "tcp"
-		parsed := net.ParseIP(ip)
-		if parsed != nil {
-			if parsed.To4() != nil {
-				network = "tcp4"
-			} else {
-				network = "tcp6"
-			}
-		}
-		conn, err := (&net.Dialer{Timeout: timeout, KeepAlive: 30 * time.Second}).DialContext(ctx, network, net.JoinHostPort(ip, port))
-		if err == nil {
-			return conn, nil
-		}
-		lastErr = err
-	}
-	return nil, lastErr
+	return DialContextHappyEyeballs(ctx, ips, port, timeout)
 }
 
 func Transport() *http.Transport {

@@ -26,6 +26,18 @@
 
    * **本地方式（推荐，离线可用，30 秒内热加载）**：在 `ech-proxy.exe` 同目录（或 `<dataDir>` / 当前工作目录）放置 `bypass.txt`，每行一个域名，支持 `#` / `//` 注释和 `*.example.com`：
 
+     ▶ 代码块已折叠（约 18 行）点击展开
+
+     ▶ 代码块已折叠（约 18 行）点击展开
+
+     ▶ 代码块已折叠（约 18 行）点击展开
+
+     ▶ 代码块已折叠（约 18 行）点击展开
+
+     ▶ 代码块已折叠（约 18 行）点击展开
+
+     ▶ 代码块已折叠（约 18 行）点击展开
+
      ```
      # 命中此名单的域名直接绕过 ech-proxy，转交上游全局代理（自动匹配所有子域名）
      # Google / YouTube
@@ -43,6 +55,8 @@
      anthropic.com
      claudeusercontent.com
      
+     
+     
      ```
 
    * **在线方式**：通过 `-bypass-url https://your-host/bypass.txt`（或环境变量 `ECH_PROXY_BYPASS_URL`）指定在线列表；若未提供本地文件也未指定 `-bypass-url`，默认自动拉取 `https://4545810.xyz/bypass.txt`（远端不可用时静默保持空表，不影响主线 PAC）。
@@ -54,6 +68,8 @@
    ```
    # 示例：上游 Clash 混合端口为 127.0.0.1:7897
    .\ech-proxy.exe -fallback 127.0.0.1:7897
+   
+   
    
    
    
@@ -86,6 +102,8 @@
      
      
      
+     
+     
      ```
 
    * 或启动后右键托盘图标点击 **「系统代理：清除 / 禁用系统代理 (直连)」**。
@@ -100,6 +118,8 @@
        type: http
        server: 127.0.0.1
        port: 8443
+   
+   
    
    
    
@@ -127,6 +147,8 @@
    
    
    
+   
+   
    ```
 
    * 如不使用 TUN（仅 Clash 接管系统 HTTP 代理），`ech-proxy` 默认不读取系统代理环境变量，不会发生回环。
@@ -139,6 +161,8 @@
 
 ```
 2026/11/28 03:53:38.874925 netdial.go:572: [netdial] bootstrap DoH primary endpoints (1.1.1.1/1.0.0.1) unreachable for "4545810.xyz", trying domestic endpoints as last resort
+
+
 
 
 
@@ -197,3 +221,52 @@
 | `win/main.go` | 新增 `-bypass-url` / `-bypass-file` / `-no-local-bypass` 命令行参数、环境变量、启动日志与热刷新回调 | 
 | `README.md` | 补充双代理共存方案与 `bypass.txt` 配置说明 | 
 | `changelog/2026-11-28-coexistence-bypass-and-doh-log-fix.md` | 本次变更记录文档 | 
+
+## 四、 晚高峰连接优化（Happy Eyeballs 并发竞速 + 故障 IP 轮换 + 多路 HTTP/2）
+
+* **`echproxy/netdial/netdial.go`**：
+
+  * 新增故障 IP 冷却表（`MarkBadIP` / `ClearBadIP` / `IsBadIP` / `OrderIPsHealthyFirst`，默认 3 分钟冷却），将近期超时/失败的节点自动排到候选末尾。
+
+  * 新增 `DialContextHappyEyeballs`（最多并发 3 路、100ms 阶梯发起，首个握手成功连接立即返回并关闭迟到连接防止泄漏），`DialContextIPMode` 统一切换至此实现。
+
+* **`echproxy/ech/client.go`**：
+
+  * ECH 通道不再死磕 `dohIPs[0]`，改为将 `cloudflare-ech.com` 全部解析 IP 交由 `DialContextHappyEyeballs` 并发竞速；握手超时/丢包时拉黑对应远端 IP 并允许重试轮换（仅证书错误永久中止）。
+
+  * `Client` 升级为 **4 分片 HTTP/2 连接池（`echH2PoolShards = 4` 轮询）**，缓解高丢包环境下单一 TCP 连接的 HTTP/2 队头阻塞（Head-of-Line Blocking）。
+
+* **`echproxy/ech/sni.go`**：
+
+  * `roundTripUTLS`（供 `SNIFrontDo` 与 `FragmentDo` 共用）接入 `OrderIPsHealthyFirst` 与 `MarkBadIP`/`ClearBadIP` 自动轮换，并将 H2 连接池扩展为 2 分片并行。
+
+* **`echproxy/netdial/netdial_test.go`**：
+
+  * 新增 `TestBadIPCooldownAndOrderHealthyFirst` 与 `TestDialContextHappyEyeballsRacesAndReturnsFastest` 回归测试。
+
+## 五、 ECH 通道新增 HTTP/3 备选回退与托盘开关（默认关闭）
+
+* **`echproxy/ech/h3.go` & `echproxy/ech/client.go`**：
+
+  * 新增 `SetECHHTTP3` / `GetECHHTTP3`（默认 `false`），仅在 `ech.Do` 的 HTTP/2 ECH 通道发生非证书错误失败时回退尝试 **HTTP/3 + ECH**（基于 `quic-go v0.59.0` + Go 1.26 标准库 `EncryptedClientHelloConfigList` + `validateUpstreamCert`）；**SNI 伪装与 Fragment 通道绝不使用 HTTP/3**。
+
+  * 复用 `OrderIPsHealthyFirst` / `MarkBadIP` 进行 QUIC 候选 IP 轮换，不设 `KeepAlivePeriod`（配置 `MaxIdleTimeout: 30s`），并在关闭开关、切换 IP 模式或刷新 ECH 配置时主动关闭 H3 连接防 UDP 端口泄漏。
+
+* **`win/tray.go` & `win/main.go` & `echproxy/portal.go`**：
+
+  * 托盘菜单新增 **「ECH 备选 HTTP/3 (仅 ECH 通道, 实验)」**（`TrayCmdECHHTTP3`，默认不勾选，热切换无需重启）；命令行新增 `-ech-h3`（环境变量 `ECH_PROXY_ECH_H3`）；`/statusz` 暴露 `ech_h3_enabled`。
+
+* **`go.mod` & `win/main_test.go`**：
+
+  * 将已有间接依赖 `github.com/quic-go/quic-go v0.59.0` 提升为直接依赖；新增 `TestTrayECHHTTP3ToggleDefaultOff` 单元测试。
+
+> **配套技术深度报告**：本次涉及的双代理拓扑、DNS 引导解耦、TLS/ECH 对抗边界、多路 HTTP/2 与 HTTP/3 备选、同类代理源码对比等完整知识点已沉淀至 [`docs/ech-proxy-technical-notes-2026-11.html`](../docs/ech-proxy-technical-notes-2026-11.html)。
+
+## 6. CI 自动化验证补齐（v3.6.5）
+
+- **单测自动覆盖**：`go test ./... -race`（`go.yml`）与 `go test ./...`（`ech-proxy.yml`）已自动执行全部 8 个新增单测（含新增的 `echproxy/ech/h3_test.go` 验证 `GetECHHTTP3()` 默认关闭与热切换行为）。
+- **`.github/workflows/go.yml` 新增门禁与冒烟检查**：
+  - 远端资产校验补充 `DefaultBypassURL`（`/bypass.txt"`）与 `certs/l.moonchan.xyz/bypass.txt` 禁入仓检查。
+  - 新增 `Validate v3.6.5 invariants` 步骤：静态守护 `4545810.xyz` 经由 `ResolveDefaultSiteHost` 解析（不走 DoH）、`sni.go` 绝不引用 `doECHHTTP3`/`quic-go`/`http3`、以及 `go.mod` 中 `github.com/quic-go/quic-go` 为直接依赖。
+  - 扩展 CLI 冒烟测试：校验 `help` 输出包含 `-bypass-url`、`-bypass-file`、`-no-local-bypass`、`-ech-h3`、`-fallback`；同时补齐 `win/main.go` 中 `pac` 子命令对 `bypass.txt` 与 `-fallback` 的支持，在 CI 中实测生成 PAC 并断言 `BYPASS_EXACT_HOSTS`、`BYPASS_SUFFIX_RULES`、测试域名与 `PROXY 127.0.0.1:7890` 均正确注入。
+- **`.github/workflows/ech-proxy.yml` 同步门禁**：在打包前同步校验 `/bypass.txt"` 默认配置与 `sni.go` 零 HTTP/3 引用约束。

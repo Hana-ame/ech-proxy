@@ -57,6 +57,7 @@ var (
 	RemoveHostsBlock          = config.RemoveHostsBlock
 	DefaultSystemHostsPath    = config.DefaultSystemHostsPath
 	GeneratePAC               = config.GeneratePAC
+	GeneratePACWithRules      = config.GeneratePACWithRules
 	FetchBytes                = netdial.FetchBytes
 	CleanHost                 = netdial.CleanHost
 	ExtractPort               = netdial.ExtractPort
@@ -104,6 +105,8 @@ var (
 	NextDefaultSNIServerName        = cloudflare_ech.NextDefaultSNIServerName
 	SetGlobalIPMode                 = cloudflare_ech.SetIPMode
 	GetGlobalIPMode                 = cloudflare_ech.GetIPMode
+	SetECHHTTP3                     = cloudflare_ech.SetECHHTTP3
+	GetECHHTTP3                     = cloudflare_ech.GetECHHTTP3
 	InitLogger                      = logger.Init
 	NewLogger                       = logger.NewManager
 	DefaultLogger                   = logger.Default

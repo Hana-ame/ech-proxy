@@ -650,3 +650,22 @@ func TestLocalPACFileFlagAndDiag(t *testing.T) {
 		t.Fatalf("diag pac should hit local domain, out=%q", got)
 	}
 }
+
+func TestTrayECHHTTP3ToggleDefaultOff(t *testing.T) {
+	orig := echproxy.GetECHHTTP3()
+	echproxy.SetECHHTTP3(false)
+	defer echproxy.SetECHHTTP3(orig)
+
+	tc := NewTrayController("127.0.0.1:8443", "https://l.moonchan.xyz:8443", "/tmp/ca.pem", nil, &fakeConsoleDriver{}, nil)
+	if tc.ECHHTTP3Enabled() {
+		t.Fatal("ECH HTTP/3 fallback must be disabled by default")
+	}
+	tc.HandleCommand(TrayCmdECHHTTP3)
+	if !tc.ECHHTTP3Enabled() {
+		t.Fatal("expected TrayCmdECHHTTP3 to enable ECH HTTP/3 fallback")
+	}
+	tc.HandleCommand(TrayCmdECHHTTP3)
+	if tc.ECHHTTP3Enabled() {
+		t.Fatal("expected second TrayCmdECHHTTP3 to disable ECH HTTP/3 fallback")
+	}
+}

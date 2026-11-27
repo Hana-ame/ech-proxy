@@ -524,6 +524,8 @@ func PlainHTTPDo(req *http.Request, ipMode ...string) (*http.Response, error) {
 }
 
 var (
+	utlsH2ShardRR atomic.Uint64
+
 	directClientMu sync.Mutex
 	directClients  = map[string]*http.Client{}
 )
@@ -943,6 +945,8 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 		}
 	}
 
+	ips = netdial.OrderIPsHealthyFirst(ips)
+	shard := utlsH2ShardRR.Add(1) % 2
 	var lastErr error
 	for i, ip := range ips {
 		if req.Context() != nil && req.Context().Err() != nil {
@@ -951,12 +955,13 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 		if i > 0 {
 			rewindRequestBody(req)
 		}
-		cacheKey := tag + "|" + ip + "|" + effectiveSNI + "|" + host
+		cacheKey := fmt.Sprintf("%s|%s|%s|%s|%d", tag, ip, effectiveSNI, host, shard)
 		dialFn := func(ctx context.Context, nextProtos []string) (*utls.UConn, error) {
 			return dialUTLSWithWrapper(ctx, ip, effectiveSNI, host, nextProtos, wrapConn)
 		}
 		resp, err := getUTLSH2Transport(cacheKey, dialFn).RoundTrip(req)
 		if err == nil {
+			netdial.ClearBadIP(ip)
 			return resp, nil
 		}
 		if IsCertError(err) {
@@ -970,6 +975,7 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 		if strings.Contains(err.Error(), "not h2") {
 			rewindRequestBody(req)
 			if resp1, err1 := getUTLSH1Client(cacheKey, dialFn).Do(req); err1 == nil {
+				netdial.ClearBadIP(ip)
 				return resp1, nil
 			} else {
 				if IsCertError(err1) {
@@ -981,6 +987,7 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 				err = err1
 			}
 		}
+		netdial.MarkBadIP(ip)
 		lastErr = err
 		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			utlsTransMu.Lock()

@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -52,9 +53,14 @@ func init() {
 	netdial.DoHResolver = ResolveHostIPsByMode
 }
 
+const echH2PoolShards = 4
+
 // Client 是基于 cloudflare-ech.com ECH 域前置的 HTTP 客户端。
+// 内部维护多条独立的 http2.Transport 分片连接池（默认 4 路轮询），
+// 避免晚高峰高丢包时所有并发请求挤在同一条 TCP 连接上触发 HTTP/2 队头阻塞。
 type Client struct {
-	inner *http.Client
+	pool []*http.Client
+	rr   atomic.Uint64
 }
 
 type echEntry struct {
@@ -197,11 +203,10 @@ func SetIPMode(mode string) {
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
 	for _, c := range clients {
-		if tr, ok := c.inner.Transport.(*http2.Transport); ok {
-			tr.CloseIdleConnections()
-		}
+		c.closeIdleConnections()
 	}
 	clients = map[string]*Client{}
+	closeECHHTTP3Clients()
 }
 
 // GetIPMode 返回当前全局默认出口协议族（默认 "v4"、"v6" 或 "dual"）。
@@ -563,10 +568,10 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 			}
 			mode = netdial.EffectiveIPMode(mode)
 
-			// 优先通过 DoH 解析 ECH 接入节点 IP（防止本地 UDP 53 DNS 被污染）
-			dialTarget := shellDomain
+			// 解析 ECH 接入节点全部候选 IP，交由 Happy Eyeballs 并发竞速与故障轮换（不再死磕 dohIPs[0]）。
+			var dialIPs []string
 			if dohIPs, derr := ResolveHostIPsByMode(ctx, shellDomain, mode); derr == nil && len(dohIPs) > 0 {
-				dialTarget = dohIPs[0]
+				dialIPs = dohIPs
 			}
 
 			var permanentErr error
@@ -575,9 +580,19 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 					return nil, permanentErr
 				}
 				echDialTimeout := 3500 * time.Millisecond
-				rawConn, err := netdial.DialContextIPMode(ctx, dialTarget, "443", mode, echDialTimeout)
+				var rawConn net.Conn
+				var err error
+				if len(dialIPs) > 0 {
+					rawConn, err = netdial.DialContextHappyEyeballs(ctx, dialIPs, "443", echDialTimeout)
+				} else {
+					rawConn, err = netdial.DialContextIPMode(ctx, shellDomain, "443", mode, echDialTimeout)
+				}
 				if err != nil {
 					return nil, err
+				}
+				remoteIP := ""
+				if ra := rawConn.RemoteAddr(); ra != nil {
+					remoteIP = netdial.CleanHost(ra.String())
 				}
 				uConn := utls.UClient(rawConn, uCfg, utls.HelloChrome_120)
 				hsCtx, hsCancel := context.WithTimeout(ctx, 4*time.Second)
@@ -585,7 +600,13 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 				hsCancel()
 				if hsErr != nil {
 					rawConn.Close()
-					permanentErr = hsErr
+					// 晚高峰丢包/超时导致的握手失败拉黑该 IP 并允许重试轮换到下一个健康 IP，不再直接永久中止。
+					if remoteIP != "" {
+						netdial.MarkBadIP(remoteIP)
+					}
+					if IsCertError(hsErr) {
+						permanentErr = hsErr
+					}
 					return nil, hsErr
 				}
 				// 核对服务端回传证书是否与伪装前访问的真实域名 host 一致、是否过期
@@ -609,14 +630,29 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 }
 
 func newClient(echConfig []byte, ipMode string) *Client {
-	return &Client{
-		inner: &http.Client{
+	pool := make([]*http.Client, echH2PoolShards)
+	for i := 0; i < echH2PoolShards; i++ {
+		pool[i] = &http.Client{
 			Transport: newTransport(echConfig, ipMode),
 			Timeout:   0,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
-		},
+		}
+	}
+	return &Client{pool: pool}
+}
+
+func (c *Client) closeIdleConnections() {
+	if c == nil {
+		return
+	}
+	for _, cli := range c.pool {
+		if cli != nil {
+			if tr, ok := cli.Transport.(*http2.Transport); ok {
+				tr.CloseIdleConnections()
+			}
+		}
 	}
 }
 
@@ -635,7 +671,8 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if req.Host == "" {
 		req.Host = req.URL.Host
 	}
-	return c.inner.Do(req)
+	idx := c.rr.Add(1) % uint64(len(c.pool))
+	return c.pool[idx].Do(req)
 }
 
 func getECHClient(ipMode string) (*Client, error) {
@@ -675,6 +712,7 @@ func getECHClient(ipMode string) (*Client, error) {
 }
 
 // Do（方式 2）通过 DoH 解析域名与 ECH 配置，使用 Cloudflare ECH 隧道发送请求，并校验回传证书。
+// 当用户开启 ECH HTTP/3 备选（默认关闭）且 HTTP/2 通道非证书错误失败时，自动回退至 HTTP/3 + ECH。
 func Do(req *http.Request, ipMode ...string) (*http.Response, error) {
 	mode := ""
 	if len(ipMode) > 0 {
@@ -684,7 +722,17 @@ func Do(req *http.Request, ipMode ...string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	return c.Do(req)
+	resp, err := c.Do(req)
+	if err == nil {
+		return resp, nil
+	}
+	if GetECHHTTP3() && !IsCertError(err) && !errors.Is(err, context.Canceled) && (req.Context() == nil || req.Context().Err() == nil) {
+		rewindRequestBody(req)
+		if h3Resp, h3Err := doECHHTTP3(req, mode); h3Err == nil {
+			return h3Resp, nil
+		}
+	}
+	return nil, err
 }
 
 // InitDefault 初始化全局默认 ECH 客户端并启动后台定期刷新协程。
@@ -726,9 +774,8 @@ func refreshLoop() {
 		}
 		clientsMu.Unlock()
 		for _, old := range oldClients {
-			if tr, ok := old.inner.Transport.(*http2.Transport); ok {
-				tr.CloseIdleConnections()
-			}
+			old.closeIdleConnections()
 		}
+		closeECHHTTP3Clients()
 	}
 }

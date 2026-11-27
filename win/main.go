@@ -48,6 +48,7 @@ func FlagOverviewText() string {
     -4                  强制 v4 出口 (IPv4 only，默认)
     -6                  强制 v6 出口 (IPv6 only)
     -dual               双端出口 (IPv4 + IPv6 双栈)
+    -ech-h3             启用 HTTP/3 作为 ECH 通道备选方案（默认关闭，SNI 绝不使用，托盘可热切换）
     -all                开启全局模式（无视 pac.txt 白名单，所有网站均通过 ech-proxy 代理）
                         （托盘右键菜单「全代理模式」可随时热切换，无需重启）
 
@@ -113,6 +114,7 @@ type CLICommand struct {
 	DataDir          string
 	ConfigURL        string
 	IPMode           string
+	ECHHTTP3         bool
 	BootstrapIP      string
 	NoBrowser        bool
 	Verbose          bool
@@ -309,6 +311,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	flag4 := fs.Bool("4", false, "强制 v4 出口")
 	flag6 := fs.Bool("6", false, "强制 v6 出口")
 	flagDual := fs.Bool("dual", false, "双端出口")
+	echH3Flag := fs.Bool("ech-h3", envBool(getenv("ECH_PROXY_ECH_H3")), "启用 HTTP/3 作为 ECH 通道备选方案（默认关闭）")
 	allFlag := fs.Bool("all", subAll || envBool(getenv("ECH_PROXY_ALL")), "全局模式")
 	skipAdScript := fs.Bool("skip-ad-script", envBool(getenv("ECH_PROXY_SKIP_AD_SCRIPT")) || envBool(getenv("ECH_PROXY_NO_AD_SCRIPT")), "跳过脚本注入步骤")
 	skipAdBlock := fs.Bool("skip-ad-block", envBool(getenv("ECH_PROXY_SKIP_AD_BLOCK")), "跳过内容过滤步骤")
@@ -527,6 +530,7 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		DataDir:          *dataDir,
 		ConfigURL:        *configURL,
 		IPMode:           normalizedIPMode,
+		ECHHTTP3:         *echH3Flag,
 		BootstrapIP:      *localIP,
 		NoBrowser:        *noBrowser || *localProxy,
 		Verbose:          *verbose,
@@ -739,7 +743,23 @@ func runToolAction(cmd CLICommand, out io.Writer) int {
 		} else {
 			fmt.Fprintf(out, "// warning: fetch whitelist failed: %v\n", err)
 		}
-		fmt.Fprint(out, echproxy.GeneratePAC(nil, cmd.Addr, cmd.AllMode, wl))
+		var bp []string
+		bypassSrc := echproxy.ResolveBypassSource(echproxy.WhitelistSourceOptions{
+			ExplicitURL:  strings.TrimSpace(cmd.BypassURL),
+			ExplicitPath: strings.TrimSpace(cmd.BypassFile),
+			DataDir:      resolveDataDir(cmd),
+			DisableLocal: cmd.NoLocalBypass,
+		})
+		for _, w := range bypassSrc.Warnings {
+			fmt.Fprintf(out, "// warning: %s\n", w)
+		}
+		fmt.Fprintf(out, "// bypass source: %s (%s)\n", bypassSrc.URL, bypassSrc.Kind)
+		if raw, err := echproxy.FetchBytes(bypassSrc.URL); err == nil {
+			bp, _ = echproxy.ParseDomainList(raw)
+		} else {
+			fmt.Fprintf(out, "// warning: fetch bypass list failed: %v\n", err)
+		}
+		fmt.Fprint(out, echproxy.GeneratePACWithRules(nil, cmd.Addr, cmd.AllMode, cmd.FallbackProxy, wl, bp))
 		return 0
 	case "sysproxy-pac":
 		mgr := NewSysProxyManager(cmd.Addr, nil)
@@ -881,6 +901,7 @@ func main() {
 	}
 
 	echproxy.Debug = cmd.Verbose
+	echproxy.SetECHHTTP3(cmd.ECHHTTP3)
 
 	var srvErr error
 	srv, srvErr = echproxy.NewServer(echproxy.ServerOptions{

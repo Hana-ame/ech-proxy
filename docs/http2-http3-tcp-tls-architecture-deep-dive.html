@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HTTP/2 与 HTTP/3 底层原理、代码实现与 TCP/TLS 握手交互架构深度报告</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+/* Utilitarian · Deep Protocol & Systems Architecture · Split answer-first hero (headline left, RTT contrast right) · 6 sections (Handshake Interaction, HTTP/2 Framing & Go Internals, HTTP/3 QUIC & quic-go Internals, TLS/ECH/ALPN Coupling Band, Proxy Gateway Architecture & YARP/Go Code Comparison, RFC & Sources) · IBM Plex Sans + Noto Sans SC + IBM Plex Mono · Dark terminal slate #0F1216 + cyan #38BDF8 / emerald #34D399 · 0px radius · Emphasis RTT numeral · Full-bleed band on TLS/QUIC coupling · 2 inline SVG diagrams (Handshake RTT timeline + HoL Blocking & Shard isolation) */
+:root {
+  --paper: #0F1216;
+  --band: #161B22;
+  --ink: #F1F5F9;
+  --ink2: #CBD5E1;
+  --mute: #94A3B8;
+  --hair: #2A3241;
+  --accent: #38BDF8;
+  --accent-text: #7DD3FC;
+  --accent-2: #34D399;
+  --accent-2-text: #6EE7B7;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: 'Noto Sans SC', 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  font-size: 16px;
+  line-height: 1.74;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  padding: 68px clamp(24px, 10.4vw, 112px) 92px;
+}
+
+.measure { max-width: 68ch; }
+
+a {
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+a:hover { color: var(--accent-2-text); }
+
+code {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 0.87em;
+  color: var(--accent-text);
+  background: #1B2330;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+
+pre {
+  font-family: 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--ink2);
+  border-left: 2px solid var(--accent);
+  padding: 6px 0 6px 18px;
+  margin: 20px 0 24px;
+  overflow-x: auto;
+}
+
+/* Split Answer-First Hero */
+.hero {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 24px;
+  align-items: end;
+  padding-bottom: 40px;
+  border-bottom: 2px solid var(--hair);
+}
+.hero-main { grid-column: span 8; }
+.hero-side {
+  grid-column: span 4;
+  border-left: 1px solid var(--hair);
+  padding-left: 24px;
+}
+
+h1 {
+  font-family: 'IBM Plex Sans', 'Noto Sans SC', sans-serif;
+  font-size: clamp(34px, 4.2vw, 50px);
+  font-weight: 700;
+  line-height: 1.18;
+  letter-spacing: -0.025em;
+  margin: 0 0 18px;
+  max-width: 24ch;
+  text-wrap: balance;
+}
+
+.deck {
+  font-size: 17px;
+  line-height: 1.65;
+  color: var(--ink2);
+  max-width: 62ch;
+  margin: 0;
+}
+
+.hero-num {
+  font-family: 'IBM Plex Sans', sans-serif;
+  font-size: clamp(44px, 5vw, 68px);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.03em;
+  color: var(--accent-2-text);
+  white-space: nowrap;
+}
+.hero-num-sub {
+  margin-top: 10px;
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--mute);
+}
+
+/* Sections */
+.sec { margin-top: 66px; }
+
+h2 {
+  font-family: 'IBM Plex Sans', 'Noto Sans SC', sans-serif;
+  font-size: clamp(23px, 2.4vw, 30px);
+  font-weight: 700;
+  line-height: 1.26;
+  letter-spacing: -0.015em;
+  margin: 0 0 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--hair);
+  color: var(--ink);
+  text-wrap: balance;
+}
+
+h3 {
+  font-family: 'IBM Plex Sans', 'Noto Sans SC', sans-serif;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.35;
+  margin: 26px 0 10px;
+  color: var(--ink);
+}
+
+p {
+  margin: 0 0 16px;
+  color: var(--ink2);
+}
+
+/* Multi-column open strips */
+.cols-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 28px 36px;
+  margin-top: 24px;
+}
+.cols-3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 24px 28px;
+  margin-top: 24px;
+}
+.col-item {
+  border-top: 1px solid var(--hair);
+  padding-top: 14px;
+}
+.col-item h3 { margin-top: 0; }
+
+/* Lists */
+ul.clean, ol.clean {
+  margin: 14px 0 20px;
+  padding: 0;
+  list-style: none;
+  max-width: 68ch;
+}
+ul.clean li, ol.clean li {
+  position: relative;
+  padding-left: 22px;
+  margin-bottom: 10px;
+  color: var(--ink2);
+}
+ul.clean li::before {
+  content: "—";
+  position: absolute;
+  left: 0;
+  color: var(--accent-text);
+  font-weight: 700;
+}
+ol.clean { counter-reset: ref; }
+ol.clean li { counter-increment: ref; padding-left: 30px; }
+ol.clean li::before {
+  content: counter(ref) ".";
+  position: absolute;
+  left: 0;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 13px;
+  color: var(--mute);
+  top: 2px;
+}
+
+/* Figures */
+figure {
+  margin: 30px 0 34px;
+  padding: 0;
+}
+.fig-title {
+  font-family: 'IBM Plex Sans', 'Noto Sans SC', sans-serif;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--ink);
+  margin: 0 0 14px;
+}
+figcaption {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--mute);
+  margin-top: 10px;
+}
+
+/* Tables (max 3) */
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  margin: 22px 0 28px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+  line-height: 1.55;
+}
+th {
+  font-family: 'IBM Plex Mono', 'Noto Sans SC', monospace;
+  font-size: 12px;
+  font-weight: 500;
+  text-align: left;
+  color: var(--mute);
+  border-bottom: 2px solid var(--hair);
+  padding: 10px 14px 10px 0;
+  white-space: nowrap;
+}
+td {
+  vertical-align: top;
+  padding: 12px 14px 12px 0;
+  border-bottom: 1px solid var(--hair);
+  color: var(--ink2);
+}
+td strong { color: var(--ink); }
+.mono {
+  font-family: 'IBM Plex Mono', monospace;
+  white-space: nowrap;
+  color: var(--accent-text);
+}
+
+/* Single Full-Bleed Band */
+.band {
+  background: var(--band);
+  margin: 64px calc(-1 * clamp(24px, 10.4vw, 112px));
+  padding: 48px clamp(24px, 10.4vw, 112px);
+  border-top: 1px solid var(--hair);
+  border-bottom: 1px solid var(--hair);
+}
+.band h2 { border-top: none; padding-top: 0; }
+
+.pullquote {
+  margin: 44px 0;
+  padding-left: 24px;
+  border-left: 3px solid var(--accent-2);
+  font-size: clamp(19px, 2.1vw, 24px);
+  line-height: 1.5;
+  font-weight: 500;
+  color: var(--ink);
+  max-width: 48ch;
+}
+
+@media (max-width: 880px) {
+  .hero-main, .hero-side { grid-column: span 12; }
+  .hero-side { border-left: none; border-top: 1px solid var(--hair); padding-left: 0; padding-top: 20px; }
+  .cols-2, .cols-3 { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<main class="page">
+
+  <header class="hero">
+    <div class="hero-main">
+      <h1>HTTP/2 与 HTTP/3 底层协议、代码实现及 TCP/TLS 握手交互架构</h1>
+      <p class="deck">从 RFC 标准、帧结构与流控状态机出发，拆解 TCP、TLS 1.3（含 ECH / ALPN）与 HTTP/2、QUIC/HTTP/3 之间的耦合关系，并直接映射到 Go <code>x/net/http2</code>、<code>quic-go/http3</code> 以及 .NET <code>YARP</code> 的真实连接池与代理网关实现。</p>
+    </div>
+    <div class="hero-side">
+      <div class="hero-num">1-RTT vs 2–3</div>
+      <div class="hero-num-sub">QUIC 将 TLS 1.3 握手直接嵌入传输层 Initial/Handshake 包，彻底合并了 TCP 与 TLS 的往返延迟，并在丢包时消除跨流队头阻塞。</div>
+    </div>
+  </header>
+
+  <!-- Section 1: TCP + TLS + H2 vs QUIC + TLS + H3 Handshake -->
+  <section class="sec">
+    <h2>TCP + TLS 1.3 + HTTP/2 与 QUIC + HTTP/3 的握手交互差异</h2>
+    <p class="measure">HTTP/2（<a href="https://datatracker.ietf.org/doc/html/rfc9113" target="_blank" rel="noopener noreferrer">RFC 9113</a>）本身依然是跑在 TCP 与 TLS 之上的应用层协议，因此一次冷启动 HTTPS 请求必须严格串行完成三个阶段：<strong>TCP 三次握手（1 RTT）→ TLS 1.3 握手并通过 ALPN 协商 <code>h2</code>（1 RTT）→ 发送 HTTP/2 Preface / SETTINGS 与首个 HEADERS 帧</strong>。如果目标 IP 被路由黑洞，连接在第一步 TCP SYN 就会超时；如果明文 SNI 被 DPI 匹配，连接会在第二步 TLS ClientHello 后收到伪造 RST。</p>
+    <p class="measure">HTTP/3（<a href="https://datatracker.ietf.org/doc/html/rfc9114" target="_blank" rel="noopener noreferrer">RFC 9114</a>）构建在基于 UDP 的 QUIC（<a href="https://datatracker.ietf.org/doc/html/rfc9000" target="_blank" rel="noopener noreferrer">RFC 9000</a>）之上，并由 <a href="https://datatracker.ietf.org/doc/html/rfc9001" target="_blank" rel="noopener noreferrer">RFC 9001</a> 规定直接复用 TLS 1.3 的握手消息（去掉了 TLS Record 层，改由 QUIC 的 <code>CRYPTO</code> 帧承载）。客户端首个 UDP Initial 包里同时携带了 QUIC 传输参数与 TLS 1.3 ClientHello（含 ALPN <code>h3</code>），服务端回复 Initial + Handshake + 1-RTT 后，客户端在 <strong>1 RTT</strong> 结束即可发出 HTTP/3 请求帧（复用会话票据时甚至可达 0-RTT）。</p>
+
+    <figure>
+      <div class="fig-title">QUIC 将 TLS 1.3 嵌入传输握手，把冷启动首包往返从 2–3 RTT 压缩至 1 RTT</div>
+      <svg viewBox="0 0 700 400" width="100%" role="img" aria-label="TCP+TLS1.3+HTTP/2 与 QUIC+TLS1.3+HTTP/3 握手时序对比图">
+        <!-- Left panel: TCP + TLS 1.3 + H2 -->
+        <text x="170" y="26" text-anchor="middle" font-family="IBM Plex Sans, Noto Sans SC, sans-serif" font-size="15" font-weight="700" fill="#7DD3FC">TCP + TLS 1.3 + HTTP/2</text>
+        <line x1="56" y1="48" x2="56" y2="365" stroke="#2A3241" stroke-width="2"/>
+        <line x1="284" y1="48" x2="284" y2="365" stroke="#2A3241" stroke-width="2"/>
+        <text x="56" y="42" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">Client</text>
+        <text x="284" y="42" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">Server</text>
+
+        <!-- RTT 1: TCP -->
+        <line x1="60" y1="74" x2="274" y2="96" stroke="#38BDF8" stroke-width="1.6"/>
+        <polygon points="274,91 282,97 273,101" fill="#38BDF8"/>
+        <text x="170" y="72" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">TCP SYN</text>
+
+        <line x1="280" y1="104" x2="66" y2="126" stroke="#38BDF8" stroke-width="1.6"/>
+        <polygon points="66,121 58,127 67,131" fill="#38BDF8"/>
+        <text x="170" y="130" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">SYN-ACK</text>
+        <text x="28" y="106" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">1 RTT</text>
+
+        <!-- RTT 2: TLS 1.3 -->
+        <line x1="60" y1="154" x2="274" y2="178" stroke="#38BDF8" stroke-width="1.6"/>
+        <polygon points="274,173 282,179 273,183" fill="#38BDF8"/>
+        <text x="170" y="152" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#7DD3FC">ACK + ClientHello (ALPN:h2)</text>
+
+        <line x1="280" y1="188" x2="66" y2="212" stroke="#38BDF8" stroke-width="1.6"/>
+        <polygon points="66,207 58,213 67,217" fill="#38BDF8"/>
+        <text x="170" y="218" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">ServerHello + Cert + Finished</text>
+        <text x="28" y="190" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">2 RTT</text>
+
+        <!-- RTT 3: H2 Data -->
+        <line x1="60" y1="248" x2="274" y2="272" stroke="#F1F5F9" stroke-width="1.8"/>
+        <polygon points="274,267 282,273 273,277" fill="#F1F5F9"/>
+        <text x="170" y="246" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#F1F5F9">Finished + H2 SETTINGS + HEADERS</text>
+
+        <line x1="280" y1="288" x2="66" y2="312" stroke="#F1F5F9" stroke-width="1.8"/>
+        <polygon points="66,307 58,313 67,317" fill="#F1F5F9"/>
+        <text x="170" y="324" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">H2 HEADERS + DATA (首包到达)</text>
+        <text x="28" y="286" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">3 RTT</text>
+
+        <!-- Divider -->
+        <line x1="350" y1="16" x2="350" y2="380" stroke="#2A3241" stroke-width="1" stroke-dasharray="4 4"/>
+
+        <!-- Right panel: QUIC + TLS 1.3 + H3 -->
+        <text x="530" y="26" text-anchor="middle" font-family="IBM Plex Sans, Noto Sans SC, sans-serif" font-size="15" font-weight="700" fill="#6EE7B7">QUIC (UDP) + TLS 1.3 + HTTP/3</text>
+        <line x1="416" y1="48" x2="416" y2="365" stroke="#2A3241" stroke-width="2"/>
+        <line x1="644" y1="48" x2="644" y2="365" stroke="#2A3241" stroke-width="2"/>
+        <text x="416" y="42" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">Client</text>
+        <text x="644" y="42" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">Server</text>
+
+        <!-- RTT 1: QUIC Initial + TLS -->
+        <line x1="420" y1="74" x2="634" y2="100" stroke="#34D399" stroke-width="1.8"/>
+        <polygon points="634,95 642,101 633,105" fill="#34D399"/>
+        <text x="530" y="70" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">Initial (CRYPTO: ClientHello + h3)</text>
+
+        <line x1="640" y1="114" x2="426" y2="140" stroke="#34D399" stroke-width="1.8"/>
+        <polygon points="426,135 418,141 427,145" fill="#34D399"/>
+        <text x="530" y="148" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">Initial + Handshake + Cert + Fin</text>
+        <text x="386" y="112" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">1 RTT</text>
+
+        <!-- RTT 2: H3 Data -->
+        <line x1="420" y1="184" x2="634" y2="210" stroke="#F1F5F9" stroke-width="1.8"/>
+        <polygon points="634,205 642,211 633,215" fill="#F1F5F9"/>
+        <text x="530" y="180" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#F1F5F9">Handshake Fin + H3 HEADERS</text>
+
+        <line x1="640" y1="226" x2="426" y2="252" stroke="#F1F5F9" stroke-width="1.8"/>
+        <polygon points="426,247 418,253 427,257" fill="#F1F5F9"/>
+        <text x="530" y="264" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">H3 HEADERS + DATA (首包到达)</text>
+        <text x="386" y="222" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">2 RTT</text>
+
+        <!-- Callout text inside empty lower right -->
+        <text x="416" y="316" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#94A3B8">会话恢复时支持 0-RTT 提前发请求</text>
+        <text x="416" y="340" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#94A3B8">每个 QUIC 流独立重传，互不阻塞</text>
+      </svg>
+      <figcaption>图注：冷启动场景下，TCP+TLS1.3+H2 需 2 RTT 完成握手、第 3 个 RTT 收到首包；QUIC+H3 仅需 1 RTT 完成握手、第 2 个 RTT 收到首包。</figcaption>
+    </figure>
+  </section>
+
+  <!-- Section 2: HTTP/2 Internals & Go Implementation -->
+  <section class="sec">
+    <h2>HTTP/2 底层原理与 Go <code>x/net/http2</code> 代码实现细节</h2>
+    <p class="measure">HTTP/2 将文本协议彻底改为<strong>二进制分帧层（Binary Framing Layer）</strong>。所有通信被切分为带 9 字节定长头（Length 24b + Type 8b + Flags 8b + R 1b + Stream ID 31b）的帧（<code>HEADERS</code>、<code>DATA</code>、<code>SETTINGS</code>、<code>WINDOW_UPDATE</code>、<code>PING</code>、<code>RST_STREAM</code>、<code>GOAWAY</code>）。客户端发起的流恒为奇数 ID（1, 3, 5...），允许在同一条 TCP 连接上交错收发几十上百个请求，彻底消除了 HTTP/1.1 的应用层队头阻塞。</p>
+
+    <div class="cols-3">
+      <div class="col-item">
+        <h3>HPACK 头部压缩</h3>
+        <p><a href="https://datatracker.ietf.org/doc/html/rfc7541" target="_blank" rel="noopener noreferrer">RFC 7541</a> 定义了静态表 + 动态表 + 霍夫曼编码。由于动态表严格依赖 TCP 的<strong>全局有序到达</strong>，两个流共享同一张动态表状态；这也是 HTTP/2 无法直接搬到无序 UDP 的原因之一。</p>
+      </div>
+      <div class="col-item">
+        <h3>双层流量控制</h3>
+        <p>HTTP/2 在 TCP 滑动窗口之上又建了<strong>连接级 + 流级两套信用窗口</strong>（默认 65,535 字节），接收方通过 <code>WINDOW_UPDATE</code> 补充额度。若某条大文件下载流耗尽连接级窗口，其它小请求流也会被卡住。</p>
+      </div>
+      <div class="col-item">
+        <h3>Go <code>http2.Transport</code> 源码约束</h3>
+        <p>Go 的 <code>x/net/http2.Transport</code> 内部 <code>clientConnPool</code> 以 <code>addr</code>（即 <code>host:443</code>）为 Key。只要当前 <code>ClientConn</code> 未达到对端通告的 <code>MAX_CONCURRENT_STREAMS</code>（通常 100），<strong>所有发往同一域名的请求只会复用 1 条 TCP 连接</strong>。</p>
+      </div>
+    </div>
+
+    <p class="measure" style="margin-top:22px;">在晚高峰国际公网丢包率达到 15%–30% 时，这种“单 TCP 复用 100 条流”的设计会暴露出最致命的短板——<strong>TCP 队头阻塞（TCP Head-of-Line Blocking）</strong>：内核 TCP 协议栈必须按字节序号严格有序地把数据交给 TLS 与 HTTP/2 解析器。只要单个 TCP 段丢失，哪怕 Stream 3 和 Stream 5 的帧已经抵达网卡缓冲区，内核也必须死等 Stream 1 的那个丢包完成 RTO/快速重传，整条连接上的几十张并发图片全部冻结。</p>
+
+    <pre>// echproxy/ech/client.go — 用 4 路独立 http2.Transport 分片绕过 Go 单 TCP 限制
+type Client struct {
+    pool []*http.Client // 4 个独立 http2.Transport，各自维护 TCP + Happy Eyeballs 建连
+    rr   atomic.Uint64  // 无锁轮询，将同一 host:443 的并发流打散到 4 条独立 TCP
+}</pre>
+  </section>
+
+  <!-- Section 3: HTTP/3 & QUIC Internals & quic-go -->
+  <section class="sec">
+    <h2>HTTP/3 与 QUIC 底层机制：如何用用户态 UDP 消灭队头阻塞</h2>
+    <p class="measure">QUIC 把传输层的可靠性、拥塞控制与多路复用全部从操作系统内核搬进了<strong>用户态 UDP</strong>。每个 QUIC 包由外层包头（含 <strong>Connection ID</strong>，网络从 Wi-Fi 切到 5G 改了客户端 IP 也能无缝迁移不断连）和加密负载构成，负载内包含多个独立的 <code>STREAM</code> 帧。每个 Stream 拥有独立的字节偏移量与接收重组缓冲区——<strong>Stream 1 丢包重传时，Stream 3 和 Stream 5 的数据可以立刻交付给上层 HTTP/3 解析器</strong>。</p>
+    <p class="measure">为了适配跨流无序到达，HTTP/3 抛弃了 HPACK，改用 <a href="https://datatracker.ietf.org/doc/html/rfc9204" target="_blank" rel="noopener noreferrer">RFC 9204 QPACK</a>：它通过两条专用的单向控制流（Encoder Stream / Decoder Stream）异步同步动态表，并允许请求帧直接引用静态表或已确认的动态表条目，避免头部解码互相阻塞。</p>
+
+    <figure>
+      <div class="fig-title">单条 TCP 丢包会卡死整条 HTTP/2 管道，而多路 H2 分片与 QUIC 流可将故障隔离</div>
+      <svg viewBox="0 0 700 370" width="100%" role="img" aria-label="单路 HTTP/2、4 分片 HTTP/2 与 HTTP/3 QUIC 丢包阻塞对比">
+        <!-- Case 1: Single H2 -->
+        <text x="12" y="28" font-family="Noto Sans SC, sans-serif" font-size="14" font-weight="700" fill="#F1F5F9">1. 单条 TCP 的 HTTP/2（默认 Go http2.Transport）</text>
+        <rect x="12" y="42" width="676" height="48" fill="none" stroke="#38BDF8" stroke-width="1.4"/>
+        <rect x="26" y="52" width="108" height="28" fill="#EF4444" fill-opacity="0.25" stroke="#F87171"/>
+        <text x="80" y="71" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#FCA5A5">S1 丢包 (重传中)</text>
+        <rect x="148" y="52" width="128" height="28" fill="#1E293B" stroke="#475569"/>
+        <text x="212" y="71" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">S3 已到达 · 被阻塞</text>
+        <rect x="290" y="52" width="128" height="28" fill="#1E293B" stroke="#475569"/>
+        <text x="354" y="71" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">S5 已到达 · 被阻塞</text>
+        <text x="556" y="71" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#FCA5A5">影响面：100% 并发流卡死</text>
+
+        <!-- Case 2: 4-Shard H2 -->
+        <text x="12" y="132" font-family="Noto Sans SC, sans-serif" font-size="14" font-weight="700" fill="#7DD3FC">2. 4 分片多路 HTTP/2（ech-proxy 当前 ECH 主通道）</text>
+        <rect x="12" y="146" width="320" height="32" fill="none" stroke="#F87171" stroke-width="1.2"/>
+        <text x="172" y="167" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#FCA5A5">TCP Shard #0: S1 丢包（仅阻塞本分片）</text>
+        <rect x="352" y="146" width="336" height="32" fill="#0F766E" fill-opacity="0.22" stroke="#34D399" stroke-width="1.2"/>
+        <text x="520" y="167" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">TCP Shard #1: S3 正常交付 ✓</text>
+        <rect x="12" y="188" width="320" height="32" fill="#0F766E" fill-opacity="0.22" stroke="#34D399" stroke-width="1.2"/>
+        <text x="172" y="209" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">TCP Shard #2: S5 正常交付 ✓</text>
+        <rect x="352" y="188" width="336" height="32" fill="#0F766E" fill-opacity="0.22" stroke="#34D399" stroke-width="1.2"/>
+        <text x="520" y="209" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">TCP Shard #3: S7 正常交付 ✓（影响面降至 25%）</text>
+
+        <!-- Case 3: HTTP/3 QUIC -->
+        <text x="12" y="264" font-family="Noto Sans SC, sans-serif" font-size="14" font-weight="700" fill="#6EE7B7">3. HTTP/3 over QUIC（ech-proxy 可选 ECH 备选通道）</text>
+        <rect x="12" y="278" width="676" height="72" fill="none" stroke="#34D399" stroke-width="1.4" stroke-dasharray="6 4"/>
+        <rect x="26" y="294" width="144" height="40" fill="#EF4444" fill-opacity="0.25" stroke="#F87171"/>
+        <text x="98" y="319" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#FCA5A5">QUIC S1 独立重传</text>
+        <rect x="186" y="294" width="150" height="40" fill="#0F766E" fill-opacity="0.25" stroke="#34D399"/>
+        <text x="261" y="319" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">QUIC S3 立即交付 ✓</text>
+        <rect x="352" y="294" width="150" height="40" fill="#0F766E" fill-opacity="0.25" stroke="#34D399"/>
+        <text x="427" y="319" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">QUIC S5 立即交付 ✓</text>
+        <text x="596" y="319" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#6EE7B7">零跨流队头阻塞</text>
+      </svg>
+      <figcaption>图注：HTTP/3 在单条 UDP 连接内即实现流级隔离；而在 UDP/443 受运营商 QoS 限速时，4 分片 HTTP/2 是 TCP 环境下最稳妥的折中方案。</figcaption>
+    </figure>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>协议维度</th>
+            <th>HTTP/1.1 (RFC 9112)</th>
+            <th>HTTP/2 (RFC 9113)</th>
+            <th>HTTP/3 (RFC 9114 + RFC 9000)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>传输层</strong></td>
+            <td>TCP（内核态）</td>
+            <td>TCP（内核态）</td>
+            <td>QUIC over UDP（用户态）</td>
+          </tr>
+          <tr>
+            <td><strong>加密层整合</strong></td>
+            <td>外挂 TLS Record</td>
+            <td>外挂 TLS 1.2/1.3（ALPN <code>h2</code>）</td>
+            <td>内嵌 TLS 1.3 <code>CRYPTO</code> 帧（ALPN <code>h3</code>）</td>
+          </tr>
+          <tr>
+            <td><strong>头部压缩</strong></td>
+            <td>无明文压缩</td>
+            <td>HPACK（依赖全局有序）</td>
+            <td>QPACK（专用单向控制流，抗乱序）</td>
+          </tr>
+          <tr>
+            <td><strong>队头阻塞</strong></td>
+            <td>应用层 + TCP 层均有</td>
+            <td>仅 TCP 层仍有</td>
+            <td>应用层与传输层均消除</td>
+          </tr>
+          <tr>
+            <td><strong>连接迁移</strong></td>
+            <td>不支持（绑定四元组）</td>
+            <td>不支持（绑定四元组）</td>
+            <td>支持（基于 Connection ID）</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Section 4: Full-Bleed Band on TLS / ECH / ALPN / DPI Coupling -->
+  <section class="band">
+    <h2>TLS 1.3、ECH、ALPN 与传输层的深层耦合陷阱</h2>
+    <div class="cols-2">
+      <div class="col-item">
+        <h3>TLS Record 层与 TCP 分段的微妙关系</h3>
+        <p>TLS 握手消息（如 ClientHello）运行在 TLS Record 层之上，每条 Record 带 5 字节头（类型 + 版本 + 长度）。一个 ClientHello 既可以在 TCP 层拆成多个 Segment，也可以在应用层主动拆进多个小 TLS Record。正如 <a href="https://www.computer.org/csdl/proceedings-article/sp/2025/223600b288/26hiUekZ19S" target="_blank" rel="noopener noreferrer">IEEE S&amp;P 2025 论文</a> 所证，许多 DPI 仅能重组 TCP 流但未实现跨 TLS Record 的 SNI 拼接，因此应用层 Record 分片比纯 TCP 分片更持久。</p>
+      </div>
+      <div class="col-item">
+        <h3>ECH（RFC 9460）如何在 H2 与 H3 中复用</h3>
+        <p>ECH 将握手拆成「外层明文 ClientHelloOuter（SNI 填公共壳如 <code>cloudflare-ech.com</code>）」和「内层加密 ClientHelloInner（含真实域名）」。因为 QUIC 直接复用 TLS 1.3 握手消息，Go 1.26 标准库的 <code>tls.Config.EncryptedClientHelloConfigList</code> 既可用于 TCP，也可直接传入 <code>quic-go</code> 的 <code>http3.Transport</code>，使 QUIC Initial 包内的真实 SNI 同样不可见——而<strong>不带 ECH 的裸 QUIC Initial 自 2024 年起已被大规模解密审查</strong>（<a href="https://gfw.report/publications/ccs26/en/" target="_blank" rel="noopener noreferrer">ACM CCS 2026</a>）。</p>
+      </div>
+      <div class="col-item">
+        <h3>ALPN 协商失败与降级路径</h3>
+        <p>服务端不支持 <code>h2</code> 时，<code>echproxy/ech/sni.go</code> 会根据协商结果回退至 HTTP/1.1 池；而 <code>echproxy/ech/h3.go</code> 必须显式设置 <code>NextProtos: []string{http3.NextProtoH3}</code> 并把证书核对挂在 <code>tls.Config.VerifyConnection</code> 回调中，确保在握手完成前即执行 <code>validateUpstreamCert</code>。</p>
+      </div>
+      <div class="col-item">
+        <h3><code>quic-go</code> 自定义 Dial 的 UDP 端口泄漏陷阱</h3>
+        <p>在 <a href="https://pkg.go.dev/github.com/quic-go/quic-go/http3" target="_blank" rel="noopener noreferrer">quic-go v0.59.0</a> 中，<code>http3.Transport.Dial</code> 返回 <code>*quic.Conn</code>，若回调里调用 <code>quic.DialAddrEarly</code>，每次拨号会独占一个系统 UDP socket。如 <a href="https://github.com/AdguardTeam/dnsproxy/issues/511" target="_blank" rel="noopener noreferrer">AdguardTeam/dnsproxy #511</a> 披露，若再开启 <code>KeepAlivePeriod</code>，被驱逐的旧连接会因不断发 PING 而永不空闲超时导致端口耗尽。因此 <code>ech-proxy</code> 的 H3 实现严禁设置 <code>KeepAlivePeriod</code>，并配合 <code>MaxIdleTimeout: 30s</code> 与关闭时主动 <code>tr.Close()</code>。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section 5: Proxy Gateway Architecture & Code Comparison -->
+  <section class="sec">
+    <h2>代理网关代码架构对照：Go（<code>ech-proxy</code>）vs .NET（<code>YARP</code> / <code>SteamTools</code>）</h2>
+    <p class="measure">在反向代理/本地 MITM 网关中，<strong>入站（浏览器 ↔ 代理）与出站（代理 ↔ 源站）是两套完全解耦的传输状态机</strong>。入站可以跑 HTTP/1.1 或 HTTP/2，出站完全可以独立升级为多路 HTTP/2 或 HTTP/3 + ECH；同时，一个网页包含的多个 CDN 子域名（如主站 + 图床 + 静态资源）在代理侧会按 <code>host:443</code> 乘以分片数建立独立连接池，因此分片数必须克制（4 路 ECH / 2 路 SNI 是延迟、内存与风控的平衡点）。</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>架构组件</th>
+            <th><code>ech-proxy</code> (Go + uTLS + quic-go)</th>
+            <th><code>YARP</code> + <code>SteamTools</code> (.NET Kestrel)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>多路 HTTP/2 实现</strong></td>
+            <td>显式维护 4 个独立 <code>*http2.Transport</code> 分片并 <code>atomic.Uint64</code> 轮询</td>
+            <td><code>SocketsHttpHandler.EnableMultipleHttp2Connections = true</code>（单 Handler 内部自动扩容连接）</td>
+          </tr>
+          <tr>
+            <td><strong>多 IP 建连与容错</strong></td>
+            <td><code>DialContextHappyEyeballs</code>（3 路 100ms 阶梯竞速）+ 3 分钟 <code>badIPUntil</code> 冷却轮换</td>
+            <td><code>ReverseProxyHttpClientHandler</code> 在 <code>ConnectCallback</code> 内按 <code>IAsyncEnumerable</code> 串行遍历 IP</td>
+          </tr>
+          <tr>
+            <td><strong>流式拷贝与缓冲</strong></td>
+            <td>响应流用 32KB <code>sync.Pool</code>；≤1MB 请求体预读 <code>bodyReplay</code> 以支持多通道重试与逃逸</td>
+            <td><code>StreamCopier</code> 用 <code>ArrayPool&lt;byte&gt;.Shared</code> + <code>StreamCopyHttpContent</code> 纯双向零缓冲流式透传</td>
+          </tr>
+          <tr>
+            <td><strong>自定义 TLS / ECH 注入点</strong></td>
+            <td>TCP 走 <code>uTLS</code> 伪装 Chrome 指纹 + ECH；H3 走标准库 <code>tls.Config</code> + <code>VerifyConnection</code></td>
+            <td><code>ConnectCallback</code> 内手动构造 TCP <code>Socket</code> + <code>SslStream</code> 改写 <code>TargetHost</code>（导致出站无法走 QUIC/H3）</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="pullquote">「决定代理网关高并发上限的，不是语言本身的加解密速度，而是能否在不触发连接爆炸的前提下，把单点丢包隔离在单条连接或单个流之内。」</div>
+  </section>
+
+
+  <!-- Section 5B: Packet Order & Response Stream Lifecycle -->
+  <section class="sec">
+    <h2>完整发包顺序与响应流生命周期：从 L2 帧到流状态机收敛</h2>
+    <p class="measure">无论 HTTP/2 还是 HTTP/3，一次请求都不是“发一个包等一个包”，而是严格按协议层封装与状态机推进的多帧序列。理解逐包顺序能直接解释代理层里的<strong>窗口耗尽卡死、<code>RST_STREAM</code> 级联中止与 0-RTT 驱逐</strong>等疑难现象。</p>
+
+    <div class="cols-2">
+      <div class="col-item">
+        <h3>HTTP/2 发包顺序与响应流（TCP + TLS 1.3）</h3>
+        <ul class="clean">
+          <li><strong>1. L2/L3/L4 建连</strong>：IEEE 802.3 以太网帧（MTU 1500B）承载 IP + TCP <code>SYN</code>（协商 <code>MSS=1460B</code>、<code>WScale</code>、<code>SACK</code>）↔ <code>SYN-ACK</code> → <code>ACK</code>。</li>
+          <li><strong>2. TLS 1.3 握手</strong>：客户端发 <code>0x16</code> Record 承载 <code>ClientHello</code>（带 <code>SNI/ECH</code>、<code>ALPN: h2</code>；分片模式拆为多个小 <code>0x16</code> Record）↔ 服务端回 <code>ServerHello</code> + <code>Certificate</code> + <code>Finished</code>。</li>
+          <li><strong>3. H2 连接序言与请求流</strong>：客户端先发 24 字节魔法序言 <code>PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n</code> + <code>SETTINGS</code>（Stream 0）+ 可选连接级 <code>WINDOW_UPDATE</code>；随后在奇数流（Stream 1）发 <code>HEADERS</code>（HPACK 压缩，无 body 时置 <code>END_STREAM=0x1</code>）与 <code>DATA</code> 帧，流状态由 <code>idle → open → half-closed (local)</code>。</li>
+          <li><strong>4. 响应流交付</strong>：服务端回 <code>SETTINGS</code> / <code>SETTINGS ACK</code> → 在 Stream 1 回 <code>HEADERS</code>（<code>:status: 200</code>）→ 连续发多个 <code>DATA</code> 帧（单帧 ≤ <code>MAX_FRAME_SIZE</code> 默认 16,384B），末帧置 <code>END_STREAM</code> 进入 <code>closed</code>；客户端消费响应体时持续回发 <code>WINDOW_UPDATE</code>（流级 + Stream 0 连接级）补充信用窗口。</li>
+        </ul>
+      </div>
+      <div class="col-item">
+        <h3>HTTP/3 发包顺序与响应流（QUIC + UDP）</h3>
+        <ul class="clean">
+          <li><strong>1. QUIC Initial + 内嵌 TLS 1.3</strong>：客户端发 UDP 载荷 ≥ <strong>1200 字节</strong>（RFC 9000 防放大攻击强制填充）的 <code>Initial</code> 包，内含 <code>CRYPTO</code> 帧（TLS 1.3 ClientHello + <code>ALPN: h3</code> + ECH）。</li>
+          <li><strong>2. 服务端合并回包</strong>：服务端在 1 个 RTT 内合并回复 <code>Initial</code> + <code>Handshake</code>（含证书）+ <code>1-RTT</code> 包。</li>
+          <li><strong>3. 并行开启控制流与请求流</strong>：客户端完成 <code>Handshake</code> 后，在 1-RTT 包内同时打开：单向控制流（Stream ID 2，类型字节 <code>0x00</code>）发 <code>SETTINGS</code>（<code>0x04</code>）；单向 QPACK 编码流（ID 6，<code>0x02</code>）与解码流（ID 10，<code>0x03</code>）；双向请求流（ID 0, 4, 8...，低 2 bit 为 <code>00</code>）发 <code>HEADERS</code>（<code>0x01</code>）+ <code>DATA</code>（<code>0x00</code>）并置 QUIC <code>FIN</code>。</li>
+          <li><strong>4. 独立响应流</strong>：服务端在同一双向 Stream ID 上回传 <code>HEADERS</code>（<code>0x01</code>）+ <code>DATA</code>（<code>0x00</code>）+ <code>FIN</code>。单个 UDP 包丢失仅影响该包所载的特定流，其余双向流与 QPACK 静态表请求毫秒级正常交付。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section 5C: Raw Bit Wire Formats -->
+  <section class="sec">
+    <h2>原始 Bit 级报文格式：从 IEEE 802.3 到 HTTP/2 与 QUIC/HTTP/3</h2>
+    <p class="measure">协议性能与 DPI 审查特征全部藏在每一层报文头的原始 bit 布局中：TCP 头的 4-bit <code>Data Offset</code> 决定了 Options（如 Timestamp）能否改变头长（<a href="https://gfw.report/publications/sp25/en/" target="_blank" rel="noopener noreferrer">S&amp;P 2025</a> 曾披露省墙仅匹配 20B 固定头长）；TLS 头的 16-bit <code>Length</code> 允许将单条 ClientHello 切进多个合法 Record；QUIC 头的 <code>Fixed Bit</code>、<code>DCID</code> 与 <strong>2-bit 前缀变长整数（VarInt）</strong> 则构成了无状态路由与 Header Protection 的基础。</p>
+
+    <figure>
+      <div class="fig-title">TLS 1.3（5B）、HTTP/2（9B）、QUIC Long Header 与 HTTP/3 VarInt 的原始 Bit 布局</div>
+      <svg viewBox="0 0 700 450" width="100%" role="img" aria-label="TLS 1.3、HTTP/2、QUIC 与 HTTP/3 原始 Bit 报文头格式图">
+        <!-- Bit ruler -->
+        <text x="12" y="18" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">bit 0</text>
+        <text x="180" y="18" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">8</text>
+        <text x="350" y="18" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">16</text>
+        <text x="520" y="18" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">24</text>
+        <text x="688" y="18" text-anchor="end" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">31</text>
+        <line x1="12" y1="24" x2="688" y2="24" stroke="#2A3241" stroke-width="1"/>
+
+        <!-- 1. TLS 1.3 Record Header (5B = 40b) -->
+        <text x="12" y="46" font-family="IBM Plex Sans, Noto Sans SC, sans-serif" font-size="14" font-weight="700" fill="#7DD3FC">1. TLS 1.3 Record Header (RFC 8446 · 固定 5 Bytes / 40 bits)</text>
+        <rect x="12" y="56" width="135" height="34" fill="#0F766E" fill-opacity="0.2" stroke="#38BDF8"/>
+        <text x="79" y="77" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#F1F5F9">Type (8b: 0x16)</text>
+        <rect x="147" y="56" width="270" height="34" fill="#161B22" stroke="#38BDF8"/>
+        <text x="282" y="77" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">LegacyVersion (16b: 0x0303)</text>
+        <rect x="417" y="56" width="271" height="34" fill="#161B22" stroke="#38BDF8"/>
+        <text x="552" y="77" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#7DD3FC">Length (16b · max 16384B)</text>
+
+        <!-- 2. HTTP/2 Frame Header (9B = 72b) -->
+        <text x="12" y="122" font-family="IBM Plex Sans, Noto Sans SC, sans-serif" font-size="14" font-weight="700" fill="#7DD3FC">2. HTTP/2 Frame Header (RFC 9113 · 固定 9 Bytes / 72 bits)</text>
+        <rect x="12" y="132" width="507" height="34" fill="#161B22" stroke="#38BDF8"/>
+        <text x="265" y="153" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#7DD3FC">Length (24b · 默认上限 16,384B, 最大 16MB)</text>
+        <rect x="519" y="132" width="169" height="34" fill="#0F766E" fill-opacity="0.2" stroke="#38BDF8"/>
+        <text x="603" y="153" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#F1F5F9">Type (8b)</text>
+
+        <rect x="12" y="166" width="169" height="34" fill="#161B22" stroke="#38BDF8"/>
+        <text x="96" y="187" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">Flags (8b)</text>
+        <rect x="181" y="166" width="32" height="34" fill="#1E293B" stroke="#475569"/>
+        <text x="197" y="187" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">R</text>
+        <rect x="213" y="166" width="475" height="34" fill="#0F766E" fill-opacity="0.2" stroke="#38BDF8"/>
+        <text x="450" y="187" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#F1F5F9">Stream Identifier (31b · 0=控制, 奇=客户端, 偶=服务端)</text>
+
+        <!-- 3. QUIC Long Header (RFC 9000) -->
+        <text x="12" y="232" font-family="IBM Plex Sans, Noto Sans SC, sans-serif" font-size="14" font-weight="700" fill="#6EE7B7">3. QUIC Long Header (RFC 9000 · Initial / Handshake)</text>
+        <rect x="12" y="242" width="46" height="34" fill="#0F766E" fill-opacity="0.28" stroke="#34D399"/>
+        <text x="35" y="263" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">F=1</text>
+        <rect x="58" y="242" width="46" height="34" fill="#0F766E" fill-opacity="0.28" stroke="#34D399"/>
+        <text x="81" y="263" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">1</text>
+        <rect x="104" y="242" width="84" height="34" fill="#161B22" stroke="#34D399"/>
+        <text x="146" y="263" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#F1F5F9">Type(2b)</text>
+        <rect x="188" y="242" width="96" height="34" fill="#161B22" stroke="#34D399"/>
+        <text x="236" y="263" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">Bits(4b)</text>
+        <rect x="284" y="242" width="404" height="34" fill="#161B22" stroke="#34D399"/>
+        <text x="486" y="263" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">Version (32b · QUIC v1 = 0x00000001)</text>
+
+        <rect x="12" y="276" width="169" height="34" fill="#161B22" stroke="#34D399"/>
+        <text x="96" y="297" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">DCID Len (8b)</text>
+        <rect x="181" y="276" width="169" height="34" fill="#0F766E" fill-opacity="0.2" stroke="#34D399"/>
+        <text x="265" y="297" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#F1F5F9">DCID (0..20B)</text>
+        <rect x="350" y="276" width="169" height="34" fill="#161B22" stroke="#34D399"/>
+        <text x="434" y="297" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">SCID Len (8b)</text>
+        <rect x="519" y="276" width="169" height="34" fill="#0F766E" fill-opacity="0.2" stroke="#34D399"/>
+        <text x="603" y="297" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#F1F5F9">SCID (0..20B)</text>
+
+        <!-- 4. HTTP/3 Frame & QUIC VarInt -->
+        <text x="12" y="344" font-family="IBM Plex Sans, Noto Sans SC, sans-serif" font-size="14" font-weight="700" fill="#6EE7B7">4. HTTP/3 Frame (RFC 9114) 与 QUIC 变长整数编码 (RFC 9000 §16)</text>
+        <rect x="12" y="354" width="200" height="34" fill="#0F766E" fill-opacity="0.22" stroke="#34D399"/>
+        <text x="112" y="375" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#F1F5F9">Type (VarInt: 0x00/0x01)</text>
+        <rect x="212" y="354" width="180" height="34" fill="#161B22" stroke="#34D399"/>
+        <text x="302" y="375" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#6EE7B7">Length (VarInt)</text>
+        <rect x="392" y="354" width="296" height="34" fill="#161B22" stroke="#34D399"/>
+        <text x="540" y="375" text-anchor="middle" font-family="IBM Plex Mono, monospace" font-size="12" fill="#CBD5E1">Frame Payload (Length Bytes)</text>
+
+        <text x="12" y="416" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">VarInt 高 2 bit 前缀:  00=1B (6b, ≤63) · 01=2B (14b, ≤16383) · 10=4B (30b) · 11=8B (62b)</text>
+        <text x="12" y="438" font-family="IBM Plex Mono, monospace" font-size="12" fill="#94A3B8">QUIC Short Header (1-RTT): Form=0 (1b) | Fixed=1 (1b) | Spin (1b) | Reserved (2b) | KeyPhase (1b) | PNLen (2b)</text>
+      </svg>
+      <figcaption>图注：HTTP/2 使用固定 9 字节头（31-bit Stream ID 含 1-bit 保留位 R）；HTTP/3 抛弃固定头长，全部采用 QUIC 2-bit 前缀 VarInt 编码，常见帧头仅 2–4 字节。</figcaption>
+    </figure>
+
+    <h3>L2 IEEE 802.3 以太网帧与 L4 TCP 20 字节基础头（Bit 偏移）</h3>
+    <pre>IEEE 802.3 Ethernet II Frame (MTU = 1500B → 决定 TCP MSS = 1460B / IPv6 1440B):
++------------------+------------------+---------------+----------------------+----------+
+| Preamble+SFD(8B) | Dst MAC (48b)    | Src MAC (48b) | EtherType (16b)      | Payload  | FCS(32b)
+| 1010...1011      | 0x0800=IPv4 / 0x86DD=IPv6 / 0x8100=802.1Q VLAN (+4B)    | 46-1500B | CRC-32
++------------------+------------------+---------------+----------------------+----------+
+
+TCP Header (RFC 9293 · 20 Bytes Base + 0~40 Bytes Options):
+ 0                   1                   2                   3
+ 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|          Source Port (16b)    |       Destination Port (16b)  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                        Sequence Number (32b)                  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Acknowledgment Number (32b)                |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|Offset | Rsrvd |C|E|U|A|P|R|S|F|            Window (16b)       |
+| (4b)  | (4b)  |W|C|R|C|S|S|Y|I|   (实际窗口 = Window &lt;&lt; WScale) |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|           Checksum (16b)      |         Urgent Pointer (16b)  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|                    Options (MSS / WScale / SACK / Timestamp)  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+</pre>
+  </section>
+
+  <!-- Section 5D: IEEE & IETF Standards Matrix (Table 3 of 3) -->
+  <section class="sec">
+    <h2>IEEE 与 IETF 核心标准规定及对代理设计的硬约束</h2>
+    <p class="measure">上层代理的每一个参数（从 <code>MAX_FRAME_SIZE</code> 到 QUIC Initial 1200B 下限、再到晚高峰丢包策略）都不是拍脑袋定的，而是由 IEEE 物理/链路层标准与 IETF 传输/应用层 RFC 逐层传导下来的硬性规定。</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>标准编号</th>
+            <th>所属层 / 组织</th>
+            <th>关键硬性规定</th>
+            <th>对 HTTP/2 · HTTP/3 代理的实际影响</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="mono">IEEE 802.3 / 802.1Q</td>
+            <td>L2 以太网 / VLAN（IEEE）</td>
+            <td>标准以太网载荷 MTU <strong>1500B</strong>（802.1Q VLAN Tag 占 4B，PPPoE 再占 8B → 1492B）</td>
+            <td>直接限定 IPv4 TCP <code>MSS ≤ 1460B</code>（PPPoE 为 1452B）；QUIC 必须做 PMTUD 且避免 IP 分片</td>
+          </tr>
+          <tr>
+            <td class="mono">IEEE 802.11</td>
+            <td>L2 Wi-Fi 无线局域网（IEEE）</td>
+            <td>空口半双工竞争（CSMA/CA）与链路层 ARQ 重传易引入微突发抖动与乱序</td>
+            <td>无线丢包放大 TCP 队头阻塞，促使多路 H2 分片或 QUIC 连接迁移（Connection ID）收益更明显</td>
+          </tr>
+          <tr>
+            <td class="mono">RFC 9293</td>
+            <td>L4 TCP（IETF）</td>
+            <td><code>Data Offset</code> 单位为 32-bit word（最小值 5 = 20B）；严格按字节序号有序交付</td>
+            <td>字节流强有序是 HTTP/2 跨流队头阻塞的根源；Options 扩充头长会影响假定 20B 头的中间盒解析</td>
+          </tr>
+          <tr>
+            <td class="mono">RFC 8446 / RFC 9460</td>
+            <td>TLS 1.3 &amp; SVCB/ECH（IETF）</td>
+            <td>单条 TLS Record 明文上限 <strong>16,384B</strong>；ECH 公钥通过 DNS type=65（HTTPS/SVCB）下发</td>
+            <td>支持合法的客户端 TLS Record 分片；ECH 强依赖支持 type=65 的 DoH 解析链路</td>
+          </tr>
+          <tr>
+            <td class="mono">RFC 9113 / RFC 7541</td>
+            <td>HTTP/2 &amp; HPACK（IETF）</td>
+            <td>9B 帧头、默认 <code>MAX_FRAME_SIZE=16KB</code>、默认流控窗口 65,535B、HPACK 全局有序</td>
+            <td>Go 单 <code>http2.Transport</code> 仅开 1 条 TCP，需多 shard 池 + <code>ReadIdleTimeout/PingTimeout</code> 防僵死</td>
+          </tr>
+          <tr>
+            <td class="mono">RFC 9000 / 9001 / 9114</td>
+            <td>QUIC &amp; HTTP/3（IETF）</td>
+            <td>Initial 包强制 ≥ <strong>1200B</strong>、2-bit VarInt 编码、Stream ID 低 2 bit 标识方向与发起方</td>
+            <td>1-RTT 建连 + 零跨流阻塞；但自定义 <code>DialAddrEarly</code> 需严控空闲超时防止 UDP socket 泄漏</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Section 6: Sources -->
+  <section class="sec">
+    <h2>标准规范与参考源码</h2>
+    <ol class="clean">
+      <li><a href="https://standards.ieee.org/ieee/802.3/10422/" target="_blank" rel="noopener noreferrer">IEEE Std 802.3 — Ethernet Standard (1500B MTU &amp; Frame Format)</a></li>
+      <li><a href="https://datatracker.ietf.org/doc/html/rfc9293" target="_blank" rel="noopener noreferrer">IETF RFC 9293 — Transmission Control Protocol (TCP)</a></li>
+      <li><a href="https://datatracker.ietf.org/doc/html/rfc8446" target="_blank" rel="noopener noreferrer">IETF RFC 8446 — The Transport Layer Security (TLS) Protocol Version 1.3</a></li>
+      <li><a href="https://datatracker.ietf.org/doc/html/rfc9460" target="_blank" rel="noopener noreferrer">IETF RFC 9460 — Service Binding and Parameter Specification via the DNS (SVCB / HTTPS)</a></li>
+      <li><a href="https://datatracker.ietf.org/doc/html/rfc9113" target="_blank" rel="noopener noreferrer">IETF RFC 9113 — HTTP/2</a></li>
+      <li><a href="https://datatracker.ietf.org/doc/html/rfc7541" target="_blank" rel="noopener noreferrer">IETF RFC 7541 — HPACK: Header Compression for HTTP/2</a></li>
+      <li><a href="https://datatracker.ietf.org/doc/html/rfc9000" target="_blank" rel="noopener noreferrer">IETF RFC 9000 — QUIC: A UDP-Based Multiplexed and Secure Transport</a></li>
+      <li><a href="https://datatracker.ietf.org/doc/html/rfc9001" target="_blank" rel="noopener noreferrer">IETF RFC 9001 — Using TLS to Secure QUIC</a></li>
+      <li><a href="https://datatracker.ietf.org/doc/html/rfc9114" target="_blank" rel="noopener noreferrer">IETF RFC 9114 — HTTP/3</a></li>
+      <li><a href="https://datatracker.ietf.org/doc/html/rfc9204" target="_blank" rel="noopener noreferrer">IETF RFC 9204 — QPACK: Field Compression for HTTP/3</a></li>
+      <li><a href="https://pkg.go.dev/github.com/quic-go/quic-go/http3" target="_blank" rel="noopener noreferrer">pkg.go.dev — github.com/quic-go/quic-go/http3</a></li>
+      <li><a href="https://github.com/AdguardTeam/dnsproxy/issues/511" target="_blank" rel="noopener noreferrer">AdguardTeam/dnsproxy #511 — HTTP/3 UDP socket leak after 0-RTT eviction</a></li>
+      <li><a href="https://www.computer.org/csdl/proceedings-article/sp/2025/223600b288/26hiUekZ19S" target="_blank" rel="noopener noreferrer">IEEE S&amp;P 2025 — Transport Layer Obscurity: Circumventing SNI Censorship on the TLS Layer</a></li>
+      <li><a href="https://gfw.report/publications/ccs26/en/" target="_blank" rel="noopener noreferrer">GFW Report (ACM CCS 2026) — CircumVolve: Automated Discovery of Censorship Evasion</a></li>
+      <li><a href="https://github.com/dotnet/yarp" target="_blank" rel="noopener noreferrer">GitHub — dotnet/yarp (YARP Reverse Proxy)</a></li>
+      <li><a href="https://github.com/BeyondDimension/SteamTools" target="_blank" rel="noopener noreferrer">GitHub — BeyondDimension/SteamTools (Watt Toolkit)</a></li>
+    </ol>
+  </section>
+
+</main>
+</body>
+</html>

@@ -28,6 +28,7 @@ const (
 	TrayCmdCheckUpdate   uintptr = 1015
 	TrayCmdDumpMemory    uintptr = 1016
 	TrayCmdAllMode       uintptr = 1017
+	TrayCmdECHHTTP3      uintptr = 1018
 )
 
 type ConsoleWindowDriver interface {
@@ -66,6 +67,7 @@ type TrayController struct {
 	Updater         *Updater
 	Console         ConsoleWindowDriver
 	SetIPModeFn     func(string)
+	SetECHHTTP3Fn   func(bool)
 	OpenURLFn       func(string)
 	CopyClipboardFn func(string) error
 	InstallCAFn     func(string) error
@@ -93,6 +95,7 @@ func NewTrayController(listenAddr, portalURL, caPath string, sysProxy *SysProxyM
 		SysProxy:        sysProxy,
 		Console:         console,
 		SetIPModeFn:     echproxy.SetGlobalIPMode,
+		SetECHHTTP3Fn:   echproxy.SetECHHTTP3,
 		OpenURLFn:       openBrowser,
 		CopyClipboardFn: copyToClipboardOnPlatform,
 		InstallCAFn:     installCAOnPlatform,
@@ -105,6 +108,31 @@ func (tc *TrayController) CurrentIPMode() string {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	return echproxy.EffectiveIPMode(tc.IPMode)
+}
+
+func (tc *TrayController) ECHHTTP3Enabled() bool {
+	return echproxy.GetECHHTTP3()
+}
+
+func (tc *TrayController) SetECHHTTP3(enabled bool) {
+	tc.mu.Lock()
+	fn, notify, cb := tc.SetECHHTTP3Fn, tc.NotifyFn, tc.OnStateChanged
+	tc.mu.Unlock()
+	if fn != nil {
+		fn(enabled)
+	} else {
+		echproxy.SetECHHTTP3(enabled)
+	}
+	if notify != nil {
+		if enabled {
+			notify("ech-proxy 已开启 ECH 备选 HTTP/3", "仅在 ECH 通道 HTTP/2 失败时作为备选回退（SNI 通道绝不使用）。", false)
+		} else {
+			notify("ech-proxy 已关闭 ECH 备选 HTTP/3", "ECH 通道已恢复纯 HTTP/2 多路连接。", false)
+		}
+	}
+	if cb != nil {
+		cb()
+	}
 }
 
 func (tc *TrayController) SetIPMode(mode string) {
@@ -305,6 +333,7 @@ func (tc *TrayController) MenuItems() []TrayMenuItem {
 		{ID: TrayCmdIPModeV4, Title: "强制 v4 出口", Checked: curIPMode == "v4"},
 		{ID: TrayCmdIPModeV6, Title: "强制 v6 出口", Checked: curIPMode == "v6"},
 		{ID: TrayCmdIPModeDual, Title: "双端出口", Checked: curIPMode == "dual"},
+		{ID: TrayCmdECHHTTP3, Title: "ECH 备选 HTTP/3 (仅 ECH 通道, 实验)", Checked: tc.ECHHTTP3Enabled()},
 		{Separator: true},
 		{ID: TrayCmdInstallCA, Title: "一键安装本地 CA 根证书 (Install CA)"},
 		{ID: TrayCmdUninstallCA, Title: "卸载本地 CA 根证书 (Uninstall CA)"},
@@ -345,6 +374,8 @@ func (tc *TrayController) HandleCommand(cmdID uintptr) bool {
 		tc.SetIPMode("v6")
 	case TrayCmdIPModeDual:
 		tc.SetIPMode("dual")
+	case TrayCmdECHHTTP3:
+		tc.SetECHHTTP3(!tc.ECHHTTP3Enabled())
 	case TrayCmdInstallCA:
 		if tc.InstallCAFn != nil && tc.CAPath != "" {
 			echproxy.SafeGo("TrayInstallCA", func() { _ = tc.InstallCAFn(tc.CAPath) })

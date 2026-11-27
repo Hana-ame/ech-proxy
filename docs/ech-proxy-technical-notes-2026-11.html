@@ -1,0 +1,660 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>零节点直连的边界与破局：ech-proxy 网络栈深度技术笔记</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Noto+Sans+SC:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+<style>
+/* Utilitarian · Engineering & Networking Technical Reference · Answer-first compact hero · 6 sections (Topology, DNS, TLS/DPI, Peak-Hour H2/H3, Open-Source Benchmarks, Self-Hosting & 2026 Landscape) · Space Grotesk + Noto Sans SC + JetBrains Mono · Crisp white #FFFFFF + deep teal #0F766E / cobalt #1D4ED8 · 0px radius · 4-metric inline strip · Full-bleed band on H2/H3 tradeoffs · 2 inline SVG diagrams (dual-topology flow + censorship-layer matrix) */
+:root {
+  --paper: #FFFFFF;
+  --band: #F4F6F8;
+  --ink: #0F172A;
+  --ink2: #1E293B;
+  --mute: #475569;
+  --hair: #CBD5E1;
+  --accent: #0F766E;
+  --accent-text: #115E59;
+  --accent-2: #1D4ED8;
+  --accent-2-text: #1E40AF;
+}
+
+* { box-sizing: border-box; }
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: 'Noto Sans SC', 'Space Grotesk', system-ui, -apple-system, sans-serif;
+  font-size: 16px;
+  line-height: 1.72;
+  -webkit-font-smoothing: antialiased;
+}
+
+.page {
+  padding: 68px clamp(24px, 10.4vw, 112px) 92px;
+}
+
+.measure { max-width: 68ch; }
+
+a {
+  color: var(--accent-text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+a:hover { color: var(--accent-2-text); }
+
+code {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.875em;
+  color: var(--ink);
+  background: #F1F5F9;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+/* Hero */
+h1 {
+  font-family: 'Space Grotesk', 'Noto Sans SC', sans-serif;
+  font-size: clamp(36px, 4.4vw, 52px);
+  font-weight: 700;
+  line-height: 1.16;
+  letter-spacing: -0.025em;
+  margin: 0 0 18px;
+  max-width: 24ch;
+  text-wrap: balance;
+}
+
+.deck {
+  font-size: 18px;
+  line-height: 1.62;
+  color: var(--ink2);
+  max-width: 66ch;
+  margin: 0 0 36px;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 24px;
+  border-top: 2px solid var(--ink);
+  border-bottom: 1px solid var(--hair);
+  padding: 20px 0 22px;
+  margin-bottom: 64px;
+}
+
+.metric-num {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 38px;
+  font-weight: 700;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  color: var(--accent-text);
+  white-space: nowrap;
+}
+
+.metric-desc {
+  margin-top: 6px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--mute);
+}
+
+/* Sections */
+.sec {
+  margin-top: 66px;
+}
+
+h2 {
+  font-family: 'Space Grotesk', 'Noto Sans SC', sans-serif;
+  font-size: clamp(24px, 2.5vw, 31px);
+  font-weight: 700;
+  line-height: 1.25;
+  letter-spacing: -0.015em;
+  margin: 0 0 18px;
+  padding-top: 18px;
+  border-top: 1px solid var(--hair);
+  text-wrap: balance;
+}
+
+h3 {
+  font-family: 'Space Grotesk', 'Noto Sans SC', sans-serif;
+  font-size: 19px;
+  font-weight: 700;
+  line-height: 1.35;
+  margin: 28px 0 10px;
+  color: var(--ink);
+}
+
+p {
+  margin: 0 0 16px;
+  color: var(--ink2);
+}
+
+/* Split layout */
+.split {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  gap: 24px;
+  align-items: start;
+}
+.split-left { grid-column: span 4; }
+.split-right { grid-column: span 8; }
+.split-left h2 { border-top: none; padding-top: 0; }
+.split-wrap {
+  border-top: 1px solid var(--hair);
+  padding-top: 22px;
+}
+
+/* Open multi-column strip */
+.cols-2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 28px 36px;
+  margin-top: 22px;
+}
+
+.col-item {
+  border-top: 1px solid var(--hair);
+  padding-top: 14px;
+}
+
+.col-item h3 { margin-top: 0; }
+
+/* Lists */
+ul.clean, ol.clean {
+  margin: 14px 0 20px;
+  padding: 0;
+  list-style: none;
+  max-width: 68ch;
+}
+ul.clean li, ol.clean li {
+  position: relative;
+  padding-left: 22px;
+  margin-bottom: 10px;
+  color: var(--ink2);
+}
+ul.clean li::before {
+  content: "—";
+  position: absolute;
+  left: 0;
+  color: var(--accent-text);
+  font-weight: 700;
+}
+ol.clean { counter-reset: ref; }
+ol.clean li { counter-increment: ref; padding-left: 30px; }
+ol.clean li::before {
+  content: counter(ref) ".";
+  position: absolute;
+  left: 0;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  color: var(--mute);
+  top: 2px;
+}
+
+/* Figures & SVGs */
+figure {
+  margin: 30px 0 34px;
+  padding: 0;
+}
+.fig-title {
+  font-family: 'Space Grotesk', 'Noto Sans SC', sans-serif;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--ink);
+  margin: 0 0 14px;
+}
+figcaption {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--mute);
+  margin-top: 10px;
+}
+
+/* Open Tables (max 3) */
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  margin: 22px 0 28px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14.5px;
+  line-height: 1.55;
+}
+th {
+  font-family: 'JetBrains Mono', 'Noto Sans SC', monospace;
+  font-size: 12.5px;
+  font-weight: 500;
+  text-align: left;
+  color: var(--mute);
+  border-bottom: 2px solid var(--ink);
+  padding: 10px 14px 10px 0;
+  white-space: nowrap;
+}
+td {
+  vertical-align: top;
+  padding: 12px 14px 12px 0;
+  border-bottom: 1px solid var(--hair);
+  color: var(--ink2);
+}
+td strong { color: var(--ink); }
+.num {
+  font-family: 'JetBrains Mono', monospace;
+  white-space: nowrap;
+  color: var(--ink);
+}
+
+/* Single Full-Bleed Band */
+.band {
+  background: var(--band);
+  margin: 64px calc(-1 * clamp(24px, 10.4vw, 112px));
+  padding: 48px clamp(24px, 10.4vw, 112px);
+  border-top: 1px solid var(--hair);
+  border-bottom: 1px solid var(--hair);
+}
+.band h2 {
+  border-top: none;
+  padding-top: 0;
+}
+
+/* Pull Quote */
+.pullquote {
+  margin: 48px 0;
+  padding-left: 24px;
+  border-left: 3px solid var(--accent);
+  font-size: clamp(20px, 2.2vw, 25px);
+  line-height: 1.48;
+  font-weight: 500;
+  color: var(--ink);
+  max-width: 46ch;
+}
+
+@media (max-width: 860px) {
+  .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .split-left, .split-right { grid-column: span 12; }
+  .cols-2 { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<main class="page">
+
+  <h1>零节点直连的边界与破局：ech-proxy 网络栈深度技术笔记</h1>
+  <p class="deck">这份笔记系统整理了 2026 年 11 月围绕 <code>ech-proxy</code> 展开的架构设计与性能排查要点：从双代理共存与 <code>bypass.txt</code> 分流、DNS 引导解耦、TLS 分片与 ECH 对抗边界，到多路 HTTP/2、仅限 ECH 的 HTTP/3 备选、同类代理源码实证以及自托管成本模型。</p>
+
+  <div class="metrics">
+    <div>
+      <div class="metric-num">4 + 2</div>
+      <div class="metric-desc">ECH 通道 4 分片、SNI/分片 2 分片多路 HTTP/2 连接池</div>
+    </div>
+    <div>
+      <div class="metric-num">3 路</div>
+      <div class="metric-desc">Happy Eyeballs 并发竞速拨号，100ms 阶梯发起</div>
+    </div>
+    <div>
+      <div class="metric-num">3 min</div>
+      <div class="metric-desc">故障/拥塞 IP 自动降权冷却时长，成功建连立即恢复</div>
+    </div>
+    <div>
+      <div class="metric-num">0 节点</div>
+      <div class="metric-desc">对仅 SNI 阻断站点零 VPS 直连；IP 黑洞秒转全局代理</div>
+    </div>
+  </div>
+
+  <!-- Section 1 -->
+  <section class="sec">
+    <h2>双代理共存与 <code>bypass.txt</code>：把免费直连和 IP 黑洞流量彻底切开</h2>
+    <p class="measure">Clash / Mihomo 虽然内置了 <code>ech-opts</code>（见 <a href="https://wiki.metacubex.one/en/config/proxies/tls/" target="_blank" rel="noopener noreferrer">Mihomo TLS 配置文档</a>），但它的作用对象是「本机到代理服务器（VPS）」的那一跳握手，且 <a href="https://wiki.metacubex.one/en/config/general/" target="_blank" rel="noopener noreferrer">Mihomo 通用模式</a> 仅包含 <code>rule</code> / <code>global</code> / <code>direct</code>，不会对普通浏览器的直连 HTTPS 做本地 CA 终结（MITM）。因此 <code>ech-proxy</code> 与 Clash 并非重复造轮子，而是天然互补：前者用 ECH / SNI 伪装 / TLS Record 分片免费吃掉仅被 SNI 阻断的站点，后者负责兜底 IP 黑洞与强风控站点。</p>
+
+    <figure>
+      <div class="fig-title">两种共存拓扑分别以 ech-proxy 或 Clash 作为单入口，避免系统代理互相覆盖</div>
+      <svg viewBox="0 0 700 390" width="100%" role="img" aria-label="两种双代理共存架构拓扑图">
+        <!-- Row 1: Scheme 1 -->
+        <text x="12" y="28" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="700" fill="#0F172A">方案一：系统 → ech-proxy → bypass.txt → 全局代理</text>
+        <line x1="12" y1="38" x2="688" y2="38" stroke="#CBD5E1" stroke-width="1"/>
+
+        <rect x="12" y="64" width="110" height="54" fill="none" stroke="#0F172A" stroke-width="1.5"/>
+        <text x="67" y="96" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="14" fill="#0F172A">系统 / 浏览器</text>
+
+        <line x1="122" y1="91" x2="162" y2="91" stroke="#475569" stroke-width="1.5"/>
+        <polygon points="162,86 172,91 162,96" fill="#475569"/>
+
+        <rect x="172" y="64" width="140" height="54" fill="#0F766E" fill-opacity="0.1" stroke="#0F766E" stroke-width="1.5"/>
+        <text x="242" y="88" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="14" font-weight="500" fill="#115E59">ech-proxy</text>
+        <text x="242" y="106" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="12" fill="#475569">PAC + MITM (8443)</text>
+
+        <!-- Branch A: bypass.txt -->
+        <path d="M312,78 L368,78 L368,66 L410,66" fill="none" stroke="#1D4ED8" stroke-width="1.5"/>
+        <polygon points="410,61 420,66 410,71" fill="#1D4ED8"/>
+        <text x="364" y="56" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="#1E40AF">命中 bypass.txt</text>
+
+        <rect x="420" y="46" width="268" height="40" fill="none" stroke="#1D4ED8" stroke-width="1.5"/>
+        <text x="554" y="71" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#1E40AF">跳过直连 → 上游全局代理 (-fallback)</text>
+
+        <!-- Branch B: normal ECH/Fragment -->
+        <path d="M312,104 L368,104 L368,128 L410,128" fill="none" stroke="#0F766E" stroke-width="1.5"/>
+        <polygon points="410,123 420,128 410,133" fill="#0F766E"/>
+        <text x="364" y="148" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="#115E59">未命中 (-all/pac)</text>
+
+        <rect x="420" y="106" width="268" height="44" fill="none" stroke="#0F766E" stroke-width="1.5"/>
+        <text x="554" y="125" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#115E59">ECH / SNI / 分片免费直连</text>
+        <text x="554" y="142" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="12" fill="#475569">若遇 IP 黑洞失败 → 自动逃逸至 -fallback</text>
+
+        <!-- Row 2: Scheme 2 -->
+        <text x="12" y="218" font-family="Noto Sans SC, sans-serif" font-size="15" font-weight="700" fill="#0F172A">方案二：系统 → Clash (rule 模式) → ech-proxy 本地出口</text>
+        <line x1="12" y1="228" x2="688" y2="228" stroke="#CBD5E1" stroke-width="1"/>
+
+        <rect x="12" y="254" width="110" height="54" fill="none" stroke="#0F172A" stroke-width="1.5"/>
+        <text x="67" y="286" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="14" fill="#0F172A">系统 / TUN</text>
+
+        <line x1="122" y1="281" x2="162" y2="281" stroke="#475569" stroke-width="1.5"/>
+        <polygon points="162,276 172,281 162,286" fill="#475569"/>
+
+        <rect x="172" y="254" width="150" height="54" fill="#1D4ED8" fill-opacity="0.08" stroke="#1D4ED8" stroke-width="1.5"/>
+        <text x="247" y="278" text-anchor="middle" font-family="Space Grotesk, sans-serif" font-size="14" font-weight="700" fill="#1E40AF">Clash / Mihomo</text>
+        <text x="247" y="296" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="12" fill="#475569">接管系统代理或 TUN</text>
+
+        <!-- Top rule: ech-proxy.exe DIRECT -->
+        <path d="M322,268 L392,268 L392,256 L420,256" fill="none" stroke="#475569" stroke-width="1.5"/>
+        <polygon points="420,251 430,256 420,261" fill="#475569"/>
+        <rect x="430" y="236" width="258" height="40" fill="none" stroke="#475569" stroke-width="1.5"/>
+        <text x="559" y="260" text-anchor="middle" font-family="JetBrains Mono, monospace" font-size="12" fill="#0F172A">PROCESS-NAME,ech-proxy.exe → DIRECT</text>
+
+        <!-- Rule to ECH-Local -->
+        <path d="M322,288 L392,288 L392,306 L420,306" fill="none" stroke="#0F766E" stroke-width="1.5"/>
+        <polygon points="420,301 430,306 420,311" fill="#0F766E"/>
+        <rect x="430" y="286" width="258" height="40" fill="none" stroke="#0F766E" stroke-width="1.5"/>
+        <text x="559" y="310" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#115E59">目标规则 → ECH-Local (-sys-proxy off)</text>
+
+        <!-- MATCH -->
+        <path d="M247,308 L247,354 L420,354" fill="none" stroke="#1D4ED8" stroke-width="1.5"/>
+        <polygon points="420,349 430,354 420,359" fill="#1D4ED8"/>
+        <rect x="430" y="334" width="258" height="40" fill="none" stroke="#1D4ED8" stroke-width="1.5"/>
+        <text x="559" y="358" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#1E40AF">MATCH 其余全部流量 → 主力代理节点</text>
+      </svg>
+      <figcaption>注：方案一中 <code>bypass.txt</code> 支持精确匹配与 <code>.domain</code> 后缀匹配（如写 <code>youtube.com</code> 自动覆盖 <code>m.youtube.com</code>），在 PAC 与服务端双层生效且优先级高于 <code>-all</code> 和 <code>pac.txt</code>；方案二在 TUN 模式下务必使用 <code>mode: rule</code> 而非纯 <code>mode: global</code>，否则会跳过 <code>PROCESS-NAME</code> 规则触发死循环。</figcaption>
+    </figure>
+
+    <div class="cols-2">
+      <div class="col-item">
+        <h3><code>pac.txt</code> 与 <code>bypass.txt</code> 的互补分工</h3>
+        <p><code>pac.txt</code> 列出「归 <code>ech-proxy</code> 管的白名单」（被 SNI 阻断但 IP 可直连的站点）；<code>bypass.txt</code> 列出「不要让 <code>ech-proxy</code> 碰的名单」（Google / YouTube 等 IP 黑洞、OpenAI / Claude 等强风控 AI 域名，以及证书固定站点）。Claude 全家桶仅需写入 <code>claude.ai</code>、<code>claude.com</code>、<code>anthropic.com</code>、<code>claudeusercontent.com</code> 四条根域即可覆盖全部子域（见 <a href="https://code.claude.com/docs/en/network-config" target="_blank" rel="noopener noreferrer">Claude Code 企业网络配置文档</a>）。</p>
+      </div>
+      <div class="col-item">
+        <h3>为什么存在 <code>bodyReplay</code>（≤1MB 预读）</h3>
+        <p>HTTP 请求体 <code>req.Body</code> 是一次性流。当 <code>auto</code> 模式在 Fragment → SNI → ECH 之间切换重试，或直连失败逃逸到 <code>-fallback</code> 时，若不预先缓存请求体，第二次发出的 POST 登录/表单会变成空包。代码已将预读严格限定在 <code>ContentLength &gt;= 0 &amp;&amp; &lt;= 1MB</code>，普通 GET 零开销，超过 1MB 或流式上传直接透传不占内存。</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section 2 -->
+  <section class="sec">
+    <h2>DNS 解析分层：彻底切断 <code>4545810.xyz</code> 的 DoH 引导死循环</h2>
+    <p class="measure">此前日志高频刷屏 <code>netdial.go:572: bootstrap DoH primary endpoints (1.1.1.1/1.0.0.1) unreachable for "4545810.xyz"</code>，根因有三层叠加：第一，为了禁用本地 UDP 53 端口，程序连 <code>https://4545810.xyz/doh</code> 前必须先向 <code>1.1.1.1:443</code> / <code>1.0.0.1:443</code> 查 <code>4545810.xyz</code> 的 IP；第二，国内网络阻断或延迟超过 800ms 窗口后虽进入 10 分钟冷却期，但冷却期内代码跳过主端点后仍无条件执行第 572 行 <code>log.Printf</code>；第三，解析全失败时不写负缓存，导致并发请求秒级重入刷屏。</p>
+    <p class="measure">最终方案是将 <code>4545810.xyz</code>（<code>DefaultSiteHost</code>）从 DoH 体系中彻底剥离：在 <code>netdial.ResolveIPs</code>、<code>resolveViaBootstrapDoH</code> 和 <code>ech.ResolveHostIPsByMode</code> 三处入口统一拦截，改走「系统 DNS（5 分钟缓存）→ 失败后原子置位一次性标志 <code>defaultSiteUseBuiltinCF</code> → 进程内永久回退内置 Cloudflare Anycast 广播 IP（<code>104.16.132.229</code> / <code>104.16.133.229</code> 及对应 IPv6）」。同时为其余引导 DoH 路径补上了冷却切换单次日志与 15 秒失败负缓存。</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>解析路径</th>
+            <th>适用目标域名</th>
+            <th>核心逻辑与缓存策略</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>1. IP 字面量直通</strong></td>
+            <td>纯 IP 目标、<code>-local-ip</code> 指定的 DoH IP</td>
+            <td>跳过一切 DNS 查询，仅按 <code>-4</code>/<code>-6</code>/<code>-dual</code> 过滤</td>
+          </tr>
+          <tr>
+            <td><strong>2. 自有域名专用解析</strong></td>
+            <td>仅限 <code>4545810.xyz</code>（DoH / PAC / 规则源）</td>
+            <td><code>net.DefaultResolver</code> 系统 DNS（5m 缓存）→ 失败置位一次性标志，回退内置 CF 广播 IP，绝不走 DoH</td>
+          </tr>
+          <tr>
+            <td><strong>3. 业务 DoH 三级解析</strong></td>
+            <td>普通网站 A/AAAA 及 <code>cloudflare-ech.com</code> type=65</td>
+            <td>依次尝试 <code>4545810.xyz/doh</code> → <code>1.1.1.1/dns-query</code> → <code>223.5.5.5/resolve</code>，按 TTL 缓存</td>
+          </tr>
+          <tr>
+            <td><strong>4. 引导 DoH 兜底</strong></td>
+            <td>业务 DoH 全败时的其他非自有域名（如镜像/第三方 URL）</td>
+            <td>800ms 优先 <code>1.1.1.1</code>/<code>1.0.0.1</code> → 切入 10m 冷却（仅打一次日志）串行兜底国内 DoH；全败写 15s 负缓存</td>
+          </tr>
+          <tr>
+            <td><strong>5. 上游代理远端解析</strong></td>
+            <td>命中 <code>bypass.txt</code> 或逃逸至 <code>-fallback</code> 的请求</td>
+            <td>直接携带原始域名交由上游代理（如 Clash）远端解析</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Section 3 -->
+  <section class="sec">
+    <h2>2026 年 TLS 握手对抗边界：为何分片与 ECH 依然有效，却过不了 IP 黑洞</h2>
+    <p class="measure">抗审查手段能否奏效，取决于阻断发生在网络协议栈的哪一层。根据 <a href="https://www.computer.org/csdl/proceedings-article/sp/2025/223600b288/26hiUekZ19S" target="_blank" rel="noopener noreferrer">IEEE S&amp;P 2025《Transport Layer Obscurity》</a>、<a href="https://gfw.report/publications/sp25/en/" target="_blank" rel="noopener noreferrer">GFW Report《A Wall Behind A Wall》</a> 以及 <a href="https://gfw.report/publications/ccs26/en/" target="_blank" rel="noopener noreferrer">ACM CCS 2026《CircumVolve》</a> 的实测结果，2026 年的对抗呈现出清晰的四层分化：纯 TCP 分片在部分运营商已失效；TLS Record 分片加 TCP 分片组合对国家出口 GFW 大部分仍有效（90% 以上服务端兼容），但在河南等省级防火墙下会被直接阻断；Cloudflare ECH 依靠加密内层 SNI 与高误伤成本的公共外壳 <code>cloudflare-ech.com</code> 保持高可用（<a href="https://github.com/net4people/bbs/issues/584" target="_blank" rel="noopener noreferrer">net4people/bbs #584</a>）；而 IP 黑洞在 TCP SYN 阶段即丢包，任何 TLS 层手段都无能为力。</p>
+
+    <figure>
+      <div class="fig-title">阻断发生在 TCP 握手层时，所有 TLS 层绕过手段均无法生效</div>
+      <svg viewBox="0 0 700 380" width="100%" role="img" aria-label="不同绕过手段对四类网络阻断机制的有效性矩阵">
+        <!-- Column headers -->
+        <text x="210" y="34" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" font-weight="700" fill="#0F172A">DNS 污染</text>
+        <text x="345" y="34" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" font-weight="700" fill="#0F172A">出口 SNI DPI</text>
+        <text x="485" y="34" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" font-weight="700" fill="#0F172A">省级防火墙</text>
+        <text x="620" y="34" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" font-weight="700" fill="#0F172A">IP 黑洞 (SYN)</text>
+        <line x1="12" y1="48" x2="688" y2="48" stroke="#0F172A" stroke-width="1.5"/>
+
+        <!-- Row 1: Pure TCP frag -->
+        <text x="12" y="92" font-family="Noto Sans SC, sans-serif" font-size="14" fill="#0F172A">纯 TCP 层分片</text>
+        <rect x="168" y="72" width="84" height="30" fill="#F1F5F9" stroke="#CBD5E1"/>
+        <text x="210" y="92" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#475569">需配 DoH</text>
+        <rect x="303" y="72" width="84" height="30" fill="#FEF3C7" stroke="#D97706"/>
+        <text x="345" y="92" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#92400E">部分退化</text>
+        <rect x="443" y="72" width="84" height="30" fill="#FEE2E2" stroke="#DC2626"/>
+        <text x="485" y="92" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#991B1B">失效</text>
+        <rect x="578" y="72" width="84" height="30" fill="#FEE2E2" stroke="#DC2626"/>
+        <text x="620" y="92" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#991B1B">无效</text>
+        <line x1="12" y1="114" x2="688" y2="114" stroke="#CBD5E1" stroke-width="1"/>
+
+        <!-- Row 2: TLS Record + TCP frag -->
+        <text x="12" y="156" font-family="Noto Sans SC, sans-serif" font-size="14" fill="#0F172A">TLS Record 分片</text>
+        <rect x="168" y="136" width="84" height="30" fill="#F1F5F9" stroke="#CBD5E1"/>
+        <text x="210" y="156" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#475569">需配 DoH</text>
+        <rect x="303" y="136" width="84" height="30" fill="#CCFBF1" stroke="#0F766E"/>
+        <text x="345" y="156" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#115E59">大部有效</text>
+        <rect x="443" y="136" width="84" height="30" fill="#FEE2E2" stroke="#DC2626"/>
+        <text x="485" y="156" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#991B1B">基本失效</text>
+        <rect x="578" y="136" width="84" height="30" fill="#FEE2E2" stroke="#DC2626"/>
+        <text x="620" y="156" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#991B1B">无效</text>
+        <line x1="12" y1="178" x2="688" y2="178" stroke="#CBD5E1" stroke-width="1"/>
+
+        <!-- Row 3: Cloudflare ECH (H2 / H3) -->
+        <text x="12" y="220" font-family="Noto Sans SC, sans-serif" font-size="14" font-weight="700" fill="#0F172A">Cloudflare ECH</text>
+        <rect x="168" y="200" width="84" height="30" fill="#CCFBF1" stroke="#0F766E"/>
+        <text x="210" y="220" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#115E59">DoH 绕过</text>
+        <rect x="303" y="200" width="84" height="30" fill="#CCFBF1" stroke="#0F766E"/>
+        <text x="345" y="220" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#115E59">稳定有效</text>
+        <rect x="443" y="200" width="84" height="30" fill="#CCFBF1" stroke="#0F766E"/>
+        <text x="485" y="220" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#115E59">多数有效</text>
+        <rect x="578" y="200" width="84" height="30" fill="#FEE2E2" stroke="#DC2626"/>
+        <text x="620" y="220" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#991B1B">无效</text>
+        <line x1="12" y1="242" x2="688" y2="242" stroke="#CBD5E1" stroke-width="1"/>
+
+        <!-- Row 4: Bare HTTP/3 QUIC -->
+        <text x="12" y="284" font-family="Noto Sans SC, sans-serif" font-size="14" fill="#0F172A">裸 HTTP/3 (无 ECH)</text>
+        <rect x="168" y="264" width="84" height="30" fill="#F1F5F9" stroke="#CBD5E1"/>
+        <text x="210" y="284" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#475569">需配 DoH</text>
+        <rect x="303" y="264" width="84" height="30" fill="#FEE2E2" stroke="#DC2626"/>
+        <text x="345" y="284" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#991B1B">已解密审查</text>
+        <rect x="443" y="264" width="84" height="30" fill="#FEE2E2" stroke="#DC2626"/>
+        <text x="485" y="284" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#991B1B">失效</text>
+        <rect x="578" y="264" width="84" height="30" fill="#FEE2E2" stroke="#DC2626"/>
+        <text x="620" y="284" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#991B1B">无效</text>
+        <line x1="12" y1="306" x2="688" y2="306" stroke="#CBD5E1" stroke-width="1"/>
+
+        <!-- Row 5: Overseas Proxy (REALITY / Hysteria2) -->
+        <text x="12" y="348" font-family="Noto Sans SC, sans-serif" font-size="14" font-weight="700" fill="#1E40AF">海外节点代理</text>
+        <rect x="168" y="328" width="84" height="30" fill="#DBEAFE" stroke="#1D4ED8"/>
+        <text x="210" y="348" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#1E40AF">远端解析</text>
+        <rect x="303" y="328" width="84" height="30" fill="#DBEAFE" stroke="#1D4ED8"/>
+        <text x="345" y="348" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#1E40AF">完全绕过</text>
+        <rect x="443" y="328" width="84" height="30" fill="#DBEAFE" stroke="#1D4ED8"/>
+        <text x="485" y="348" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#1E40AF">完全绕过</text>
+        <rect x="578" y="328" width="84" height="30" fill="#DBEAFE" stroke="#1D4ED8"/>
+        <text x="620" y="348" text-anchor="middle" font-family="Noto Sans SC, sans-serif" font-size="13" fill="#1E40AF">完全绕过</text>
+      </svg>
+      <figcaption>综合参考：IEEE S&amp;P 2025（Transport Layer Obscurity / A Wall Behind A Wall）、ACM CCS 2026（CircumVolve）及 net4people/bbs 社区实测。</figcaption>
+    </figure>
+  </section>
+
+  <!-- Section 4: Full-Bleed Band -->
+  <section class="band">
+    <h2>晚高峰连接调优：Happy Eyeballs、多路 HTTP/2 与仅限 ECH 的 HTTP/3 备选</h2>
+    <div class="split">
+      <div class="split-left">
+        <p>晚高峰（20:00–23:30）国内公网出口丢包飙升时，单 IP 串行拨号与单一 HTTP/2 TCP 连接的队头阻塞会把整页加载拖成幻灯片。在不触碰 Cloudflare 优选 IP（遵守 ToS）的前提下，本轮从三层解决了拥塞放大问题。</p>
+      </div>
+      <div class="split-right">
+        <ul class="clean">
+          <li><strong>Happy Eyeballs 并发竞速与故障 IP 冷却</strong>：<code>DialContextHappyEyeballs</code> 按健康度重排候选 IP，最多并发 3 路（100ms 阶梯发起），首个 TCP 握手成功立即胜出并关闭迟到连接；超时或握手失败的 IP 自动记入 3 分钟冷却表，避免后续请求死磕同一拥塞节点。</li>
+          <li><strong>多路 HTTP/2 连接池（4 分片 / 2 分片）</strong>：Go 的单个 <code>http2.Transport</code> 对同一 <code>host:443</code> 只会复用 1 条 TCP 连接。将 ECH 拆成 4 个独立 <code>http2.Transport</code> 轮询、SNI/分片拆成 2 个分片，可在不稀释连接复用、不触发多 CDN 子域名连接爆炸的前提下，将单 TCP 丢包的队头阻塞面压缩到 1/4。</li>
+          <li><strong>仅限 ECH 的 HTTP/3 备选（托盘热开关，默认关闭）</strong>：由于裸 QUIC Initial 已遭 SNI 审查且部分运营商限速 UDP/443，HTTP/3 严格仅作 ECH 通道的 H2 失败回退（SNI/Fragment 绝不使用），复用 <code>quic-go v0.59.0</code> 与 Go 1.26 原生 <code>EncryptedClientHelloConfigList</code>，并特意不设 <code>KeepAlivePeriod</code> 以防 <a href="https://github.com/AdguardTeam/dnsproxy/issues/511" target="_blank" rel="noopener noreferrer">quic-go 0-RTT 驱逐 UDP 端口泄漏</a>。</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <!-- Section 5 -->
+  <section class="sec">
+    <h2>同类开源代理源码实证：性能差距不在加解密，而在连接池与试错链路</h2>
+    <p class="measure">对照 <code>ech-proxy</code>、<a href="https://github.com/BeyondDimension/SteamTools" target="_blank" rel="noopener noreferrer">Watt Toolkit（SteamTools）</a> + <a href="https://github.com/dotnet/yarp" target="_blank" rel="noopener noreferrer">dotnet/yarp</a> 以及 <a href="https://github.com/docmirror/dev-sidecar" target="_blank" rel="noopener noreferrer">dev-sidecar</a> 源码核验后可以确认：直连工具的满速带宽上限取决于本地宽带到目标 CDN 的物理链路，真正的架构差异体现在入站/出站协议栈、连接池复用以及冷启动试错成本。</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>工具 / 引擎</th>
+            <th>绕过机制</th>
+            <th>连接池与协议栈实证</th>
+            <th>核心优劣势</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong><code>ech-proxy</code> (Go)</strong></td>
+            <td>本地 CA MITM + ECH / SNI / TLS Record 分片三通道</td>
+            <td>4 路 ECH H2 + 2 路 SNI/分片 H2 + Happy Eyeballs + 可选 ECH H3；32KB <code>sync.Pool</code></td>
+            <td>三通道覆盖面最广、单二进制最轻；冷启动未知域名需路由试错（命中单域名缓存后零开销）</td>
+          </tr>
+          <tr>
+            <td><strong><a href="https://github.com/BeyondDimension/SteamTools" target="_blank" rel="noopener noreferrer">SteamTools</a> + <a href="https://github.com/dotnet/yarp" target="_blank" rel="noopener noreferrer">YARP</a> (.NET)</strong></td>
+            <td>本地 CA 反代 + 静态规则 SNI 伪造</td>
+            <td>Kestrel 入站开 H1/H2/H3 + YARP <code>ArrayPool</code> 零分配流式转发；出站因自定义 <code>ConnectCallback</code> 锁定 TCP <code>SslStream</code></td>
+            <td>命中静态规则零试错、流式转发极强；但无 ECH/分片，且带完整 GUI 体积内存偏重</td>
+          </tr>
+          <tr>
+            <td><strong><a href="https://github.com/URenko/Accesser" target="_blank" rel="noopener noreferrer">Accesser</a> / <a href="https://github.com/docmirror/dev-sidecar" target="_blank" rel="noopener noreferrer">dev-sidecar</a></strong></td>
+            <td>本地 CA MITM + SNI 伪装（dev-sidecar 新版含 ECH 回退）</td>
+            <td>Python 异步 / Electron + Node.js（<code>vendor/ds-core</code> 子模块）</td>
+            <td>上手友好、规则现成；高并发大流量吞吐弱于 Go/.NET，Electron 常驻内存偏高</td>
+          </tr>
+          <tr>
+            <td><strong><a href="https://github.com/hufrea/byedpi" target="_blank" rel="noopener noreferrer">ByeDPI</a> / <a href="https://github.com/valdikss/goodbyedpi" target="_blank" rel="noopener noreferrer">GoodbyeDPI</a></strong></td>
+            <td>零 MITM：TLS 分片 / 乱序 / 驱动改包</td>
+            <td>C 语言纯字节流透传或 WinDivert 网卡层直通，原生保留 H2/H3</td>
+            <td>延迟与资源占用最优、免装 CA；但无 ECH 与 SNI 伪装，遇强 DPI 绕过率受限</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="pullquote">「直连工具省流量、海外节点破黑洞：在 2026 年，混合分流比单押任何一种协议都更稳、更省钱。」</div>
+  </section>
+
+  <!-- Section 6 -->
+  <section class="sec">
+    <h2>自托管成本边界与 2026 代理生态：为何智利家宽模式在 CN 无法复制</h2>
+    <p class="measure">公开 Invidious 实例 <a href="https://nadeko.net/donate/" target="_blank" rel="noopener noreferrer">nadeko.net</a>（由智利独立开发者 Fijxu 单人维护）每天仅视频中转就消耗超过 <strong>7TB</strong>（月超 210TB），但全部 30 多项服务的月成本仅约 <strong>$123 USD</strong>，完全靠加密货币与 <a href="https://liberapay.com/Fijxu/" target="_blank" rel="noopener noreferrer">Liberapay</a> / BuyMeACoffee 捐赠覆盖。其低成本的核心前提是：智利家宽标配 1Gbps 上下行对称无限流量光纤（如 <a href="https://www.tumundo.cl/" target="_blank" rel="noopener noreferrer">Tu Mundo</a>）、住宅 IP 天然绕过 YouTube 对机房 IP 的风控（<a href="https://lowendtalk.com/discussion/216131/anyone-familiar-with-invidious-on-vps" target="_blank" rel="noopener noreferrer">LowEndTalk</a>），且无 80/443 封禁与反 PCDN 严打。在 CN 环境下，家宽上行不对称、反 PCDN 监控、CGNAT/端口封禁与合规红线决定了只能依赖海外节点。</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>2026 主流方案</th>
+            <th>代表技术 / 工具</th>
+            <th>晚高峰稳定性</th>
+            <th>参考月成本</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>零节点本地直连</strong></td>
+            <td><code>ech-proxy</code> / <a href="https://github.com/xvzc/spoofdpi" target="_blank" rel="noopener noreferrer">SpoofDPI</a> / <a href="https://github.com/hufrea/byedpi" target="_blank" rel="noopener noreferrer">ByeDPI</a></td>
+            <td>中（受公网拥塞影响，无法过 IP 黑洞）</td>
+            <td class="num">¥0</td>
+          </tr>
+          <tr>
+            <td><strong>廉价 VPS 自建</strong></td>
+            <td><a href="https://github.com/XTLS/xray-core" target="_blank" rel="noopener noreferrer">Xray-core</a>（REALITY / XHTTP）、<a href="https://github.com/HyNetworks/hysteria" target="_blank" rel="noopener noreferrer">Hysteria2</a></td>
+            <td>中高（Hysteria2 抗丢包强，独享 IP 友好）</td>
+            <td class="num">¥15–¥40</td>
+          </tr>
+          <tr>
+            <td><strong>优化线路 VPS 自建</strong></td>
+            <td>CN2 GIA / CMIN2 / 9929 + REALITY</td>
+            <td>极高（全天候低延迟低丢包）</td>
+            <td class="num">¥50–¥150+</td>
+          </tr>
+          <tr>
+            <td><strong>中转 / 专线机场</strong></td>
+            <td><a href="https://github.com/clash-verge-rev/clash-verge-rev" target="_blank" rel="noopener noreferrer">Clash Verge Rev</a> / <a href="https://github.com/2dust/v2rayn" target="_blank" rel="noopener noreferrer">v2rayN</a> + <a href="https://github.com/sagernet/sing-box" target="_blank" rel="noopener noreferrer">sing-box</a></td>
+            <td>高（晚高峰快，但共享 IP 易触发 AI 风控）</td>
+            <td class="num">¥15–¥60</td>
+          </tr>
+          <tr>
+            <td><strong>混合分流架构</strong></td>
+            <td><code>ech-proxy</code> + <code>bypass.txt</code> + 中转/干净落地链式代理</td>
+            <td>极高（兼顾省流、晚高峰满速与 AI 零风控）</td>
+            <td class="num">¥30–¥80</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Sources -->
+  <section class="sec">
+    <h2>参考来源</h2>
+    <ol class="clean">
+      <li><a href="https://wiki.metacubex.one/en/config/proxies/tls/" target="_blank" rel="noopener noreferrer">Mihomo Docs — TLS configuration (ech-opts)</a></li>
+      <li><a href="https://wiki.metacubex.one/en/config/general/" target="_blank" rel="noopener noreferrer">Mihomo Docs — General configuration</a></li>
+      <li><a href="https://www.computer.org/csdl/proceedings-article/sp/2025/223600b288/26hiUekZ19S" target="_blank" rel="noopener noreferrer">IEEE S&amp;P 2025 — Transport Layer Obscurity: Circumventing SNI Censorship on the TLS Layer</a></li>
+      <li><a href="https://gfw.report/publications/sp25/en/" target="_blank" rel="noopener noreferrer">GFW Report (S&amp;P 2025) — A Wall Behind A Wall: Emerging Regional Censorship in China</a></li>
+      <li><a href="https://gfw.report/publications/ccs26/en/" target="_blank" rel="noopener noreferrer">GFW Report (ACM CCS 2026) — CircumVolve: Automated Discovery of Censorship Evasion</a></li>
+      <li><a href="https://github.com/net4people/bbs/issues/442" target="_blank" rel="noopener noreferrer">net4people/bbs #442 — 省墙与上海电信 ClientHello 分片实测讨论</a></li>
+      <li><a href="https://github.com/net4people/bbs/issues/584" target="_blank" rel="noopener noreferrer">net4people/bbs #584 — 免代理直连受 SNI 阻断 Cloudflare 站点的 ECH Fronting 方案</a></li>
+      <li><a href="https://pkg.go.dev/github.com/quic-go/quic-go/http3" target="_blank" rel="noopener noreferrer">pkg.go.dev — github.com/quic-go/quic-go/http3 API 文档</a></li>
+      <li><a href="https://github.com/AdguardTeam/dnsproxy/issues/511" target="_blank" rel="noopener noreferrer">AdguardTeam/dnsproxy #511 — HTTP/3 UDP socket leak after 0-RTT eviction</a></li>
+      <li><a href="https://code.claude.com/docs/en/network-config" target="_blank" rel="noopener noreferrer">Claude Code Docs — Enterprise network configuration</a></li>
+      <li><a href="https://nadeko.net/donate/" target="_blank" rel="noopener noreferrer">nadeko.net — Official Donate &amp; Monthly Cost Disclosure</a></li>
+      <li><a href="https://lowendtalk.com/discussion/216131/anyone-familiar-with-invidious-on-vps" target="_blank" rel="noopener noreferrer">LowEndTalk — Fijxu on hosting inv.nadeko.net over residential internet</a></li>
+      <li><a href="https://www.tumundo.cl/" target="_blank" rel="noopener noreferrer">Tu Mundo Chile — 1Gbps/2Gbps Symmetrical Residential Fiber Plans</a></li>
+      <li><a href="https://liberapay.com/Fijxu/" target="_blank" rel="noopener noreferrer">Liberapay — Fijxu Patron Funding Page</a></li>
+    </ol>
+  </section>
+
+</main>
+</body>
+</html>

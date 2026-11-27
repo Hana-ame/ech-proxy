@@ -152,9 +152,9 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			adEnabled = opts.AdScript.Enabled()
 			skipAdScript = opts.AdScript.SkipAdScript()
 			skipAdBlock = opts.AdScript.SkipAdBlock()
-			if opts.AdScript.AllMode() {
-				allMode = true
-			}
+			// 以 AdScriptManager 的运行期值为准；opts.AllMode 只是启动时的值拷贝，
+			// 用「或」会把 /proxy.pac 同一个静态 true 钉死，导致运行期无法关闭 all 模式。
+			allMode = opts.AdScript.AllMode()
 			adSource = opts.AdScript.Source()
 			adVersion = opts.AdScript.VersionHash()
 			whitelistCount = len(opts.AdScript.Whitelist())
@@ -234,7 +234,17 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			portStr = p
 		}
 		proxyAddr := "127.0.0.1:" + portStr
-		global := opts.AllMode || (opts.AdScript != nil && opts.AdScript.AllMode()) || c.Query("mode") == "all" || c.Query("global") == "1"
+		// AllMode 的运行期真值以 AdScriptManager 为准（SetAllMode 可热切换）。
+		// 早期写法是 opts.AllMode || ..., 而 opts.AllMode 是启动时的值拷贝，
+		// 于是「启动开 -all、运行期再关掉」永远关不掉（或关系被静态 true 钉死）。
+		global := c.Query("mode") == "all" || c.Query("global") == "1"
+		if !global {
+			if opts.AdScript != nil {
+				global = opts.AdScript.AllMode()
+			} else {
+				global = opts.AllMode
+			}
+		}
 		var wl, bp []string
 		if opts.AdScript != nil {
 			wl = opts.AdScript.Whitelist()

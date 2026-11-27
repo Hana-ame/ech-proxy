@@ -248,9 +248,54 @@ func rewindRequestBody(req *http.Request) {
 	}
 }
 
+// bufferRaceBody 把请求体读入内存，供各竞速分支各取一份完整副本。
+//
+// 返回 ok=false 表示请求体超过 maxBufferedReqBody 上限、长度未知且超限，或读取出错，
+// 调用方必须改走串行路径。绝不能拿被 LimitReader 截断的 body 去竞速：那样每个分支
+// 都会发出残缺请求，而 clone.ContentLength 仍是原始值，上游要么报长度不符、要么
+// 在 chunked 传输下静默丢失尾部（典型表现是上传大文件后服务端存到半截文件）。
+func bufferRaceBody(req *http.Request) ([]byte, bool) {
+	if req == nil || req.Body == nil || req.Body == http.NoBody {
+		return nil, true
+	}
+	if req.ContentLength > maxBufferedReqBody {
+		return nil, false
+	}
+	if req.GetBody != nil {
+		rc, err := req.GetBody()
+		if err != nil {
+			return nil, false
+		}
+		defer rc.Close()
+		b, rerr := io.ReadAll(io.LimitReader(rc, maxBufferedReqBody+1))
+		if rerr != nil || len(b) > maxBufferedReqBody {
+			return nil, false
+		}
+		return b, true
+	}
+	b, err := io.ReadAll(io.LimitReader(req.Body, maxBufferedReqBody+1))
+	if err != nil {
+		// 已读部分接回剩余流，让串行路径能继续读到完整 body。
+		req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(b), req.Body))
+		return nil, false
+	}
+	if len(b) > maxBufferedReqBody {
+		// 长度未知（chunked）且超出上限：同样把已读部分接回，保持 body 完整可读。
+		req.Body = io.NopCloser(io.MultiReader(bytes.NewReader(b), req.Body))
+		return nil, false
+	}
+	req.Body = io.NopCloser(bytes.NewReader(b))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(b)), nil
+	}
+	return b, true
+}
+
 func cloneRequestForRace(req *http.Request, ctx context.Context, bodyBytes []byte) *http.Request {
 	clone := req.Clone(ctx)
-	if len(bodyBytes) > 0 {
+	// 用 != nil 而非 len > 0：空 body 的解是 []byte{}（非 nil），必须走这里重建
+	// 独立的 Reader，否则两个分支会共享同一个 Body 指针。
+	if bodyBytes != nil {
 		clone.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		clone.GetBody = func() (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader(bodyBytes)), nil
@@ -299,20 +344,38 @@ func raceModes(req *http.Request, modes []string, normIPMode string, host string
 		return resp, err
 	}
 
-	var bodyBytes []byte
-	if req.GetBody != nil {
-		if rc, err := req.GetBody(); err == nil {
-			bodyBytes, _ = io.ReadAll(io.LimitReader(rc, maxBufferedReqBody))
-			_ = rc.Close()
-		}
-	} else if req.Body != nil && req.Body != http.NoBody {
-		if b, err := io.ReadAll(io.LimitReader(req.Body, maxBufferedReqBody)); err == nil {
-			bodyBytes = b
-			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			req.GetBody = func() (io.ReadCloser, error) {
-				return io.NopCloser(bytes.NewReader(bodyBytes)), nil
+	bodyBytes, canRace := bufferRaceBody(req)
+	if !canRace {
+		// 请求体超过缓冲上限（或长度未知且超限、读取出错），无法安全克隆给多个分支。
+		// 改为串行尝试——宁慢不残。首次尝试拿到的就是完整 body；只有 GetBody 可重放时
+		// 才继续试后续模式，否则第二个分支只会读到已耗尽的流。
+		replayable := req.GetBody != nil
+		var lastErr error
+		for i, m := range modes {
+			if i > 0 && !replayable {
+				break
 			}
+			rewindRequestBody(req)
+			resp, err := doSingleMode(req, m, normIPMode)
+			if err == nil {
+				setCachedRoute(host, m)
+				return resp, nil
+			}
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			if IsCertError(err) {
+				return nil, err
+			}
+			if ctxErr := req.Context().Err(); ctxErr != nil {
+				return nil, ctxErr
+			}
+			lastErr = err
 		}
+		if lastErr != nil {
+			return nil, lastErr
+		}
+		return nil, fmt.Errorf("all transport modes (%s) failed for %s", strings.Join(modes, ", "), host)
 	}
 
 	racers := make(map[string]context.CancelFunc, len(modes))

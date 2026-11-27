@@ -60,6 +60,27 @@ func closeECHHTTP3Clients() {
 	}
 }
 
+// closeECHHTTP3IdleConnections 只回收空闲的 H3 连接，不打断正在传输的流。
+//
+// 用于 ECH 配置热更新的场景：http3.Transport.Close() 会直接拆掉所有 QUIC 连接，
+// 把此刻正在下载的视频 / 大文件在刷新边界上掐断；而配置更新只需要让新连接用新
+// 配置即可，老的空闲连接顺手回收就行。
+func closeECHHTTP3IdleConnections() {
+	h3ClientsMu.Lock()
+	old := h3Clients
+	h3Clients = map[string]*http.Client{}
+	h3ClientsMu.Unlock()
+
+	for _, cli := range old {
+		if cli == nil {
+			continue
+		}
+		if tr, ok := cli.Transport.(*http3.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+	}
+}
+
 func newECHHTTP3Client(echConfig []byte, ipMode string) *http.Client {
 	cfgCopy := append([]byte(nil), echConfig...)
 	tr := &http3.Transport{

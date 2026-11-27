@@ -8,6 +8,7 @@
 package cloudflare_ech
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -865,12 +866,19 @@ func refreshLoop() {
 	defer ticker.Stop()
 	for range ticker.C {
 		ctx, cancel := context.WithTimeout(context.Background(), dohTimeout)
-		echConfig, err := fetchECHConfig(ctx, shellDomain)
+		// 必须用 Once 版本回源：fetchECHConfig 命中缓存时返回的是同一个 slice，
+		// 后面的「配置未变化就跳过重建」会让整个刷新循环永久空转，
+		// 而若不做这个比较，又会每 5 分钟无理由拆一次连接池。
+		echConfig, err := fetchECHConfigOnce(ctx, shellDomain)
 		cancel()
 		if err != nil {
 			continue
 		}
 		clientsMu.Lock()
+		if bytes.Equal(lastECHConfig, echConfig) {
+			clientsMu.Unlock()
+			continue
+		}
 		lastECHConfig = echConfig
 		var oldClients []*Client
 		for mode, old := range clients {
@@ -881,6 +889,7 @@ func refreshLoop() {
 		for _, old := range oldClients {
 			old.closeIdleConnections()
 		}
-		closeECHHTTP3Clients()
+		// 只回收空闲 H3 连接：强杀会把正在下载的视频/大文件在刷新边界上掐断。
+		closeECHHTTP3IdleConnections()
 	}
 }

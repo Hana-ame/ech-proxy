@@ -187,6 +187,7 @@ func (j *Jar) SaveResponseCookies(host string, resp *http.Response) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	now := time.Now()
+	normHost := normalizeCookieHost(host)
 	for _, s := range scs {
 		c, ok := parseSetCookie(s)
 		if !ok {
@@ -195,15 +196,22 @@ func (j *Jar) SaveResponseCookies(host string, resp *http.Response) {
 		if c.MaxAge > 0 && c.Expires.IsZero() {
 			c.Expires = now.Add(time.Duration(c.MaxAge) * time.Second)
 		}
-		key := host
+		// 归属校验：8443 门户的 DefaultJar 是跨站点共享的全局 Jar，必须按 RFC 6265 的 domain-match
+		// 确认上游只能为自己或其父域下发 Domain。早期实现直接信任 Set-Cookie 的 Domain，
+		// 任意上游站点都能下发 Domain=.pixiv.net 覆盖、或用 Max-Age=0 删除其他站点的登录态（跨站 Cookie 投毒）。
+		key := normHost
 		if c.Domain != "" {
-			if d := strings.TrimPrefix(c.Domain, "."); strings.Contains(d, ".") {
+			d := strings.ToLower(strings.Trim(strings.TrimSpace(c.Domain), "."))
+			if d == "" || !strings.Contains(d, ".") || !(key == d || strings.HasSuffix(key, "."+d)) {
+				// 越权 Domain：退化为 host-only，丢弃上游伪造的父域范围
+				c.Domain = ""
+			} else {
 				key = "." + d
 			}
 		}
 		// 检测上游显式删除/使 Cookie 过期的情形（如 Pixiv 登出或 Session 失效下发 PHPSESSID=deleted; Max-Age=0）
 		if !isAlive(c, now) || strings.EqualFold(c.Value, "deleted") || c.Value == "" {
-			j.deleteCookieLocked(host, key, c.Name)
+			j.deleteCookieLocked(normHost, key, c.Name)
 			continue
 		}
 		j.saveOneLocked(key, c, now)
@@ -224,6 +232,11 @@ func (j *Jar) ApplyToRequestWithPriority(host string, req *http.Request, fixedCo
 	merged := make(map[string]string)
 	for _, d := range parentDomains(host) {
 		j.collectAliveLocked(d, now, merged)
+	}
+	// 根域自身的 Domain=pixiv.net 会以 ".pixiv.net" 为键存储；访问 pixiv.net 时 parentDomains 为空，
+	// 必须额外查一次带前导点的键，否则该类 Cookie 永远发不出去。
+	if trimmed := strings.TrimPrefix(host, "."); trimmed != "" {
+		j.collectAliveLocked("."+trimmed, now, merged)
 	}
 	j.collectAliveLocked(host, now, merged)
 	j.mu.Unlock()
@@ -371,10 +384,25 @@ func isAlive(c *http.Cookie, now time.Time) bool {
 	return c.MaxAge >= 0 && (c.Expires.IsZero() || now.Before(c.Expires))
 }
 
+// normalizeCookieHost 归一化 Cookie 作用域主机：转小写、去端口、去首尾点。
+func normalizeCookieHost(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if hp, _, err := net.SplitHostPort(h); err == nil {
+		h = hp
+	}
+	h = strings.TrimPrefix(h, ".")
+	return strings.TrimSuffix(h, ".")
+}
+
+// parentDomains 返回 host 的所有父域 Cookie 键，按「由宽到窄」顺序排列。
+//
+// 顺序很关键：ApplyToRequest 把各层 Cookie 依次写入 merged（后写覆盖前写），
+// 必须让最具体的父域最后写入，否则 .pixiv.net 会覆盖掉 .accounts.pixiv.net 的同名 Cookie，
+// 与 RFC 6265「最具体域优先」相反。早期实现按由窄到宽返回，属于反序缺陷。
 func parentDomains(host string) []string {
-	var out []string
 	parts := strings.Split(host, ".")
-	for i := 1; i < len(parts)-1; i++ {
+	var out []string
+	for i := len(parts) - 2; i >= 1; i-- {
 		out = append(out, "."+strings.Join(parts[i:], "."))
 	}
 	return out

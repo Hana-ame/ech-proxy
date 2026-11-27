@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -261,10 +262,16 @@ func QueryDoH(ctx context.Context, name string, qtype int) (*http.Response, erro
 		ctxSec, cancelSec := context.WithTimeout(ctx, 2*time.Second)
 		secondaryURL := fmt.Sprintf("%s?name=%s&type=%d", cfg.fallbackURL, url.QueryEscape(name), qtype)
 		resp2, err2 := doDohRequest(ctxSec, secondaryURL, "", cfg.ipMode)
-		cancelSec()
 		if err2 == nil && resp2 != nil && resp2.StatusCode == http.StatusOK {
+			// 关键：不能在这里立刻 cancelSec()。doDohRequest 只完成到响应头，
+			// body 尚未读取；取消 ctx 会关闭底层连接，使调用方随后的 Read 直接返回
+			// context.Canceled，这条「自解析兜底」分支就此静默失效。
+			// 把 cancel 推迟到 Body.Close，2 秒上限由 WithTimeout 自身的定时器兜底。
+			resp2.Body = &bodyWithCancel{ReadCloser: resp2.Body, cancel: cancelSec}
 			return resp2, nil
-		} else if resp2 != nil && resp2.Body != nil {
+		}
+		cancelSec()
+		if resp2 != nil && resp2.Body != nil {
 			_ = resp2.Body.Close()
 		}
 	}
@@ -306,6 +313,27 @@ func QueryDoH(ctx context.Context, name string, qtype int) (*http.Response, erro
 		return nil, fmt.Errorf("all DoH endpoints failed (primary: %v, aliyun: %v)", err, err3)
 	}
 	return resp, err
+}
+
+// bodyWithCancel 把「释放 ctx」的时机从「拿到响应头」推迟到「response body 关闭」。
+//
+// 背景：doDohRequest 用 http.Client.Do 只完成到响应头就返回，body 仍在连接上等待读取。
+// 若在返回前调用 context 的 cancel，Transport 会立刻关闭该连接，调用方随后的
+// Read/Decode 拿到 context.Canceled，表现为「DoH 查询莫名失败」。
+type bodyWithCancel struct {
+	ReadCloser io.ReadCloser
+	cancel     context.CancelFunc
+}
+
+func (b *bodyWithCancel) Read(p []byte) (int, error) { return b.ReadCloser.Read(p) }
+
+func (b *bodyWithCancel) Close() error {
+	err := b.ReadCloser.Close()
+	if b.cancel != nil {
+		b.cancel()
+		b.cancel = nil
+	}
+	return err
 }
 
 func doDohRequest(ctx context.Context, urlStr, dialIP, ipMode string) (*http.Response, error) {

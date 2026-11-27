@@ -374,7 +374,10 @@ func CompileBodyReplace(rules []BodyReplaceRule) {
 
 func compileBodyReplace(rules []BodyReplaceRule) {
 	for i := range rules {
-		if rules[i].Old != "" && rules[i].Compiled == nil {
+		// 仅当显式声明 regex:true 时才编译正则。早期实现无条件编译，
+		// 使普通字面量规则里的 "." 被当成通配符（"a.b.com" 会命中 "axb.com"），
+		// 且 New 里的 "$1" 会被正则展开，误伤无关内容。
+		if rules[i].Regex && rules[i].Old != "" && rules[i].Compiled == nil {
 			rules[i].Compiled, _ = regexp.Compile(rules[i].Old)
 		}
 	}

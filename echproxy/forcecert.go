@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
 
 // 本文件实现「强行访问」的会话级记忆、多 Token 并发容错与限速，用于约束 ?__ech_proxy_force_cert__=<token> 覆盖：
@@ -175,19 +177,38 @@ func lowerForceHost(h string) string {
 	return strings.TrimSuffix(h, ".")
 }
 
+// sharedHostingSuffixes 是「同一后缀下每个子域归属不同主体」的共享托管域。
+// 这类后缀绝不能写入会话级通配免检（批准 evil.github.io 不能连带放行 victim.github.io）。
+var sharedHostingSuffixes = map[string]bool{
+	"github.io": true, "gitlab.io": true, "githubusercontent.com": true,
+	"netlify.app": true, "vercel.app": true, "pages.dev": true, "workers.dev": true,
+	"herokuapp.com": true, "azurewebsites.net": true, "cloudfront.net": true,
+	"appspot.com": true, "blogspot.com": true, "s3.amazonaws.com": true,
+	"web.app": true, "firebaseapp.com": true, "glitch.me": true,
+	"ngrok.io": true, "ngrok-free.app": true, "trycloudflare.com": true,
+	"repl.co": true, "codesandbox.io": true, "surge.sh": true,
+}
+
+// baseRegistrableDomain 返回 host 的可注册域（eTLD+1），用于「强行访问」的父域记忆。
+//
+// 早期实现硬编码了 10 个双段公共后缀，遗漏 com.au / co.kr / gov.cn / com.br 等大量后缀：
+// 批准 bad.com.au 时会把 ".com.au" 写入 approved，导致本会话内所有 *.com.au 全部跳过证书校验。
+// 现改为使用 publicsuffix 权威后缀表；共享托管域（github.io 等）直接返回空，只按精确主机放行。
 func baseRegistrableDomain(host string) string {
-	labels := strings.Split(host, ".")
-	if len(labels) < 2 {
-		return host
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	if host == "" || net.ParseIP(host) != nil {
+		return ""
 	}
-	if len(labels) >= 3 {
-		lastTwo := labels[len(labels)-2] + "." + labels[len(labels)-1]
-		switch lastTwo {
-		case "co.jp", "ne.jp", "or.jp", "com.cn", "net.cn", "org.cn", "co.uk", "org.uk", "com.tw", "com.hk":
-			return strings.Join(labels[len(labels)-3:], ".")
-		}
+	base, err := publicsuffix.EffectiveTLDPlusOne(host)
+	if err != nil || base == "" {
+		// 单标签主机（localhost、内网短名）与纯公共后缀（com、co.uk）在这里报错，
+		// 只按精确主机放行，不写父域记忆。
+		return ""
 	}
-	return strings.Join(labels[len(labels)-2:], ".")
+	if sharedHostingSuffixes[base] {
+		return ""
+	}
+	return base
 }
 
 // reset 清空全部会话级状态（仅用于测试隔离）。

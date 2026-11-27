@@ -615,37 +615,48 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 	}
 }
 
+// bootstrapRaceResult 是单个引导端点的竞速结果。
+//
+// reachable 区分两种「没有拿到 IP」：端点查询成功但该域名确实没有此类型记录（reachable=true），
+// 与端点连不上/超时/返回错误（reachable=false）。二者绝不能混为一谈——早期实现把
+// 「无 AAAA 记录」当成「主端点不可达」，直接触发冷却并把后续所有解析静默切到国内 DoH。
+type bootstrapRaceResult struct {
+	ips       []net.IP
+	reachable bool
+}
+
 // raceBootstrapEndpoints 在给定端点集合内并发竞速，返回首个有非空结果的解析结果。
+// 第二个返回值报告「是否至少有一个端点成功完成了查询」，用于区分「无记录」与「不可达」。
 // 只在该集合内竞速，不跨集合混合——用于把「主端点」与「国内兜底端点」严格分层。
-func raceBootstrapEndpoints(ctx context.Context, eps []bootstrapEndpoint, host string, qt int) []net.IP {
+func raceBootstrapEndpoints(ctx context.Context, eps []bootstrapEndpoint, host string, qt int) ([]net.IP, bool) {
 	if len(eps) == 0 {
-		return nil
+		return nil, false
 	}
-	resCh := make(chan []net.IP, len(eps))
+	resCh := make(chan bootstrapRaceResult, len(eps))
 	raceCtx, raceCancel := context.WithCancel(ctx)
 	defer raceCancel()
 	for _, ep := range eps {
 		targetEP := ep
 		go func() {
 			res, err := queryBootstrapEndpoint(raceCtx, targetEP, host, qt)
-			if err == nil && len(res) > 0 {
-				resCh <- res
-			} else {
-				resCh <- nil
-			}
+			resCh <- bootstrapRaceResult{ips: res, reachable: err == nil}
 		}()
 	}
+	reachable := false
 	for i := 0; i < len(eps); i++ {
 		select {
 		case r := <-resCh:
-			if len(r) > 0 {
-				return r
+			if r.reachable {
+				reachable = true
+			}
+			if len(r.ips) > 0 {
+				return r.ips, true
 			}
 		case <-ctx.Done():
-			return nil
+			return nil, reachable
 		}
 	}
-	return nil
+	return nil, reachable
 }
 
 func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) ([]string, error) {
@@ -664,12 +675,20 @@ func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) 
 		// 第一阶段：只竞速主端点（1.1.1.1 / 1.0.0.1），并给它们一个「优先窗口」。
 		// 正常网络下主端点在窗口内返回即直接采用，国内端点全程不参与，
 		// 严格符合 README「引导 IP 仅限 1.1.1.1 / 1.0.0.1」。
-		// 主端点一旦被判定不可达则进入冷却期，后续解析不再重复等待优先窗口。
+		// 主端点一旦被判定「不可达」则进入冷却期，后续解析不再重复等待优先窗口。
 		if primaryBootstrapUsable(time.Now()) {
 			preferCtx, preferCancel := context.WithTimeout(ctx, bootstrapPrimaryPreferWindow)
-			won = raceBootstrapEndpoints(preferCtx, primaryBootstrapEndpoints, host, qt)
+			var primaryReachable bool
+			won, primaryReachable = raceBootstrapEndpoints(preferCtx, primaryBootstrapEndpoints, host, qt)
 			preferCancel()
-			if len(won) == 0 {
+			switch {
+			case len(won) > 0:
+				// 主端点给出结果，正常收下。
+			case primaryReachable:
+				// 主端点可达，但该域名确实没有这一类型的记录（如 v4-only 域名查 AAAA）。
+				// 这是权威答案：既不该据此判定主端点不可达，也不必再去问国内端点要同一个空结果。
+				continue
+			default:
 				enteredCooldown = markPrimaryBootstrapUnreachable(time.Now())
 			}
 		}
@@ -681,7 +700,7 @@ func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) 
 			if enteredCooldown {
 				log.Printf("[netdial] bootstrap DoH primary endpoints (1.1.1.1/1.0.0.1) unreachable for %q, switching to domestic fallback quietly for %s", host, bootstrapPrimaryCooldown)
 			}
-			won = raceBootstrapEndpoints(ctx, fallbackBootstrapEndpoints, host, qt)
+			won, _ = raceBootstrapEndpoints(ctx, fallbackBootstrapEndpoints, host, qt)
 		}
 		if len(won) > 0 {
 			ips = append(ips, won...)
@@ -690,11 +709,14 @@ func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) 
 
 	filtered := FilterIPsByMode(ips, norm)
 	if len(filtered) == 0 {
+		// 走到这里有两种可能：端点全部不可达，或端点正常应答但该域名没有符合条件的记录
+		// （例如 v6 模式下域名只有 A 记录）。错误文案要同时覆盖，否则日志会把「无记录」
+		// 误报成「网络不可达」，排查时被带偏。
 		var resolveErr error
 		if domesticBootstrapAllowed() {
-			resolveErr = fmt.Errorf("DoH resolve %s (%s) failed (primary and domestic bootstrap endpoints both unreachable)", host, norm)
+			resolveErr = fmt.Errorf("DoH resolve %s (%s) failed: no usable record, or bootstrap endpoints unreachable (primary + domestic)", host, norm)
 		} else {
-			resolveErr = fmt.Errorf("DoH resolve %s (%s) failed (primary bootstrap endpoints unreachable; domestic fallback disabled by ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP)", host, norm)
+			resolveErr = fmt.Errorf("DoH resolve %s (%s) failed: no usable record, or primary bootstrap endpoints unreachable (domestic fallback disabled by ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP)", host, norm)
 		}
 		// 写入短时负缓存（15s），防止高并发请求在网络异常或某协议族无记录时反复打爆引导 DoH 与日志。
 		bootstrapCacheMu.Lock()

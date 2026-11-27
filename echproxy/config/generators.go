@@ -207,6 +207,21 @@ func FormatPACProxyString(raw string) string {
 	if raw == "" {
 		return "DIRECT"
 	}
+	// 允许 -fallback 直接填带协议头的地址（http://host:port、socks5://host:port）。
+	// 早期实现会把协议头原样拼进 PAC，产出 "PROXY http://127.0.0.1:7890" 这类非法语法，浏览器整条规则失效。
+	if i := strings.Index(raw, "://"); i >= 0 {
+		scheme := strings.ToLower(strings.TrimSpace(raw[:i]))
+		rest := strings.TrimSpace(raw[i+3:])
+		if rest == "" {
+			return "DIRECT"
+		}
+		switch scheme {
+		case "http", "https":
+			return "PROXY " + rest + "; DIRECT"
+		case "socks", "socks5", "socks5h":
+			return "SOCKS5 " + rest + "; SOCKS " + rest + "; DIRECT"
+		}
+	}
 	upper := strings.ToUpper(raw)
 	if strings.HasPrefix(upper, "PROXY ") || strings.HasPrefix(upper, "SOCKS ") || strings.HasPrefix(upper, "SOCKS5 ") || upper == "DIRECT" {
 		if !strings.HasSuffix(upper, "DIRECT") {
@@ -331,12 +346,27 @@ function FindProxyForURL(url, host) {
     return "DIRECT";
   }
   host = host.toLowerCase();
-  var colonIdx = host.indexOf(":");
-  if (colonIdx !== -1) {
-    host = host.substring(0, colonIdx);
+  // IPv6 字面量：要么被 [ ] 包裹，要么冒号出现两次以上。
+  // 不能用「含一个冒号」判断，否则 fc2.com:8080 这类「域名:端口」会被误当成 ULA 地址而直连。
+  var isV6 = host.charAt(0) === "[" ||
+      (host.indexOf(":") !== -1 && host.indexOf(":") !== host.lastIndexOf(":"));
+  if (host.charAt(0) === "[") {
+    var rb = host.indexOf("]");
+    if (rb !== -1) {
+      host = host.substring(1, rb);
+    }
+  } else {
+    var colonIdx = host.indexOf(":");
+    if (colonIdx !== -1) {
+      host = host.substring(0, colonIdx);
+    }
   }
   while (host.length > 0 && host.charAt(host.length - 1) === ".") {
     host = host.substring(0, host.length - 1);
+  }
+  if (isV6 && (host === "::1" || host === "::" ||
+      host.indexOf("fe80:") === 0 || host.indexOf("fc") === 0 || host.indexOf("fd") === 0)) {
+    return "DIRECT";
   }
   if (isPlainHostName(host) ||
       host === "localhost" ||

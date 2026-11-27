@@ -3,7 +3,9 @@
 package rewrite
 
 import (
+	"net"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 
@@ -100,18 +102,61 @@ func appendVaryHeader(dst http.Header, token string) {
 	dst.Set("Vary", strings.Join(tokens, ", "))
 }
 
-// ApplyCORSHeaders 为响应注入完整的跨域许可头（仅用于 8443 门户模式与本地管理端点）。
+// normalizeHostPort 归一化 "host:port" 用于同源相等比较：小写化、剥离 IPv6 方括号、
+// 并把 80/443 视为默认端口省略。只用于比较，不要求输出是合法的 host:port 字面量。
+func normalizeHostPort(hp string) string {
+	hp = strings.ToLower(strings.TrimSpace(hp))
+	h, p, err := net.SplitHostPort(hp)
+	if err != nil {
+		return strings.TrimSuffix(strings.Trim(hp, "[]"), ":")
+	}
+	h = strings.Trim(h, "[]")
+	if p == "80" || p == "443" {
+		return h
+	}
+	return h + ":" + p
+}
+
+// sameOriginHost 判断 Origin 头是否与请求的 Host 同源（忽略 scheme，只比 host:port）。
+// "null"（sandbox iframe / file:// 的不透明源）与解析失败一律按时跨源处理。
+func sameOriginHost(origin, reqHost string) bool {
+	if origin == "" || reqHost == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return normalizeHostPort(u.Host) == normalizeHostPort(reqHost)
+}
+
+// ApplyCORSHeaders 为响应注入跨域许可头（仅用于 8443 门户模式与本地管理端点）。
+//
+// 安全约束：绝不反射任意 Origin。早期实现对任意 Origin 都回写 Access-Control-Allow-Origin
+// 并附带 Allow-Credentials: true，同时无条件打开 Access-Control-Allow-Private-Network。
+// 结果是任意公网页面都能从浏览器直接 fetch http://127.0.0.1:8443/debug/log 或 /statusz，
+// 读出完整代理日志（含用户访问过的全部 URL）与运行状态，用户无需任何操作。
+//
+// 现在仅对同源 Origin 发放带凭据的许可：跨源请求拿不到 Allow-Origin，浏览器直接拒绝读取；
+// 同源请求浏览器本就不校验 CORS 头，功能不受影响。
 func ApplyCORSHeaders(dst http.Header, req *http.Request) {
-	var origin, reqHeaders string
+	var origin, reqHeaders, reqHost string
 	if req != nil {
 		origin = req.Header.Get("Origin")
 		reqHeaders = req.Header.Get("Access-Control-Request-Headers")
+		reqHost = req.Host
 	}
-	if origin != "" {
+	switch {
+	case origin != "" && !sameOriginHost(origin, reqHost):
+		// 跨源：不发放读取许可，也不声明允许凭据。
+		dst.Del("Access-Control-Allow-Origin")
+		dst.Del("Access-Control-Allow-Credentials")
+	case origin != "":
 		dst.Set("Access-Control-Allow-Origin", origin)
 		dst.Set("Access-Control-Allow-Credentials", "true")
 		appendVaryHeader(dst, "Origin")
-	} else {
+	default:
+		// 无 Origin：导航请求或同源请求，浏览器不校验 CORS 头，保持无凭据通配即可。
 		dst.Set("Access-Control-Allow-Origin", "*")
 		dst.Del("Access-Control-Allow-Credentials")
 	}
@@ -123,7 +168,9 @@ func ApplyCORSHeaders(dst http.Header, req *http.Request) {
 	}
 	dst.Set("Access-Control-Expose-Headers", "*, Content-Length, Content-Range, Accept-Ranges, Content-Type, ETag, Last-Modified, Date, Cache-Control")
 	dst.Set("Access-Control-Max-Age", "86400")
-	dst.Set("Access-Control-Allow-Private-Network", "true")
+	// 明确清除 PNA 许可：它允许公网页面通过预检直连本机端口，与上面的同源约束冲突。
+	// 若上游自行下发该头，这里也要覆盖掉（本函数是管理端点/门户响应的最终裁定方）。
+	dst.Del("Access-Control-Allow-Private-Network")
 	dst.Set("Cross-Origin-Resource-Policy", "cross-origin")
 	dst.Set("Timing-Allow-Origin", "*")
 }

@@ -11,7 +11,6 @@ import (
 	"time"
 
 	cloudflare_ech "github.com/Hana-ame/ech-proxy/echproxy/ech"
-	"github.com/Hana-ame/ech-proxy/echproxy/rewrite"
 	"github.com/gin-gonic/gin"
 )
 
@@ -24,7 +23,26 @@ import (
 //   - 若证书已过期 -> 明确提示「已过期」（显示证书生效与过期时间）；
 //   - 并提供「强行访问」按钮（带一次性防伪 Token，点击后在当前会话放行该站点并继续执行去广告与插入自有广告脚本）。
 func serveCertWarningPage(c *gin.Context, err error, kind, certHost, detail, requestHost, upstreamHost string) {
-	rewrite.ApplyCORSHeaders(c.Writer.Header(), c.Request)
+	// 安全：告警页 HTML 内含一次性 force token，绝不能允许跨源读取。
+	// 此前这里调用 ApplyCORSHeaders 会反射任意 Origin 并允许凭据（还带 Allow-Private-Network），
+	// 恶意页面可跨源 fetch 本页、取出 token 并静默消费，从而在用户无感知下关闭该域名的证书校验。
+	// 这里改为只允许同源文档使用，且禁止被 iframe 嵌入 / 被当作资源读取。
+	corsHeader := c.Writer.Header()
+	for _, h := range []string{
+		"Access-Control-Allow-Origin",
+		"Access-Control-Allow-Credentials",
+		"Access-Control-Allow-Methods",
+		"Access-Control-Allow-Headers",
+		"Access-Control-Expose-Headers",
+		"Access-Control-Max-Age",
+		"Access-Control-Allow-Private-Network",
+		"Timing-Allow-Origin",
+	} {
+		corsHeader.Del(h)
+	}
+	corsHeader.Set("Cross-Origin-Resource-Policy", "same-origin")
+	corsHeader.Set("Cross-Origin-Opener-Policy", "same-origin")
+	corsHeader.Set("Content-Security-Policy", "frame-ancestors 'none'; base-uri 'none'")
 	if certHost == "" {
 		certHost = upstreamHost
 	}

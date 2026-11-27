@@ -142,10 +142,10 @@ func applyBodyReplace(body []byte, rules []config.BodyReplaceRule) []byte {
 			}
 			continue
 		}
+		// 字面量规则只做字面量替换。早期实现在未命中时回退执行正则替换，
+		// 会让 "." 变成通配符并展开 "$1"，误改无关内容。
 		if bytes.Contains(body, []byte(r.Old)) {
 			body = bytes.ReplaceAll(body, []byte(r.Old), []byte(r.New))
-		} else if r.Compiled != nil {
-			body = r.Compiled.ReplaceAll(body, []byte(r.New))
 		}
 	}
 	return body

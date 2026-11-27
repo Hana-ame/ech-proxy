@@ -897,11 +897,11 @@ func (m *AdScriptManager) BypassLocalPath() string {
 
 func (m *AdScriptManager) BypassList() []string {
 	if m == nil {
-		return []string{}
+		return MergeWithDefaultSensitiveBypass(nil)
 	}
 	ptr := m.bypassPtr.Load()
 	if ptr == nil || len(*ptr) == 0 {
-		return []string{}
+		return MergeWithDefaultSensitiveBypass(nil)
 	}
 	return append([]string(nil), (*ptr)...)
 }
@@ -910,7 +910,7 @@ func (m *AdScriptManager) SwapBypassList(domains []string) []string {
 	if m == nil {
 		return []string{}
 	}
-	norm := normalizeDomainSlice(domains)
+	norm := MergeWithDefaultSensitiveBypass(domains)
 	oldPtr := m.bypassPtr.Swap(&norm)
 	if oldPtr == nil {
 		return []string{}

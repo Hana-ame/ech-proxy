@@ -1007,7 +1007,7 @@ func TransportWithIPModeAndCertCheck(mode string, certCheck func(host string, pe
 			}
 			tlsConn := tls.Client(rawConn, &tls.Config{
 				ServerName:         host,
-				InsecureSkipVerify: true,
+				InsecureSkipVerify: certCheck != nil,
 				MinVersion:         tls.VersionTLS12,
 				NextProtos:         []string{"h2", "http/1.1"},
 			})

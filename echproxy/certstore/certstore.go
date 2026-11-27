@@ -33,7 +33,8 @@ const (
 	leafCertFile      = "fullchain.pem"
 	leafKeyFile       = "privkey.pem"
 	caValidDuration   = 10 * 365 * 24 * time.Hour
-	leafValidDuration = 730 * 24 * time.Hour
+	leafValidDuration = 365 * 24 * time.Hour
+	leafRenewMargin   = 7 * 24 * time.Hour
 	leafSerialMax     = 1 << 62
 )
 
@@ -152,14 +153,22 @@ func DefaultDataDir() (string, error) {
 	if exe, err := os.Executable(); err == nil {
 		exeDir = filepath.Dir(exe)
 	}
+	// 兼容旧版本便携目录：若程序同目录已存在历史 ca/ca.pem，继续沿用以免已安装根证书失效；
+	// 全新安装一律将 CA 私钥落盘到系统当前用户配置目录（如 %APPDATA%\ech-proxy），
+	// 避免随程序目录被打包/分享而泄露私钥，同时受益于操作系统用户目录 ACL 隔离。
+	if exeDir != "" {
+		if _, err := os.Stat(filepath.Join(exeDir, "ca", caCertName)); err == nil && canWrite(exeDir) {
+			return exeDir, nil
+		}
+	}
 	base, err := os.UserConfigDir()
-	if err != nil {
-		return "", fmt.Errorf("cannot determine user config dir: %w", err)
+	if err == nil && base != "" {
+		return filepath.Join(base, "ech-proxy"), nil
 	}
 	if exeDir != "" && canWrite(exeDir) {
 		return exeDir, nil
 	}
-	return filepath.Join(base, "ech-proxy"), nil
+	return "", fmt.Errorf("cannot determine user config dir: %w", err)
 }
 
 func canWrite(dir string) bool {
@@ -292,7 +301,7 @@ func (st *Store) CertificateFor(host string) (*tls.Certificate, error) {
 	defer st.mu.Unlock()
 
 	key := certGroupingDomain(host)
-	if c, ok := st.leaf[key]; ok {
+	if c, ok := st.leaf[key]; ok && !leafNeedsRenewal(c) {
 		return c, nil
 	}
 	if leaf, err := st.loadLeaf(key); err == nil {
@@ -339,7 +348,32 @@ func (st *Store) loadLeaf(domain string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
+	if len(cert.Certificate) > 0 {
+		if parsed, perr := x509.ParseCertificate(cert.Certificate[0]); perr == nil {
+			cert.Leaf = parsed
+		}
+	}
+	if leafNeedsRenewal(&cert) {
+		return nil, os.ErrNotExist
+	}
 	return &cert, nil
+}
+
+func leafNeedsRenewal(cert *tls.Certificate) bool {
+	if cert == nil || len(cert.Certificate) == 0 {
+		return true
+	}
+	leaf := cert.Leaf
+	if leaf == nil {
+		var err error
+		leaf, err = x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return true
+		}
+		cert.Leaf = leaf
+	}
+	now := time.Now()
+	return now.Before(leaf.NotBefore) || now.After(leaf.NotAfter.Add(-leafRenewMargin))
 }
 
 func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
@@ -398,6 +432,9 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 	if err != nil {
 		return nil, err
 	}
+	if parsed, perr := x509.ParseCertificate(certDER); perr == nil {
+		tlsCert.Leaf = parsed
+	}
 	return &tlsCert, nil
 }
 
@@ -452,7 +489,8 @@ func generateCA() (*CA, error) {
 		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign | x509.KeyUsageDigitalSignature,
 		BasicConstraintsValid: true,
 		IsCA:                  true,
-		MaxPathLen:            1,
+		MaxPathLen:            0,
+		MaxPathLenZero:        true,
 		SubjectKeyId:          skid[:],
 		AuthorityKeyId:        skid[:],
 	}

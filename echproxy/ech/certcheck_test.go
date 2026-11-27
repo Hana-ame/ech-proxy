@@ -170,9 +170,12 @@ func TestValidateUpstreamCert(t *testing.T) {
 		t.Fatalf("WithAllowBadCert should bypass mismatched cert, got %v", err)
 	}
 
-	// 8. 无证书可校验 -> 放行
-	if err := validateUpstreamCert(context.Background(), realDomain, nil); err != nil {
-		t.Fatalf("no peer certs should pass, got %v", err)
+	// 8. 无证书或空域名 -> Fail-Closed 拒绝（避免空证书链绕过）
+	if err := validateUpstreamCert(context.Background(), realDomain, nil); !errors.Is(err, ErrCertUntrusted) {
+		t.Fatalf("no peer certs: want ErrCertUntrusted (fail-closed), got %v", err)
+	}
+	if err := validateUpstreamCert(context.Background(), "", []*x509.Certificate{trusted}); !errors.Is(err, ErrCertMismatch) {
+		t.Fatalf("empty domain: want ErrCertMismatch (fail-closed), got %v", err)
 	}
 
 	// 9. 过期优先于不一致（时间客观无效时先判 expired）

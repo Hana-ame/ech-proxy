@@ -90,6 +90,8 @@ var (
 	// 本地 pac.txt 优先：解析与探测入口统一从 rewrite 暴露，避免 win/ 与 echproxy/ 各写一份判定。
 	ResolveWhitelistSource          = rewrite.ResolveWhitelistSource
 	ResolveBypassSource             = rewrite.ResolveBypassSource
+	DefaultSensitiveBypassDomains   = rewrite.DefaultSensitiveBypassDomains
+	MergeWithDefaultSensitiveBypass = rewrite.MergeWithDefaultSensitiveBypass
 	DefaultLocalWhitelistCandidates = rewrite.DefaultLocalWhitelistCandidates
 	DefaultLocalBypassCandidates    = rewrite.DefaultLocalBypassCandidates
 	IsLocalWhitelistSource          = rewrite.IsLocalWhitelistSource

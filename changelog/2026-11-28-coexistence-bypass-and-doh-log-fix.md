@@ -270,3 +270,20 @@
   - 新增 `Validate v3.6.5 invariants` 步骤：静态守护 `4545810.xyz` 经由 `ResolveDefaultSiteHost` 解析（不走 DoH）、`sni.go` 绝不引用 `doECHHTTP3`/`quic-go`/`http3`、以及 `go.mod` 中 `github.com/quic-go/quic-go` 为直接依赖。
   - 扩展 CLI 冒烟测试：校验 `help` 输出包含 `-bypass-url`、`-bypass-file`、`-no-local-bypass`、`-ech-h3`、`-fallback`；同时补齐 `win/main.go` 中 `pac` 子命令对 `bypass.txt` 与 `-fallback` 的支持，在 CI 中实测生成 PAC 并断言 `BYPASS_EXACT_HOSTS`、`BYPASS_SUFFIX_RULES`、测试域名与 `PROXY 127.0.0.1:7890` 均正确注入。
 - **`.github/workflows/ech-proxy.yml` 同步门禁**：在打包前同步校验 `/bypass.txt"` 默认配置与 `sni.go` 零 HTTP/3 引用约束。
+
+## 7. 本地 CA / TLS 纵深安全加固与高敏感域名默认绕过（v3.6.5）
+
+- **内置高敏感域名绕过清单（`bypass.txt` & `echproxy/rewrite/bypass_defaults.go`）**：
+  - 在仓库根目录新增可直接部署或本地使用的 `bypass.txt`，同时在 `echproxy/rewrite/bypass_defaults.go` 中内置 `DefaultSensitiveBypassDomains`（覆盖中国主流网银/银联、国际主流银行/券商、支付宝/微信/PayPal/Stripe 等支付平台、1Password/Bitwarden/ProtonPass 等密码管理器、Windows/macOS 系统更新与 OCSP/CRL 信任链、以及核心账号登录域名）。
+  - `AdScriptManager.BypassList()` / `SwapBypassList()` 与 `win/main.go` 的 `pac` 子命令均自动合并去重 `DefaultSensitiveBypassDomains`，确保即使在 `-all` 全代理模式或远端 `bypass.txt` 不可达时，上述高敏感流量也始终跳过本地 CA MITM 解密。
+- **上游证书校验改为 Fail-Closed（`echproxy/ech/certcheck.go`）**：
+  - 修正 `validateUpstreamCert` 在 `len(peerCerts) == 0` 或 `realDomain == ""` 时直接 `return nil` 的边界漏洞，改为分别返回 `ErrCertUntrusted` 与 `ErrCertMismatch`，并同步更新 `echproxy/ech/certcheck_test.go`。
+- **本地 CA 最小权限、私钥隔离与过期叶子自动轮换（`echproxy/certstore/certstore.go`）**：
+  - 根 CA 约束收紧为 `MaxPathLen: 0, MaxPathLenZero: true`（禁止签发二级中间 CA）。
+  - 叶子证书有效期从 730 天缩短至 365 天（符合现代浏览器 ≤398 天上限）。
+  - `loadLeaf()` 与内存缓存命中路径增加 `leafNeedsRenewal` 校验：已过期或距离过期不足 7 天的缓存叶子证书自动丢弃并重新签发。
+  - `DefaultDataDir()` 对全新安装优先落盘至系统当前用户配置目录（如 Windows `%APPDATA%\ech-proxy`），避免 `ca/ca.key` 随便携程序目录被误打包泄露（若旧目录已存在 `ca/ca.pem` 则保持向后兼容）。
+- **自定义传输层 `nil` 回调兜底（`echproxy/netdial/netdial.go`）**：
+  - `TransportWithIPModeAndCertCheck` 改为 `InsecureSkipVerify: certCheck != nil`，防止调用方传入 `nil` 回调时意外跳过 TLS 证书校验。
+- **单测与 CI 门禁**：
+  - 新增 `TestCAHardeningAndExpiredLeafAutoRotation` 与 `TestDefaultSensitiveBypassDomainsAlwaysActive`；并在 `.github/workflows/go.yml` 中新增对 `MaxPathLenZero: true`、`InsecureSkipVerify: certCheck != nil`、`DefaultSensitiveBypassDomains` 与 `bypass.txt` 的静态守护断言。

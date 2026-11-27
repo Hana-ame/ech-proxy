@@ -1,10 +1,16 @@
 package certstore
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestCertGroupingDomainAndMultiLevelWildcardVerify(t *testing.T) {
@@ -72,5 +78,65 @@ func TestCertGroupingDomainAndMultiLevelWildcardVerify(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dataDir, "ca", "leaves")); err != nil {
 		t.Errorf("expected local CA leaves under <dataDir>/ca/leaves, got err=%v", err)
+	}
+}
+
+func TestCAHardeningAndExpiredLeafAutoRotation(t *testing.T) {
+	dataDir := t.TempDir()
+	st, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if !st.ca.Cert.MaxPathLenZero || st.ca.Cert.MaxPathLen != 0 {
+		t.Fatalf("expected root CA MaxPathLen=0 & MaxPathLenZero=true, got MaxPathLen=%d MaxPathLenZero=%v",
+			st.ca.Cert.MaxPathLen, st.ca.Cert.MaxPathLenZero)
+	}
+	if leafValidDuration > 398*24*time.Hour {
+		t.Fatalf("leafValidDuration %v exceeds 398-day browser ceiling", leafValidDuration)
+	}
+
+	// 写入一张已过期叶子证书到磁盘缓存，验证 CertificateFor 自动重新签发有效证书
+	domain := "rotate-test.example"
+	dir := st.leafDir(domain)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(99),
+		Subject:      pkix.Name{CommonName: domain},
+		NotBefore:    time.Now().Add(-48 * time.Hour),
+		NotAfter:     time.Now().Add(-24 * time.Hour),
+		DNSNames:     []string{domain, "*." + domain},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, expTmpl, st.ca.Cert, &key.PublicKey, st.ca.Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := append(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: st.ca.Cert.Raw})...,
+	)
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	if err := os.WriteFile(filepath.Join(dir, leafCertFile), certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, leafKeyFile), keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	fresh, err := st.CertificateFor(domain)
+	if err != nil {
+		t.Fatalf("CertificateFor expired cached leaf failed: %v", err)
+	}
+	parsed, err := x509.ParseCertificate(fresh.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !parsed.NotAfter.After(time.Now().Add(300 * 24 * time.Hour)) {
+		t.Fatalf("expected rotated fresh leaf cert, got NotAfter=%s", parsed.NotAfter)
 	}
 }

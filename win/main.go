@@ -759,7 +759,7 @@ func runToolAction(cmd CLICommand, out io.Writer) int {
 		} else {
 			fmt.Fprintf(out, "// warning: fetch bypass list failed: %v\n", err)
 		}
-		fmt.Fprint(out, echproxy.GeneratePACWithRules(nil, cmd.Addr, cmd.AllMode, cmd.FallbackProxy, wl, bp))
+		fmt.Fprint(out, echproxy.GeneratePACWithRules(nil, cmd.Addr, cmd.AllMode, cmd.FallbackProxy, wl, echproxy.MergeWithDefaultSensitiveBypass(bp)))
 		return 0
 	case "sysproxy-pac":
 		mgr := NewSysProxyManager(cmd.Addr, nil)

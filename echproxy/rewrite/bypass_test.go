@@ -63,3 +63,24 @@ func TestAdScriptManagerBypassListMatching(t *testing.T) {
 		t.Error("pixiv.net should not match bypass.txt")
 	}
 }
+
+func TestDefaultSensitiveBypassDomainsAlwaysActive(t *testing.T) {
+	mgr := NewAdScriptManager(AdScriptOptions{
+		NoLocalPAC:    true,
+		NoLocalBypass: true,
+	})
+	for _, host := range []string{
+		"mybank.icbc.com.cn",
+		"www.paypal.com",
+		"vault.bitwarden.com",
+		"download.windowsupdate.com",
+		"login.microsoftonline.com",
+	} {
+		if !mgr.IsBypassed(host) {
+			t.Errorf("expected sensitive domain %q to be bypassed by default", host)
+		}
+	}
+	if mgr.IsBypassed("pixiv.net") {
+		t.Error("non-sensitive domain pixiv.net should not be in DefaultSensitiveBypassDomains")
+	}
+}

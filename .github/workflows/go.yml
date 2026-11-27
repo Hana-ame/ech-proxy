@@ -73,6 +73,11 @@ jobs:
           # quic-go 必须为 go.mod 直接依赖（非 indirect）
           grep -Eq '^[[:space:]]+github\.com/quic-go/quic-go v' go.mod
           ! grep -Eq 'github\.com/quic-go/quic-go v.*// indirect' go.mod
+          # TLS 本地 CA 与敏感域名安全加固不变量
+          grep -q 'MaxPathLenZero:[[:space:]]*true' echproxy/certstore/certstore.go
+          grep -q 'InsecureSkipVerify:[[:space:]]*certCheck != nil' echproxy/netdial/netdial.go
+          grep -q 'DefaultSensitiveBypassDomains' echproxy/rewrite/bypass_defaults.go
+          test -f bypass.txt
 
       - name: Run full unit & integration tests with race detector
         run: go test ./... -race -v -coverprofile=coverage.out

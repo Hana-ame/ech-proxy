@@ -145,12 +145,22 @@ func validateUpstreamCert(ctx context.Context, realDomain string, peerCerts []*x
 	if allowBadCert(ctx) {
 		return nil
 	}
-	if len(peerCerts) == 0 {
-		return nil
-	}
 	realDomain = normalizeCertDomain(realDomain)
+	if len(peerCerts) == 0 {
+		return &CertError{
+			Host:   realDomain,
+			Kind:   "chain",
+			Detail: fmt.Sprintf("upstream %s presented no peer certificates", realDomain),
+			err:    ErrCertUntrusted,
+		}
+	}
 	if realDomain == "" {
-		return nil
+		return &CertError{
+			Host:   "",
+			Kind:   "mismatch",
+			Detail: "empty target domain for upstream certificate verification",
+			err:    ErrCertMismatch,
+		}
 	}
 
 	leaf := peerCerts[0]

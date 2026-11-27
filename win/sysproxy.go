@@ -247,14 +247,11 @@ func (m *SysProxyManager) captureOriginalLocked(current SysProxyState) {
 
 // pushPrevStateLocked 把切换前的系统代理状态压入恢复栈。
 //
-// 绝不能把「指向自己的代理」压栈：进程被强杀后会残留
-// AutoConfigURL=http://127.0.0.1:<port>/proxy.pac，下次启动时 hasOriginal 仍为 false
-// （构造时已被 isSelfProxy 过滤），若栈底又是这条残留，CleanupOnExit 就会把它写回系统代理，
-// 用户正常退出后直接断网。这类残留只能丢弃，最终由 Clear() 收尾。
+// 这里**故意不过滤**「指向自己的代理」：PAC 热刷新（?t= / ?mode=all 变化）时，
+// 压进去的上一帧本来就是本机 PAC URL，Pop() 要能回到上一个参数组合
+// （见 TestSysProxyManagerAtomicReplaceAndOldValuePop）。真正需要防的是
+// 崩溃残留被当成"原始状态"，那由 captureOriginalLocked 与 CleanupOnExit 负责。
 func (m *SysProxyManager) pushPrevStateLocked(prev SysProxyState) {
-	if isSelfProxy(prev, m.listenAddr) {
-		return
-	}
 	m.prevStates = append(m.prevStates, prev)
 }
 

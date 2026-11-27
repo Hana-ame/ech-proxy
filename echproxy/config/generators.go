@@ -355,7 +355,10 @@ function FindProxyForURL(url, host) {
     if (rb !== -1) {
       host = host.substring(1, rb);
     }
-  } else {
+  } else if (!isV6) {
+    // 只有「域名:端口」才剥端口。浏览器传给 FindProxyForURL 的 IPv6 是**不带方括号**的
+    // "2001:db8::1"，若落进这个分支会被截成 "2001"，后面 isPlainHostName("2001") 命中，
+    // 公网 IPv6 字面量就被永久强制直连了（"::1" 更会被截成空串）。
     var colonIdx = host.indexOf(":");
     if (colonIdx !== -1) {
       host = host.substring(0, colonIdx);

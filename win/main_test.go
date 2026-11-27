@@ -656,7 +656,7 @@ func TestTrayECHHTTP3ToggleDefaultOff(t *testing.T) {
 	echproxy.SetECHHTTP3(false)
 	defer echproxy.SetECHHTTP3(orig)
 
-	tc := NewTrayController("127.0.0.1:8443", "https://l.moonchan.xyz:8443", "/tmp/ca.pem", nil, &fakeConsoleDriver{}, nil)
+	tc := NewTrayController("127.0.0.1:8443", "https://l.moonchan.xyz:8443", "/tmp/ca.pem", nil, &stubConsoleDriver{}, nil)
 	if tc.ECHHTTP3Enabled() {
 		t.Fatal("ECH HTTP/3 fallback must be disabled by default")
 	}

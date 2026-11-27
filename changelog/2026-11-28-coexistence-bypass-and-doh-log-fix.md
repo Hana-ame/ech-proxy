@@ -27,12 +27,21 @@
    * **本地方式（推荐，离线可用，30 秒内热加载）**：在 `ech-proxy.exe` 同目录（或 `<dataDir>` / 当前工作目录）放置 `bypass.txt`，每行一个域名，支持 `#` / `//` 注释和 `*.example.com`：
 
      ```
-     # 命中此名单的域名直接绕过 ech-proxy，转交上游全局代理
+     # 命中此名单的域名直接绕过 ech-proxy，转交上游全局代理（自动匹配所有子域名）
+     # Google / YouTube
      google.com
      youtube.com
      googlevideo.com
+     
+     # OpenAI / ChatGPT
      openai.com
      chatgpt.com
+     
+     # Claude / Anthropic 全家桶
+     claude.ai
+     claude.com
+     anthropic.com
+     claudeusercontent.com
      
      ```
 
@@ -45,6 +54,9 @@
    ```
    # 示例：上游 Clash 混合端口为 127.0.0.1:7897
    .\ech-proxy.exe -fallback 127.0.0.1:7897
+   
+   
+   
    
    ```
 
@@ -71,6 +83,9 @@
      ```
      .\ech-proxy.exe -sys-proxy off
      
+     
+     
+     
      ```
 
    * 或启动后右键托盘图标点击 **「系统代理：清除 / 禁用系统代理 (直连)」**。
@@ -85,6 +100,9 @@
        type: http
        server: 127.0.0.1
        port: 8443
+   
+   
+   
    
    ```
 
@@ -106,6 +124,9 @@
      # 3. 其余流量走你的主力全局代理策略组
      - MATCH,PROXY
    
+   
+   
+   
    ```
 
    * 如不使用 TUN（仅 Clash 接管系统 HTTP 代理），`ech-proxy` 默认不读取系统代理环境变量，不会发生回环。
@@ -118,6 +139,9 @@
 
 ```
 2026/11/28 03:53:38.874925 netdial.go:572: [netdial] bootstrap DoH primary endpoints (1.1.1.1/1.0.0.1) unreachable for "4545810.xyz", trying domestic endpoints as last resort
+
+
+
 
 ```
 
@@ -159,7 +183,7 @@
 
 | 文件路径 | 变更说明 | 
 | ----- | ----- | 
-| `echproxy/netdial/netdial.go` | `4545810.xyz` 改走系统 DNS，失败后置位一次性标志永久回退内置 Cloudflare Anycast 广播 IP；加固冷却期日志去重与 15s 负缓存 |
+| `echproxy/netdial/netdial.go` | `4545810.xyz` 改走系统 DNS，失败后置位一次性标志永久回退内置 Cloudflare Anycast 广播 IP；加固冷却期日志去重与 15s 负缓存 | 
 | `echproxy/ech/sni.go` | `ResolveHostIPsByMode` 对 `4545810.xyz` 直接转交 `netdial.ResolveDefaultSiteHost`，不再走 DoH | 
 | `echproxy/netdial/netdial_test.go` | 新增冷却期状态转换与日志去重单元测试 | 
 | `echproxy/rewrite/paclocal.go` | 新增 `LocalBypassFileName`（`bypass.txt`）、`DefaultLocalBypassCandidates`、`ResolveBypassSource`（支持本地自动探测与在线地址） | 

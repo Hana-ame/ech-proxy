@@ -8,7 +8,7 @@
 //   - android/main.go（App 内建）：靠 android/app/src/main/cpp/jni_wrapper.c
 //     的静态 JNI 名（Java_xyz_moonchan_echproxy_MainActivity_*），写死了 App
 //     自己的包名 —— 只能给自己用。
-//   - android-lib/go/main.go（本文件，库）：靠 jni_onload.c 的 JNI_OnLoad +
+//   - android-lib/go/main.go（本文件，库）：靠 jni_onload_android.c 的 JNI_OnLoad +
 //     RegisterNatives 在运行时把函数绑到 xyz/moonchan/echproxy/android/EchProxy，
 //     与下游 App 的包名无关 —— 任意第三方 App 引 AAR 即可用。
 //
@@ -22,7 +22,9 @@
 //     go build -buildmode=c-shared -ldflags="-s -w" \
 //       -o libechproxy.so ./android-lib/go/
 //
-// 产物：libechproxy.so（Go 核心 + jni_onload.c 的 JNI 注册层，单文件，无外部依赖）。
+// 产物：libechproxy.so（Go 核心 + jni_onload_android.c 的 JNI 注册层，单文件，无外部依赖）。
+
+//go:build android
 
 package main
 

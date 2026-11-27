@@ -1,4 +1,4 @@
-// android-lib/go/jni_onload.c
+// android-lib/go/jni_onload_android.c
 //
 // ECH Proxy 嵌入式库（AAR）的 JNI 动态注册层。
 //

@@ -99,7 +99,7 @@ echproxy-android-<ver>.aar
 ## 本仓库维护
 
 - Go 导出层：[`android-lib/go/main.go`](../android-lib/go/main.go)（包装 `echproxy` 核心）
-- JNI 动态注册：[`android-lib/go/jni_onload.c`](../android-lib/go/jni_onload.c)
+- JNI 动态注册：[`android-lib/go/jni_onload_android.c`](../android-lib/go/jni_onload_android.c)
 - Java API：[`android-lib/src/main/java/.../EchProxy.java`](../android-lib/src/main/java/xyz/moonchan/echproxy/android/EchProxy.java)
 - 打包脚本：[`scripts/build-android-lib.sh`](../scripts/build-android-lib.sh)
 - CI：`.github/workflows/ech-proxy-lib.yml`（手动或 tag push，产物挂 Release）

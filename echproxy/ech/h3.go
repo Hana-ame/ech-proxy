@@ -186,7 +186,7 @@ func getECHHTTP3Client(ipMode string) (*http.Client, error) {
 	return c, nil
 }
 
-const echHTTP3FallbackTimeout = 60 * time.Second
+const echHTTP3HeaderTimeout = 30 * time.Second
 
 type cancelOnCloseReadCloser struct {
 	io.ReadCloser
@@ -202,23 +202,30 @@ func (c *cancelOnCloseReadCloser) Close() error {
 }
 
 // doECHHTTP3 仅作为 ECH 通道在 HTTP/2 失败时的备选方案调用。
-// 若调用方未设置 ctx deadline，则自动套用 60s 上限并在 resp.Body.Close 时释放 cancel，
-// 避免"对端建连后不回包"挂满空闲超时或泄漏 context。
+// 若调用方未设置 ctx deadline，仅对"等待首个响应头"阶段施加 30s 上限（拿到响应头后立即 Stop 定时器），
+// 既覆盖"建连后不回包"的挂死场景，又绝不截断长流式响应或大文件下载。
 func doECHHTTP3(req *http.Request, ipMode string) (*http.Response, error) {
 	c, err := getECHHTTP3Client(ipMode)
 	if err != nil {
 		return nil, err
 	}
-	var cancel context.CancelFunc
+	var (
+		cancel context.CancelFunc
+		timer  *time.Timer
+	)
 	if _, hasDeadline := req.Context().Deadline(); !hasDeadline {
 		var ctx context.Context
-		ctx, cancel = context.WithTimeout(req.Context(), echHTTP3FallbackTimeout)
+		ctx, cancel = context.WithCancel(req.Context())
+		timer = time.AfterFunc(echHTTP3HeaderTimeout, cancel)
 		req = req.Clone(ctx)
 	}
 	if req.Host == "" {
 		req.Host = req.URL.Host
 	}
 	resp, err := c.Do(req)
+	if timer != nil {
+		timer.Stop()
+	}
 	if err != nil {
 		if cancel != nil {
 			cancel()

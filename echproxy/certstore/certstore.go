@@ -299,7 +299,7 @@ func (st *Store) TLSConfig(portalCert *tls.Certificate) *tls.Config {
 	}
 }
 
-func (st *Store) CertificateFor(host string) (*tls.Certificate, error) {
+func (st *Store) CertificateFor(host string) (cert *tls.Certificate, err error) {
 	host = netdial.CleanHost(host)
 	if host == "" {
 		return nil, errors.New("certstore: empty host")
@@ -330,9 +330,22 @@ func (st *Store) CertificateFor(host string) (*tls.Certificate, error) {
 	st.mu.Unlock()
 
 	// 磁盘读取与 RSA-2048 密钥生成完全在锁外执行，避免并发 HTTPS 握手全局串行排队；
-	// 同域名并发请求由 st.inflight[key] 合并去重。
-	var cert *tls.Certificate
-	var err error
+	// 同域名并发请求由 st.inflight[key] 合并去重；defer 确保即使 panic 也能唤醒等待者并清理 inflight。
+	defer func() {
+		if r := recover(); r != nil {
+			cert = nil
+			err = fmt.Errorf("certstore: panic issuing leaf for %s: %v", key, r)
+		}
+		st.mu.Lock()
+		if err == nil && cert != nil {
+			st.leaf[key] = cert
+		}
+		delete(st.inflight, key)
+		call.cert, call.err = cert, err
+		close(call.done)
+		st.mu.Unlock()
+	}()
+
 	if leaf, lerr := st.loadLeaf(key); lerr == nil {
 		cert = leaf
 	} else if !os.IsNotExist(lerr) {
@@ -340,15 +353,6 @@ func (st *Store) CertificateFor(host string) (*tls.Certificate, error) {
 	} else {
 		cert, err = st.issueLeafWithCA(key, ca, crlBaseURL)
 	}
-
-	st.mu.Lock()
-	if err == nil && cert != nil {
-		st.leaf[key] = cert
-	}
-	delete(st.inflight, key)
-	call.cert, call.err = cert, err
-	close(call.done)
-	st.mu.Unlock()
 	return cert, err
 }
 
@@ -379,12 +383,15 @@ func (st *Store) loadLeaf(domain string) (*tls.Certificate, error) {
 	}
 	cert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		return nil, err
+		// 证书与私钥不匹配或文件损坏时视为需要重新签发，避免该域名永久失败
+		return nil, os.ErrNotExist
 	}
 	if len(cert.Certificate) > 0 {
-		if parsed, perr := x509.ParseCertificate(cert.Certificate[0]); perr == nil {
-			cert.Leaf = parsed
+		parsed, perr := x509.ParseCertificate(cert.Certificate[0])
+		if perr != nil {
+			return nil, os.ErrNotExist
 		}
+		cert.Leaf = parsed
 	}
 	if leafNeedsRenewal(&cert) {
 		return nil, os.ErrNotExist
@@ -455,13 +462,14 @@ func (st *Store) issueLeafWithCA(domain string, ca *CA, crlBaseURL string) (*tls
 	}
 	var fullchainPEM strings.Builder
 	fullchainPEM.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
-	fullchainPEM.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: st.ca.Cert.Raw}))
+	fullchainPEM.Write(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Cert.Raw}))
 
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-	if err := writeFileAtomic(filepath.Join(dir, leafCertFile), []byte(fullchainPEM.String()), 0o600); err != nil {
+	// 先写私钥再写证书链，且 loadLeaf 对不匹配密钥对自动重签，确保中断落盘安全自愈
+	if err := writeFileAtomic(filepath.Join(dir, leafKeyFile), keyPEM, 0o600); err != nil {
 		return nil, err
 	}
-	if err := writeFileAtomic(filepath.Join(dir, leafKeyFile), keyPEM, 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(dir, leafCertFile), []byte(fullchainPEM.String()), 0o600); err != nil {
 		return nil, err
 	}
 	tlsCert, err := tls.X509KeyPair([]byte(fullchainPEM.String()), keyPEM)

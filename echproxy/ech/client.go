@@ -58,9 +58,12 @@ const echH2PoolShards = 4
 // Client 是基于 cloudflare-ech.com ECH 域前置的 HTTP 客户端。
 // 内部维护多条独立的 http2.Transport 分片连接池（默认 4 路轮询），
 // 避免晚高峰高丢包时所有并发请求挤在同一条 TCP 连接上触发 HTTP/2 队头阻塞。
+const echShardCooldown = 30 * time.Second
+
 type Client struct {
-	pool []*http.Client
-	rr   atomic.Uint64
+	pool     []*http.Client
+	badUntil []atomic.Int64
+	rr       atomic.Uint64
 }
 
 type echEntry struct {
@@ -640,7 +643,7 @@ func newClient(echConfig []byte, ipMode string) *Client {
 			},
 		}
 	}
-	return &Client{pool: pool}
+	return &Client{pool: pool, badUntil: make([]atomic.Int64, echH2PoolShards)}
 }
 
 func (c *Client) closeIdleConnections() {
@@ -679,6 +682,41 @@ func isIdempotentNoBody(req *http.Request) bool {
 	return req.Body == nil || req.Body == http.NoBody
 }
 
+func (c *Client) pickHealthyShard(nowNano int64, exclude int) int {
+	n := len(c.pool)
+	start := int(c.rr.Add(1) % uint64(n))
+	fallback := -1
+	for step := 0; step < n; step++ {
+		i := (start + step) % n
+		if i == exclude {
+			continue
+		}
+		if fallback == -1 {
+			fallback = i
+		}
+		if i < len(c.badUntil) && c.badUntil[i].Load() > nowNano {
+			continue
+		}
+		return i
+	}
+	if fallback != -1 {
+		return fallback
+	}
+	return start
+}
+
+func (c *Client) markShardBad(idx int) {
+	if idx >= 0 && idx < len(c.badUntil) {
+		c.badUntil[idx].Store(time.Now().Add(echShardCooldown).UnixNano())
+	}
+}
+
+func (c *Client) clearShardBad(idx int) {
+	if idx >= 0 && idx < len(c.badUntil) {
+		c.badUntil[idx].Store(0)
+	}
+}
+
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if c == nil || len(c.pool) == 0 {
 		return nil, errors.New("ech client pool is empty")
@@ -686,15 +724,30 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	if req.Host == "" {
 		req.Host = req.URL.Host
 	}
-	n := uint64(len(c.pool))
-	idx := c.rr.Add(1) % n
+	nowNano := time.Now().UnixNano()
+	idx := c.pickHealthyShard(nowNano, -1)
 	resp, err := c.pool[idx].Do(req)
-	if err == nil || n < 2 || IsCertError(err) || req.Context().Err() != nil || !isIdempotentNoBody(req) {
+	if err == nil {
+		c.clearShardBad(idx)
+		return resp, nil
+	}
+	if !IsCertError(err) && (req.Context() == nil || req.Context().Err() == nil) {
+		c.markShardBad(idx)
+	}
+	if len(c.pool) < 2 || IsCertError(err) || (req.Context() != nil && req.Context().Err() != nil) || !isIdempotentNoBody(req) {
 		return resp, err
 	}
-	// 某条 H2 分片劣化时对无 Body 幂等请求自动换下一分片重试一次，避免持续性 25% 失败率
-	nextIdx := (idx + 1) % n
-	return c.pool[nextIdx].Do(req)
+	// 某条 H2 分片劣化时标记冷却并切换健康分片重试一次；两次均失败时用 errors.Join 保留双错误上下文
+	nextIdx := c.pickHealthyShard(time.Now().UnixNano(), idx)
+	resp2, err2 := c.pool[nextIdx].Do(req)
+	if err2 == nil {
+		c.clearShardBad(nextIdx)
+		return resp2, nil
+	}
+	if !IsCertError(err2) && (req.Context() == nil || req.Context().Err() == nil) {
+		c.markShardBad(nextIdx)
+	}
+	return nil, errors.Join(err, err2)
 }
 
 func getECHClient(ipMode string) (*Client, error) {
@@ -750,9 +803,11 @@ func Do(req *http.Request, ipMode ...string) (*http.Response, error) {
 	}
 	if GetECHHTTP3() && !IsCertError(err) && !errors.Is(err, context.Canceled) && (req.Context() == nil || req.Context().Err() == nil) {
 		rewindRequestBody(req)
-		if h3Resp, h3Err := doECHHTTP3(req, mode); h3Err == nil {
+		h3Resp, h3Err := doECHHTTP3(req, mode)
+		if h3Err == nil {
 			return h3Resp, nil
 		}
+		return nil, errors.Join(err, fmt.Errorf("ech h3 fallback: %w", h3Err))
 	}
 	return nil, err
 }

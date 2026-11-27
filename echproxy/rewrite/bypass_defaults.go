@@ -1,7 +1,9 @@
 package rewrite
 
+import "sync"
+
 // defaultSensitiveBypassDomains 是内置的高敏感域名默认绕过清单（定长私有数组，防止外部包篡改）。
-// 覆盖网银、支付、密码管理器、系统更新、第三方 OCSP/CRL 信任链及核心账号登录域名。
+// 覆盖网银、支付、微信认证（不误伤 mp.weixin.qq.com）、密码管理器、系统更新、成对 OCSP/CRL 信任链及核心账号登录。
 var defaultSensitiveBypassDomains = [...]string{
 	// 中国主流网银与银联（Banking CN）
 	"icbc.com.cn",
@@ -39,12 +41,13 @@ var defaultSensitiveBypassDomains = [...]string{
 	"interactivebrokers.com",
 	"wise.com",
 	"revolut.com",
-	// 支付与钱包（Payment）
+	// 支付、钱包与微信认证（Payment & WeChat Auth，保留 mp.weixin.qq.com 正常走代理）
 	"alipay.com",
 	"alipayobjects.com",
 	"tenpay.com",
-	"weixin.qq.com",
 	"pay.weixin.qq.com",
+	"open.weixin.qq.com",
+	"login.weixin.qq.com",
 	"paypal.com",
 	"paypalobjects.com",
 	"stripe.com",
@@ -73,7 +76,7 @@ var defaultSensitiveBypassDomains = [...]string{
 	"enpass.io",
 	"keepersecurity.com",
 	"yubico.com",
-	// 操作系统更新与证书吊销/OCSP/CRL 信任服务（OS Updates & PKI Trust）
+	// 操作系统更新与成对 OCSP/CRL 证书信任服务（OS Updates & PKI Trust）
 	"windowsupdate.com",
 	"update.microsoft.com",
 	"download.windowsupdate.com",
@@ -91,7 +94,15 @@ var defaultSensitiveBypassDomains = [...]string{
 	"crl.apple.com",
 	"crl.microsoft.com",
 	"ocsp.digicert.com",
+	"crl.digicert.com",
+	"crl3.digicert.com",
+	"crl4.digicert.com",
 	"ocsp.pki.goog",
+	"crl.pki.goog",
+	"ocsp.starfieldtech.com",
+	"crl.starfieldtech.com",
+	"ocsp.verisign.com",
+	"crl.verisign.com",
 	"ocsp.sectigo.com",
 	"crl.sectigo.com",
 	"ocsp.usertrust.com",
@@ -99,8 +110,11 @@ var defaultSensitiveBypassDomains = [...]string{
 	"ocsp.globalsign.com",
 	"crl.globalsign.com",
 	"ocsp.comodoca.com",
+	"crl.comodoca.com",
 	"ocsp.entrust.net",
+	"crl.entrust.net",
 	"ocsp.godaddy.com",
+	"crl.godaddy.com",
 	"ocsp.r2m01.amazontrust.com",
 	"ocsp.sca1b.amazontrust.com",
 	// 核心账号登录与 OAuth 强校验域名（Core Auth）
@@ -111,15 +125,25 @@ var defaultSensitiveBypassDomains = [...]string{
 	"idmsa.apple.com",
 }
 
+// defaultSensitiveBypassNormalized 使用 sync.OnceValue 预计算归一化后的只读兜底快照，
+// 避免在空表/远端不可达时每次 CONNECT / BypassList() 重复分配和归一化。
+var defaultSensitiveBypassNormalized = sync.OnceValue(func() []string {
+	return normalizeDomainSlice(defaultSensitiveBypassDomains[:])
+})
+
 // DefaultSensitiveBypassDomains 返回内置高敏感绕过域名清单的只读副本。
 func DefaultSensitiveBypassDomains() []string {
-	return append([]string(nil), defaultSensitiveBypassDomains[:]...)
+	return append([]string(nil), defaultSensitiveBypassNormalized()...)
 }
 
 // MergeWithDefaultSensitiveBypass 将用户/远端 bypass.txt 列表与内置高敏感绕过域名合并去重。
 func MergeWithDefaultSensitiveBypass(domains []string) []string {
-	merged := make([]string, 0, len(defaultSensitiveBypassDomains)+len(domains))
-	merged = append(merged, defaultSensitiveBypassDomains[:]...)
+	if len(domains) == 0 {
+		return append([]string(nil), defaultSensitiveBypassNormalized()...)
+	}
+	base := defaultSensitiveBypassNormalized()
+	merged := make([]string, 0, len(base)+len(domains))
+	merged = append(merged, base...)
 	merged = append(merged, domains...)
 	return normalizeDomainSlice(merged)
 }

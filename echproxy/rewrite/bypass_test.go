@@ -103,6 +103,12 @@ func TestDefaultSensitiveBypassDomainsImmutableAndPKICoverage(t *testing.T) {
 		"login.weixin.qq.com",
 		"accounts.google.com",
 		"crl.apple.com",
+		"pay.weixin.qq.com",
+		"crl3.digicert.com",
+		"crl.pki.goog",
+		"ocsp.starfieldtech.com",
+		"crl.starfieldtech.com",
+		"ocsp.verisign.com",
 		"ocsp.sectigo.com",
 		"ocsp.usertrust.com",
 		"ocsp.globalsign.com",
@@ -110,5 +116,8 @@ func TestDefaultSensitiveBypassDomainsImmutableAndPKICoverage(t *testing.T) {
 		if !mgr.IsBypassed(host) {
 			t.Errorf("expected %q to be protected by DefaultSensitiveBypassDomains", host)
 		}
+	}
+	if mgr.IsBypassed("mp.weixin.qq.com") {
+		t.Error("mp.weixin.qq.com must NOT be bypassed by DefaultSensitiveBypassDomains")
 	}
 }

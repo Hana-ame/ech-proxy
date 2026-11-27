@@ -165,3 +165,35 @@ func TestConcurrentCertificateForSingleflightAndRaceSafety(t *testing.T) {
 		t.Fatalf("concurrent CertificateFor failed: %v", err)
 	}
 }
+
+func TestLoadLeafSelfHealsOnMismatchedKeyPair(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	domain := "corrupt-leaf.example"
+	if _, err := st.CertificateFor(domain); err != nil {
+		t.Fatalf("initial CertificateFor: %v", err)
+	}
+	// 破坏磁盘上的私钥并清空内存缓存，模拟中途断电或旧备份密钥不匹配
+	dir := st.leafDir(domain)
+	badKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	badKeyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(badKey)})
+	if err := os.WriteFile(filepath.Join(dir, leafKeyFile), badKeyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st.mu.Lock()
+	delete(st.leaf, domain)
+	st.mu.Unlock()
+
+	healed, err := st.CertificateFor(domain)
+	if err != nil {
+		t.Fatalf("CertificateFor should self-heal mismatched leaf keypair, got err=%v", err)
+	}
+	if healed == nil || len(healed.Certificate) < 2 {
+		t.Fatalf("expected valid re-issued leaf chain after self-heal")
+	}
+}

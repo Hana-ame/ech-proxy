@@ -550,8 +550,8 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	}
 	emptyWL := []string{}
 	m.whitelistPtr.Store(&emptyWL)
-	emptyBypass := []string{}
-	m.bypassPtr.Store(&emptyBypass)
+	defaultBypass := defaultSensitiveBypassNormalized()
+	m.bypassPtr.Store(&defaultBypass)
 	m.enabled.Store(opts.Enabled && !opts.SkipAdScript)
 	m.skipAdBlock.Store(opts.SkipAdBlock)
 	m.allMode.Store(opts.AllMode)
@@ -895,22 +895,32 @@ func (m *AdScriptManager) BypassLocalPath() string {
 	return m.bypassLocalPath
 }
 
-func (m *AdScriptManager) BypassList() []string {
+func (m *AdScriptManager) bypassSliceReadOnly() []string {
 	if m == nil {
-		return MergeWithDefaultSensitiveBypass(nil)
+		return defaultSensitiveBypassNormalized()
 	}
 	ptr := m.bypassPtr.Load()
 	if ptr == nil || len(*ptr) == 0 {
-		return MergeWithDefaultSensitiveBypass(nil)
+		return defaultSensitiveBypassNormalized()
 	}
-	return append([]string(nil), (*ptr)...)
+	return *ptr
+}
+
+func (m *AdScriptManager) BypassList() []string {
+	src := m.bypassSliceReadOnly()
+	return append([]string(nil), src...)
 }
 
 func (m *AdScriptManager) SwapBypassList(domains []string) []string {
 	if m == nil {
 		return []string{}
 	}
-	norm := MergeWithDefaultSensitiveBypass(domains)
+	var norm []string
+	if len(domains) == 0 {
+		norm = defaultSensitiveBypassNormalized()
+	} else {
+		norm = MergeWithDefaultSensitiveBypass(domains)
+	}
 	oldPtr := m.bypassPtr.Swap(&norm)
 	if oldPtr == nil {
 		return []string{}
@@ -926,10 +936,7 @@ func (m *AdScriptManager) IsBypassed(hosts ...string) bool {
 	if m == nil {
 		return false
 	}
-	bp := m.BypassList()
-	if len(bp) == 0 {
-		return false
-	}
+	bp := m.bypassSliceReadOnly()
 	for _, h := range hosts {
 		if MatchDomainInList(h, bp) {
 			return true

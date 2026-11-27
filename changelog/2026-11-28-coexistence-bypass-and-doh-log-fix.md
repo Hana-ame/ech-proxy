@@ -297,3 +297,16 @@
 5. **修复 `DefaultDataDir` 的 `nil` 错误 `%w` 格式化（`echproxy/certstore/certstore.go`）**：当 `os.UserConfigDir()` 返回空路径且 `err == nil` 时改为明确返回非 nil 错误，避免出现 `%!w(<nil>)`。
 6. **锁外生成 RSA-2048 叶子证书 + 按域名 singleflight 去重（`echproxy/certstore/certstore.go`）**：`CertificateFor` 释放 `st.mu` 后再执行磁盘加载与 RSA-2048 密钥生成，同时用 `st.inflight[key]` 合并同域名并发握手请求，消除并发打开多站点时的全局串行排队与到期集中续期卡顿。
 7. **新增回归单测**：补充 `TestDefaultSensitiveBypassDomainsImmutableAndPKICoverage`、`TestZeroValueClientDoReturnsErrorWithoutPanic`、`TestConcurrentCertificateForSingleflightAndRaceSafety`。
+
+## 9. 深度代码评审 10 项修复（v3.6.5-r3）
+
+1. **ECH HTTP/3 改为仅限制响应头等待（`echproxy/ech/h3.go`）**：将 `context.WithTimeout` 改为 `context.WithCancel` + `time.AfterFunc(30s, cancel)` 并在 `c.Do(req)` 返回后立刻 `timer.Stop()`，既防止建连后不回包挂死，又绝不静默截断流式响应与大文件下载。
+2. **`loadLeaf` 密钥对不匹配自愈 + 先写私钥后写证书（`echproxy/certstore/certstore.go`）**：`tls.X509KeyPair` 或 `x509.ParseCertificate` 失败时返回 `os.ErrNotExist` 触发自动重签；`issueLeafWithCA` 调整为先落盘 `privkey.pem` 再落盘 `fullchain.pem`，彻底消除半写状态导致的域名永久失效。
+3. **收窄微信绕过范围（`bypass.txt` & `echproxy/rewrite/bypass_defaults.go`）**：移除过宽的 `weixin.qq.com`，精准保留 `pay.weixin.qq.com`、`open.weixin.qq.com`、`login.weixin.qq.com`，避免误伤公众号文章页 `mp.weixin.qq.com`。
+4. **明确 `bypass.txt` 无 `-fallback` 时的行为说明（`bypass.txt`）**：在文件头注释中点明未配置 `-fallback` 时命中绕过清单会退回 `DIRECT`（涉及 `accounts.google.com` 等境外登录域）。
+5. **消除 `BypassList()` / `IsBypassed()` 热路径重复分配（`echproxy/rewrite/bypass_defaults.go` & `adscript.go`）**：使用 `sync.OnceValue` 预计算归一化兜底快照并初始化 `bypassPtr`，`IsBypassed()` 改为只读零分配查询。
+6. **ECH 4 路分片健康冷却标记（`echproxy/ech/client.go`）**：为 `Client` 增加按分片的 `badUntil []atomic.Int64`（30s 冷却），劣化分片在冷却期内自动跳过，消除重试前仍有 25% 请求先撞坏分片导致的延迟翻倍。
+7. **保留双阶段完整错误上下文（`echproxy/ech/client.go`）**：分片重试与 HTTP/3 回退均失败时使用 `errors.Join` 合并首次与末次错误，避免真实首错被吞掉。
+8. **`inflight` 并发签发增加 `defer` + `recover` 防死锁（`echproxy/certstore/certstore.go`）**：使用具名返回值并在 `defer` 中兜底 `recover`、删除 `st.inflight[key]` 并 `close(call.done)`，防止异常 panic 永久阻塞同域名后续握手。
+9. **补全成对 OCSP/CRL 域名（`bypass.txt` & `echproxy/rewrite/bypass_defaults.go`）**：补齐 `crl.digicert.com`/`crl3.digicert.com`/`crl4.digicert.com`、`crl.pki.goog`、`ocsp.starfieldtech.com`/`crl.starfieldtech.com`、`ocsp.verisign.com`/`crl.verisign.com` 及 `crl.comodoca.com`/`crl.entrust.net`/`crl.godaddy.com`。
+10. **清理两处遗留**：删除 `echproxy/server.go` 中未被引用的 `DefaultSensitiveBypassDomains` 死别名；将 `issueLeafWithCA` 内残留的 `st.ca.Cert.Raw` 统一为参数 `ca.Cert.Raw`。

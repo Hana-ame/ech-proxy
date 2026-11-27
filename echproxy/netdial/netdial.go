@@ -498,7 +498,6 @@ func queryBootstrapEndpoint(ctx context.Context, ep bootstrapEndpoint, host stri
 	return ips, nil
 }
 
-
 func builtinCloudflareIPsForMode(mode string) ([]string, error) {
 	filtered := FilterIPsByMode(builtinCloudflareAnycastIPs, mode)
 	if len(filtered) == 0 {
@@ -1013,10 +1012,15 @@ func TransportWithIPMode(mode string) *http.Transport {
 }
 
 func TransportWithIPModeAndCertCheck(mode string, certCheck func(host string, peerCerts []*x509.Certificate) error) *http.Transport {
+	// 这里绝不能把 "dual" 夹成 DefaultIPMode。
+	// EffectiveIPMode 已经做过归一化（未知/空值 → v4），所以早先那三行
+	// `if norm != "v4" && norm != "v6" { norm = DefaultIPMode }` 唯一真实效果就是
+	// 把 dual 悄悄改成 v4：直连路径（directDo）下，纯 IPv6 站点在 dual 模式下
+	// 必然解析失败（FilterIPsByMode 把 AAAA 全滤掉 → "no A record"）。
+	// 保留 dual 后，解析仍走 netdial.DoHResolver = ech.ResolveHostIPsByMode，
+	// 而 doResolveHostIPs 对 dual 已是「先查 A，拿到结果就不再查 AAAA」，
+	// 于是直连侧自动继承同一套 v4 优先语义，同时补上「无 A 记录时查 AAAA」的兜底。
 	norm := EffectiveIPMode(mode)
-	if norm != "v4" && norm != "v6" {
-		norm = DefaultIPMode
-	}
 	return &http.Transport{
 		DialTLSContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)

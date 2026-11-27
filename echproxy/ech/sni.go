@@ -820,6 +820,11 @@ func doResolveHostIPs(ctx context.Context, host, normMode, cacheKey string) ([]s
 			}
 			resp.Body.Close()
 		}
+		// dual 的语义是「v4 优先、v6 兜底」，不是「两族都查」：
+		// qtypes 顺序固定为 [A, AAAA]，A 只要有结果就直接跳出，AAAA 只在
+		// 「域名没有 A 记录」（纯 v6 站点）时才被查询。别改成无条件查两族——
+		// 墙内双栈域名一旦把 v6 候选交给 HappyEyeballs 竞速，遇到「有地址无路由」
+		// 的网络会白等一轮超时，而 v4 本来就是通的。
 		if normMode == "dual" && len(ips) > 0 {
 			break
 		}

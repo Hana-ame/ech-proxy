@@ -1004,7 +1004,11 @@ func main() {
 			srv.AdScript.SetOnWhitelistUpdated(func(domains []string) {
 				if sysProxyMgr != nil && sysProxyMgr.Mode() == SysProxyPAC {
 					log.Printf("[PAC] Whitelist updated (%d domains), refreshing system proxy PAC URL...", len(domains))
-					if err := sysProxyMgr.SetMode(SysProxyPAC); err != nil {
+					// 必须用 RefreshPAC（只换 PAC URL）而不是 SetMode(SysProxyPAC)：
+					// SetMode 每次都会把「切换前状态」压进恢复栈，而白名单每 30s 就可能刷新一次，
+					// 几百次之后恢复栈里塞满指向自己的 PAC 帧，Pop/CleanupOnExit 的语义全被污染。
+					// 同文件下方的 bypass 回调用的正是 RefreshPAC。
+					if _, _, err := sysProxyMgr.RefreshPAC(); err != nil {
 						log.Printf("WARNING: Failed to refresh system proxy PAC: %v", err)
 					}
 				}

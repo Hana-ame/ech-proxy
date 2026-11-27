@@ -186,7 +186,10 @@ func (tc *TrayController) SetAllMode(all bool) error {
 	switch {
 	case sp != nil && sp.Mode() == SysProxyPAC:
 		_, _, err = sp.RefreshPAC()
-	case sp != nil && sp.Mode() == SysProxyOff:
+	case sp != nil && sp.Mode() == SysProxyOff && all:
+		// 只有「打开全代理」才顺带把系统代理切到 PAC。关闭全代理时若当前是直连，
+		// 说明用户本来就是直连（或主动关掉了系统代理），此时再 SetMode(PAC)
+		// 等于替用户把代理重新打开 —— 表现为「点了取消全代理，结果整个系统开始走代理」。
 		err = sp.SetMode(SysProxyPAC)
 	}
 

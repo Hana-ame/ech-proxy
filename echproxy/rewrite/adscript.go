@@ -911,9 +911,13 @@ func (m *AdScriptManager) BypassList() []string {
 	return append([]string(nil), src...)
 }
 
-func (m *AdScriptManager) SwapBypassList(domains []string) []string {
+// swapBypassListBoth 与 SwapBypassList 相同，但同时返回「已合并内置敏感域」的新表。
+//
+// 调用方需要「同形态」比较：SwapBypassList 返回的旧表是合并后的，而传入的 domains
+// 是文件原文，二者直接对比永远不相等（内置项恒非空）。
+func (m *AdScriptManager) swapBypassListBoth(domains []string) (prev, cur []string) {
 	if m == nil {
-		return []string{}
+		return []string{}, []string{}
 	}
 	var norm []string
 	if len(domains) == 0 {
@@ -923,9 +927,14 @@ func (m *AdScriptManager) SwapBypassList(domains []string) []string {
 	}
 	oldPtr := m.bypassPtr.Swap(&norm)
 	if oldPtr == nil {
-		return []string{}
+		return []string{}, norm
 	}
-	return append([]string(nil), (*oldPtr)...)
+	return append([]string(nil), (*oldPtr)...), norm
+}
+
+func (m *AdScriptManager) SwapBypassList(domains []string) []string {
+	prev, _ := m.swapBypassListBoth(domains)
+	return prev
 }
 
 func (m *AdScriptManager) SetBypassList(domains []string) {
@@ -980,7 +989,7 @@ func (m *AdScriptManager) RefreshBypassOnce() ([]string, error) {
 		}
 		return m.BypassList(), fmt.Errorf("parse bypass list from %s: %w", url, perr)
 	}
-	prev := m.SwapBypassList(domains)
+	prev, cur := m.swapBypassListBoth(domains)
 	if cacheDir != "" && len(raw) > 0 && kind != WhitelistKindLocal {
 		_ = os.MkdirAll(cacheDir, 0o755)
 		_ = os.WriteFile(filepath.Join(cacheDir, cachedBypassName), raw, 0o644)
@@ -988,7 +997,9 @@ func (m *AdScriptManager) RefreshBypassOnce() ([]string, error) {
 	m.mu.RLock()
 	cb := m.onBypassUpdated
 	m.mu.RUnlock()
-	if cb != nil && !slicesEqual(prev, domains) {
+	// 必须和「合并内置敏感域后的新表」比较，不能拿文件原文比：旧表永远是合并过的，
+	// 本地 bypass.txt 存在时两者恒不相等，回调会每 30 秒触发一次（重建 PAC + 热刷新系统代理）。
+	if cb != nil && !slicesEqual(prev, cur) {
 		cb(domains)
 	}
 	return append([]string(nil), domains...), nil

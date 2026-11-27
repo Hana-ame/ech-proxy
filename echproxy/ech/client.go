@@ -66,6 +66,11 @@ type Client struct {
 	pool     []*http.Client
 	badUntil []atomic.Int64
 	rr       atomic.Uint64
+
+	// ipMode / force 记录创建参数：ECH 配置热更新时 refreshLoop 要按原样重建池，
+	// 而池的 map 键把 force 也编进去了（"v4|force"），不能拿键当 ipMode 用。
+	ipMode string
+	force  bool
 }
 
 type echEntry struct {
@@ -426,8 +431,8 @@ func fetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
 // 代理直接启动不起来。这里把预算拉到约 2 分钟（8 次尝试、退避翻倍封顶 30s），
 // 配合 QueryDoH 内部「首选 → 1.1.1.1 → 223.5.5.5」三级回退，窗口内基本自愈。
 const (
-	echFetchAttempts    = 8
-	echFetchMaxBackoff  = 30 * time.Second
+	echFetchAttempts   = 8
+	echFetchMaxBackoff = 30 * time.Second
 )
 
 func doFetchECHConfig(ctx context.Context, domain string) ([]byte, error) {
@@ -575,7 +580,16 @@ func parseSVCBWire(wire []byte) ([]byte, error) {
 	return nil, fmt.Errorf("ECH SvcParam not found")
 }
 
-func newTransport(echConfig []byte, ipMode string) *http2.Transport {
+// newTransport 构造 ECH-H2 通道的 transport。
+//
+// force 对应请求上的「强行访问」标记（WithAllowBadCert）。它必须固定在 transport 上、
+// 并按 force 分池，理由有两条：
+//  1. 证书校验只发生在**首次拨号**（下方 validateUpstreamCert），连接一旦进了池，
+//     后续请求直接复用，不会重新校验。若 force 连接与普通连接共池，用户对某个
+//     MITM 站点点过一次「强行访问」，之后该站点所有普通请求都会静默复用这条未校验连接。
+//  2. http2.Transport 的 DialTLSContext 拿到的是它自己的 ctx，不保证携带请求 ctx 上的
+//     value；不显式注入就会让「强行访问」在该通道静默失效（校验永远跑）。
+func newTransport(echConfig []byte, ipMode string, force bool) *http2.Transport {
 	return &http2.Transport{
 		AllowHTTP:       false,
 		IdleConnTimeout: 15 * time.Second,
@@ -585,6 +599,9 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 			host, _, err := net.SplitHostPort(addr)
 			if err != nil {
 				return nil, err
+			}
+			if force {
+				ctx = WithAllowBadCert(ctx)
 			}
 			uCfg := &utls.Config{
 				ServerName:                     host,
@@ -661,18 +678,23 @@ func newTransport(echConfig []byte, ipMode string) *http2.Transport {
 	}
 }
 
-func newClient(echConfig []byte, ipMode string) *Client {
+func newClient(echConfig []byte, ipMode string, force bool) *Client {
 	pool := make([]*http.Client, echH2PoolShards)
 	for i := 0; i < echH2PoolShards; i++ {
 		pool[i] = &http.Client{
-			Transport: newTransport(echConfig, ipMode),
+			Transport: newTransport(echConfig, ipMode, force),
 			Timeout:   0,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
 		}
 	}
-	return &Client{pool: pool, badUntil: make([]atomic.Int64, echH2PoolShards)}
+	return &Client{
+		pool:     pool,
+		badUntil: make([]atomic.Int64, echH2PoolShards),
+		ipMode:   ipMode,
+		force:    force,
+	}
 }
 
 func (c *Client) closeIdleConnections() {
@@ -696,7 +718,7 @@ func New() (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newClient(echConfig, netdial.DefaultIPMode), nil
+	return newClient(echConfig, netdial.DefaultIPMode, false), nil
 }
 
 func isIdempotentNoBody(req *http.Request) bool {
@@ -779,14 +801,20 @@ func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	return nil, errors.Join(err, err2)
 }
 
-func getECHClient(ipMode string) (*Client, error) {
+func getECHClient(ipMode string, force bool) (*Client, error) {
 	mode := netdial.NormalizeIPMode(ipMode)
 	if mode == "" {
 		mode = currentConfig().ipMode
 	}
 	mode = netdial.EffectiveIPMode(mode)
+	// 「强行访问」必须独占一套池（见 newTransport 注释）：未校验的连接一旦与普通请求
+	// 共池，后续请求就会静默跳过证书校验。
+	cacheKey := mode
+	if force {
+		cacheKey += "|force"
+	}
 	clientsMu.Lock()
-	if c, ok := clients[mode]; ok {
+	if c, ok := clients[cacheKey]; ok {
 		clientsMu.Unlock()
 		return c, nil
 	}
@@ -807,11 +835,11 @@ func getECHClient(ipMode string) (*Client, error) {
 
 	clientsMu.Lock()
 	defer clientsMu.Unlock()
-	if c, ok := clients[mode]; ok {
+	if c, ok := clients[cacheKey]; ok {
 		return c, nil
 	}
-	c := newClient(lastECHConfig, mode)
-	clients[mode] = c
+	c := newClient(lastECHConfig, mode, force)
+	clients[cacheKey] = c
 	return c, nil
 }
 
@@ -822,7 +850,7 @@ func Do(req *http.Request, ipMode ...string) (*http.Response, error) {
 	if len(ipMode) > 0 {
 		mode = ipMode[0]
 	}
-	c, err := getECHClient(mode)
+	c, err := getECHClient(mode, req != nil && allowBadCert(req.Context()))
 	if err != nil {
 		return nil, err
 	}
@@ -852,7 +880,7 @@ func InitDefault() error {
 	clientsMu.Lock()
 	lastECHConfig = cfg
 	clientsMu.Unlock()
-	if _, err := getECHClient(""); err != nil {
+	if _, err := getECHClient("", false); err != nil {
 		return err
 	}
 	refreshOnce.Do(func() {
@@ -881,9 +909,10 @@ func refreshLoop() {
 		}
 		lastECHConfig = echConfig
 		var oldClients []*Client
-		for mode, old := range clients {
+		for key, old := range clients {
 			oldClients = append(oldClients, old)
-			clients[mode] = newClient(echConfig, mode)
+			// 键可能带 "|force" 后缀，不能当 ipMode 用：按 Client 记录的原参数重建。
+			clients[key] = newClient(echConfig, old.ipMode, old.force)
 		}
 		clientsMu.Unlock()
 		for _, old := range oldClients {

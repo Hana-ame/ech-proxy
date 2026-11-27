@@ -230,6 +230,17 @@ func replaceWildcardDomain(body []byte, suffix, target string) []byte {
 			out = append(out, rest...)
 			break
 		}
+		// 通配规则 *.example.com 只能命中「点分隔的子域」。body 里的 notexample.com
+		// 同样含有 "example.com"，但前一个字符是 't' —— 那是另一个域名，不是子域。
+		// 缺这个校验会把它一并改写过去（左边界只剩 isDomainChar 的判断，而它对这个
+		// 位置天然为真，因为 walk-back 恰好停在域名起点）。
+		// "%2E" / "%2e" 视作点：URL 编码过的子域分隔符在 HTML/JSON 正文里很常见。
+		if i > 0 && rest[i-1] != '.' &&
+			!(i >= 3 && rest[i-3] == '%' && rest[i-2] == '2' && (rest[i-1] == 'e' || rest[i-1] == 'E')) {
+			out = append(out, rest[:i+len(suffix)]...)
+			rest = rest[i+len(suffix):]
+			continue
+		}
 		start := i
 		for start > 0 && isDomainChar(rest[start-1]) {
 			if start >= 3 && rest[start-3] == '%' && isHexDigit(rest[start-2]) && isHexDigit(rest[start-1]) {

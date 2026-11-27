@@ -81,7 +81,7 @@ func closeECHHTTP3IdleConnections() {
 	}
 }
 
-func newECHHTTP3Client(echConfig []byte, ipMode string) *http.Client {
+func newECHHTTP3Client(echConfig []byte, ipMode string, force bool) *http.Client {
 	cfgCopy := append([]byte(nil), echConfig...)
 	tr := &http3.Transport{
 		TLSClientConfig: &tls.Config{
@@ -126,8 +126,14 @@ func newECHHTTP3Client(echConfig []byte, ipMode string) *http.Client {
 			perHostTLS.NextProtos = []string{http3.NextProtoH3}
 			// 交由统一证书核对函数 validateUpstreamCert 校验真实域名与有效期
 			perHostTLS.InsecureSkipVerify = true
+			// 「强行访问」必须显式注入校验 ctx：quic-go 传进来的 ctx 不保证携带
+			// 请求 ctx 上的 value，否则该通道的强行访问会静默失效。
+			certCtx := ctx
+			if force {
+				certCtx = WithAllowBadCert(ctx)
+			}
 			perHostTLS.VerifyConnection = func(cs tls.ConnectionState) error {
-				return validateUpstreamCert(ctx, host, cs.PeerCertificates)
+				return validateUpstreamCert(certCtx, host, cs.PeerCertificates)
 			}
 
 			var lastErr error
@@ -166,15 +172,20 @@ func newECHHTTP3Client(echConfig []byte, ipMode string) *http.Client {
 	}
 }
 
-func getECHHTTP3Client(ipMode string) (*http.Client, error) {
+func getECHHTTP3Client(ipMode string, force bool) (*http.Client, error) {
 	mode := netdial.NormalizeIPMode(ipMode)
 	if mode == "" {
 		mode = currentConfig().ipMode
 	}
 	mode = netdial.EffectiveIPMode(mode)
+	// 同 ECH-H2：未做证书校验的「强行访问」连接必须独占一套池。
+	cacheKey := mode
+	if force {
+		cacheKey += "|force"
+	}
 
 	h3ClientsMu.Lock()
-	if c, ok := h3Clients[mode]; ok {
+	if c, ok := h3Clients[cacheKey]; ok {
 		h3ClientsMu.Unlock()
 		return c, nil
 	}
@@ -199,11 +210,11 @@ func getECHHTTP3Client(ipMode string) (*http.Client, error) {
 
 	h3ClientsMu.Lock()
 	defer h3ClientsMu.Unlock()
-	if c, ok := h3Clients[mode]; ok {
+	if c, ok := h3Clients[cacheKey]; ok {
 		return c, nil
 	}
-	c := newECHHTTP3Client(cfg, mode)
-	h3Clients[mode] = c
+	c := newECHHTTP3Client(cfg, mode, force)
+	h3Clients[cacheKey] = c
 	return c, nil
 }
 
@@ -226,7 +237,7 @@ func (c *cancelOnCloseReadCloser) Close() error {
 // 若调用方未设置 ctx deadline，仅对"等待首个响应头"阶段施加 30s 上限（拿到响应头后立即 Stop 定时器），
 // 既覆盖"建连后不回包"的挂死场景，又绝不截断长流式响应或大文件下载。
 func doECHHTTP3(req *http.Request, ipMode string) (*http.Response, error) {
-	c, err := getECHHTTP3Client(ipMode)
+	c, err := getECHHTTP3Client(ipMode, req != nil && allowBadCert(req.Context()))
 	if err != nil {
 		return nil, err
 	}

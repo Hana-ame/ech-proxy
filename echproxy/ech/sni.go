@@ -846,12 +846,18 @@ func doResolveHostIPs(ctx context.Context, host, normMode, cacheKey string) ([]s
 	return ips, nil
 }
 
-func dialUTLSOnce(ctx context.Context, ip, sniName, verifyHost string, nextProtos []string, helloID utls.ClientHelloID, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
+func dialUTLSOnce(ctx context.Context, ip, port, sniName, verifyHost string, nextProtos []string, helloID utls.ClientHelloID, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
 	tcpTimeout := 3500 * time.Millisecond
+	// 端口不能写死 443：原域名模式下客户端可能访问 2053/2083/2087/2096/8443 等
+	// MITM 认可的非标 HTTPS 端口（proxy.go 已把它们保留进上游地址），
+	// 拨到 443 会打到另一个服务或直接握手失败。
+	if port == "" {
+		port = "443"
+	}
 	rawConn, err := (&net.Dialer{
 		Timeout:   tcpTimeout,
 		KeepAlive: 30 * time.Second,
-	}).DialContext(ctx, "tcp", net.JoinHostPort(ip, "443"))
+	}).DialContext(ctx, "tcp", net.JoinHostPort(ip, port))
 	if err != nil {
 		return nil, err
 	}
@@ -904,8 +910,8 @@ func isTLSRetryableError(err error) bool {
 //     自动无感降级至「纯 TCP 层分段 + Chrome_120」以及「纯 TCP 层分段 + Firefox_120（不含实验性 Kyber 扩展）」，
 //     确保既能绕过 GFW SNI 检测，又能 100% 兼容各类严苛源站 TLS 栈。
 //   - 若首次拨号就是 TCP 连接/握手超时，立即跳过该 IP，杜绝同一个死 IP 串行重试 3 次（10s x 3 = 30s）。
-func dialUTLSWithWrapper(ctx context.Context, ip, sniName, verifyHost string, nextProtos []string, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
-	uConn, err := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloChrome_120, wrapConn)
+func dialUTLSWithWrapper(ctx context.Context, ip, port, sniName, verifyHost string, nextProtos []string, wrapConn func(net.Conn) net.Conn) (*utls.UConn, error) {
+	uConn, err := dialUTLSOnce(ctx, ip, port, sniName, verifyHost, nextProtos, utls.HelloChrome_120, wrapConn)
 	if err == nil || ctx.Err() != nil {
 		return uConn, err
 	}
@@ -919,10 +925,10 @@ func dialUTLSWithWrapper(ctx context.Context, ip, sniName, verifyHost string, ne
 		tcpWrap := func(c net.Conn) net.Conn {
 			return newTCPFragmentConn(c, 32)
 		}
-		if uConn2, err2 := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloChrome_120, tcpWrap); err2 == nil || IsCertError(err2) {
+		if uConn2, err2 := dialUTLSOnce(ctx, ip, port, sniName, verifyHost, nextProtos, utls.HelloChrome_120, tcpWrap); err2 == nil || IsCertError(err2) {
 			return uConn2, err2
 		} else if isTLSRetryableError(err2) {
-			if uConn3, err3 := dialUTLSOnce(ctx, ip, sniName, verifyHost, nextProtos, utls.HelloFirefox_120, tcpWrap); err3 == nil || IsCertError(err3) {
+			if uConn3, err3 := dialUTLSOnce(ctx, ip, port, sniName, verifyHost, nextProtos, utls.HelloFirefox_120, tcpWrap); err3 == nil || IsCertError(err3) {
 				return uConn3, err3
 			}
 		}
@@ -1021,6 +1027,11 @@ func getUTLSH1Client(cacheKey string, dialFn func(ctx context.Context, nextProto
 func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func(net.Conn) net.Conn) (*http.Response, error) {
 	normMode := resolveEffectiveIPMode(ipMode)
 	host := extractRequestHost(req)
+	port := requestTargetPort(req)
+	// 「强行访问」（allowBadCert）必须独占一类连接池键：TLS 校验只发生在**首次拨号**，
+	// 连接进池后后续请求直接复用、不会重新校验。共池会让用户对某个 MITM 站点的一次
+	// 「强行访问」变成之后所有普通请求的静默跳过校验。
+	force := allowBadCert(req.Context())
 	ips, err := ResolveHostIPsByMode(req.Context(), host, normMode)
 	if err != nil {
 		return nil, err
@@ -1046,9 +1057,17 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 		if i > 0 {
 			rewindRequestBody(req)
 		}
-		cacheKey := fmt.Sprintf("%s|%s|%s|%s|%d", tag, ip, effectiveSNI, host, shard)
+		// cacheKey 必须含端口与 force：端口不同的上游是不同服务；force 见上方注释。
+		cacheKey := fmt.Sprintf("%s|%s|%s|%s|%s|%d", tag, ip, effectiveSNI, host, port, shard)
+		if force {
+			cacheKey += "|force"
+		}
 		dialFn := func(ctx context.Context, nextProtos []string) (*utls.UConn, error) {
-			return dialUTLSWithWrapper(ctx, ip, effectiveSNI, host, nextProtos, wrapConn)
+			if force {
+				// 显式注入：http2/http1 transport 传来的 ctx 不保证携带请求 ctx 上的 value。
+				ctx = WithAllowBadCert(ctx)
+			}
+			return dialUTLSWithWrapper(ctx, ip, port, effectiveSNI, host, nextProtos, wrapConn)
 		}
 		resp, err := getUTLSH2Transport(cacheKey, dialFn).RoundTrip(req)
 		if err == nil {
@@ -1103,6 +1122,26 @@ func roundTripUTLS(req *http.Request, ipMode, tag, sniName string, wrapConn func
 	return nil, fmt.Errorf("all IPs failed for %s: %w", host, lastErr)
 }
 
+// requestTargetPort 取本次请求要连的上游端口，缺省 443。
+//
+// 门户模式下上游 URL 不带端口；原域名模式下 proxy.go 会把客户端真实端口拼进 Host
+// （2053/2083/2087/2096/8443 等 MITM 认可的端口），这里必须把它带下去，
+// 否则 SNI / Fragment 通道会一律拨 443。
+func requestTargetPort(req *http.Request) string {
+	if req == nil {
+		return "443"
+	}
+	if p := netdial.ExtractPort(req.Host); p != "" {
+		return p
+	}
+	if req.URL != nil {
+		if p := netdial.ExtractPort(req.URL.Host); p != "" {
+			return p
+		}
+	}
+	return "443"
+}
+
 // DialRawTLS 为需要原始字节流的场景（WebSocket over CONNECT MITM 等）建立到 host:443 的
 // 已握手 uTLS 连接：DoH 解析 + 与主传输一致的 uTLS 指纹与 ClientHello 分片重试 + 上游证书核对。
 //
@@ -1121,7 +1160,7 @@ func DialRawTLS(ctx context.Context, host, ipMode string) (net.Conn, error) {
 	fragWrap := func(c net.Conn) net.Conn { return newTCPFragmentConn(c, 32) }
 	var lastErr error
 	for _, ip := range ips {
-		uConn, derr := dialUTLSWithWrapper(ctx, ip, host, host, []string{"http/1.1"}, fragWrap)
+		uConn, derr := dialUTLSWithWrapper(ctx, ip, "443", host, host, []string{"http/1.1"}, fragWrap)
 		if derr == nil {
 			return uConn, nil
 		}

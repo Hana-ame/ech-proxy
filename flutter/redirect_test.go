@@ -8,7 +8,12 @@ package main
 // Location 仍走 ECH；跳到别处（跨主机/非 http(s)）原样回传客户端。
 // 本测试钉住 resolveSameHost 的跟随边界，防止将来把客户端引去直连被墙域名。
 
-import "testing"
+import (
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+)
 
 func TestIsRedirect(t *testing.T) {
 	cases := []struct {
@@ -64,6 +69,46 @@ func TestResolveSameHost(t *testing.T) {
 			want: "",
 		},
 		{
+			// 同主机但降级到明文 http：ECH 通道的价值全在 TLS，跟随等于自拆保护。
+			name: "同主机 http 降级不跟随",
+			loc:  "http://x.moonchan.xyz/api/x",
+			want: "",
+		},
+		{
+			// 协议相对 URL 也以 "/" 开头，曾被当成站内路径拼成
+			// https://x.moonchan.xyz//cdn.other.com/a（必然 404）。
+			name: "协议相对 URL 不跟随",
+			loc:  "//cdn.other.com/a",
+			want: "",
+		},
+		{
+			name: "协议相对且同主机也不跟随",
+			loc:  "//x.moonchan.xyz/api/x",
+			want: "",
+		},
+		{
+			// "///x" 不是协议相对引用，是站内路径（RFC 3986 §4.2 只认两个斜杠）。
+			name: "三斜杠仍是站内路径",
+			loc:  "///a/b",
+			want: "https://x.moonchan.xyz///a/b",
+		},
+		{
+			name: "主机名大小写不敏感",
+			loc:  "https://X.MoonChan.XYZ/api/x",
+			want: "https://X.MoonChan.XYZ/api/x",
+		},
+		{
+			// 尾点在 DNS 上等价，但原样进 SNI 会握手失败，必须归一化。
+			name: "主机名尾点归一化",
+			loc:  "https://x.moonchan.xyz.:8443/api/x",
+			want: "https://x.moonchan.xyz:8443/api/x",
+		},
+		{
+			name: "带 userinfo 不跟随",
+			loc:  "https://u:p@x.moonchan.xyz/api/x",
+			want: "",
+		},
+		{
 			name: "非 http(s) 协议不跟随",
 			loc:  "ftp://x.moonchan.xyz/api/x",
 			want: "",
@@ -83,6 +128,51 @@ func TestResolveSameHost(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := resolveSameHost(c.loc, host); got != c.want {
 				t.Errorf("resolveSameHost(%q) = %q, want %q", c.loc, got, c.want)
+			}
+		})
+	}
+}
+
+// TestIsMethodPreservingRedirect 钉住「哪些 3xx 不许改写成 GET」。
+// 混淆这两类会让 POST /api/twitter/<username>（保存标签）在重定向后
+// 变成一次 GET —— 上游要么 405，要么按查询语义误处理。
+func TestIsMethodPreservingRedirect(t *testing.T) {
+	cases := []struct {
+		code int
+		want bool
+	}{
+		{301, false},
+		{302, false},
+		{303, false},
+		{307, true},
+		{308, true},
+		{200, false},
+	}
+	for _, c := range cases {
+		if got := isMethodPreservingRedirect(c.code); got != c.want {
+			t.Errorf("isMethodPreservingRedirect(%d) = %v, want %v", c.code, got, c.want)
+		}
+	}
+}
+
+// TestHasRequestBody 钉住「有 body」的判定：长度未知（-1，chunked）必须
+// 按有 body 处理，否则带 chunked body 的 307 会被当成可安全重放。
+func TestHasRequestBody(t *testing.T) {
+	cases := []struct {
+		name string
+		req  *http.Request
+		want bool
+	}{
+		{"nil request", nil, false},
+		{"无 body（NoBody/0）", &http.Request{Body: http.NoBody, ContentLength: 0}, false},
+		{"Body 为 nil", &http.Request{ContentLength: 0}, false},
+		{"已知长度 body", &http.Request{Body: io.NopCloser(strings.NewReader("x")), ContentLength: 1}, true},
+		{"长度未知 chunked", &http.Request{Body: io.NopCloser(strings.NewReader("x")), ContentLength: -1}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := hasRequestBody(c.req); got != c.want {
+				t.Errorf("hasRequestBody(%s) = %v, want %v", c.name, got, c.want)
 			}
 		})
 	}

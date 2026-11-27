@@ -348,19 +348,27 @@ func StartProxy(bootstrapIP *C.char) (port uint16) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", router)
 
-	proxyServer = &http.Server{
+	srv := &http.Server{
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
+	proxyServer = srv
 
 	// 5. 明文 HTTP 监听
-	go func() {
+	//
+	// srv 必须作为参数传入协程，不能在里面裸读全局 proxyServer：
+	// 协程真正被调度可能晚于本函数返回，此时若 StopProxy 已经把 proxyServer
+	// 置为 nil，全局读会直接 nil 解引用 panic（且 ln 永不关闭，泄漏 FD）。
+	go func(s *http.Server) {
 		defer guardPanic("Serve")
-		if err := proxyServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+		// Serve 返回后确保监听句柄释放：若本次 Serve 因 server 已被 Close
+		// 而立刻返回，listener 从未被注册进 s.listeners，Close() 关不到它。
+		defer ln.Close()
+		if err := s.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("server error: %v", err)
 		}
-	}()
+	}(srv)
 
 	// echReady 放到监听真正起来之后：这样"就绪"与"端口有人在听"同时成立。
 	echReady = true
@@ -615,18 +623,35 @@ func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 	attempts := 0
 	for isRedirect(resp.StatusCode) && attempts < 5 {
 		loc := resp.Header.Get("Location")
-		resp.Body.Close()
+		// 关闭当前响应体必须推迟到「确定要跟随下一跳」之后。原先无条件提前 Close，
+		// 两个 break 分支（无 Location / 跨主机）随后会走到下面的 io.Copy，
+		// 读一个已关闭的 body，带非零 Content-Length 时客户端会挂住或收到截断响应。
 		if loc == "" {
 			break
 		}
 		next := resolveSameHost(loc, targetHost)
 		if next == "" {
-			// 跨主机/非 http(s)：不再跟随，原样返回 3xx 给客户端。
+			// 跨主机/非 https：不再跟随，原样返回 3xx 给客户端。
+			break
+		}
+		// 307/308 要求方法不变。入站请求的 Body 已被上游读空，且服务端请求
+		// 的 r.GetBody 恒为 nil，根本无法重放；此时若照旧改写成 GET + nil body，
+		// 等于把「保存标签」这类 POST 静默降级成 GET —— 上游要么 405，要么
+		// 按查询语义误处理。带 body 的 307/308 因此不跟随，把 3xx 原样交回。
+		if isMethodPreservingRedirect(resp.StatusCode) && hasRequestBody(r) {
+			log.Printf("← %d %s (307/308 带请求体，不可重放，不跟随)", resp.StatusCode, targetURL)
 			break
 		}
 		attempts++
-		log.Printf("→ (redirect %d) %s", resp.StatusCode, next)
-		redirectReq, rerr := http.NewRequestWithContext(r.Context(), http.MethodGet, next, nil)
+		// 301/302/303 按浏览器惯例降级 GET；307/308 到这里已确认无 body，
+		// 保留原方法（GET/HEAD/DELETE/POST-无体 都能安全重放）。
+		method := http.MethodGet
+		if isMethodPreservingRedirect(resp.StatusCode) {
+			method = r.Method
+		}
+		log.Printf("→ (redirect %d) %s %s", resp.StatusCode, method, next)
+		resp.Body.Close()
+		redirectReq, rerr := http.NewRequestWithContext(r.Context(), method, next, nil)
 		if rerr != nil {
 			http.Error(w, "redirect request: "+rerr.Error(), http.StatusBadRequest)
 			return
@@ -640,7 +665,13 @@ func apiProxyHandler(w http.ResponseWriter, r *http.Request, targetHost, path st
 			return
 		}
 	}
-	defer resp.Body.Close()
+	// 用闭包而不是裸 defer：中间任一跳失败时 resp 会被赋成 nil，
+	// 裸 defer resp.Body.Close() 会在返回路径上 nil 解引用。
+	defer func() {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+	}()
 
 	// 逐跳头必须过滤（见包级 hopByHop 注释）：原来这里全量转发，上游的
 	// Transfer-Encoding 会和 Go ResponseWriter 自己的分帧叠加。

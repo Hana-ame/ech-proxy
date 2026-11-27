@@ -1,0 +1,89 @@
+name: ech-proxy-android-lib
+
+# 构建 ECH Proxy 嵌入式 AAR 库，供第三方 Java/Kotlin App 引用。
+# 触发：手动（workflow_dispatch）或 tag push（v*）时挂到 GitHub Release。
+# 不需要签名密钥（库非 APK），不需要 AGP/Gradle。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（缺省取 git describe）"
+        required: false
+        type: string
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-lib:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # git describe 需要 tag 历史
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android NDK
+        run: |
+          NDK_VERSION="r27"
+          curl -L -o /tmp/ndk.zip "https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          unzip -q /tmp/ndk.zip -d /tmp/
+          NDK_DIR="/tmp/android-ndk-${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=${NDK_DIR}" >> $GITHUB_ENV
+          echo "${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> $GITHUB_PATH
+          ls "${NDK_DIR}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang"
+
+      - name: Version
+        id: ver
+        run: |
+          INPUT="${{ inputs.version }}"
+          if [[ -n "$INPUT" ]]; then
+            VER="$INPUT"
+          elif [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="$(git describe --tags --always 2>/dev/null | sed 's/^v//' || echo 0.0.0)"
+          fi
+          echo "VERSION=$VER" >> $GITHUB_OUTPUT
+          echo "==> version: $VER"
+
+      - name: Build AAR
+        env:
+          VERSION: ${{ steps.ver.outputs.VERSION }}
+        run: |
+          chmod +x scripts/build-android-lib.sh
+          ./scripts/build-android-lib.sh "$VERSION"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: echproxy-android-${{ steps.ver.outputs.VERSION }}
+          path: |
+            dist/echproxy-android-*.aar
+            dist/echproxy-android-*.aar.sha256
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${{ steps.ver.outputs.VERSION }}"
+          gh release upload "${GITHUB_REF_NAME}" \
+            dist/echproxy-android-${VER}.aar \
+            dist/echproxy-android-${VER}.aar.sha256 \
+            --repo Hana-ame/ech-proxy --clobber

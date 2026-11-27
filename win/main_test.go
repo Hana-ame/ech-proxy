@@ -63,8 +63,10 @@ func TestParseCLIArgsSubcommandsFlagsAndSysProxyDefaults(t *testing.T) {
 	noEnv := func(string) string { return "" }
 
 	// 1. 默认主流（mainstream）启动为 smart 模式（PAC HTTPS Proxy），默认 ipmode = ipv4 ("v4")，监听 127.0.0.1:8443，不开启 PortalMode 或 LocalProxy
+	//    注意：-all 全代理模式自 7d7c248「subAll 默认改为 true」起默认开启，
+	//    因此这里默认期望 AllMode 为 true；原先的 !AllMode 断言已过期。
 	c1, err := parseCLIArgs("ech-proxy", nil, noEnv)
-	if err != nil || c1.Action != "run" || c1.Mode != "smart" || c1.AllMode || c1.PortalMode || c1.IPMode != "v4" || c1.Addr != "127.0.0.1:8443" || c1.LocalProxy {
+	if err != nil || c1.Action != "run" || c1.Mode != "smart" || !c1.AllMode || c1.PortalMode || c1.IPMode != "v4" || c1.Addr != "127.0.0.1:8443" || c1.LocalProxy {
 		t.Errorf("default parseCLIArgs = %+v, %v", c1, err)
 	}
 	if c1.SysProxy != SysProxyPAC || !c1.EnableTray || c1.HideConsole || c1.SkipAdScript || c1.SkipAdBlock {

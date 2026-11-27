@@ -108,6 +108,11 @@ type Store struct {
 	leaf       map[string]*tls.Certificate
 	inflight   map[string]*leafGenCall
 	crlBaseURL string
+	// crlPEM / crlExpiry 缓存已签发的空吊销列表。
+	// 原先每次 /crl 请求都持 st.mu 现场做一次 RSA-2048 签名，而同一把锁也保护证书签发，
+	// 并发拉取 CRL 会把所有 TLS 握手的 GetCertificate 一起堵死。
+	crlPEM    []byte
+	crlExpiry time.Time
 }
 
 func (st *Store) SetPortalCert(cert *tls.Certificate) {
@@ -255,19 +260,39 @@ func (st *Store) CRL() ([]byte, error) {
 	if st == nil || st.ca == nil || st.ca.Cert == nil || st.ca.Key == nil {
 		return nil, errors.New("certstore: CA not initialized")
 	}
-	st.mu.Lock()
-	defer st.mu.Unlock()
 	now := time.Now()
+
+	// 先尝试命中缓存。CRL 是一份「空吊销列表」，内容只随签名时间变化，
+	// 客户端按 NextUpdate 决定何时重取，没必要每次请求都重新做一次 RSA 签名。
+	st.mu.Lock()
+	if len(st.crlPEM) > 0 && now.Before(st.crlExpiry) {
+		cached := st.crlPEM
+		st.mu.Unlock()
+		return cached, nil
+	}
+	caCert, caKey := st.ca.Cert, st.ca.Key
+	st.mu.Unlock()
+
+	// 签名在锁外完成：这是 RSA-2048 的纯 CPU 操作，放在锁内会让并发的 /crl
+	// 请求把证书签发（同一把 st.mu）整体串行化，握手直接卡住。
 	tmpl := &x509.RevocationList{
 		Number:     big.NewInt(now.Unix()),
 		ThisUpdate: now,
 		NextUpdate: now.Add(30 * 24 * time.Hour),
 	}
-	der, err := x509.CreateRevocationList(rand.Reader, tmpl, st.ca.Cert, st.ca.Key)
+	der, err := x509.CreateRevocationList(rand.Reader, tmpl, caCert, caKey)
 	if err != nil {
 		return nil, err
 	}
-	return pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der}), nil
+	crlPEM := pem.EncodeToMemory(&pem.Block{Type: "X509 CRL", Bytes: der})
+
+	st.mu.Lock()
+	st.crlPEM = crlPEM
+	// 缓存 12 小时，远小于 NextUpdate（30 天）：客户端任何时刻取到的 CRL
+	// 离过期都还有半个多月，同时把签名次数从「每请求一次」降到每天两次。
+	st.crlExpiry = now.Add(12 * time.Hour)
+	st.mu.Unlock()
+	return crlPEM, nil
 }
 
 func (st *Store) TLSConfig(portalCert *tls.Certificate) *tls.Config {
@@ -346,7 +371,7 @@ func (st *Store) CertificateFor(host string) (cert *tls.Certificate, err error) 
 		st.mu.Unlock()
 	}()
 
-	if leaf, lerr := st.loadLeaf(key); lerr == nil {
+	if leaf, lerr := st.loadLeaf(key, ca, crlBaseURL); lerr == nil {
 		cert = leaf
 	} else if !os.IsNotExist(lerr) {
 		err = fmt.Errorf("certstore: cannot load leaf for %s: %w", key, lerr)
@@ -371,7 +396,10 @@ func (st *Store) leafDir(domain string) string {
 	return filepath.Join(st.DataDir, "ca", leavesSubDir, sanitizeDomain(domain))
 }
 
-func (st *Store) loadLeaf(domain string) (*tls.Certificate, error) {
+// loadLeaf 读取磁盘缓存的叶子证书并校验其仍然可用。
+// ca 与 crlBaseURL 由调用方在持锁状态下取好快照传入：本函数在锁外执行（磁盘 IO + 解析），
+// 直接读 st.ca / st.crlBaseURL 会与 SetCRLBaseURL 构成数据竞态。
+func (st *Store) loadLeaf(domain string, ca *CA, crlBaseURL string) (*tls.Certificate, error) {
 	dir := st.leafDir(domain)
 	certPEM, err := os.ReadFile(filepath.Join(dir, leafCertFile))
 	if err != nil {
@@ -392,6 +420,23 @@ func (st *Store) loadLeaf(domain string) (*tls.Certificate, error) {
 			return nil, os.ErrNotExist
 		}
 		cert.Leaf = parsed
+	}
+	// 缓存的叶子证书必须仍由当前 CA 签发。CA 被重建（用户清了 ca/ 目录、换了机器、
+	// 或 dataDir 迁移）后，磁盘上的 ca/leaves/ 还是旧 CA 签的证书，而代理会一直下发它，
+	// 浏览器侧表现为「所有 HTTPS 站握手失败」，并且要等叶子证书自然过期（最长 358 天）才恢复。
+	// 这里检出后返回 os.ErrNotExist，交给上层自动重签。
+	if ca != nil && ca.Cert != nil && cert.Leaf != nil {
+		if err := cert.Leaf.CheckSignatureFrom(ca.Cert); err != nil {
+			return nil, os.ErrNotExist
+		}
+	}
+	// 端口切换后旧叶子证书里固化的 CRL Distribution Points 会指向已失效的地址，
+	// Windows schannel 的吊销校验会因此报错。地址不一致即视为需要重签。
+	if crlBaseURL != "" && cert.Leaf != nil {
+		expected := crlBaseURL + "/crl"
+		if len(cert.Leaf.CRLDistributionPoints) == 0 || cert.Leaf.CRLDistributionPoints[0] != expected {
+			return nil, os.ErrNotExist
+		}
 	}
 	if leafNeedsRenewal(&cert) {
 		return nil, os.ErrNotExist

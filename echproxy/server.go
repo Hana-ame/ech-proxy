@@ -18,6 +18,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Hana-ame/ech-proxy/echproxy/certstore"
@@ -170,9 +171,12 @@ type ServerOptions struct {
 }
 
 type Server struct {
-	mu         sync.RWMutex
-	Options    ServerOptions
-	Config     *config.Config
+	mu      sync.RWMutex
+	Options ServerOptions
+	Config  *config.Config
+	// tlsCertMu 保护 TLSCert：它在后台协程（8443-SilentCompatLoader）里写入，
+	// 而 TLSConfig.GetCertificate 会在每个握手协程里读取。
+	tlsCertMu  sync.RWMutex
 	TLSCert    *tls.Certificate
 	CertStore  *certstore.Store
 	Engine     *gin.Engine
@@ -185,6 +189,46 @@ type Server struct {
 	AdScript   *rewrite.AdScriptManager
 	Logger     *logger.Manager
 	bgCancel   context.CancelFunc
+	// plainMu 保护 plainServer（双模监听里的明文分支）。
+	plainMu     sync.Mutex
+	plainServer *http.Server
+}
+
+// setTLSCert 线程安全地记录后台加载到的真实证书。
+func (s *Server) setTLSCert(cert *tls.Certificate) {
+	s.tlsCertMu.Lock()
+	s.TLSCert = cert
+	s.tlsCertMu.Unlock()
+}
+
+// currentTLSCert 线程安全地取当前证书（可能为 nil，表示尚未加载完成）。
+func (s *Server) currentTLSCert() *tls.Certificate {
+	s.tlsCertMu.RLock()
+	defer s.tlsCertMu.RUnlock()
+	return s.TLSCert
+}
+
+// setPlainServer 记录双模监听里的明文 HTTP 服务，供 Shutdown/Close 关闭。
+func (s *Server) setPlainServer(srv *http.Server) {
+	s.plainMu.Lock()
+	s.plainServer = srv
+	s.plainMu.Unlock()
+}
+
+// closePlainServer 关闭明文 HTTP 服务；graceful 为 true 时先等待在途请求。
+func (s *Server) closePlainServer(ctx context.Context, graceful bool) {
+	s.plainMu.Lock()
+	srv := s.plainServer
+	s.plainServer = nil
+	s.plainMu.Unlock()
+	if srv == nil {
+		return
+	}
+	if graceful && ctx != nil {
+		_ = srv.Shutdown(ctx)
+		return
+	}
+	_ = srv.Close()
 }
 
 func InitECH(bootstrapIP, ipMode string) error {
@@ -413,7 +457,9 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	topHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer logger.RecoverAndLog("HTTPTopHandler", nil)
 		// 提供吊销列表与根证书，供客户端证书校验时经 CRL Distribution Points / AIA 拉取。
-		if store != nil {
+		// 必须同时校验 Host：否则经代理访问任意外部站点的 /crl 或 /ca.pem 也会被本地截获，
+		// 把本该发给上游的请求换成我们自己的 CA 证书/吊销列表。
+		if store != nil && isPortalOrLocalAdminHost(r.Host) {
 			switch r.URL.Path {
 			case "/crl":
 				if crl, err := store.CRL(); err == nil {
@@ -452,8 +498,30 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 
 	isTLS := !opts.HTTPMode
-	if isTLS && store != nil {
-		httpSrv.TLSConfig = store.TLSConfig(nil)
+	// srvHolder 把刚构造出的 Server 绑定给 TLSConfig.GetCertificate。用局部 atomic.Pointer
+	// 而不是包级变量：同时可能存在 443 与 8443 两个 Server 实例，包级变量会互相覆盖。
+	var srvHolder atomic.Pointer[Server]
+	if isTLS {
+		if store != nil {
+			httpSrv.TLSConfig = store.TLSConfig(nil)
+		} else {
+			// store 不可用（如 dataDir 不可写导致 CA 初始化失败）时也必须给出非 nil 的
+			// TLSConfig：serveDualModeTLS 会把它交给 tls.NewListener，nil 会让首个握手
+			// 直接 panic，表现为「8443 门户完全连不上」，即便后台已经拉到真实公网证书。
+			// 这里用 GetCertificate 延迟到握手时取后台加载的证书。
+			httpSrv.TLSConfig = &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				NextProtos: []string{"h2", "http/1.1"},
+				GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+					if self := srvHolder.Load(); self != nil {
+						if cert := self.currentTLSCert(); cert != nil {
+							return cert, nil
+						}
+					}
+					return nil, errors.New("no upstream certificate loaded yet")
+				},
+			}
+		}
 	}
 
 	srv := &Server{
@@ -471,6 +539,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		Logger:     logMgr,
 		bgCancel:   bgCancel,
 	}
+	srvHolder.Store(srv)
 
 	// 后台静默加载 8443 方案的 upstream.json 与真实证书（绝不阻塞任何其他代码，报错静默忽略）
 	SafeGo("8443-SilentCompatLoader", func() {
@@ -492,9 +561,7 @@ func NewServer(opts ServerOptions) (*Server, error) {
 		seedCookiesFromConfig(cfg)
 		if loaded.CertPath != "" && loaded.KeyPath != "" && !opts.HTTPMode {
 			if pc, cerr := certstore.LoadRemoteCert(loaded.CertPath, loaded.KeyPath); cerr == nil && pc != nil {
-				srv.mu.Lock()
-				srv.TLSCert = pc
-				srv.mu.Unlock()
+				srv.setTLSCert(pc)
 				if store != nil {
 					store.SetPortalCert(pc)
 				}
@@ -570,6 +637,9 @@ func (s *Server) serveDualModeTLS() error {
 			IdleTimeout:       s.HTTPServer.IdleTimeout,
 			ErrorLog:          s.HTTPServer.ErrorLog,
 		}
+		// 挂到 Server 上，否则 Shutdown/Close 完全管不到它：PAC 主线下浏览器发来的
+		// HTTP / CONNECT 流量几乎全走这个明文分支，退出时这些连接会一直滞留、泄漏 FD。
+		s.setPlainServer(plainSrv)
 		_ = plainSrv.Serve(plainChan)
 	})
 
@@ -633,7 +703,23 @@ func (l *chanListener) Accept() (net.Conn, error) {
 }
 
 func (l *chanListener) Close() error {
-	l.once.Do(func() { close(l.done) })
+	l.once.Do(func() {
+		close(l.done)
+		// 排空缓冲区里已在排队、尚未被 Accept 取走的连接。
+		// 只关 done 的话，这些 net.Conn 既不会被 Accept 返回，也不会被任何人关闭，
+		// 退出时会一直占着 FD（双模监听下最多 128+128 个）。
+		draining := true
+		for draining {
+			select {
+			case c := <-l.ch:
+				if c != nil {
+					_ = c.Close()
+				}
+			default:
+				draining = false
+			}
+		}
+	})
 	return nil
 }
 
@@ -658,6 +744,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.Listener != nil {
 		_ = s.Listener.Close()
 	}
+	// 双模监听下的明文 HTTP 服务是独立实例，必须单独优雅关闭，
+	// 否则 PAC 主线下的大量明文连接会带着 FD 一起滞留到进程退出。
+	s.closePlainServer(ctx, true)
 	if s.HTTPServer != nil {
 		return s.HTTPServer.Shutdown(ctx)
 	}
@@ -674,6 +763,7 @@ func (s *Server) Close() error {
 	if s.Listener != nil {
 		_ = s.Listener.Close()
 	}
+	s.closePlainServer(nil, false)
 	if s.HTTPServer != nil {
 		return s.HTTPServer.Close()
 	}

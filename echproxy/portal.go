@@ -48,6 +48,10 @@ func NewEngine(cfg *config.Config) *gin.Engine {
 func New443Engine(_ *certstore.Store, auth *AuthConfig) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// 不信任任何 X-Forwarded-For：本代理是客户端直连的本地/边缘服务，前面不会有反向代理。
+	// gin 默认信任所有来源，c.ClientIP() 会直接采信请求头，攻击者轮换该头即可绕过
+	// AuthConfig 的单 IP 失败限速，并把 failures map 撑到清扫阈值。
+	r.SetTrustedProxies(nil)
 	r.Use(gin.Recovery())
 	emptyCfg := &config.Config{}
 	proxyHandler := ProxyHandlerWithConfig(emptyCfg, auth, nil)
@@ -62,6 +66,8 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 	}
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// 同 New443Engine：不信任 X-Forwarded-For，避免伪造该头绕过鉴权限速。
+	r.SetTrustedProxies(nil)
 	r.Use(gin.Recovery(), corsMiddleware())
 
 	seedCookiesFromConfig(cfg)

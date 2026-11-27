@@ -139,11 +139,19 @@ type Updater struct {
 	onStateChanged  func()
 
 	updateStaged atomic.Bool
-	stagedHash   string
-	lastChecked  time.Time
-	lastError    string
-	stopOnce     sync.Once
-	stopCh       chan struct{}
+	// applyStarted 保证延迟替换只真正执行一次。退出路径上托盘退出、ctx.Done()、
+	// main 的 defer 都会调 ApplyStagedUpdateOnExit：重复执行时 .new 已被首个调用搬走，
+	// 后续调用白跑；更糟的是首个调用失败会拉起延迟替换 cmd，三次调用会并发拉起
+	// 三个 cmd.exe 抢同一批文件。
+	applyStarted atomic.Bool
+	// checkMu 串行化 CheckAndDownloadOnce：后台 StartAutoCheck 的首次立即检查
+	// 与用户在托盘点「检查更新」可能同时进入，两者共用同一个 .tmp 会互相覆盖/触发 ENOENT。
+	checkMu     sync.Mutex
+	stagedHash  string
+	lastChecked time.Time
+	lastError   string
+	stopOnce    sync.Once
+	stopCh      chan struct{}
 }
 
 func NewUpdater(opts UpdaterOptions) *Updater {
@@ -273,6 +281,9 @@ func (u *Updater) CheckAndDownloadOnce() (bool, error) {
 	if u == nil || u.exePath == "" || u.fetchFn == nil {
 		return false, nil
 	}
+	// 串行化：后台自动检查与托盘手动检查可能同时进入，二者共用同一个临时文件。
+	u.checkMu.Lock()
+	defer u.checkMu.Unlock()
 	log.Printf("[Updater] Checking update for %s (%s)...", u.AssetName(), u.checksumsURL)
 	rawChecksums, err := u.fetchFn(u.checksumsURL)
 	if err != nil {
@@ -292,6 +303,17 @@ func (u *Updater) CheckAndDownloadOnce() (bool, error) {
 	curHash, curErr := fileSHA256Hex(u.exePath)
 	if curErr == nil && strings.EqualFold(curHash, expectedHash) {
 		u.setLastError("")
+		// 已是最新版：清理可能残留的旧 .new 并撤销 staged 标记。
+		// 否则它会在下次启动被 ApplyPendingUpdateOnStartup 直接覆盖上去，
+		// 表现为「手动回退到旧版本，重启后又被装回新版本」。
+		if _, statErr := os.Stat(u.StagedPath()); statErr == nil {
+			_ = os.Remove(u.StagedPath())
+			u.updateStaged.Store(false)
+			u.mu.Lock()
+			u.stagedHash = ""
+			u.mu.Unlock()
+			log.Printf("[Updater] Removed stale staged file (already up to date)")
+		}
 		log.Printf("[Updater] Already up to date (current sha256 matches latest: %s)", expectedHash[:12])
 		return false, nil
 	}
@@ -321,12 +343,31 @@ func (u *Updater) CheckAndDownloadOnce() (bool, error) {
 		log.Printf("[Updater] %v", err)
 		return false, err
 	}
-	tmpPath := stagedPath + ".tmp"
-	if err := os.WriteFile(tmpPath, binBytes, 0o755); err != nil {
+	// 用 CreateTemp 生成唯一临时名，而不是固定的 stagedPath+".tmp"：
+	// 固定名在并发场景下会让两次下载互相覆盖（A 写一半被 B 重命名走，或 rename 报 ENOENT）。
+	// 虽然 CheckAndDownloadOnce 已由 checkMu 串行化，这里仍不依赖上层互斥——
+	// 同一进程内多 Updater 实例或残留的旧 .tmp 都不该让新文件写失败。
+	tmpFile, err := os.CreateTemp(filepath.Dir(stagedPath), ".ech-proxy-update-*.tmp")
+	if err != nil {
 		u.setLastError(err.Error())
-		log.Printf("[Updater] Failed to write temp file: %v", err)
+		log.Printf("[Updater] Failed to create temp file: %v", err)
 		return false, err
 	}
+	tmpPath := tmpFile.Name()
+	if _, werr := tmpFile.Write(binBytes); werr != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpPath)
+		u.setLastError(werr.Error())
+		log.Printf("[Updater] Failed to write temp file: %v", werr)
+		return false, werr
+	}
+	if cerr := tmpFile.Close(); cerr != nil {
+		_ = os.Remove(tmpPath)
+		u.setLastError(cerr.Error())
+		log.Printf("[Updater] Failed to close temp file: %v", cerr)
+		return false, cerr
+	}
+	_ = os.Chmod(tmpPath, 0o755)
 	if err := os.Rename(tmpPath, stagedPath); err != nil {
 		_ = os.Remove(tmpPath)
 		u.setLastError(err.Error())
@@ -362,10 +403,27 @@ func (u *Updater) ApplyStagedUpdateOnExit() (bool, error) {
 	if u == nil || u.exePath == "" {
 		return false, nil
 	}
+	// 退出路径上托盘、ctx.Done()、main 的 defer 都会调到这里（历史上一共 5 处）。
+	// 只让第一次「确实有 .new」的调用真正执行：后续调用若也走改名/延迟替换，
+	// 会多个 cmd.exe 抢同一批文件。
 	stagedPath := u.StagedPath()
 	info, err := os.Stat(stagedPath)
 	if err != nil || info.IsDir() || info.Size() == 0 {
 		return false, nil
+	}
+	// CAS 放在 Stat 之后：早期某次调用可能 .new 尚未落地，不能让它提前消耗掉唯一机会。
+	if !u.applyStarted.CompareAndSwap(false, true) {
+		return false, nil
+	}
+	// 覆盖运行中的 exe 前复核哈希：.new 可能是上一次更新留下的旧文件，也可能是
+	// 下载后被外部改动/截断的残骸。stagedHash 已知时必须一致，否则宁可放弃这次替换。
+	if want := u.StagedHash(); want != "" {
+		got, herr := fileSHA256Hex(stagedPath)
+		if herr != nil || !strings.EqualFold(got, want) {
+			u.setLastError(fmt.Sprintf("staged file hash mismatch before apply (got %q)", got))
+			log.Printf("[Updater] Refusing to apply staged update: hash mismatch (got %q, want %q)", got, want)
+			return false, fmt.Errorf("staged file hash mismatch: got %s, want %s", got, want)
+		}
 	}
 	oldPath := u.BackupPath()
 	_ = os.Remove(oldPath)

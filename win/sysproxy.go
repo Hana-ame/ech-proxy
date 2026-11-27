@@ -245,6 +245,19 @@ func (m *SysProxyManager) captureOriginalLocked(current SysProxyState) {
 	}
 }
 
+// pushPrevStateLocked 把切换前的系统代理状态压入恢复栈。
+//
+// 绝不能把「指向自己的代理」压栈：进程被强杀后会残留
+// AutoConfigURL=http://127.0.0.1:<port>/proxy.pac，下次启动时 hasOriginal 仍为 false
+// （构造时已被 isSelfProxy 过滤），若栈底又是这条残留，CleanupOnExit 就会把它写回系统代理，
+// 用户正常退出后直接断网。这类残留只能丢弃，最终由 Clear() 收尾。
+func (m *SysProxyManager) pushPrevStateLocked(prev SysProxyState) {
+	if isSelfProxy(prev, m.listenAddr) {
+		return
+	}
+	m.prevStates = append(m.prevStates, prev)
+}
+
 func (m *SysProxyManager) SetFallbackProxy(raw string) {
 	if m == nil {
 		return
@@ -286,7 +299,7 @@ func (m *SysProxyManager) ReplacePAC(pacURL string) (SysProxyState, error) {
 	if err := m.driver.ApplyPAC(pacURL); err != nil {
 		return prev, fmt.Errorf("apply system PAC (%s): %w", pacURL, err)
 	}
-	m.prevStates = append(m.prevStates, prev)
+	m.pushPrevStateLocked(prev)
 	m.mode = SysProxyPAC
 	m.modified = true
 	m.appliedPACURL = pacURL
@@ -339,7 +352,7 @@ func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
 		if err := m.driver.ApplyPAC(pacURL); err != nil {
 			return fmt.Errorf("apply system PAC (%s): %w", pacURL, err)
 		}
-		m.prevStates = append(m.prevStates, prev)
+		m.pushPrevStateLocked(prev)
 		m.mode = SysProxyPAC
 		m.modified = true
 		m.appliedPACURL = pacURL
@@ -353,7 +366,7 @@ func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
 		if err := m.driver.ApplyGlobal(m.listenAddr, DefaultProxyBypass); err != nil {
 			return fmt.Errorf("apply global system proxy (%s): %w", m.listenAddr, err)
 		}
-		m.prevStates = append(m.prevStates, prev)
+		m.pushPrevStateLocked(prev)
 		m.mode = SysProxyGlobal
 		m.modified = true
 		log.Printf("[SysProxy] Windows/OS system proxy set to Global HTTP/HTTPS mode: %s", m.listenAddr)
@@ -374,6 +387,9 @@ func (m *SysProxyManager) SetMode(mode SysProxyMode) error {
 		}
 		m.mode = SysProxyOff
 		m.modified = false
+		// 成功恢复/清除后立刻丢弃整个恢复栈：留着陈旧栈帧只会在下次 CleanupOnExit
+		// 或 Pop 时把早已失效的状态重新写回系统代理。
+		m.prevStates = nil
 		return nil
 
 	default:
@@ -388,14 +404,26 @@ func (m *SysProxyManager) CleanupOnExit() {
 		return
 	}
 	var target SysProxyState
-	if m.hasOriginal {
+	useClear := false
+	switch {
+	case m.hasOriginal:
 		target = m.originalState
-	} else if len(m.prevStates) > 0 {
+	case len(m.prevStates) > 0 && !isSelfProxy(m.prevStates[0], m.listenAddr):
 		target = m.prevStates[0]
-	} else {
+	default:
+		// 没有可信的原始状态，或栈底就是崩溃残留的自身 PAC（AutoConfigURL 指向
+		// 本机 /proxy.pac）。此时把栈底写回系统代理等于让用户退出后直接断网，
+		// 只能清空为直连。
 		target = SysProxyState{Mode: SysProxyOff}
+		useClear = true
 	}
-	if err := m.driver.Restore(target); err != nil {
+	var err error
+	if useClear {
+		err = m.driver.Clear()
+	} else {
+		err = m.driver.Restore(target)
+	}
+	if err != nil {
 		log.Printf("[SysProxy] WARNING: failed to restore system proxy on exit: %v", err)
 	} else {
 		log.Printf("[SysProxy] System proxy restored to original state on exit (mode=%s, proxyEnable=%v, server=%s, pac=%s, autoDetect=%v)",
@@ -403,6 +431,7 @@ func (m *SysProxyManager) CleanupOnExit() {
 	}
 	m.mode = normalizeRestoredMode(target.Mode)
 	m.modified = false
+	m.prevStates = nil
 }
 
 func (m *SysProxyManager) StatusText() string {

@@ -531,11 +531,11 @@ func TestTunnelLimiterDeletesPeerEntryWhenIdle(t *testing.T) {
 	if !ok {
 		t.Fatal("Acquire failed")
 	}
-	if _, present := l.peers.Load("203.0.113.9"); !present {
+	if l.peerCount("203.0.113.9") != 1 {
 		t.Fatal("peer must be tracked while a tunnel is active")
 	}
 	rel()
-	if _, present := l.peers.Load("203.0.113.9"); present {
+	if l.peerCount("203.0.113.9") != 0 {
 		t.Error("peer entry must be deleted when its counter reaches zero")
 	}
 	if l.ActiveCount() != 0 {

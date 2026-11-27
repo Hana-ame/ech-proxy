@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"strings"
@@ -390,10 +391,46 @@ func uninstallCAOnPlatform(caPath string) error {
 }
 
 // scheduleWindowsDelayedMove 在进程即将退出时启动后台延迟替换命令，确保运行中的 .exe 退出后立即被 .new 覆盖。
+//
+// 两个必须避开的坑：
+//  1. 不能用 exec.Command("cmd.exe", "/C", script) 传含引号的脚本。Go 在 Windows 上会走
+//     syscall.EscapeArg，把内层引号转义成 \"，而 cmd.exe 不识别这种转义，会把反斜杠当成
+//     路径字面量，move /Y 必然失败——错误又被 >nul 2>&1 吞掉，表现为「更新提示成功、
+//     重启后版本没变」。这里改用 SysProcAttr.CmdLine 原样传命令行。
+//  2. 路径不拼进命令行：含 & 或 % 会被 cmd.exe 当作命令分隔符 / 变量展开。改为通过环境变量
+//     传入，由 cmd 展开 %VAR%，展开结果不再二次解析特殊字符。
+//
+// 另外把单次 ping 改为 30 次重试：ping -n 2 只等约 1 秒，短于主进程的 Shutdown 超时，
+// 一次就放弃等于必然失败；要等旧 exe 的文件锁真正释放，move 才能成功。
 func scheduleWindowsDelayedMove(stagedPath, targetExePath, backupPath string) {
-	script := fmt.Sprintf(`ping 127.0.0.1 -n 2 > nul & move /Y "%s" "%s" > nul 2>&1 & del /F /Q "%s" > nul 2>&1`,
-		stagedPath, targetExePath, backupPath)
-	cmd := exec.Command("cmd.exe", "/C", script)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	_ = cmd.Start()
+	const (
+		envSrc = "ECH_PROXY_UPDATE_SRC"
+		envDst = "ECH_PROXY_UPDATE_DST"
+		envBak = "ECH_PROXY_UPDATE_BAK"
+	)
+	// 每轮等待约 1 秒后尝试替换；move 成功后源文件消失，后续轮次自然失败且无副作用。
+	// 三个细节都是踩过的坑：
+	//   - `%%i` 必须写两个百分号：Sprintf 会把它还原成 `%i`，而 cmd /C 的**命令行**
+	//     只认单个百分号（`%%i` 属于批处理语法，实测报「此时不应有 %%i」）。
+	//   - `&& del` 必须在 do 的括号内并且用 &&，不能写成 `do (...) & del`：那样 del
+	//     属于循环体，第一次重试就会把备份删掉；万一 30 轮都没替换成功，程序目录里
+	//     既没有 exe 也没有备份，彻底无法启动。用 && 则只有 move 成功才删备份。
+	script := fmt.Sprintf(
+		`for /L %%i in (1,1,30) do @(ping 127.0.0.1 -n 2 >nul & move /Y "%%%s%%" "%%%s%%" >nul 2>&1 && del /F /Q "%%%s%%" >nul 2>&1)`,
+		envSrc, envDst, envBak)
+	cmd := exec.Command("cmd.exe")
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow: true,
+		CmdLine:    "cmd.exe /C " + script,
+	}
+	cmd.Env = append(os.Environ(),
+		envSrc+"="+stagedPath,
+		envDst+"="+targetExePath,
+		envBak+"="+backupPath,
+	)
+	// Start 失败必须留痕：这是退出路径上唯一还能说明「替换根本没启动」的地方，
+	// 静默丢弃只会复现「提示更新成功、重启后版本没变」。
+	if err := cmd.Start(); err != nil {
+		log.Printf("[Updater] failed to start delayed replace: %v", err)
+	}
 }

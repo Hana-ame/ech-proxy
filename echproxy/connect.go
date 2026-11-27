@@ -88,6 +88,14 @@ func (a *AuthConfig) Check(req *http.Request, clientIP string) (bool, error) {
 				delete(a.failures, k)
 			}
 		}
+		// 清扫后仍然超限，说明 5 分钟窗口内确实有上万个不同来源在打。
+		// 此时必须主动淘汰，否则每次请求都要持锁全表扫描一遍 O(N)。
+		for k := range a.failures {
+			if len(a.failures) < authFailuresPurgeThreshold {
+				break
+			}
+			delete(a.failures, k)
+		}
 	}
 	fw, exists := a.failures[clientIP]
 	if exists && now.Before(fw.windowEnd) && fw.count >= maxAuthFailures {
@@ -105,6 +113,11 @@ func (a *AuthConfig) Check(req *http.Request, clientIP string) (bool, error) {
 		delete(a.failures, clientIP)
 		return true, nil
 	}
+	// 重新加锁后必须重新读取 fw/exists，不能沿用上面快照：
+	// 凭据校验是在锁外做的，这段时间里并发的失败请求可能已经创建/递增了窗口。
+	// 沿用旧快照会让 N 个并发失败只记 1 次（后写者用 {count:1} 覆盖前者的递增），
+	// 限速形同虚设。
+	fw, exists = a.failures[clientIP]
 	if !exists || !now.Before(fw.windowEnd) {
 		a.failures[clientIP] = &authFailWindow{count: 1, windowEnd: now.Add(authFailureWindow)}
 	} else {
@@ -149,7 +162,15 @@ type TunnelLimiter struct {
 	PerPeerMax int
 	GlobalMax  int
 	globalCur  atomic.Int32
-	peers      sync.Map
+	// peerMu 保护 peers。
+	//
+	// 这里不能用 sync.Map：Acquire 需要「读当前值 → 校验 → 回写」三步原子完成，
+	// 而 sync.Map 只保证单步原子。原实现的 LoadOrStore 与 Add(1) 之间存在窗口：
+	// G1 释放最后一个隧道把计数减到 0 并 CompareAndDelete 掉该指针，G2 却已在
+	// LoadOrStore 拿到同一个指针，随后在孤儿计数器上 Add(1) 成功——这次占用既不计入
+	// PerPeerMax（G3 会新建计数器），也永远不会被删除，高并发下可突破单 IP 上限并泄漏 map。
+	peerMu sync.Mutex
+	peers  map[string]int
 }
 
 func NewTunnelLimiter(perPeerMax, globalMax int) *TunnelLimiter {
@@ -159,37 +180,57 @@ func NewTunnelLimiter(perPeerMax, globalMax int) *TunnelLimiter {
 	if globalMax <= 0 {
 		globalMax = DefaultGlobalMaxTunnels
 	}
-	return &TunnelLimiter{PerPeerMax: perPeerMax, GlobalMax: globalMax}
+	return &TunnelLimiter{PerPeerMax: perPeerMax, GlobalMax: globalMax, peers: make(map[string]int)}
 }
 
 func (l *TunnelLimiter) Acquire(peerIP string) (func(), bool) {
 	if l == nil {
 		return func() {}, true
 	}
-	val, _ := l.peers.LoadOrStore(peerIP, &atomic.Int32{})
-	peerCounter := val.(*atomic.Int32)
-
-	if peerCounter.Add(1) > int32(l.PerPeerMax) {
-		peerCounter.Add(-1)
+	l.peerMu.Lock()
+	if l.peers == nil {
+		l.peers = make(map[string]int)
+	}
+	cur := l.peers[peerIP]
+	if cur+1 > l.PerPeerMax {
+		l.peerMu.Unlock()
 		return nil, false
 	}
-	if l.globalCur.Add(1) > int32(l.GlobalMax) {
-		l.globalCur.Add(-1)
-		peerCounter.Add(-1)
+	if int(l.globalCur.Load())+1 > l.GlobalMax {
+		l.peerMu.Unlock()
 		return nil, false
 	}
+	// 递增与校验在同一把锁内完成，不存在「校验通过后被别人改掉」的窗口。
+	l.peers[peerIP] = cur + 1
+	l.globalCur.Add(1)
+	l.peerMu.Unlock()
 
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			l.globalCur.Add(-1)
-			// 计数归零时删除该 peer 条目：原先只 Add(-1) 不 Delete，每个出现过的客户端 IP
-			// 都会在 sync.Map 里永久留下一个 *atomic.Int32，长期运行无界增长（issue #45）。
-			if peerCounter.Add(-1) == 0 {
-				l.peers.CompareAndDelete(peerIP, peerCounter)
+			l.peerMu.Lock()
+			switch n := l.peers[peerIP] - 1; {
+			case n <= 0:
+				// 归零即删：否则每个出现过的客户端 IP 都会永久残留 map 条目。
+				delete(l.peers, peerIP)
+			default:
+				l.peers[peerIP] = n
 			}
+			// 全局计数也在锁内递减，保证 globalCur 与 peers 的总和始终一致。
+			l.globalCur.Add(-1)
+			l.peerMu.Unlock()
 		})
 	}, true
+}
+
+// peerCount 返回某个 peer 当前的活跃隧道数（供测试与诊断使用）。
+func (l *TunnelLimiter) peerCount(peerIP string) int {
+	if l == nil {
+		return 0
+	}
+	l.peerMu.Lock()
+	defer l.peerMu.Unlock()
+	return l.peers[peerIP]
 }
 
 func (l *TunnelLimiter) ActiveCount() int {

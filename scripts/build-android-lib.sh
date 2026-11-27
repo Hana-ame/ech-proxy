@@ -129,8 +129,7 @@ build_abi arm64-v8a arm64 aarch64-linux-android${API}-clang
 echo "==> javac EchProxy.java"
 CLASSES="$WORK/classes"
 mkdir -p "$CLASSES"
-javac -release 8 \
-    -d "$CLASSES" \
+javac -d "$CLASSES" \
     android-lib/src/main/java/xyz/moonchan/echproxy/android/EchProxy.java
 
 echo "==> jar classes.jar"

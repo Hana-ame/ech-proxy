@@ -103,6 +103,10 @@
 | `-whitelist-url` | 自定义 `pac.txt` 地址（默认 `https://4545810.xyz/pac.txt`）；**显式指定后不再使用本地 pac.txt** |
 | `-pac-file` | 显式指定本地 `pac.txt` 路径（默认自动探测，见「本地 pac.txt 优先」一节） |
 | `-no-local-pac` | 忽略本地 `pac.txt`，强制使用在线白名单（等价环境变量 `ECH_PROXY_NO_LOCAL_PAC=1`） |
+| `-bypass-url` | 自定义 `bypass.txt` 绕过名单地址（默认 `https://4545810.xyz/bypass.txt`）；命中域名直接转交上游全局代理（`-fallback`） |
+| `-bypass-file` | 显式指定本地 `bypass.txt` 路径（默认自动探测：程序同目录 → `<dataDir>` → 当前目录，改文件 30s 内热加载） |
+| `-no-local-bypass` | 忽略本地 `bypass.txt`，强制使用在线绕过名单（等价环境变量 `ECH_PROXY_NO_LOCAL_BYPASS=1`） |
+| `-fallback` | 指定上游全局代理（如 `127.0.0.1:7897` / `socks5://127.0.0.1:7897`），用于 `bypass.txt` 直接转交及直连失败兜底 |
 | `-ip` | 出口 IP 协议族兼容别名（支持 `4` / `ipv4` / `6` / `ipv6` / `dual` / `0`，兼容旧版 `-ip 4` 调用习惯） |
 | `-mode` | 运行模式选择（`smart` / `443` / `local`；若旧版脚本误传悬空 `-mode -ip 4` 将自动容错忽略） |
 | `ca install` / `-ca-install` | 一键安装本地 CA 根证书到受信任根证书库 |
@@ -131,6 +135,18 @@ PAC 白名单支持「放文件即生效」，**不需要任何命令行参数**
 7. 缓存隔离：本地来源**不写入也不读取** `<dataDir>/cache/pac.txt`（该缓存只服务在线来源），避免上次联网残留的旧名单顶掉用户刚放的本地文件。
 
 ---
+
+---
+
+## 四·续、 与主力代理（Clash / Mihomo / v2rayN）共存方案
+
+1. **方案一：`系统 -> ech-proxy -> bypass.txt（本地/在线） -> 全局代理`**
+   - 关闭主力代理的「系统代理」与「TUN 模式」，仅保留本地代理端口（如 `127.0.0.1:7897`）。
+   - 在 `ech-proxy.exe` 同目录放置 `bypass.txt`（每行一个域名，支持 `#` 注释和 `*.domain`，30s 内热加载），或通过 `-bypass-url` 指定在线列表。
+   - 启动 `ech-proxy.exe -fallback 127.0.0.1:7897`：命中 `bypass.txt` 的域名直接走上游全局代理；其余域名优先走 `ech-proxy` 直连，失败时自动兜底逃逸到全局代理。
+2. **方案二：`系统 -> Clash(全局代理) -> ech-proxy`**
+   - 以 `ech-proxy.exe -sys-proxy off` 启动（或在托盘中禁用系统代理），v3.6.1+ 默认已开启 `-all`。
+   - 在 Clash / Mihomo 中添加本地 HTTP 节点 `ECH-Local`（`127.0.0.1:8443`），并在 `rules:` 最顶部加入 `PROCESS-NAME,ech-proxy.exe,DIRECT` 防止 TUN 回环，再将目标域名指向 `ECH-Local`、其余流量通过 `MATCH,PROXY` 走主力全局代理。
 
 ## 五、 Windows 7 (32位 `386` / 64位 `amd64`) 兼容性与构建说明（借鉴 Xray / V2Ray 方案）
 

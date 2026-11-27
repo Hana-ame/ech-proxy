@@ -25,6 +25,10 @@ const (
 	// DefaultWhitelistURL 是 PAC 方案专属的远程白名单（pac.txt，一行一个 domain）默认地址（失败 fallback = []）。
 	DefaultWhitelistURL = "https://" + netdial.DefaultSiteHost + "/pac.txt"
 
+	// DefaultBypassURL 是共存分流用的远程绕过清单（bypass.txt，一行一个 domain）默认地址。
+	// 命中 bypass.txt 的域名将跳过 ech-proxy，直接走上游全局代理（-fallback）或直连。
+	DefaultBypassURL = "https://" + netdial.DefaultSiteHost + "/bypass.txt"
+
 	// DefaultAdultSitesURL 是「成人网站清单」（adult.txt，一行一个 domain）默认地址 ——
 	// 与 pac.txt 并列的第二个文件：pac.txt 只决定 PAC 路由，adult.txt 决定是否去广告 + 插入自有广告。
 	// 采用手动维护，不再依赖 HTML 自动检测。
@@ -43,6 +47,7 @@ const (
 	maxWhitelistHistory = 16
 	cachedScriptName    = "ads.js"
 	cachedWhitelistName = "pac.txt"
+	cachedBypassName    = "bypass.txt"
 )
 
 var DefaultAdNetworkBlockedURLs = []string{
@@ -435,7 +440,15 @@ type AdScriptOptions struct {
 	PACFile string
 	// NoLocalPAC 为 true 时忽略一切本地 pac.txt，直接用在线白名单（-no-local-pac）。
 	NoLocalPAC bool
-	// DataDir 是数据目录，用于探测 <dataDir>/pac.txt；可为空。
+	// BypassURL 是显式指定的 bypass.txt 地址（-bypass-url / ECH_PROXY_BYPASS_URL）。
+	BypassURL string
+	// BypassFile 是显式指定的本地 bypass.txt 路径（-bypass-file / ECH_PROXY_BYPASS_FILE）。
+	BypassFile string
+	// NoLocalBypass 为 true 时忽略一切本地 bypass.txt，直接使用在线地址（-no-local-bypass）。
+	NoLocalBypass bool
+	// OnBypassUpdated 在 bypass.txt 更新后触发（用于热刷新系统 PAC）。
+	OnBypassUpdated func([]string)
+	// DataDir 是数据目录，用于探测 <dataDir>/pac.txt 与 <dataDir>/bypass.txt；可为空。
 	DataDir string
 }
 
@@ -450,6 +463,9 @@ type AdScriptManager struct {
 	whitelistKind string
 	// whitelistLocalPath 是命中的本地 pac.txt 绝对路径（非本地来源时为空）。
 	whitelistLocalPath string
+	bypassURL          string
+	bypassKind         string
+	bypassLocalPath    string
 	adultSitesURL      string
 	blocklistURL       string
 	updateInterval     time.Duration
@@ -457,9 +473,11 @@ type AdScriptManager struct {
 	fetchFn            func(string) ([]byte, error)
 
 	onWhitelistUpdated func([]string)
+	onBypassUpdated    func([]string)
 
 	whitelistPtr     atomic.Pointer[[]string]
 	whitelistHistory [][]string
+	bypassPtr        atomic.Pointer[[]string]
 	adultSites       []string
 
 	scriptBytes []byte
@@ -489,6 +507,15 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	for _, w := range src.Warnings {
 		log.Printf("[AdScript] %s", w)
 	}
+	bypassSrc := ResolveBypassSource(WhitelistSourceOptions{
+		ExplicitURL:  strings.TrimSpace(opts.BypassURL),
+		ExplicitPath: strings.TrimSpace(opts.BypassFile),
+		DataDir:      strings.TrimSpace(opts.DataDir),
+		DisableLocal: opts.NoLocalBypass,
+	})
+	for _, w := range bypassSrc.Warnings {
+		log.Printf("[AdScript] bypass: %s", w)
+	}
 	adultURL := strings.TrimSpace(opts.AdultSitesURL)
 	if adultURL == "" {
 		adultURL = DefaultAdultSitesURL
@@ -511,6 +538,9 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 		whitelistURL:       whiteURL,
 		whitelistKind:      src.Kind,
 		whitelistLocalPath: src.LocalPath,
+		bypassURL:          bypassSrc.URL,
+		bypassKind:         bypassSrc.Kind,
+		bypassLocalPath:    bypassSrc.LocalPath,
 		adultSitesURL:      adultURL,
 		blocklistURL:       blockURL,
 		updateInterval:     interval,
@@ -520,11 +550,14 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 	}
 	emptyWL := []string{}
 	m.whitelistPtr.Store(&emptyWL)
+	emptyBypass := []string{}
+	m.bypassPtr.Store(&emptyBypass)
 	m.enabled.Store(opts.Enabled && !opts.SkipAdScript)
 	m.skipAdBlock.Store(opts.SkipAdBlock)
 	m.allMode.Store(opts.AllMode)
 
 	m.onWhitelistUpdated = opts.OnWhitelistUpdated
+	m.onBypassUpdated = opts.OnBypassUpdated
 
 	if m.cacheDir != "" {
 		if cached, err := os.ReadFile(filepath.Join(m.cacheDir, cachedScriptName)); err == nil && isValidAdScript(cached) {
@@ -539,6 +572,13 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 				}
 			}
 		}
+		if bypassSrc.LocalPath == "" {
+			if cachedBP, err := os.ReadFile(filepath.Join(m.cacheDir, cachedBypassName)); err == nil {
+				if domains, perr := ParseDomainList(cachedBP); perr == nil && len(domains) > 0 {
+					m.SwapBypassList(domains)
+				}
+			}
+		}
 	}
 	if src.LocalPath != "" {
 		// 本地文件同步读取，保证 /proxy.pac 从第一帧起就是本地清单（不依赖后台刷新时序）。
@@ -550,6 +590,17 @@ func NewAdScriptManager(opts AdScriptOptions) *AdScriptManager {
 			}
 		} else {
 			log.Printf("[AdScript] read local pac.txt %s: %v", src.LocalPath, err)
+		}
+	}
+	if bypassSrc.LocalPath != "" {
+		if raw, err := os.ReadFile(bypassSrc.LocalPath); err == nil {
+			if domains, perr := ParseDomainList(raw); perr == nil {
+				m.SwapBypassList(domains)
+			} else {
+				log.Printf("[AdScript] parse local bypass.txt %s: %v", bypassSrc.LocalPath, perr)
+			}
+		} else {
+			log.Printf("[AdScript] read local bypass.txt %s: %v", bypassSrc.LocalPath, err)
 		}
 	}
 	return m
@@ -809,6 +860,133 @@ func (m *AdScriptManager) IsWhitelisted(hosts ...string) bool {
 	return false
 }
 
+func (m *AdScriptManager) SetOnBypassUpdated(fn func([]string)) {
+	if m != nil {
+		m.mu.Lock()
+		m.onBypassUpdated = fn
+		m.mu.Unlock()
+	}
+}
+
+func (m *AdScriptManager) BypassURL() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.bypassURL
+}
+
+func (m *AdScriptManager) BypassSourceKind() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.bypassKind
+}
+
+func (m *AdScriptManager) BypassLocalPath() string {
+	if m == nil {
+		return ""
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.bypassLocalPath
+}
+
+func (m *AdScriptManager) BypassList() []string {
+	if m == nil {
+		return []string{}
+	}
+	ptr := m.bypassPtr.Load()
+	if ptr == nil || len(*ptr) == 0 {
+		return []string{}
+	}
+	return append([]string(nil), (*ptr)...)
+}
+
+func (m *AdScriptManager) SwapBypassList(domains []string) []string {
+	if m == nil {
+		return []string{}
+	}
+	norm := normalizeDomainSlice(domains)
+	oldPtr := m.bypassPtr.Swap(&norm)
+	if oldPtr == nil {
+		return []string{}
+	}
+	return append([]string(nil), (*oldPtr)...)
+}
+
+func (m *AdScriptManager) SetBypassList(domains []string) {
+	_ = m.SwapBypassList(domains)
+}
+
+func (m *AdScriptManager) IsBypassed(hosts ...string) bool {
+	if m == nil {
+		return false
+	}
+	bp := m.BypassList()
+	if len(bp) == 0 {
+		return false
+	}
+	for _, h := range hosts {
+		if MatchDomainInList(h, bp) {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *AdScriptManager) RefreshBypassOnce() ([]string, error) {
+	if m == nil {
+		return []string{}, nil
+	}
+	m.mu.RLock()
+	url, fetch, cacheDir, kind, localPath := m.bypassURL, m.fetchFn, m.cacheDir, m.bypassKind, m.bypassLocalPath
+	m.mu.RUnlock()
+
+	if url == "" || fetch == nil {
+		return m.BypassList(), nil
+	}
+	var raw []byte
+	var err error
+	if p, ok := localWhitelistPath(url); ok {
+		if localPath != "" {
+			p = localPath
+		}
+		raw, err = os.ReadFile(p)
+	} else {
+		raw, err = fetch(url)
+	}
+	if err != nil {
+		// 在线默认 bypass.txt 若远端暂未部署或拉取失败，静默保留旧值/空表，不干扰主线 PAC。
+		if kind != WhitelistKindRemote {
+			log.Printf("[AdScript] Failed to fetch bypass list from %s: %v (retaining previous bypass list)", url, err)
+		}
+		return m.BypassList(), fmt.Errorf("fetch bypass list from %s: %w", url, err)
+	}
+	domains, perr := ParseDomainList(raw)
+	if perr != nil {
+		if kind != WhitelistKindRemote {
+			log.Printf("[AdScript] Failed to parse bypass list from %s: %v (retaining previous bypass list)", url, perr)
+		}
+		return m.BypassList(), fmt.Errorf("parse bypass list from %s: %w", url, perr)
+	}
+	prev := m.SwapBypassList(domains)
+	if cacheDir != "" && len(raw) > 0 && kind != WhitelistKindLocal {
+		_ = os.MkdirAll(cacheDir, 0o755)
+		_ = os.WriteFile(filepath.Join(cacheDir, cachedBypassName), raw, 0o644)
+	}
+	m.mu.RLock()
+	cb := m.onBypassUpdated
+	m.mu.RUnlock()
+	if cb != nil && !slicesEqual(prev, domains) {
+		cb(domains)
+	}
+	return append([]string(nil), domains...), nil
+}
+
 // AdultSitesURL 返回成人网站清单（adult.txt）地址。
 func (m *AdScriptManager) AdultSitesURL() string {
 	if m == nil {
@@ -1020,7 +1198,7 @@ func (m *AdScriptManager) refreshInterval() time.Duration {
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if m.whitelistKind == WhitelistKindLocal {
+	if m.whitelistKind == WhitelistKindLocal || m.bypassKind == WhitelistKindLocal {
 		const localReloadInterval = 30 * time.Second
 		if m.updateInterval < localReloadInterval {
 			return m.updateInterval
@@ -1079,6 +1257,7 @@ func (m *AdScriptManager) RefreshOnce() (bool, error) {
 	// 一律原样返回），保留后台每 30 分钟一次 adult.txt 网络请求纯属无意义开销与
 	// 隐私泄露面（issue #46）。需要手动刷新仍可显式调用 RefreshAdultSitesOnce。
 	_, whiteErr := m.RefreshWhitelistOnce()
+	_, _ = m.RefreshBypassOnce()
 	return false, whiteErr
 }
 

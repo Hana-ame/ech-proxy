@@ -82,14 +82,18 @@ var (
 	ContainsAdultAdInHTML   = rewrite.ContainsAdultAdInHTML
 	DefaultAdScriptURL      = rewrite.DefaultAdScriptURL
 	DefaultWhitelistURL     = rewrite.DefaultWhitelistURL
+	DefaultBypassURL        = rewrite.DefaultBypassURL
 	DefaultAdultSitesURL    = rewrite.DefaultAdultSitesURL
 	DefaultBlocklistURL     = rewrite.DefaultBlocklistURL
 	DefaultAdScriptInterval = rewrite.DefaultAdScriptUpdateInterval
 	// 本地 pac.txt 优先：解析与探测入口统一从 rewrite 暴露，避免 win/ 与 echproxy/ 各写一份判定。
 	ResolveWhitelistSource          = rewrite.ResolveWhitelistSource
+	ResolveBypassSource             = rewrite.ResolveBypassSource
 	DefaultLocalWhitelistCandidates = rewrite.DefaultLocalWhitelistCandidates
+	DefaultLocalBypassCandidates    = rewrite.DefaultLocalBypassCandidates
 	IsLocalWhitelistSource          = rewrite.IsLocalWhitelistSource
 	LocalWhitelistFileName          = rewrite.LocalWhitelistFileName
+	LocalBypassFileName             = rewrite.LocalBypassFileName
 	WhitelistKindExplicit           = rewrite.WhitelistKindExplicit
 	WhitelistKindLocal              = rewrite.WhitelistKindLocal
 	WhitelistKindRemote             = rewrite.WhitelistKindRemote
@@ -152,6 +156,9 @@ type ServerOptions struct {
 	PACFile string
 	// NoLocalPAC 为 true 时忽略本地 pac.txt，强制使用在线白名单（-no-local-pac）。
 	NoLocalPAC       bool
+	BypassURL        string
+	BypassFile       string
+	NoLocalBypass    bool
 	AdultSitesURL    string
 	BlocklistURL     string
 	AdScriptInterval time.Duration
@@ -344,6 +351,9 @@ func NewServer(opts ServerOptions) (*Server, error) {
 			WhitelistURL:   strings.TrimSpace(opts.WhitelistURL),
 			PACFile:        strings.TrimSpace(opts.PACFile),
 			NoLocalPAC:     opts.NoLocalPAC,
+			BypassURL:      strings.TrimSpace(opts.BypassURL),
+			BypassFile:     strings.TrimSpace(opts.BypassFile),
+			NoLocalBypass:  opts.NoLocalBypass,
 			DataDir:        dataDir,
 			AdultSitesURL:  strings.TrimSpace(opts.AdultSitesURL),
 			BlocklistURL:   strings.TrimSpace(opts.BlocklistURL),

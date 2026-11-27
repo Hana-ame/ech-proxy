@@ -329,7 +329,19 @@ func ProxyHandlerWithConfig(cfg *config.Config, auth *AuthConfig, adScript *rewr
 		}
 		attachReplayBody(outReq, bodyReplay)
 
-		resp, err := roundTripFn(outReq, uc.Mode, uc.IPMode)
+		var resp *http.Response
+		if adScript != nil && adScript.IsBypassed(host, uc.Host) {
+			if fbTransport := getFallbackTransport(); fbTransport != nil {
+				resp, err = fbTransport.RoundTrip(outReq)
+				if err == nil {
+					debugLogf("[%s] Bypass rule matched for %s -> forwarded directly to upstream proxy (%s)", clientIP, uc.Host, GetFallbackProxy())
+				}
+			} else {
+				resp, err = roundTripFn(outReq, uc.Mode, uc.IPMode)
+			}
+		} else {
+			resp, err = roundTripFn(outReq, uc.Mode, uc.IPMode)
+		}
 		if err != nil && clientSentPlainHTTP && targetScheme == "https" && !cloudflare_ech.IsCertError(err) && origDomainMode {
 			if bodyReplay != nil {
 				c.Request.Body = io.NopCloser(bytes.NewReader(bodyReplay))

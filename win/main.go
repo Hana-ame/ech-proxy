@@ -57,6 +57,10 @@ func FlagOverviewText() string {
     -pac-file           显式指定本地 pac.txt 路径（默认自动探测：程序同目录 → 数据目录 → 当前目录）
     -no-local-pac       忽略本地 pac.txt，强制使用在线白名单
                         本地 pac.txt 存在则默认优先使用：离线可用，改文件约 30s 内热加载，无需重启
+    -bypass-url         自定义 bypass.txt 绕过名单地址（默认 https://4545810.xyz/bypass.txt）
+                        命中 bypass.txt 的域名跳过 ech-proxy，直接走上游全局代理（-fallback）
+    -bypass-file        显式指定本地 bypass.txt 路径（默认自动探测：程序同目录 → 数据目录 → 当前目录）
+    -no-local-bypass    忽略本地 bypass.txt，强制使用在线绕过名单
 
   诊断子命令（一次性真实请求，不启动监听、不改系统代理与 hosts）:
     probe -host <域名>   逐通道诊断：direct / fragment / sni / ech / auto 各打一次并打印状态码与错误
@@ -126,6 +130,9 @@ type CLICommand struct {
 	WhitelistURL     string
 	PACFile          string
 	NoLocalPAC       bool
+	BypassURL        string
+	BypassFile       string
+	NoLocalBypass    bool
 	AdultSitesURL    string
 	BlocklistURL     string
 	AdScriptInterval time.Duration
@@ -326,6 +333,9 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 	// 存在即用它（离线可用），不存在才用 -whitelist-url / 内置在线地址。
 	pacFile := fs.String("pac-file", getenv("ECH_PROXY_PAC_FILE"), "本地 pac.txt 路径（存在则默认优先使用）")
 	noLocalPAC := fs.Bool("no-local-pac", envBool(getenv("ECH_PROXY_NO_LOCAL_PAC")), "忽略本地 pac.txt，强制使用在线白名单")
+	bypassURL := fs.String("bypass-url", getenv("ECH_PROXY_BYPASS_URL"), "bypass.txt 地址（命中域名直接转交上游全局代理）")
+	bypassFile := fs.String("bypass-file", getenv("ECH_PROXY_BYPASS_FILE"), "本地 bypass.txt 路径（存在则默认优先使用）")
+	noLocalBypass := fs.Bool("no-local-bypass", envBool(getenv("ECH_PROXY_NO_LOCAL_BYPASS")), "忽略本地 bypass.txt，强制使用在线绕过名单")
 	adultSitesURL := fs.String("adult-sites-url", getenv("ECH_PROXY_ADULT_SITES_URL"), "自定义站点清单地址")
 	adultDomainsAlias := fs.String("adult-domains-url", "", "pac.txt 别名")
 	blocklistURL := fs.String("blocklist-url", getenv("ECH_PROXY_BLOCKLIST_URL"), "自定义补充规则地址")
@@ -534,6 +544,9 @@ func parseCLIArgs(progName string, args []string, getenv func(string) string) (C
 		WhitelistURL:     resolvedWhitelistURL,
 		PACFile:          strings.TrimSpace(*pacFile),
 		NoLocalPAC:       *noLocalPAC,
+		BypassURL:        strings.TrimSpace(*bypassURL),
+		BypassFile:       strings.TrimSpace(*bypassFile),
+		NoLocalBypass:    *noLocalBypass,
 		AdultSitesURL:    strings.TrimSpace(*adultSitesURL),
 		BlocklistURL:     strings.TrimSpace(*blocklistURL),
 		AdScriptInterval: *adScriptInterval,
@@ -891,6 +904,9 @@ func main() {
 		WhitelistURL:     cmd.WhitelistURL,
 		PACFile:          cmd.PACFile,
 		NoLocalPAC:       cmd.NoLocalPAC,
+		BypassURL:        cmd.BypassURL,
+		BypassFile:       cmd.BypassFile,
+		NoLocalBypass:    cmd.NoLocalBypass,
 		AdultSitesURL:    cmd.AdultSitesURL,
 		BlocklistURL:     cmd.BlocklistURL,
 		AdScriptInterval: cmd.AdScriptInterval,
@@ -913,6 +929,10 @@ func main() {
 		log.Printf("[PAC] whitelist source: %s (kind=%s)", srv.AdScript.WhitelistURL(), srv.AdScript.WhitelistSourceKind())
 		if p := srv.AdScript.WhitelistLocalPath(); p != "" {
 			log.Printf("[PAC] local pac.txt in use: %s (%d domains)", p, len(srv.AdScript.Whitelist()))
+		}
+		log.Printf("[PAC] bypass source: %s (kind=%s, %d domains)", srv.AdScript.BypassURL(), srv.AdScript.BypassSourceKind(), len(srv.AdScript.BypassList()))
+		if bp := srv.AdScript.BypassLocalPath(); bp != "" {
+			log.Printf("[PAC] local bypass.txt in use: %s (%d domains)", bp, len(srv.AdScript.BypassList()))
 		}
 	}
 
@@ -954,10 +974,10 @@ func main() {
 		if srv.AdScript != nil {
 			srv.AdScript.SetAllMode(sysProxyMgr.AllMode())
 		}
-		if cmd.FallbackProxy == "" {
-			if fb := sysProxyMgr.FallbackProxy(); fb != "" {
-				echproxy.SetFallbackProxy(fb)
-			}
+		if fb := strings.TrimSpace(cmd.FallbackProxy); fb != "" {
+			sysProxyMgr.SetFallbackProxy(fb)
+		} else if fb := sysProxyMgr.FallbackProxy(); fb != "" {
+			echproxy.SetFallbackProxy(fb)
 		}
 		if srv.AdScript != nil {
 			srv.AdScript.SetOnWhitelistUpdated(func(domains []string) {
@@ -965,6 +985,14 @@ func main() {
 					log.Printf("[PAC] Whitelist updated (%d domains), refreshing system proxy PAC URL...", len(domains))
 					if err := sysProxyMgr.SetMode(SysProxyPAC); err != nil {
 						log.Printf("WARNING: Failed to refresh system proxy PAC: %v", err)
+					}
+				}
+			})
+			srv.AdScript.SetOnBypassUpdated(func(domains []string) {
+				if sysProxyMgr != nil && sysProxyMgr.Mode() == SysProxyPAC {
+					log.Printf("[PAC] Bypass list updated (%d domains), hot-refreshing system proxy PAC URL...", len(domains))
+					if _, _, err := sysProxyMgr.RefreshPAC(); err != nil {
+						log.Printf("WARNING: Failed to hot-refresh system proxy PAC: %v", err)
 					}
 				}
 			})

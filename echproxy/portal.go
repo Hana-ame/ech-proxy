@@ -145,8 +145,9 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		adEnabled, skipAdScript, skipAdBlock := false, true, false
 		allMode := opts.AllMode
 		adSource, adVersion := "disabled", ""
-		whitelistCount, adultSitesCount, blocklistCount := 0, 0, 0
+		whitelistCount, bypassCount, adultSitesCount, blocklistCount := 0, 0, 0, 0
 		whitelistSource, whitelistKind, whitelistPath := DefaultWhitelistURL, WhitelistKindRemote, ""
+		bypassSource, bypassKind, bypassPath := DefaultBypassURL, WhitelistKindRemote, ""
 		if opts.AdScript != nil {
 			adEnabled = opts.AdScript.Enabled()
 			skipAdScript = opts.AdScript.SkipAdScript()
@@ -163,6 +164,10 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			whitelistSource = opts.AdScript.WhitelistURL()
 			whitelistKind = opts.AdScript.WhitelistSourceKind()
 			whitelistPath = opts.AdScript.WhitelistLocalPath()
+			bypassCount = len(opts.AdScript.BypassList())
+			bypassSource = opts.AdScript.BypassURL()
+			bypassKind = opts.AdScript.BypassSourceKind()
+			bypassPath = opts.AdScript.BypassLocalPath()
 		}
 		logFile := ""
 		if opts.Logger != nil {
@@ -191,6 +196,10 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 			"whitelist_source":  whitelistSource,
 			"whitelist_kind":    whitelistKind,
 			"whitelist_path":    whitelistPath,
+			"bypass_count":      bypassCount,
+			"bypass_source":     bypassSource,
+			"bypass_kind":       bypassKind,
+			"bypass_path":       bypassPath,
 			"adult_sites_count": adultSitesCount,
 			"blocklist_count":   blocklistCount,
 			"log_file":          logFile,
@@ -225,15 +234,19 @@ func NewEngineWithOptions(opts EngineOptions) *gin.Engine {
 		}
 		proxyAddr := "127.0.0.1:" + portStr
 		global := opts.AllMode || (opts.AdScript != nil && opts.AdScript.AllMode()) || c.Query("mode") == "all" || c.Query("global") == "1"
-		var wl []string
+		var wl, bp []string
 		if opts.AdScript != nil {
 			wl = opts.AdScript.Whitelist()
+			bp = opts.AdScript.BypassList()
 		}
 		// fallback 仅用于本 PAC 脚本文本内容（客户端侧兜底），绝不在这里修改服务端全局兜底代理：
 		// 该路由是 loopback 上的无鉴权 GET，任意网页都能发起，历史上 SetFallbackProxy(fallback)
 		// 会让恶意页面一条 GET 就把全局上游代理改成任意地址（安全 issue #39）。
 		fallback := c.Query("fallback")
-		pac := config.GeneratePACWithFallback(nil, proxyAddr, global, fallback, wl)
+		if strings.TrimSpace(fallback) == "" {
+			fallback = GetFallbackProxy()
+		}
+		pac := config.GeneratePACWithRules(nil, proxyAddr, global, fallback, wl, bp)
 		c.Header("Content-Type", "application/x-ns-proxy-autoconfig; charset=utf-8")
 		c.Header("Cache-Control", "no-store, no-cache, must-revalidate")
 		c.String(http.StatusOK, pac)

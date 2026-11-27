@@ -253,3 +253,93 @@ func TestDomesticBootstrapFallbackGate(t *testing.T) {
 		t.Error("value '0' must keep domestic fallback enabled")
 	}
 }
+
+func TestMarkPrimaryBootstrapUnreachableCooldownTransition(t *testing.T) {
+	primaryBootstrapMu.Lock()
+	origRetryAt := primaryBootstrapRetryAt
+	primaryBootstrapRetryAt = time.Time{}
+	primaryBootstrapMu.Unlock()
+	defer func() {
+		primaryBootstrapMu.Lock()
+		primaryBootstrapRetryAt = origRetryAt
+		primaryBootstrapMu.Unlock()
+	}()
+
+	now := time.Now()
+	if !primaryBootstrapUsable(now) {
+		t.Fatal("primary bootstrap should be usable before first failure")
+	}
+	if entered := markPrimaryBootstrapUnreachable(now); !entered {
+		t.Error("first failure must report entered=true so caller logs once")
+	}
+	if primaryBootstrapUsable(now.Add(1 * time.Second)) {
+		t.Error("primary bootstrap must not be usable during cooldown")
+	}
+	if entered := markPrimaryBootstrapUnreachable(now.Add(1 * time.Second)); entered {
+		t.Error("repeated mark during active cooldown must return entered=false to suppress log spam")
+	}
+	afterCooldown := now.Add(bootstrapPrimaryCooldown + 2*time.Second)
+	if !primaryBootstrapUsable(afterCooldown) {
+		t.Error("primary bootstrap must become usable again after cooldown expires")
+	}
+	if entered := markPrimaryBootstrapUnreachable(afterCooldown); !entered {
+		t.Error("failure after cooldown expiry must report entered=true again")
+	}
+}
+
+func TestResolveDefaultSiteHostSystemDNSAndOneTimeCFFallback(t *testing.T) {
+	origLookup := systemLookupIPFn
+	origFlag := defaultSiteUseBuiltinCF.Load()
+	defer func() {
+		systemLookupIPFn = origLookup
+		defaultSiteUseBuiltinCF.Store(origFlag)
+		bootstrapCacheMu.Lock()
+		delete(bootstrapCache, "sysdns|"+DefaultSiteHost+"|v4")
+		delete(bootstrapCache, "sysdns|"+DefaultSiteHost+"|v6")
+		bootstrapCacheMu.Unlock()
+	}()
+
+	defaultSiteUseBuiltinCF.Store(false)
+	bootstrapCacheMu.Lock()
+	delete(bootstrapCache, "sysdns|"+DefaultSiteHost+"|v4")
+	bootstrapCacheMu.Unlock()
+
+	// 1. System DNS succeeds: returns system DNS IP without setting fallback flag.
+	calls := 0
+	systemLookupIPFn = func(ctx context.Context, host string) ([]net.IP, error) {
+		calls++
+		return []net.IP{net.ParseIP("104.21.1.2")}, nil
+	}
+	ips, err := ResolveIPs(context.Background(), DefaultSiteHost, "v4")
+	if err != nil || len(ips) != 1 || ips[0] != "104.21.1.2" {
+		t.Fatalf("system DNS success: got (%v, %v), want [104.21.1.2]", ips, err)
+	}
+	if defaultSiteUseBuiltinCF.Load() {
+		t.Error("fallback flag must remain false when system DNS succeeds")
+	}
+
+	// 2. System DNS fails: sets one-time flag and returns built-in Cloudflare anycast IPs;
+	// subsequent calls must NOT invoke system DNS again.
+	bootstrapCacheMu.Lock()
+	delete(bootstrapCache, "sysdns|"+DefaultSiteHost+"|v4")
+	bootstrapCacheMu.Unlock()
+	failCalls := 0
+	systemLookupIPFn = func(ctx context.Context, host string) ([]net.IP, error) {
+		failCalls++
+		return nil, errors.New("dns timeout")
+	}
+	ips1, err := ResolveIPs(context.Background(), DefaultSiteHost, "v4")
+	if err != nil || len(ips1) == 0 || ips1[0] != "104.16.132.229" {
+		t.Fatalf("first fallback call: got (%v, %v), want built-in CF v4", ips1, err)
+	}
+	if !defaultSiteUseBuiltinCF.Load() {
+		t.Error("one-time fallback flag must be set after system DNS failure")
+	}
+	ips2, err := ResolveIPs(context.Background(), DefaultSiteHost, "v4")
+	if err != nil || len(ips2) == 0 || ips2[0] != "104.16.132.229" {
+		t.Fatalf("second fallback call: got (%v, %v), want built-in CF v4", ips2, err)
+	}
+	if failCalls != 1 {
+		t.Errorf("systemLookupIPFn called %d times after failure, want exactly 1 (one-time flag)", failCalls)
+	}
+}

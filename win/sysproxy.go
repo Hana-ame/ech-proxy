@@ -104,7 +104,8 @@ type SysProxyManager struct {
 	// appliedPACURL 是最近一次真正写入系统的 PAC 地址（仅在成功 ApplyPAC 后记录）。
 	// 用于「全代理热切换」：PAC 模式下的开关切换不压栈、也不改变系统代理拓扑，
 	// 只需把新的 PAC URL 原子覆盖上去，避免用户每勾选一次就在恢复栈里堆一层。
-	appliedPACURL string
+	appliedPACURL    string
+	explicitFallback string
 }
 
 func NewSysProxyManager(listenAddr string, driver SysProxyDriver) *SysProxyManager {
@@ -244,6 +245,15 @@ func (m *SysProxyManager) captureOriginalLocked(current SysProxyState) {
 	}
 }
 
+func (m *SysProxyManager) SetFallbackProxy(raw string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.explicitFallback = strings.TrimSpace(raw)
+	m.mu.Unlock()
+}
+
 func (m *SysProxyManager) FallbackProxy() string {
 	if m == nil {
 		return ""
@@ -254,6 +264,9 @@ func (m *SysProxyManager) FallbackProxy() string {
 }
 
 func (m *SysProxyManager) getFallbackLocked() string {
+	if m.explicitFallback != "" {
+		return m.explicitFallback
+	}
 	if m.hasOriginal && m.originalState.ProxyEnable && strings.TrimSpace(m.originalState.ProxyServer) != "" {
 		if !isSelfProxy(m.originalState, m.listenAddr) {
 			return m.originalState.ProxyServer

@@ -17,6 +17,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,6 +34,7 @@ const (
 	DefaultSiteHost = "4545810.xyz"
 
 	bootstrapCacheTTL      = 5 * time.Minute
+	bootstrapNegCacheTTL   = 15 * time.Second
 	maxBootstrapCacheItems = 512
 )
 
@@ -225,6 +227,7 @@ func FormatIPMode(mode string) string {
 
 type bootstrapCacheEntry struct {
 	ips    []string
+	err    error
 	expiry time.Time
 }
 
@@ -258,6 +261,33 @@ var (
 	// bootstrapPrimaryPreferWindow（3 次重试下会耗尽上层 10s 预算）。
 	primaryBootstrapMu      sync.Mutex
 	primaryBootstrapRetryAt time.Time
+
+	// defaultSiteUseBuiltinCF 是一次性开关：解析 4545810.xyz（DefaultSiteHost）时不再走 DoH，
+	// 优先使用系统 DNS；一旦系统 DNS 失败，置位此标志并在本次进程生命周期内直接使用内置 Cloudflare 广播 IP。
+	defaultSiteUseBuiltinCF atomic.Bool
+
+	// builtinCloudflareAnycastIPs 为 cloudflare.com 的内置 Anycast 广播 IP（nslookup cloudflare.com）。
+	builtinCloudflareAnycastIPs = []net.IP{
+		net.ParseIP("104.16.132.229"),
+		net.ParseIP("104.16.133.229"),
+		net.ParseIP("2606:4700::6810:84e5"),
+		net.ParseIP("2606:4700::6810:85e5"),
+	}
+
+	// systemLookupIPFn 默认调用系统 DNS（供单元测试替换注入）。
+	systemLookupIPFn = func(ctx context.Context, host string) ([]net.IP, error) {
+		addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		out := make([]net.IP, 0, len(addrs))
+		for _, a := range addrs {
+			if a.IP != nil && !a.IP.IsLoopback() && !a.IP.IsUnspecified() && !IsPrivateOrReservedIP(a.IP) {
+				out = append(out, a.IP)
+			}
+		}
+		return out, nil
+	}
 )
 
 // TransportPoolStats 返回 netdial 内部缓存的各模式 Transport 数量与标识。
@@ -399,10 +429,16 @@ func primaryBootstrapUsable(now time.Time) bool {
 }
 
 // markPrimaryBootstrapUnreachable 记录主端点不可达，进入冷却期。
-func markPrimaryBootstrapUnreachable(now time.Time) {
+// 返回 entered=true 表示本次调用刚从「可用/已过冷却」切换进入新一轮冷却期，
+// 调用方据此仅在状态切换时打一次告警日志，避免冷却期内每次解析反复刷屏。
+func markPrimaryBootstrapUnreachable(now time.Time) (entered bool) {
 	primaryBootstrapMu.Lock()
+	if !now.Before(primaryBootstrapRetryAt) {
+		entered = true
+	}
 	primaryBootstrapRetryAt = now.Add(bootstrapPrimaryCooldown)
 	primaryBootstrapMu.Unlock()
+	return entered
 }
 
 // domesticBootstrapAllowed 报告是否允许把国内公共 DoH 作为「最后兜底」。
@@ -452,6 +488,61 @@ func queryBootstrapEndpoint(ctx context.Context, ep bootstrapEndpoint, host stri
 	return ips, nil
 }
 
+
+func builtinCloudflareIPsForMode(mode string) ([]string, error) {
+	filtered := FilterIPsByMode(builtinCloudflareAnycastIPs, mode)
+	if len(filtered) == 0 {
+		return nil, fmt.Errorf("no built-in Cloudflare anycast IP matches ip_mode %q", EffectiveIPMode(mode))
+	}
+	return filtered, nil
+}
+
+// ResolveDefaultSiteHost 解析项目自有域名（4545810.xyz）：
+//  1. 不再通过 DoH（1.1.1.1/1.0.0.1 或国内 DoH）查询，彻底避免引导循环与刷屏；
+//  2. 优先使用系统 DNS（net.DefaultResolver）解析并缓存；
+//  3. 一旦系统 DNS 失败或无有效公网记录，置位一次性标志 defaultSiteUseBuiltinCF，
+//     后续直接使用内置 Cloudflare Anycast 广播 IP（nslookup cloudflare.com）。
+func ResolveDefaultSiteHost(ctx context.Context, mode string) ([]string, error) {
+	norm := EffectiveIPMode(mode)
+	if defaultSiteUseBuiltinCF.Load() {
+		return builtinCloudflareIPsForMode(norm)
+	}
+
+	cacheKey := "sysdns|" + DefaultSiteHost + "|" + norm
+	now := time.Now()
+	bootstrapCacheMu.Lock()
+	if e, ok := bootstrapCache[cacheKey]; ok && now.Before(e.expiry) && len(e.ips) > 0 {
+		bootstrapCacheMu.Unlock()
+		return e.ips, nil
+	}
+	bootstrapCacheMu.Unlock()
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	rawIPs, err := systemLookupIPFn(lookupCtx, DefaultSiteHost)
+	cancel()
+
+	if err == nil {
+		if filtered := FilterIPsByMode(rawIPs, norm); len(filtered) > 0 {
+			bootstrapCacheMu.Lock()
+			bootstrapCache[cacheKey] = bootstrapCacheEntry{
+				ips:    filtered,
+				expiry: time.Now().Add(bootstrapCacheTTL),
+			}
+			bootstrapCacheMu.Unlock()
+			return filtered, nil
+		}
+		err = fmt.Errorf("system DNS returned no valid %s IP for %s", norm, DefaultSiteHost)
+	}
+
+	if defaultSiteUseBuiltinCF.CompareAndSwap(false, true) {
+		log.Printf("[netdial] system DNS failed for %q (%v); one-time flag set, falling back to built-in Cloudflare anycast IPs", DefaultSiteHost, err)
+	}
+	return builtinCloudflareIPsForMode(norm)
+}
+
 // ResolveViaBootstrapDoH 仅通过 HTTPS（端口 443）向 IP 直连 DoH 端点查询，绝不发起任何 UDP/TCP 53 端口连接，
 // 且絕不回调上层 DoHResolver，内置内存缓存与 Singleflight 并发合并。
 func ResolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, error) {
@@ -462,6 +553,9 @@ func ResolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, error) {
 	host = CleanHost(host)
 	norm := EffectiveIPMode(mode)
+	if host == DefaultSiteHost {
+		return ResolveDefaultSiteHost(ctx, norm)
+	}
 	if ip := net.ParseIP(host); ip != nil {
 		filtered := FilterIPsByMode([]net.IP{ip}, norm)
 		if len(filtered) == 0 {
@@ -475,6 +569,9 @@ func resolveViaBootstrapDoH(ctx context.Context, host, mode string) ([]string, e
 	bootstrapCacheMu.Lock()
 	if e, ok := bootstrapCache[cacheKey]; ok && now.Before(e.expiry) {
 		bootstrapCacheMu.Unlock()
+		if e.err != nil {
+			return nil, e.err
+		}
 		return e.ips, nil
 	}
 	bootstrapCacheMu.Unlock()
@@ -553,6 +650,7 @@ func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) 
 
 	for _, qt := range qtypes {
 		var won []net.IP
+		enteredCooldown := false
 		// 第一阶段：只竞速主端点（1.1.1.1 / 1.0.0.1），并给它们一个「优先窗口」。
 		// 正常网络下主端点在窗口内返回即直接采用，国内端点全程不参与，
 		// 严格符合 README「引导 IP 仅限 1.1.1.1 / 1.0.0.1」。
@@ -562,14 +660,17 @@ func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) 
 			won = raceBootstrapEndpoints(preferCtx, primaryBootstrapEndpoints, host, qt)
 			preferCancel()
 			if len(won) == 0 {
-				markPrimaryBootstrapUnreachable(time.Now())
+				enteredCooldown = markPrimaryBootstrapUnreachable(time.Now())
 			}
 		}
 		if len(won) == 0 && domesticBootstrapAllowed() {
 			// 第二阶段（最后兜底）：主端点全部失败后才串行启用国内端点。
 			// 原实现把国内端点与主端点放进同一并发竞速，国内延迟更低会几乎总是胜出，
 			// 导致实际用的是 223.5.5.5 等国内 DoH，违背 README 承诺（issue #41）。
-			log.Printf("[netdial] bootstrap DoH primary endpoints (1.1.1.1/1.0.0.1) unreachable for %q, trying domestic endpoints as last resort", host)
+			// 仅在刚触发进入冷却期时打一次日志，冷却期内静默走国内兜底，避免对 4545810.xyz 等域名高频刷屏。
+			if enteredCooldown {
+				log.Printf("[netdial] bootstrap DoH primary endpoints (1.1.1.1/1.0.0.1) unreachable for %q, switching to domestic fallback quietly for %s", host, bootstrapPrimaryCooldown)
+			}
 			won = raceBootstrapEndpoints(ctx, fallbackBootstrapEndpoints, host, qt)
 		}
 		if len(won) > 0 {
@@ -579,10 +680,20 @@ func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) 
 
 	filtered := FilterIPsByMode(ips, norm)
 	if len(filtered) == 0 {
+		var resolveErr error
 		if domesticBootstrapAllowed() {
-			return nil, fmt.Errorf("DoH resolve %s (%s) failed (primary and domestic bootstrap endpoints both unreachable)", host, norm)
+			resolveErr = fmt.Errorf("DoH resolve %s (%s) failed (primary and domestic bootstrap endpoints both unreachable)", host, norm)
+		} else {
+			resolveErr = fmt.Errorf("DoH resolve %s (%s) failed (primary bootstrap endpoints unreachable; domestic fallback disabled by ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP)", host, norm)
 		}
-		return nil, fmt.Errorf("DoH resolve %s (%s) failed (primary bootstrap endpoints unreachable; domestic fallback disabled by ECH_PROXY_DISABLE_DOMESTIC_BOOTSTRAP)", host, norm)
+		// 写入短时负缓存（15s），防止高并发请求在网络异常或某协议族无记录时反复打爆引导 DoH 与日志。
+		bootstrapCacheMu.Lock()
+		bootstrapCache[cacheKey] = bootstrapCacheEntry{
+			err:    resolveErr,
+			expiry: time.Now().Add(bootstrapNegCacheTTL),
+		}
+		bootstrapCacheMu.Unlock()
+		return nil, resolveErr
 	}
 
 	bootstrapCacheMu.Lock()
@@ -614,6 +725,9 @@ func doResolveViaBootstrapDoH(ctx context.Context, host, norm, cacheKey string) 
 func ResolveIPs(ctx context.Context, host, mode string) ([]string, error) {
 	host = CleanHost(host)
 	norm := EffectiveIPMode(mode)
+	if host == DefaultSiteHost {
+		return ResolveDefaultSiteHost(ctx, norm)
+	}
 	if ip := net.ParseIP(host); ip != nil {
 		filtered := FilterIPsByMode([]net.IP{ip}, norm)
 		if len(filtered) == 0 {

@@ -247,7 +247,21 @@ func FormatPACProxyString(raw string) string {
 
 // GeneratePACWithFallback generates a PAC script that routes whitelisted domains through ech-proxy,
 // and falls back non-whitelisted domains to an upstream proxy (e.g. local v2ray) if configured.
-func GeneratePACWithFallback(_ *Config, proxyHostPort string, global bool, fallbackProxy string, extraWhitelist ...[]string) string {
+func GeneratePACWithFallback(cfg *Config, proxyHostPort string, global bool, fallbackProxy string, extraWhitelist ...[]string) string {
+	var mergedWL []string
+	for _, list := range extraWhitelist {
+		mergedWL = append(mergedWL, list...)
+	}
+	return GeneratePACWithRules(cfg, proxyHostPort, global, fallbackProxy, mergedWL, nil)
+}
+
+// GeneratePACWithRules 生成带 bypass.txt 绕过规则的 PAC 脚本：
+//   - 本地环回/内网一律 DIRECT；
+//   - 命中 bypassList（bypass.txt）的域名直接返回 FALLBACK_STR（上游全局代理，未配时为 DIRECT），
+//     优先级高于 GLOBAL_MODE（-all）和 pac.txt 白名单；
+//   - 命中 GLOBAL_MODE 或 whitelist（pac.txt）的域名走 PROXY_STR（ech-proxy，失败时回退 FALLBACK_STR）；
+//   - 其余域名返回 FALLBACK_STR。
+func GeneratePACWithRules(_ *Config, proxyHostPort string, global bool, fallbackProxy string, whitelist []string, bypassList []string) string {
 	if strings.TrimSpace(proxyHostPort) == "" {
 		proxyHostPort = "127.0.0.1:8443"
 	}
@@ -266,18 +280,33 @@ func GeneratePACWithFallback(_ *Config, proxyHostPort string, global bool, fallb
 		}
 	}
 
-	for _, list := range extraWhitelist {
-		for _, raw := range list {
-			if d := netdial.NormalizeDomainEntry(raw); d != "" {
-				exactMap[d] = true
-				addSuffix("." + d)
-			}
+	for _, raw := range whitelist {
+		if d := netdial.NormalizeDomainEntry(raw); d != "" {
+			exactMap[d] = true
+			addSuffix("." + d)
 		}
 	}
 	sort.Strings(finalSuffixes)
 
+	bypassExactMap := make(map[string]bool)
+	bypassSuffixSeen := make(map[string]bool)
+	var bypassSuffixes []string
+	for _, raw := range bypassList {
+		if d := netdial.NormalizeDomainEntry(raw); d != "" {
+			bypassExactMap[d] = true
+			s := "." + d
+			if !bypassSuffixSeen[s] {
+				bypassSuffixSeen[s] = true
+				bypassSuffixes = append(bypassSuffixes, s)
+			}
+		}
+	}
+	sort.Strings(bypassSuffixes)
+
 	exactJSON, _ := json.Marshal(exactMap)
 	suffixJSON, _ := json.Marshal(finalSuffixes)
+	bypassExactJSON, _ := json.Marshal(bypassExactMap)
+	bypassSuffixJSON, _ := json.Marshal(bypassSuffixes)
 	globalStr := "false"
 	if global {
 		globalStr = "true"
@@ -294,6 +323,8 @@ var PROXY_STR = %s;
 var GLOBAL_MODE = %s;
 var EXACT_HOSTS = %s;
 var SUFFIX_RULES = %s;
+var BYPASS_EXACT_HOSTS = %s;
+var BYPASS_SUFFIX_RULES = %s;
 
 function FindProxyForURL(url, host) {
   if (!host) {
@@ -315,6 +346,15 @@ function FindProxyForURL(url, host) {
       shExpMatch(host, "*.local")) {
     return "DIRECT";
   }
+  if (BYPASS_EXACT_HOSTS[host]) {
+    return FALLBACK_STR;
+  }
+  for (var j = 0; j < BYPASS_SUFFIX_RULES.length; j++) {
+    var b = BYPASS_SUFFIX_RULES[j];
+    if (host.length > b.length && host.substring(host.length - b.length) === b) {
+      return FALLBACK_STR;
+    }
+  }
   if (GLOBAL_MODE) {
     return PROXY_STR;
   }
@@ -329,5 +369,5 @@ function FindProxyForURL(url, host) {
   }
   return FALLBACK_STR;
 }
-`, string(fallbackJSON), string(proxyJSON), globalStr, string(exactJSON), string(suffixJSON))
+`, string(fallbackJSON), string(proxyJSON), globalStr, string(exactJSON), string(suffixJSON), string(bypassExactJSON), string(bypassSuffixJSON))
 }

@@ -634,6 +634,9 @@ func ResolveHostIPs(ctx context.Context, host string) ([]string, error) {
 func ResolveHostIPsByMode(ctx context.Context, host, ipMode string) ([]string, error) {
 	host = netdial.CleanHost(host)
 	normMode := resolveEffectiveIPMode(ipMode)
+	if host == netdial.DefaultSiteHost {
+		return netdial.ResolveDefaultSiteHost(ctx, normMode)
+	}
 
 	if parsed := net.ParseIP(host); parsed != nil {
 		filtered := netdial.FilterIPsByMode([]net.IP{parsed}, normMode)

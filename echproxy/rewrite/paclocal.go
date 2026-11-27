@@ -225,3 +225,83 @@ func usableLocalWhitelist(path string) (bool, string) {
 	}
 	return true, ""
 }
+
+// LocalBypassFileName 是本地自定义 bypass.txt 文件名。
+// 用于「系统 -> ech-proxy -> bypass.txt（本地/在线） -> 全局代理」共存方案：
+// 命中 bypass.txt 的域名将跳过 ech-proxy 直连/ECH 尝试，直接转交给上游全局代理（-fallback）；
+// 未配置全局代理时则回退 DIRECT。
+//
+// 判定优先级（见 ResolveBypassSource）：
+//  1. 显式配置 -bypass-url / ECH_PROXY_BYPASS_URL；
+//  2. -no-local-bypass / ECH_PROXY_NO_LOCAL_BYPASS=1 时忽略本地文件；
+//  3. 显式配置 -bypass-file / ECH_PROXY_BYPASS_FILE；
+//  4. 自动探测：<exeDir>/bypass.txt → <dataDir>/bypass.txt → <cwd>/bypass.txt；
+//  5. 都没有 → 在线 DefaultBypassURL（拉取失败静默保留空表，不影响主线 PAC）。
+const LocalBypassFileName = "bypass.txt"
+
+// DefaultLocalBypassCandidates 返回自动探测本地 bypass.txt 的候选路径（按优先级）：
+// 程序所在目录 → 数据目录 → 当前工作目录。
+func DefaultLocalBypassCandidates(dataDir string) []string {
+	var out []string
+	if exe, err := os.Executable(); err == nil {
+		out = append(out, filepath.Join(filepath.Dir(exe), LocalBypassFileName))
+	}
+	if d := strings.TrimSpace(dataDir); d != "" {
+		out = append(out, filepath.Join(d, LocalBypassFileName))
+	}
+	if wd, err := os.Getwd(); err == nil {
+		out = append(out, filepath.Join(wd, LocalBypassFileName))
+	}
+	return dedupePaths(out)
+}
+
+// ResolveBypassSource 按与 ResolveWhitelistSource 相同的离线优先规则解析 bypass.txt 来源。
+func ResolveBypassSource(opts WhitelistSourceOptions) WhitelistSource {
+	out := WhitelistSource{URL: DefaultBypassURL, Kind: WhitelistKindRemote}
+
+	if u := strings.TrimSpace(opts.ExplicitURL); u != "" {
+		out.URL = u
+		out.Kind = WhitelistKindExplicit
+		if p, ok := localWhitelistPath(u); ok {
+			if abs, err := filepath.Abs(p); err == nil {
+				out.LocalPath = abs
+			} else {
+				out.LocalPath = p
+			}
+		}
+		return out
+	}
+
+	if opts.DisableLocal {
+		out.Warnings = append(out.Warnings, fmt.Sprintf("已禁用本地 %s（-no-local-bypass），使用在线列表 %s", LocalBypassFileName, DefaultBypassURL))
+		return out
+	}
+
+	if p := strings.TrimSpace(opts.ExplicitPath); p != "" {
+		if ok, warn := usableLocalWhitelist(p); ok {
+			res := localWhitelistResult(p)
+			res.Warnings = out.Warnings
+			return res
+		} else if warn != "" {
+			out.Warnings = append(out.Warnings, fmt.Sprintf("-bypass-file %q 不可用: %s", p, warn))
+		}
+	}
+
+	cands := opts.Candidates
+	if len(cands) == 0 {
+		cands = DefaultLocalBypassCandidates(opts.DataDir)
+	}
+	for _, cand := range dedupePaths(cands) {
+		ok, warn := usableLocalWhitelist(cand)
+		if warn != "" {
+			out.Warnings = append(out.Warnings, warn)
+		}
+		if ok {
+			res := localWhitelistResult(cand)
+			res.Warnings = out.Warnings
+			return res
+		}
+	}
+
+	return out
+}

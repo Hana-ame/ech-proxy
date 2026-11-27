@@ -667,12 +667,34 @@ func New() (*Client, error) {
 	return newClient(echConfig, netdial.DefaultIPMode), nil
 }
 
+func isIdempotentNoBody(req *http.Request) bool {
+	if req == nil {
+		return false
+	}
+	switch req.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+	default:
+		return false
+	}
+	return req.Body == nil || req.Body == http.NoBody
+}
+
 func (c *Client) Do(req *http.Request) (*http.Response, error) {
+	if c == nil || len(c.pool) == 0 {
+		return nil, errors.New("ech client pool is empty")
+	}
 	if req.Host == "" {
 		req.Host = req.URL.Host
 	}
-	idx := c.rr.Add(1) % uint64(len(c.pool))
-	return c.pool[idx].Do(req)
+	n := uint64(len(c.pool))
+	idx := c.rr.Add(1) % n
+	resp, err := c.pool[idx].Do(req)
+	if err == nil || n < 2 || IsCertError(err) || req.Context().Err() != nil || !isIdempotentNoBody(req) {
+		return resp, err
+	}
+	// 某条 H2 分片劣化时对无 Body 幂等请求自动换下一分片重试一次，避免持续性 25% 失败率
+	nextIdx := (idx + 1) % n
+	return c.pool[nextIdx].Do(req)
 }
 
 func getECHClient(ipMode string) (*Client, error) {

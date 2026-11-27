@@ -1,7 +1,7 @@
 # ech-proxy bypass.txt — 高敏感域名与共存绕过清单
 # 命中此清单的域名将跳过 ech-proxy 本地 CA MITM 解密，直接走上游代理（-fallback）或直连。
 # 可直接部署到 https://4545810.xyz/bypass.txt，或放在 ech-proxy.exe 同目录离线热加载。
-# （注：下方网银/支付/密码管理器/系统更新域名也已内置于程序默认安全绕过列表，即使本文件为空也会生效。）
+# （注：下方网银/支付/密码管理器/系统更新与 OCSP/CRL 域名也已内置于程序默认安全绕过列表，即使本文件为空也会生效。）
 
 # === 中国主流网银与银联（Banking CN） ===
 icbc.com.cn
@@ -45,6 +45,7 @@ revolut.com
 alipay.com
 alipayobjects.com
 tenpay.com
+weixin.qq.com
 pay.weixin.qq.com
 paypal.com
 paypalobjects.com
@@ -76,7 +77,7 @@ enpass.io
 keepersecurity.com
 yubico.com
 
-# === 操作系统更新与证书吊销/信任服务（OS Updates & System Trust） ===
+# === 操作系统更新与证书吊销/OCSP/CRL 信任服务（OS Updates & PKI Trust） ===
 windowsupdate.com
 update.microsoft.com
 download.windowsupdate.com
@@ -91,11 +92,24 @@ gdmf.apple.com
 xp.apple.com
 ocsp.apple.com
 ocsp2.apple.com
+crl.apple.com
 crl.microsoft.com
 ocsp.digicert.com
 ocsp.pki.goog
+ocsp.sectigo.com
+crl.sectigo.com
+ocsp.usertrust.com
+crl.usertrust.com
+ocsp.globalsign.com
+crl.globalsign.com
+ocsp.comodoca.com
+ocsp.entrust.net
+ocsp.godaddy.com
+ocsp.r2m01.amazontrust.com
+ocsp.sca1b.amazontrust.com
 
-# === 核心账号登录与强证书校验域名（Core Auth） ===
+# === 核心账号登录与 OAuth 强校验域名（Core Auth） ===
+accounts.google.com
 login.microsoftonline.com
 login.live.com
 appleid.apple.com

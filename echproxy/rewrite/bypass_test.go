@@ -84,3 +84,31 @@ func TestDefaultSensitiveBypassDomainsAlwaysActive(t *testing.T) {
 		t.Error("non-sensitive domain pixiv.net should not be in DefaultSensitiveBypassDomains")
 	}
 }
+
+func TestDefaultSensitiveBypassDomainsImmutableAndPKICoverage(t *testing.T) {
+	s1 := DefaultSensitiveBypassDomains()
+	if len(s1) == 0 {
+		t.Fatal("expected non-empty DefaultSensitiveBypassDomains")
+	}
+	orig := s1[0]
+	s1[0] = "evil.invalid"
+	s2 := DefaultSensitiveBypassDomains()
+	if s2[0] != orig {
+		t.Fatalf("DefaultSensitiveBypassDomains mutated across calls: got %q, want %q", s2[0], orig)
+	}
+
+	mgr := NewAdScriptManager(AdScriptOptions{NoLocalPAC: true, NoLocalBypass: true})
+	for _, host := range []string{
+		"open.weixin.qq.com",
+		"login.weixin.qq.com",
+		"accounts.google.com",
+		"crl.apple.com",
+		"ocsp.sectigo.com",
+		"ocsp.usertrust.com",
+		"ocsp.globalsign.com",
+	} {
+		if !mgr.IsBypassed(host) {
+			t.Errorf("expected %q to be protected by DefaultSensitiveBypassDomains", host)
+		}
+	}
+}

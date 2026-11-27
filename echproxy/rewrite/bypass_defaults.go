@@ -1,9 +1,8 @@
 package rewrite
 
-// DefaultSensitiveBypassDomains 是内置的高敏感域名默认绕过清单（网银、支付、密码管理器、系统更新与证书吊销/核心登录）。
-// 即使远端 bypass.txt 不可达或本地 bypass.txt 仅包含自定义域名，这些高敏感域名也始终跳过本地 CA MITM，
-// 避免在 -all 全代理模式下对金融、密码库与系统信任链流量执行本地解密重签。
-var DefaultSensitiveBypassDomains = []string{
+// defaultSensitiveBypassDomains 是内置的高敏感域名默认绕过清单（定长私有数组，防止外部包篡改）。
+// 覆盖网银、支付、密码管理器、系统更新、第三方 OCSP/CRL 信任链及核心账号登录域名。
+var defaultSensitiveBypassDomains = [...]string{
 	// 中国主流网银与银联（Banking CN）
 	"icbc.com.cn",
 	"ccb.com",
@@ -44,6 +43,7 @@ var DefaultSensitiveBypassDomains = []string{
 	"alipay.com",
 	"alipayobjects.com",
 	"tenpay.com",
+	"weixin.qq.com",
 	"pay.weixin.qq.com",
 	"paypal.com",
 	"paypalobjects.com",
@@ -73,7 +73,7 @@ var DefaultSensitiveBypassDomains = []string{
 	"enpass.io",
 	"keepersecurity.com",
 	"yubico.com",
-	// 操作系统更新与证书吊销/信任服务（OS Updates & System Trust）
+	// 操作系统更新与证书吊销/OCSP/CRL 信任服务（OS Updates & PKI Trust）
 	"windowsupdate.com",
 	"update.microsoft.com",
 	"download.windowsupdate.com",
@@ -88,20 +88,38 @@ var DefaultSensitiveBypassDomains = []string{
 	"xp.apple.com",
 	"ocsp.apple.com",
 	"ocsp2.apple.com",
+	"crl.apple.com",
 	"crl.microsoft.com",
 	"ocsp.digicert.com",
 	"ocsp.pki.goog",
-	// 核心账号登录与强证书校验域名（Core Auth）
+	"ocsp.sectigo.com",
+	"crl.sectigo.com",
+	"ocsp.usertrust.com",
+	"crl.usertrust.com",
+	"ocsp.globalsign.com",
+	"crl.globalsign.com",
+	"ocsp.comodoca.com",
+	"ocsp.entrust.net",
+	"ocsp.godaddy.com",
+	"ocsp.r2m01.amazontrust.com",
+	"ocsp.sca1b.amazontrust.com",
+	// 核心账号登录与 OAuth 强校验域名（Core Auth）
+	"accounts.google.com",
 	"login.microsoftonline.com",
 	"login.live.com",
 	"appleid.apple.com",
 	"idmsa.apple.com",
 }
 
+// DefaultSensitiveBypassDomains 返回内置高敏感绕过域名清单的只读副本。
+func DefaultSensitiveBypassDomains() []string {
+	return append([]string(nil), defaultSensitiveBypassDomains[:]...)
+}
+
 // MergeWithDefaultSensitiveBypass 将用户/远端 bypass.txt 列表与内置高敏感绕过域名合并去重。
 func MergeWithDefaultSensitiveBypass(domains []string) []string {
-	merged := make([]string, 0, len(DefaultSensitiveBypassDomains)+len(domains))
-	merged = append(merged, DefaultSensitiveBypassDomains...)
+	merged := make([]string, 0, len(defaultSensitiveBypassDomains)+len(domains))
+	merged = append(merged, defaultSensitiveBypassDomains[:]...)
 	merged = append(merged, domains...)
 	return normalizeDomainSlice(merged)
 }

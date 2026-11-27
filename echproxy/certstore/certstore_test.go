@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -138,5 +139,29 @@ func TestCAHardeningAndExpiredLeafAutoRotation(t *testing.T) {
 	}
 	if !parsed.NotAfter.After(time.Now().Add(300 * 24 * time.Hour)) {
 		t.Fatalf("expected rotated fresh leaf cert, got NotAfter=%s", parsed.NotAfter)
+	}
+}
+
+func TestConcurrentCertificateForSingleflightAndRaceSafety(t *testing.T) {
+	st, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	hosts := []string{"a.example.com", "a.example.com", "b.example.org", "c.example.net", "b.example.org"}
+	var wg sync.WaitGroup
+	errs := make(chan error, len(hosts))
+	for _, h := range hosts {
+		wg.Add(1)
+		go func(host string) {
+			defer wg.Done()
+			if _, err := st.CertificateFor(host); err != nil {
+				errs <- err
+			}
+		}(h)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent CertificateFor failed: %v", err)
 	}
 }

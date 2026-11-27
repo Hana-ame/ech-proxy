@@ -94,12 +94,19 @@ type CA struct {
 	KeyPath  string
 }
 
+type leafGenCall struct {
+	done chan struct{}
+	cert *tls.Certificate
+	err  error
+}
+
 type Store struct {
 	mu         sync.Mutex
 	DataDir    string
 	ca         *CA
 	portalCert *tls.Certificate
 	leaf       map[string]*tls.Certificate
+	inflight   map[string]*leafGenCall
 	crlBaseURL string
 }
 
@@ -168,7 +175,10 @@ func DefaultDataDir() (string, error) {
 	if exeDir != "" && canWrite(exeDir) {
 		return exeDir, nil
 	}
-	return "", fmt.Errorf("cannot determine user config dir: %w", err)
+	if err != nil {
+		return "", fmt.Errorf("cannot determine user config dir: %w", err)
+	}
+	return "", errors.New("cannot determine user config dir: empty path")
 }
 
 func canWrite(dir string) bool {
@@ -193,8 +203,9 @@ func NewStore(dataDir string) (*Store, error) {
 	}
 
 	st := &Store{
-		DataDir: dataDir,
-		leaf:    make(map[string]*tls.Certificate),
+		DataDir:  dataDir,
+		leaf:     make(map[string]*tls.Certificate),
+		inflight: make(map[string]*leafGenCall),
 	}
 	caPath := filepath.Join(dataDir, "ca", caCertName)
 	keyPath := filepath.Join(dataDir, "ca", caKeyName)
@@ -297,26 +308,48 @@ func (st *Store) CertificateFor(host string) (*tls.Certificate, error) {
 		return nil, fmt.Errorf("certstore: refusing to issue certificate for IP (%s)", host)
 	}
 
-	st.mu.Lock()
-	defer st.mu.Unlock()
-
 	key := certGroupingDomain(host)
+
+	st.mu.Lock()
 	if c, ok := st.leaf[key]; ok && !leafNeedsRenewal(c) {
+		st.mu.Unlock()
 		return c, nil
 	}
-	if leaf, err := st.loadLeaf(key); err == nil {
-		st.leaf[key] = leaf
-		return leaf, nil
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("certstore: cannot load leaf for %s: %w", key, err)
+	if call, waiting := st.inflight[key]; waiting {
+		st.mu.Unlock()
+		<-call.done
+		return call.cert, call.err
+	}
+	call := &leafGenCall{done: make(chan struct{})}
+	if st.inflight == nil {
+		st.inflight = make(map[string]*leafGenCall)
+	}
+	st.inflight[key] = call
+	ca := st.ca
+	crlBaseURL := st.crlBaseURL
+	st.mu.Unlock()
+
+	// 磁盘读取与 RSA-2048 密钥生成完全在锁外执行，避免并发 HTTPS 握手全局串行排队；
+	// 同域名并发请求由 st.inflight[key] 合并去重。
+	var cert *tls.Certificate
+	var err error
+	if leaf, lerr := st.loadLeaf(key); lerr == nil {
+		cert = leaf
+	} else if !os.IsNotExist(lerr) {
+		err = fmt.Errorf("certstore: cannot load leaf for %s: %w", key, lerr)
+	} else {
+		cert, err = st.issueLeafWithCA(key, ca, crlBaseURL)
 	}
 
-	cert, err := st.issueLeaf(key)
-	if err != nil {
-		return nil, err
+	st.mu.Lock()
+	if err == nil && cert != nil {
+		st.leaf[key] = cert
 	}
-	st.leaf[key] = cert
-	return cert, nil
+	delete(st.inflight, key)
+	call.cert, call.err = cert, err
+	close(call.done)
+	st.mu.Unlock()
+	return cert, err
 }
 
 func certGroupingDomain(host string) string {
@@ -376,7 +409,10 @@ func leafNeedsRenewal(cert *tls.Certificate) bool {
 	return now.Before(leaf.NotBefore) || now.After(leaf.NotAfter.Add(-leafRenewMargin))
 }
 
-func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
+func (st *Store) issueLeafWithCA(domain string, ca *CA, crlBaseURL string) (*tls.Certificate, error) {
+	if ca == nil || ca.Cert == nil || ca.Key == nil {
+		return nil, errors.New("certstore: CA not initialized")
+	}
 	serial, err := rand.Int(rand.Reader, big.NewInt(leafSerialMax))
 	if err != nil {
 		return nil, err
@@ -392,8 +428,8 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 	skid := sha1.Sum(x509.MarshalPKCS1PublicKey(&key.PublicKey))
 
 	var crlPoints []string
-	if st.crlBaseURL != "" {
-		crlPoints = []string{st.crlBaseURL + "/crl"}
+	if crlBaseURL != "" {
+		crlPoints = []string{crlBaseURL + "/crl"}
 	}
 
 	tmpl := &x509.Certificate{
@@ -405,11 +441,11 @@ func (st *Store) issueLeaf(domain string) (*tls.Certificate, error) {
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
 		SubjectKeyId:          skid[:],
-		AuthorityKeyId:        st.ca.Cert.SubjectKeyId,
+		AuthorityKeyId:        ca.Cert.SubjectKeyId,
 		DNSNames:              sans,
 		CRLDistributionPoints: crlPoints,
 	}
-	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, st.ca.Cert, &key.PublicKey, st.ca.Key)
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Cert, &key.PublicKey, ca.Key)
 	if err != nil {
 		return nil, err
 	}

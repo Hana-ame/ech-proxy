@@ -287,3 +287,13 @@
   - `TransportWithIPModeAndCertCheck` 改为 `InsecureSkipVerify: certCheck != nil`，防止调用方传入 `nil` 回调时意外跳过 TLS 证书校验。
 - **单测与 CI 门禁**：
   - 新增 `TestCAHardeningAndExpiredLeafAutoRotation` 与 `TestDefaultSensitiveBypassDomainsAlwaysActive`；并在 `.github/workflows/go.yml` 中新增对 `MaxPathLenZero: true`、`InsecureSkipVerify: certCheck != nil`、`DefaultSensitiveBypassDomains` 与 `bypass.txt` 的静态守护断言。
+
+## 8. 代码评审 7 项稳定性与并发安全修复（v3.6.5-r2）
+
+1. **只读化内置敏感绕过清单（`echproxy/rewrite/bypass_defaults.go`）**：将导出的可变切片改为私有定长数组 `defaultSensitiveBypassDomains`，通过 `DefaultSensitiveBypassDomains() []string` 返回副本，杜绝跨包篡改安全兜底清单。
+2. **补齐高敏感与 PKI 信任链域名覆盖（`bypass.txt` & `bypass_defaults.go`）**：补充 `weixin.qq.com`（覆盖 `open.weixin.qq.com` / `login.weixin.qq.com`）、`accounts.google.com`、`crl.apple.com` 及第三方 OCSP/CRL（Sectigo / UserTrust / GlobalSign / Comodo / Entrust / GoDaddy / Amazon Trust）。
+3. **ECH HTTP/3 兜底超时上限（`echproxy/ech/h3.go`）**：`doECHHTTP3` 在调用方未传 `ctx` deadline 时自动套用 60s 上限，并通过 `cancelOnCloseReadCloser` 在响应体关闭时释放 `cancel`，避免连接挂死又不切断流式响应。
+4. **ECH 4 路分片故障转移与零值防御（`echproxy/ech/client.go`）**：`Client.Do` 增加 `len(c.pool) == 0` 除零保护；对无 Body 幂等请求（GET/HEAD/OPTIONS）在单分片非证书错误失败时自动切换下一分片重试一次，消除单路劣化导致的持续 25% 失败率。
+5. **修复 `DefaultDataDir` 的 `nil` 错误 `%w` 格式化（`echproxy/certstore/certstore.go`）**：当 `os.UserConfigDir()` 返回空路径且 `err == nil` 时改为明确返回非 nil 错误，避免出现 `%!w(<nil>)`。
+6. **锁外生成 RSA-2048 叶子证书 + 按域名 singleflight 去重（`echproxy/certstore/certstore.go`）**：`CertificateFor` 释放 `st.mu` 后再执行磁盘加载与 RSA-2048 密钥生成，同时用 `st.inflight[key]` 合并同域名并发握手请求，消除并发打开多站点时的全局串行排队与到期集中续期卡顿。
+7. **新增回归单测**：补充 `TestDefaultSensitiveBypassDomainsImmutableAndPKICoverage`、`TestZeroValueClientDoReturnsErrorWithoutPanic`、`TestConcurrentCertificateForSingleflightAndRaceSafety`。
